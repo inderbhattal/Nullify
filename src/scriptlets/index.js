@@ -39,6 +39,9 @@ import { objectPrune } from './object-prune.js';
 import { trustedSetConstant } from './trusted-set-constant.js';
 import { spoofCss } from './spoof-css.js';
 import { trustedReplaceFetchResponse, trustedReplaceXhrResponse } from './trusted-replace-fetch-response.js';
+import { trustedClickElement } from './trusted-click-element.js';
+import { m3uPrune } from './m3u-prune.js';
+import { hideWindowError } from './hide-window-error.js';
 
 // ---------------------------------------------------------------------------
 // Registry — maps scriptlet name (and aliases) to implementation
@@ -66,6 +69,7 @@ const REGISTRY = new Map([
   ['no-fetch-if', noFetchIf],
   ['prevent-xhr', preventXhr],
   ['no-xhr-if', noXhrIf],
+  ['m3u-prune', m3uPrune],
 
   // DOM manipulation
   ['remove-attr', removeAttr],
@@ -109,6 +113,8 @@ const REGISTRY = new Map([
   // Trusted (privileged) variants
   ['trusted-set-constant', trustedSetConstant],
   ['tsc', trustedSetConstant],
+  ['trusted-click-element', trustedClickElement],
+  ['tce', trustedClickElement],
 
   // Anti-adblock / CSS spoofing
   ['spoof-css', spoofCss],
@@ -116,6 +122,8 @@ const REGISTRY = new Map([
   ['trfr', trustedReplaceFetchResponse],
   ['trusted-replace-xhr-response', trustedReplaceXhrResponse],
   ['trxr', trustedReplaceXhrResponse],
+  ['hide-window-error', hideWindowError],
+  ['hwe', hideWindowError],
 ]);
 
 // ---------------------------------------------------------------------------

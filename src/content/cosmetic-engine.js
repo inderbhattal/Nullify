@@ -154,7 +154,7 @@ export class CosmeticEngine {
   init(rules) {
     const exceptions = new Set(rules.exceptions || []);
 
-    // Ingest all selectors, separating procedural from plain CSS
+    // Ingest all selectors (now mostly domain-specific + user rules)
     const allSelectors = [
       ...(rules.generic || []),
       ...(rules.domainSpecific || []),
@@ -168,8 +168,6 @@ export class CosmeticEngine {
       const isProcedural = isProceduralSelector(sel);
       
       // Fast-path: Chrome supports :has() natively now. 
-      // If the selector is ONLY a native CSS :has() and no other Nullify-specific ops,
-      // we can treat it as plain CSS.
       if (isProcedural && !sel.includes(':has-text(') && !sel.includes(':upward(') && 
           !sel.includes(':xpath(') && !sel.includes(':matches-css') && 
           !sel.includes(':min-text-length') && !sel.includes(':watch-attr')) {
@@ -190,6 +188,8 @@ export class CosmeticEngine {
     this._cssSelectors = cssSelectors;
     this._exceptions = exceptions;
 
+    // Only inject extra CSS if we have site-specific or user rules.
+    // The massive generic list is now handled by service-worker.js via insertCSS.
     if (cssSelectors.length > 0) this._injectCSS(cssSelectors);
     if (exceptions.size > 0) this._injectExceptionCSS([...exceptions]);
     if (this._proceduralRules.length > 0) this._applyAllProcedural();

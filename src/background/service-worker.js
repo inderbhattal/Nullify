@@ -15,8 +15,10 @@
 
 import { StorageKeys, getStorage, setStorage, getAllowlist } from '../shared/storage.js';
 import { RulesDB } from '../shared/db.js';
+import { BloomFilter } from '../shared/bloom.js';
 
 const db = new RulesDB();
+let bloom = new BloomFilter();
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -52,9 +54,22 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 });
 
 chrome.runtime.onStartup.addListener(async () => {
+  await loadBloomFilter();
   await applyPrivacySettings();
   await scheduleFilterUpdateAlarm();
 });
+
+async function loadBloomFilter() {
+  const data = await getStorage(StorageKeys.BLOOM_FILTER);
+  if (data) {
+    try {
+      bloom = BloomFilter.deserialize(data);
+      console.log('[AdBlock] Bloom Filter loaded');
+    } catch (err) {
+      console.error('[AdBlock] Failed to deserialize Bloom Filter:', err);
+    }
+  }
+}
 
 /**
  * Fetch latest rules and index them into IndexedDB.
@@ -76,18 +91,38 @@ async function ingestRules() {
     // Wipe and rebuild index
     await db.clear();
     
+    // Build a new Bloom Filter for all hostnames
+    const newBloom = new BloomFilter();
+
     if (cosData.domainSpecific) {
       await db.putBulkCosmeticRules(cosData.domainSpecific);
+      for (const hostname of Object.keys(cosData.domainSpecific)) {
+        newBloom.add(hostname);
+      }
     }
+    
     if (scriptData) {
       await db.putBulkScriptletRules(scriptData);
+      for (const rule of scriptData) {
+        if (rule.domains) {
+          for (const d of rule.domains) newBloom.add(d);
+        }
+      }
     }
 
-    // Store generic cosmetic rules in storage
-    await setStorage(StorageKeys.COSMETIC_GENERIC_RULES, cosData.generic || []);
-    
+    // Save Bloom Filter
+    bloom = newBloom;
+    await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
+
+    // Pre-compile generic rules into a single CSS block
+    if (cosData.generic && cosData.generic.length > 0) {
+      // Chunking if too large for storage, but 2MB is usually okay for one key
+      const css = cosData.generic.join(',') + ' { display: none !important; }';
+      await setStorage(StorageKeys.GENERIC_CSS, css);
+    }
+
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
-    console.log('[AdBlock] Rule indexing complete');
+    console.log('[AdBlock] Rule indexing and Bloom Filter build complete');
   } catch (err) {
     console.error('[AdBlock] Failed to ingest rules:', err);
   }
@@ -569,14 +604,17 @@ async function handleMessage(message, sender) {
 // ---------------------------------------------------------------------------
 
 async function getCosmeticRulesForPage(hostname) {
-  const generic = (await getStorage(StorageKeys.COSMETIC_GENERIC_RULES)) || [];
   const domainSpecific = [];
   const parts = hostname.split('.');
+  
+  // 1. Check Bloom Filter before hitting IndexedDB
   for (let i = 0; i < parts.length - 1; i++) {
     const domain = parts.slice(i).join('.');
-    const domainRules = await db.getCosmeticRules(domain);
-    if (domainRules.length > 0) {
-      domainSpecific.push(...domainRules);
+    if (bloom.has(domain)) {
+      const domainRules = await db.getCosmeticRules(domain);
+      if (domainRules.length > 0) {
+        domainSpecific.push(...domainRules);
+      }
     }
   }
 
@@ -596,12 +634,49 @@ async function getCosmeticRulesForPage(hostname) {
   }
 
   return {
-    generic: [...generic, ...userGeneric],
+    generic: userGeneric, // Massive static rules are now injected via SW
     domainSpecific: [...domainSpecific, ...userDomainSelectors],
     exceptions: [...userExceptions],
   };
 }
 
 async function getScriptletRulesForPage(hostname) {
+  const parts = hostname.split('.');
+  let mightHaveRules = false;
+  
+  // Check the empty string key for generic scriptlet rules
+  if (bloom.has('')) mightHaveRules = true;
+  else {
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (bloom.has(parts.slice(i).join('.'))) {
+        mightHaveRules = true;
+        break;
+      }
+    }
+  }
+
+  if (!mightHaveRules) return [];
+  
   return await db.getScriptletRules(hostname);
 }
+
+// ---------------------------------------------------------------------------
+// Injection — Native Generic Hide
+// ---------------------------------------------------------------------------
+chrome.webNavigation.onCommitted.addListener(async (details) => {
+  if (details.frameId !== 0) return; // Only main frame
+  if (!details.url.startsWith('http')) return;
+
+  const css = await getStorage(StorageKeys.GENERIC_CSS);
+  if (!css) return;
+
+  try {
+    await chrome.scripting.insertCSS({
+      target: { tabId: details.tabId },
+      css: css,
+      origin: 'USER',
+    });
+  } catch (err) {
+    // Ignore restricted pages
+  }
+});

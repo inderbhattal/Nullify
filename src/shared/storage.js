@@ -16,6 +16,8 @@ export const StorageKeys = {
   LAST_UPDATE_CHECK: 'lastUpdateCheck',
   COSMETIC_RULES_VERSION: 'cosmeticRulesVersion',
   COSMETIC_GENERIC_RULES: 'cosmeticGenericRules',
+  BLOOM_FILTER: 'bloomFilter',
+  GENERIC_CSS: 'genericCss',
 };
 
 /** Get a single value from storage. Returns null if not found. */

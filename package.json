@@ -1,6 +1,6 @@
 {
   "name": "nullify",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "A powerful MV3 Chrome ad blocker with uBlock Origin-level features",
   "type": "module",
   "engines": {
@@ -18,7 +18,7 @@
     "clean": "rm -rf dist/ rules/*.json",
     "clean:all": "npm run clean && rm -rf node_modules/",
     "version:sync": "node scripts/version.mjs",
-    "version:bump": "f() { npm version --no-git-tag-version \"$1\" && npm run version:sync && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to $(node -p \"require('./package.json').version\")\" && git tag v$(node -p \"require('./package.json').version\"); }; f"
+    "version:bump": "f() { new_ver=$(npm version --no-git-tag-version \"$1\") && npm run version:sync -- \"${new_ver#v}\" && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to ${new_ver#v}\" && git tag \"$new_ver\"; }; f"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.268",

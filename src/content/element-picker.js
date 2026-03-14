@@ -517,7 +517,16 @@ function buildDialogHTML(candidates, target, hostname) {
       }
       .adblock-picker-row:hover { background: #21262d; }
       .adblock-picker-row:has(input:checked) { background: rgba(88,166,255,0.08); border-color: #58a6ff; }
-      .adblock-picker-row input { flex-shrink: 0; accent-color: #58a6ff; }
+      .adblock-picker-row input[type="radio"] {
+        appearance: radio !important;
+        -webkit-appearance: radio !important;
+        width: 14px !important;
+        height: 14px !important;
+        margin: 0 !important;
+        flex-shrink: 0;
+        accent-color: #58a6ff !important;
+        cursor: pointer;
+      }
       .adblock-picker-sel {
         flex: 1; font-family: monospace; font-size: 12px; color: #e6edf3;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

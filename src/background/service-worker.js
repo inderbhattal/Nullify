@@ -1,0 +1,585 @@
+/**
+ * service-worker.js
+ *
+ * The background service worker for AdBlock MV3.
+ *
+ * Responsibilities:
+ *  - On install/startup: initialize storage, load cosmetic/scriptlet rules
+ *  - Manage dynamic DNR rules (user filters, per-site exceptions)
+ *  - Track blocked-request counts per tab
+ *  - Respond to messages from content scripts (provide scriptlets, cosmetic rules)
+ *  - Schedule periodic filter-list update checks (alarms)
+ *  - Manage per-site allowlist
+ *  - Apply WebRTC/privacy settings
+ */
+
+import { StorageKeys, getStorage, setStorage, getAllowlist } from '../shared/storage.js';
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+const ALARM_FILTER_UPDATE = 'filter-list-update';
+const FILTER_UPDATE_INTERVAL_MINUTES = 24 * 60; // 24 hours
+
+// DNR rule ID ranges (avoid collisions between categories)
+const DNR_USER_RULES_START = 900_000;
+const DNR_ALLOWLIST_START = 990_000;
+
+// ---------------------------------------------------------------------------
+// Install / startup
+// ---------------------------------------------------------------------------
+chrome.runtime.onInstalled.addListener(async (details) => {
+  console.log('[AdBlock] onInstalled:', details.reason);
+
+  if (details.reason === 'install') {
+    await initializeDefaults();
+  }
+
+  await applyPrivacySettings();
+  await scheduleFilterUpdateAlarm();
+
+  // Update badge for all existing tabs
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    updateBadge(tab.id);
+  }
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await applyPrivacySettings();
+  await scheduleFilterUpdateAlarm();
+});
+
+// ---------------------------------------------------------------------------
+// Initialization
+// ---------------------------------------------------------------------------
+async function initializeDefaults() {
+  const existing = await getStorage(StorageKeys.SETTINGS);
+  if (existing) return;
+
+  await setStorage(StorageKeys.SETTINGS, {
+    blockWebRTC: true,
+    upgradeInsecureRequests: true,
+    blockHyperlinkAuditing: true,
+    enabled: true,
+  });
+
+  await setStorage(StorageKeys.ALLOWLIST, []);
+  await setStorage(StorageKeys.USER_FILTERS, '');
+  await setStorage(StorageKeys.TAB_STATS, {});
+  await setStorage(StorageKeys.FILTER_LISTS_META, {});
+
+  // Enabled/disabled rulesets
+  await setStorage(StorageKeys.ENABLED_RULESETS, {
+    easylist: true,
+    easyprivacy: true,
+    annoyances: true,
+    malware: true,
+    'ubo-filters': true,
+    'ubo-unbreak': true,
+  });
+
+  console.log('[AdBlock] Defaults initialized');
+}
+
+// ---------------------------------------------------------------------------
+// Privacy settings
+// ---------------------------------------------------------------------------
+async function applyPrivacySettings() {
+  const settings = await getStorage(StorageKeys.SETTINGS) || {};
+
+  // Block WebRTC IP leaks
+  if (chrome.privacy && settings.blockWebRTC !== false) {
+    chrome.privacy.network.webRTCIPHandlingPolicy.set({
+      value: 'disable_non_proxied_udp',
+    });
+  }
+
+  // Block hyperlink auditing (ping attribute)
+  if (chrome.privacy && settings.blockHyperlinkAuditing !== false) {
+    chrome.privacy.websites.hyperlinkAuditingEnabled.set({ value: false });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Alarms — periodic filter list updates
+// ---------------------------------------------------------------------------
+async function scheduleFilterUpdateAlarm() {
+  await chrome.alarms.clear(ALARM_FILTER_UPDATE);
+  chrome.alarms.create(ALARM_FILTER_UPDATE, {
+    delayInMinutes: FILTER_UPDATE_INTERVAL_MINUTES,
+    periodInMinutes: FILTER_UPDATE_INTERVAL_MINUTES,
+  });
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === ALARM_FILTER_UPDATE) {
+    await checkFilterListUpdates();
+  }
+});
+
+async function checkFilterListUpdates() {
+  console.log('[AdBlock] Checking for filter list updates...');
+  // In production this would re-fetch and recompile filter lists.
+  // For now, log the check time.
+  await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
+}
+
+// ---------------------------------------------------------------------------
+// Tab stats tracking — count blocked requests per tab
+// ---------------------------------------------------------------------------
+const tabStats = new Map(); // tabId → { blocked: number, url: string }
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  tabStats.delete(tabId);
+  persistTabStats();
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading' && changeInfo.url) {
+    tabStats.set(tabId, { blocked: 0, url: changeInfo.url });
+    updateBadge(tabId);
+  }
+});
+
+chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
+  const { request, rule } = info;
+  if (rule.rulesetId !== '_dynamic' && rule.rulesetId !== '_session') {
+    if (!tabStats.has(request.tabId)) {
+      tabStats.set(request.tabId, { blocked: 0, url: request.url });
+    }
+    tabStats.get(request.tabId).blocked++;
+    updateBadge(request.tabId);
+  }
+});
+
+function updateBadge(tabId) {
+  if (!tabId || tabId < 0) return; // ignore non-tab requests (tabId = -1)
+  const stats = tabStats.get(tabId);
+  const count = stats?.blocked || 0;
+  const text = count > 999 ? '999+' : count > 0 ? String(count) : '';
+
+  chrome.action.setBadgeText({ text, tabId }).catch(() => {});
+  chrome.action.setBadgeBackgroundColor({ color: '#E74C3C', tabId }).catch(() => {});
+}
+
+async function persistTabStats() {
+  const obj = {};
+  for (const [tabId, stats] of tabStats) {
+    obj[tabId] = stats;
+  }
+  await setStorage(StorageKeys.TAB_STATS, obj).catch(() => {});
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic rules management
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse cosmetic (##) and exception (#@#) rules from a user filter text.
+ * Returns a structure matching the cosmetic-rules.json shape, plus exceptions.
+ *
+ * Formats:
+ *   example.com##.selector   → domain-specific hide
+ *   ##.selector              → generic hide
+ *   example.com#@#.selector  → domain-specific exception (un-hide)
+ *   #@#.selector             → generic exception (un-hide)
+ */
+function parseUserCosmeticRules(text) {
+  const generic = [];
+  const domainSpecific = {};
+  const genericExceptions = [];
+  const domainExceptions = {};
+
+  for (const line of (text || '').split('\n')) {
+    const t = line.trim();
+    if (!t || t.startsWith('!') || t.startsWith('[')) continue;
+
+    // Exception first (#@# contains ## as substring, check #@# first via indexOf)
+    const exIdx = t.indexOf('#@#');
+    if (exIdx !== -1 && !t.slice(0, exIdx).includes('#')) {
+      const domain = t.slice(0, exIdx).trim();
+      const sel = t.slice(exIdx + 3).trim();
+      if (!sel) continue;
+      if (domain) {
+        (domainExceptions[domain] = domainExceptions[domain] || []).push(sel);
+      } else {
+        genericExceptions.push(sel);
+      }
+      continue;
+    }
+
+    // Scriptlet — skip (handled separately)
+    if (t.includes('##+js(')) continue;
+
+    const cosIdx = t.indexOf('##');
+    if (cosIdx !== -1) {
+      const domain = t.slice(0, cosIdx).trim();
+      const sel = t.slice(cosIdx + 2).trim();
+      if (!sel) continue;
+      if (domain) {
+        (domainSpecific[domain] = domainSpecific[domain] || []).push(sel);
+      } else {
+        generic.push(sel);
+      }
+    }
+  }
+
+  return { generic, domainSpecific, genericExceptions, domainExceptions };
+}
+
+/** Apply user-defined filters as dynamic DNR rules + cosmetic rules. */
+async function applyUserFilters(filtersText) {
+  const lines = (filtersText || '').split('\n').filter(Boolean);
+  const newRules = [];
+  let id = DNR_USER_RULES_START;
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('!')) continue;
+
+    // Simple domain block: parse ||example.com^ pattern
+    const rule = parseSimpleNetworkRule(trimmed, id++);
+    if (rule) newRules.push(rule);
+  }
+
+  // Get existing dynamic rules in user range
+  const existing = await chrome.declarativeNetRequest.getDynamicRules();
+  const userRuleIds = existing
+    .filter((r) => r.id >= DNR_USER_RULES_START && r.id < DNR_ALLOWLIST_START)
+    .map((r) => r.id);
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: userRuleIds,
+    addRules: newRules,
+  });
+
+  // Extract and persist cosmetic rules so content scripts can use them
+  const cosmeticRules = parseUserCosmeticRules(filtersText);
+  await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
+
+  // Invalidate cache so next page load picks up new rules
+  cachedCosmeticRules = null;
+
+  console.log(`[AdBlock] Applied ${newRules.length} user network rules, ` +
+    `${cosmeticRules.generic.length} generic cosmetic rules, ` +
+    `${cosmeticRules.genericExceptions.length} generic exceptions`);
+}
+
+/** Parse a simple ABP-style network rule into a DNR rule object. */
+function parseSimpleNetworkRule(line, id) {
+  const isException = line.startsWith('@@');
+  const pattern = isException ? line.slice(2) : line;
+
+  if (!pattern || pattern.length < 3) return null;
+
+  // Check for cosmetic or scriptlet — skip (handled by content script)
+  if (pattern.includes('##') || pattern.includes('#@#') || pattern.includes('##+js')) return null;
+
+  const dollarPos = pattern.lastIndexOf('$');
+  let urlFilter = pattern;
+  let resourceTypes = null;
+
+  if (dollarPos > 0) {
+    urlFilter = pattern.slice(0, dollarPos);
+    const opts = pattern.slice(dollarPos + 1).split(',');
+    const typeMap = {
+      script: 'script', image: 'image', stylesheet: 'stylesheet',
+      xmlhttprequest: 'xmlhttprequest', document: 'main_frame',
+      subdocument: 'sub_frame', font: 'font', media: 'media',
+      websocket: 'websocket', ping: 'ping', other: 'other',
+    };
+    const types = opts.map(o => typeMap[o]).filter(Boolean);
+    if (types.length > 0) resourceTypes = types;
+  }
+
+  const condition = { urlFilter };
+  if (resourceTypes) condition.resourceTypes = resourceTypes;
+
+  return {
+    id,
+    priority: isException ? 3 : 1,
+    condition,
+    action: { type: isException ? 'allow' : 'block' },
+  };
+}
+
+/** Add a site to the per-site allowlist (disable blocking for domain). */
+async function allowSite(domain) {
+  const allowlist = await getAllowlist();
+  if (!allowlist.includes(domain)) {
+    allowlist.push(domain);
+    await setStorage(StorageKeys.ALLOWLIST, allowlist);
+  }
+  await rebuildAllowlistRules(allowlist);
+}
+
+/** Remove a site from the allowlist. */
+async function disallowSite(domain) {
+  let allowlist = await getAllowlist();
+  allowlist = allowlist.filter((d) => d !== domain);
+  await setStorage(StorageKeys.ALLOWLIST, allowlist);
+  await rebuildAllowlistRules(allowlist);
+}
+
+/** Rebuild DNR allow-all-requests rules from allowlist. */
+async function rebuildAllowlistRules(allowlist) {
+  const existing = await chrome.declarativeNetRequest.getDynamicRules();
+  const allowlistRuleIds = existing
+    .filter((r) => r.id >= DNR_ALLOWLIST_START)
+    .map((r) => r.id);
+
+  const newRules = allowlist.map((domain, i) => ({
+    id: DNR_ALLOWLIST_START + i,
+    priority: 10,
+    condition: {
+      requestDomains: [domain],
+    },
+    action: { type: 'allowAllRequests' },
+  }));
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: allowlistRuleIds,
+    addRules: newRules,
+  });
+}
+
+/** Enable or disable a static ruleset by ID. */
+async function setRulesetEnabled(rulesetId, enabled) {
+  if (enabled) {
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      enableRulesetIds: [rulesetId],
+      disableRulesetIds: [],
+    });
+  } else {
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      enableRulesetIds: [],
+      disableRulesetIds: [rulesetId],
+    });
+  }
+
+  const meta = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  meta[rulesetId] = enabled;
+  await setStorage(StorageKeys.ENABLED_RULESETS, meta);
+}
+
+// ---------------------------------------------------------------------------
+// Scriptlet injection
+// ---------------------------------------------------------------------------
+
+/**
+ * Inject scriptlets into a tab/frame via chrome.scripting.executeScript
+ * in the MAIN world — this allows intercepting window-level properties.
+ */
+async function injectScriptlets(tabId, frameId, scriptletRules) {
+  if (!scriptletRules || scriptletRules.length === 0) return;
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: executeScriptlets,
+      args: [scriptletRules],
+    });
+  } catch (err) {
+    // Tab may have navigated away — ignore
+    if (!err.message?.includes('No frame with id')) {
+      console.warn('[AdBlock] Scriptlet injection failed:', err.message);
+    }
+  }
+}
+
+/**
+ * This function runs in the MAIN world of the page.
+ * It receives serialized scriptlet specs and executes them.
+ * Must be self-contained (no closures from SW context).
+ */
+function executeScriptlets(specs) {
+  // The scriptlets bundle is injected separately as scriptlets-world.js
+  // which registers itself as window.__adblockScriptlets.
+  // Here we just call it.
+  if (typeof window.__adblockScriptlets === 'undefined') {
+    // Scriptlets bundle not yet loaded — skip silently
+    return;
+  }
+  for (const spec of specs) {
+    try {
+      window.__adblockScriptlets.run(spec.name, spec.args);
+    } catch (e) {
+      // Individual scriptlet errors should not break others
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Message bus
+// ---------------------------------------------------------------------------
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handleMessage(message, sender)
+    .then(sendResponse)
+    .catch((err) => sendResponse({ error: err.message }));
+  return true; // Keep channel open for async response
+});
+
+async function handleMessage(message, sender) {
+  const { type, payload } = message;
+
+  switch (type) {
+    case 'GET_TAB_STATS': {
+      const tabId = payload?.tabId ?? sender.tab?.id;
+      return tabStats.get(tabId) || { blocked: 0 };
+    }
+
+    case 'GET_SETTINGS':
+      return (await getStorage(StorageKeys.SETTINGS)) || {};
+
+    case 'SET_SETTINGS': {
+      await setStorage(StorageKeys.SETTINGS, payload);
+      await applyPrivacySettings();
+      return { ok: true };
+    }
+
+    case 'GET_ALLOWLIST':
+      return await getAllowlist();
+
+    case 'ALLOW_SITE':
+      await allowSite(payload.domain);
+      return { ok: true };
+
+    case 'DISALLOW_SITE':
+      await disallowSite(payload.domain);
+      return { ok: true };
+
+    case 'IS_SITE_ALLOWED': {
+      const allowlist = await getAllowlist();
+      return { allowed: allowlist.includes(payload.domain) };
+    }
+
+    case 'GET_USER_FILTERS':
+      return { filters: (await getStorage(StorageKeys.USER_FILTERS)) || '' };
+
+    case 'SET_USER_FILTERS': {
+      await setStorage(StorageKeys.USER_FILTERS, payload.filters);
+      await applyUserFilters(payload.filters);
+      return { ok: true };
+    }
+
+    case 'GET_COSMETIC_RULES': {
+      // Return cosmetic rules for the page's hostname
+      return await getCosmeticRulesForPage(payload.hostname);
+    }
+
+    case 'GET_SCRIPTLET_RULES': {
+      // Return scriptlet specs for the page's hostname
+      const rules = await getScriptletRulesForPage(payload.hostname);
+      if (rules.length > 0 && sender.tab?.id) {
+        await injectScriptlets(sender.tab.id, sender.frameId || 0, rules);
+      }
+      return { rules };
+    }
+
+    case 'SET_RULESET_ENABLED': {
+      await setRulesetEnabled(payload.rulesetId, payload.enabled);
+      return { ok: true };
+    }
+
+    case 'GET_ENABLED_RULESETS':
+      return (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+
+    case 'CONTENT_BLOCKED': {
+      // Content script reports a cosmetically-hidden element
+      const tabId = sender.tab?.id;
+      if (tabId) {
+        const entry = tabStats.get(tabId) || { blocked: 0 };
+        entry.blocked += payload.count || 1;
+        tabStats.set(tabId, entry);
+        updateBadge(tabId);
+      }
+      return { ok: true };
+    }
+
+    default:
+      return { error: `Unknown message type: ${type}` };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cosmetic + scriptlet rule lookup
+// ---------------------------------------------------------------------------
+
+let cachedCosmeticRules = null;
+let cachedScriptletRules = null;
+
+async function loadCosmeticRules() {
+  if (cachedCosmeticRules) return cachedCosmeticRules;
+
+  try {
+    const url = chrome.runtime.getURL('rules/cosmetic-rules.json');
+    const resp = await fetch(url);
+    cachedCosmeticRules = await resp.json();
+  } catch {
+    cachedCosmeticRules = { generic: [], domainSpecific: {} };
+  }
+
+  return cachedCosmeticRules;
+}
+
+async function loadScriptletRules() {
+  if (cachedScriptletRules) return cachedScriptletRules;
+
+  try {
+    const url = chrome.runtime.getURL('rules/scriptlet-rules.json');
+    const resp = await fetch(url);
+    cachedScriptletRules = await resp.json();
+  } catch {
+    cachedScriptletRules = [];
+  }
+
+  return cachedScriptletRules;
+}
+
+async function getCosmeticRulesForPage(hostname) {
+  const rules = await loadCosmeticRules();
+  const generic = rules.generic || [];
+
+  // Find domain-specific rules — check hostname and parent domains
+  const domainSpecific = [];
+  const parts = hostname.split('.');
+  for (let i = 0; i < parts.length - 1; i++) {
+    const domain = parts.slice(i).join('.');
+    if (rules.domainSpecific[domain]) {
+      domainSpecific.push(...rules.domainSpecific[domain]);
+    }
+  }
+
+  // Merge user-defined cosmetic rules from My Filters
+  const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
+  const userGeneric = userRules.generic || [];
+  const userExceptions = new Set([...(userRules.genericExceptions || [])]);
+  const userDomainSelectors = [];
+
+  for (let i = 0; i < parts.length - 1; i++) {
+    const domain = parts.slice(i).join('.');
+    if (userRules.domainSpecific?.[domain]) {
+      userDomainSelectors.push(...userRules.domainSpecific[domain]);
+    }
+    if (userRules.domainExceptions?.[domain]) {
+      for (const sel of userRules.domainExceptions[domain]) userExceptions.add(sel);
+    }
+  }
+
+  return {
+    generic: [...generic, ...userGeneric],
+    domainSpecific: [...domainSpecific, ...userDomainSelectors],
+    exceptions: [...userExceptions],
+  };
+}
+
+async function getScriptletRulesForPage(hostname) {
+  const rules = await loadScriptletRules();
+
+  return rules.filter((rule) => {
+    if (!rule.domains || rule.domains.length === 0) return true;
+    return rule.domains.some((d) => hostname === d || hostname.endsWith('.' + d));
+  });
+}

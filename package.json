@@ -1,0 +1,33 @@
+{
+  "name": "nullify",
+  "version": "1.0.0",
+  "description": "A powerful MV3 Chrome ad blocker with uBlock Origin-level features",
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "setup": "npm install && npm run build:sample-rules && npm run build:ext",
+    "setup:prod": "npm install && npm run build:rules && npm run build:ext",
+    "build": "npm run build:rules && npm run build:ext",
+    "build:rules": "node scripts/build-rules.mjs",
+    "build:ext": "webpack --mode production",
+    "build:sample-rules": "node scripts/build-rules.mjs --sample",
+    "dev": "npm run build:sample-rules && webpack --mode development --watch",
+    "lint": "eslint src/ scripts/ --ext .js,.mjs",
+    "clean": "rm -rf dist/ rules/*.json",
+    "clean:all": "npm run clean && rm -rf node_modules/"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.268",
+    "ajv": "^8.18.0",
+    "copy-webpack-plugin": "^12.0.2",
+    "css-loader": "^7.1.2",
+    "eslint": "^9.15.0",
+    "html-webpack-plugin": "^5.6.3",
+    "mini-css-extract-plugin": "^2.9.2",
+    "style-loader": "^4.0.0",
+    "webpack": "^5.96.1",
+    "webpack-cli": "^5.1.4"
+  }
+}

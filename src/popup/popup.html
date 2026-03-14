@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nullify</title>
+  <link rel="stylesheet" href="../../dist/popup.css">
+</head>
+<body>
+  <div class="popup">
+    <!-- Header -->
+    <header class="popup-header">
+      <div class="logo">
+        <img src="../../assets/icons/icon32.png" alt="Nullify" class="logo-icon">
+        <span class="logo-text">Nullify</span>
+      </div>
+      <div class="power-btn-wrap">
+        <button id="toggleSite" class="power-btn" title="Enable/disable on this site">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M12 2v4M12 18v4M7.05 4.93 9.88 7.76M14.12 16.24l2.83 2.83M2 12h4M18 12h4M4.93 7.05l2.83 2.83M16.24 14.12l2.83 2.83"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- Site status bar -->
+    <div class="site-bar" id="siteBar">
+      <span class="site-url" id="siteUrl">Loading...</span>
+      <span class="site-status" id="siteStatus">Protected</span>
+    </div>
+
+    <!-- Stats -->
+    <div class="stats-grid">
+      <div class="stat-card">
+        <div class="stat-number" id="blockedCount">0</div>
+        <div class="stat-label">Blocked on page</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-number" id="totalBlocked">0</div>
+        <div class="stat-label">Total today</div>
+      </div>
+    </div>
+
+    <!-- Quick actions -->
+    <div class="quick-actions" style="grid-template-columns: repeat(4, 1fr)">
+      <button class="action-btn" id="btnAllowSite" title="Pause blocking for this site">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/>
+        </svg>
+        <span id="allowLabel">Pause on site</span>
+      </button>
+
+      <button class="action-btn" id="btnPicker" title="Pick an element to block">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/><line x1="12" y1="1" x2="12" y2="3"/>
+          <line x1="12" y1="21" x2="12" y2="23"/><line x1="1" y1="12" x2="3" y2="12"/>
+          <line x1="21" y1="12" x2="23" y2="12"/>
+        </svg>
+        <span>Pick element</span>
+      </button>
+
+      <button class="action-btn" id="btnRefresh" title="Reload this page">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+        </svg>
+        <span>Reload</span>
+      </button>
+
+      <button class="action-btn" id="btnDashboard" title="Open dashboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+          <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+        </svg>
+        <span>Dashboard</span>
+      </button>
+    </div>
+
+    <!-- Filter lists summary -->
+    <div class="filter-summary">
+      <div class="filter-summary-title">Active filter lists</div>
+      <div class="filter-list-chips" id="filterListChips"></div>
+    </div>
+  </div>
+
+  <script src="../../dist/popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nullify — Dashboard</title>
+  <link rel="stylesheet" href="../../dist/options.css">
+</head>
+<body>
+  <div class="dashboard">
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-logo">
+        <img src="../../assets/icons/icon48.png" alt="Nullify" class="sidebar-icon">
+        <div>
+          <div class="sidebar-title">Nullify</div>
+          <div class="sidebar-version">v1.0.0</div>
+        </div>
+      </div>
+
+      <ul class="nav-list">
+        <li class="nav-item active" data-tab="filter-lists">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
+            <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>
+            <line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>
+          </svg>
+          Filter Lists
+        </li>
+        <li class="nav-item" data-tab="my-filters">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          My Filters
+        </li>
+        <li class="nav-item" data-tab="allowlist">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+          </svg>
+          Allowlist
+        </li>
+        <li class="nav-item" data-tab="settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          Settings
+        </li>
+      </ul>
+    </nav>
+
+    <!-- Main content -->
+    <main class="main-content">
+
+      <!-- ---- Filter Lists ---- -->
+      <section id="tab-filter-lists" class="tab-content active">
+        <div class="section-header">
+          <h2>Filter Lists</h2>
+          <button class="btn btn-primary" id="btnUpdateAll">Update All</button>
+        </div>
+        <p class="section-desc">Enable or disable individual filter lists. Changes take effect immediately.</p>
+
+        <div class="list-grid" id="filterListGrid">
+          <!-- Populated by JS -->
+        </div>
+      </section>
+
+      <!-- ---- My Filters ---- -->
+      <section id="tab-my-filters" class="tab-content">
+        <div class="section-header">
+          <h2>My Filters</h2>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-secondary" id="btnImportFilters" title="Import filters from file">Import</button>
+            <button class="btn btn-secondary" id="btnExportFilters" title="Export filters to file">Export</button>
+            <button class="btn btn-primary" id="btnApplyFilters">Apply</button>
+          </div>
+        </div>
+        <p class="section-desc">
+          Enter custom filter rules in uBlock Origin / AdBlock Plus syntax.
+          One rule per line. Lines starting with <code>!</code> are comments.
+        </p>
+
+        <div class="filter-examples">
+          <strong>Examples:</strong>
+          <code>||ads.example.com^</code> — block a domain<br>
+          <code>@@||safe.example.com^</code> — allow (exception)<br>
+          <code>example.com##.ad-banner</code> — hide element by CSS selector<br>
+          <code>##[class*="advertisement"]</code> — hide generic ad elements
+        </div>
+
+        <textarea id="userFiltersArea" class="filter-editor" spellcheck="false"
+          placeholder="! Enter your custom filter rules here&#10;! Example: ||ads.example.com^"></textarea>
+
+        <div class="filter-status" id="filterStatus"></div>
+      </section>
+
+      <!-- ---- Allowlist ---- -->
+      <section id="tab-allowlist" class="tab-content">
+        <div class="section-header">
+          <h2>Allowlist</h2>
+        </div>
+        <p class="section-desc">Sites on this list will have all blocking disabled.</p>
+
+        <div class="add-site-row">
+          <input type="text" id="allowlistInput" class="text-input" placeholder="example.com">
+          <button class="btn btn-primary" id="btnAddAllowlist">Add site</button>
+        </div>
+
+        <ul class="allowlist-items" id="allowlistItems">
+          <!-- Populated by JS -->
+        </ul>
+      </section>
+
+      <!-- ---- Settings ---- -->
+      <section id="tab-settings" class="tab-content">
+        <div class="section-header">
+          <h2>Settings</h2>
+        </div>
+
+        <div class="settings-group">
+          <h3>Privacy</h3>
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Block WebRTC IP leaks</strong>
+              <span class="toggle-desc">Prevents your real IP address from leaking via WebRTC</span>
+            </span>
+            <input type="checkbox" id="settingWebRTC" class="toggle">
+          </label>
+
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Block hyperlink auditing</strong>
+              <span class="toggle-desc">Prevents websites from tracking clicks via the <code>ping</code> attribute</span>
+            </span>
+            <input type="checkbox" id="settingPing" class="toggle">
+          </label>
+
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Upgrade HTTP to HTTPS</strong>
+              <span class="toggle-desc">Automatically upgrades insecure requests to HTTPS</span>
+            </span>
+            <input type="checkbox" id="settingHTTPS" class="toggle">
+          </label>
+        </div>
+
+        <div class="settings-group">
+          <h3>Appearance</h3>
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Show blocked count badge</strong>
+              <span class="toggle-desc">Display number of blocked requests on the extension icon</span>
+            </span>
+            <input type="checkbox" id="settingBadge" class="toggle">
+          </label>
+        </div>
+
+        <div class="settings-group">
+          <h3>About</h3>
+          <div class="about-info">
+            <p><strong>Nullify</strong> v1.0.0</p>
+            <p>A privacy-focused, open-source ad blocker built on Chrome Manifest V3.</p>
+            <p>Compatible with EasyList, EasyPrivacy, uBlock Origin filter list syntax.</p>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="../../dist/options.js"></script>
+</body>
+</html>

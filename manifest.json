@@ -83,7 +83,8 @@
     "alarms",
     "tabs",
     "webNavigation",
-    "privacy"
+    "privacy",
+    "contextMenus"
   ],
   "host_permissions": [
     "<all_urls>"

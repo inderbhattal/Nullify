@@ -129,6 +129,28 @@ async function ingestRules() {
 }
 
 // ---------------------------------------------------------------------------
+// Context Menu — Quick Access to Picker
+// ---------------------------------------------------------------------------
+chrome.contextMenus.create({
+  id: 'nullify-block-element',
+  title: 'Block element...',
+  contexts: ['all'],
+}, () => {
+  if (chrome.runtime.lastError) {
+    // Ignore error if already exists
+  }
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === 'nullify-block-element' && tab?.id) {
+    chrome.tabs.sendMessage(tab.id, { type: 'ACTIVATE_PICKER' }).catch(() => {
+      // Tab might not have content script loaded yet
+    });
+  }
+});
+
+
+// ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
 async function initializeDefaults() {

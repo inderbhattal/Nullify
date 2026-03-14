@@ -22,7 +22,9 @@ const db = new RulesDB();
 // Constants
 // ---------------------------------------------------------------------------
 const ALARM_FILTER_UPDATE = 'filter-list-update';
+const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const FILTER_UPDATE_INTERVAL_MINUTES = 24 * 60; // 24 hours
+const STATS_CLEANUP_INTERVAL_MINUTES = 30;
 
 // DNR rule ID ranges (avoid collisions between categories)
 const DNR_USER_RULES_START = 900_000;
@@ -38,7 +40,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     await initializeDefaults();
   }
 
-  await ingestCosmeticRules(); // Build initial rule index
+  await ingestRules(); // Build initial rule index
   await applyPrivacySettings();
   await scheduleFilterUpdateAlarm();
 
@@ -55,30 +57,39 @@ chrome.runtime.onStartup.addListener(async () => {
 });
 
 /**
- * Fetch the latest cosmetic-rules.json and index them into IndexedDB.
+ * Fetch latest rules and index them into IndexedDB.
  * This keeps the Service Worker's memory usage low by not holding rules in RAM.
  */
-async function ingestCosmeticRules() {
+async function ingestRules() {
   try {
-    const url = chrome.runtime.getURL('rules/cosmetic-rules.json');
-    const resp = await fetch(url);
-    const data = await resp.json();
+    // 1. Ingest Cosmetic Rules
+    const cosUrl = chrome.runtime.getURL('rules/cosmetic-rules.json');
+    const cosData = await (await fetch(cosUrl)).json();
 
-    console.log(`[AdBlock] Indexing ${data.generic?.length || 0} generic and ${Object.keys(data.domainSpecific || {}).length} domain-specific rules...`);
+    // 2. Ingest Scriptlet Rules
+    const scriptUrl = chrome.runtime.getURL('rules/scriptlet-rules.json');
+    const scriptData = await (await fetch(scriptUrl)).json();
 
-    // Store generic rules in storage.local (fast access, relatively small)
-    await setStorage(StorageKeys.COSMETIC_GENERIC_RULES, data.generic || []);
+    console.log(`[AdBlock] Indexing ${cosData.generic?.length || 0} generic and ${Object.keys(cosData.domainSpecific || {}).length} domain-specific cosmetic rules...`);
+    console.log(`[AdBlock] Indexing ${scriptData.length || 0} scriptlet rules...`);
 
-    // Index domain-specific rules into IndexedDB
+    // Wipe and rebuild index
     await db.clear();
-    if (data.domainSpecific) {
-      await db.putBulkCosmeticRules(data.domainSpecific);
+    
+    if (cosData.domainSpecific) {
+      await db.putBulkCosmeticRules(cosData.domainSpecific);
+    }
+    if (scriptData) {
+      await db.putBulkScriptletRules(scriptData);
     }
 
+    // Store generic cosmetic rules in storage
+    await setStorage(StorageKeys.COSMETIC_GENERIC_RULES, cosData.generic || []);
+    
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
-    console.log('[AdBlock] Cosmetic rule indexing complete');
+    console.log('[AdBlock] Rule indexing complete');
   } catch (err) {
-    console.error('[AdBlock] Failed to ingest cosmetic rules:', err);
+    console.error('[AdBlock] Failed to ingest rules:', err);
   }
 }
 
@@ -142,13 +153,35 @@ async function scheduleFilterUpdateAlarm() {
     delayInMinutes: FILTER_UPDATE_INTERVAL_MINUTES,
     periodInMinutes: FILTER_UPDATE_INTERVAL_MINUTES,
   });
+
+  await chrome.alarms.clear(ALARM_STATS_CLEANUP);
+  chrome.alarms.create(ALARM_STATS_CLEANUP, {
+    delayInMinutes: STATS_CLEANUP_INTERVAL_MINUTES,
+    periodInMinutes: STATS_CLEANUP_INTERVAL_MINUTES,
+  });
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_FILTER_UPDATE) {
     await checkFilterListUpdates();
+  } else if (alarm.name === ALARM_STATS_CLEANUP) {
+    await cleanupTabStats();
   }
 });
+
+async function cleanupTabStats() {
+  const activeTabs = await chrome.tabs.query({});
+  const activeTabIds = new Set(activeTabs.map(t => t.id));
+  
+  let changed = false;
+  for (const tabId of Array.from(tabStats.keys())) {
+    if (!activeTabIds.has(tabId)) {
+      tabStats.delete(tabId);
+      changed = true;
+    }
+  }
+  if (changed) await persistTabStats();
+}
 
 async function checkFilterListUpdates() {
   console.log('[AdBlock] Checking for filter list updates...');
@@ -569,20 +602,6 @@ async function getCosmeticRulesForPage(hostname) {
   };
 }
 
-let cachedScriptletRules = null;
 async function getScriptletRulesForPage(hostname) {
-  if (!cachedScriptletRules) {
-    try {
-      const url = chrome.runtime.getURL('rules/scriptlet-rules.json');
-      const resp = await fetch(url);
-      cachedScriptletRules = await resp.json();
-    } catch {
-      cachedScriptletRules = [];
-    }
-  }
-
-  return cachedScriptletRules.filter((rule) => {
-    if (!rule.domains || rule.domains.length === 0) return true;
-    return rule.domains.some((d) => hostname === d || hostname.endsWith('.' + d));
-  });
+  return await db.getScriptletRules(hostname);
 }

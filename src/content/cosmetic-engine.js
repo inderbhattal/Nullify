@@ -98,6 +98,35 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+/**
+ * Pre-parses a procedural selector into an execution plan (array of operations).
+ * This avoids repeated string manipulation during DOM mutation scans.
+ */
+function parseProceduralPlan(selector) {
+  const plan = [];
+  let remaining = selector;
+
+  while (remaining) {
+    const firstOp = extractFirstOp(remaining);
+    if (!firstOp) {
+      // Remaining part is plain CSS
+      plan.push({ type: 'css', selector: remaining.trim() });
+      break;
+    }
+    
+    // Add base CSS if present
+    if (firstOp.base) {
+      plan.push({ type: 'css', selector: firstOp.base });
+    }
+    
+    // Add the operator
+    plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
+    remaining = firstOp.rest;
+  }
+  
+  return plan;
+}
+
 // ---------------------------------------------------------------------------
 // CosmeticEngine class
 // ---------------------------------------------------------------------------
@@ -135,8 +164,24 @@ export class CosmeticEngine {
     for (const sel of allSelectors) {
       if (!sel || !sel.trim()) continue;
       if (exceptions.has(sel)) continue; // user excepted this selector
-      if (isProceduralSelector(sel)) {
-        this._proceduralRules.push(sel);
+      
+      const isProcedural = isProceduralSelector(sel);
+      
+      // Fast-path: Chrome supports :has() natively now. 
+      // If the selector is ONLY a native CSS :has() and no other Nullify-specific ops,
+      // we can treat it as plain CSS.
+      if (isProcedural && !sel.includes(':has-text(') && !sel.includes(':upward(') && 
+          !sel.includes(':xpath(') && !sel.includes(':matches-css') && 
+          !sel.includes(':min-text-length') && !sel.includes(':watch-attr')) {
+        cssSelectors.push(sel);
+        continue;
+      }
+
+      if (isProcedural) {
+        this._proceduralRules.push({
+          selector: sel,
+          plan: parseProceduralPlan(sel)
+        });
       } else {
         cssSelectors.push(sel);
       }
@@ -206,72 +251,60 @@ export class CosmeticEngine {
     }
   }
 
-  /**
-   * Apply a single procedural selector rule.
-   * Supports full operator chaining, e.g.:
-   *   div:has-text(Sponsored):upward(article)
-   */
-  _applyProcedural(selector) {
-    // :xpath() selects elements independently — handle separately
-    const firstOp = extractFirstOp(selector);
-    if (firstOp?.op === 'xpath' && !firstOp.base) {
-      this._applyXPath(firstOp.arg);
+  /** Apply a pre-parsed procedural rule. */
+  _applyProcedural(rule) {
+    const { plan, selector } = rule;
+    const first = plan[0];
+
+    // Handle XPath independent entry point
+    if (first.type === 'op' && first.op === 'xpath') {
+      this._applyXPath(first.arg);
       return;
     }
 
-    if (!firstOp) {
-      // Plain CSS — shouldn't be here normally, but handle gracefully
+    let elements = [];
+    let planIdx = 0;
+
+    // Determine initial set of elements
+    if (first.type === 'css') {
       try {
-        for (const el of document.querySelectorAll(selector)) this._hideElement(el, selector);
-      } catch { /* invalid selector */ }
-      return;
+        elements = [...document.querySelectorAll(first.selector)];
+        planIdx = 1;
+      } catch { return; }
+    } else {
+      elements = [document.documentElement];
     }
-
-    const { base, op, arg, rest } = firstOp;
-    let elements;
-    try {
-      elements = base ? [...document.querySelectorAll(base)] : [document.documentElement];
-    } catch { return; }
 
     for (const el of elements) {
-      const result = this._applyOp(el, op, arg);
-      if (!result) continue;
-
-      if (rest) {
-        // More operators in the chain
-        this._applyProceduralOnElement(result, rest, selector);
-      } else {
-        this._hideElement(result, selector);
-      }
+      this._runPlanOnElement(el, plan.slice(planIdx), selector);
     }
   }
 
-  /**
-   * Continue applying a chained selector (rest part) starting from a
-   * single already-resolved element.
-   */
-  _applyProceduralOnElement(el, selectorRest, fullSelector) {
-    const parsed = extractFirstOp(selectorRest);
-    if (!parsed) {
-      // Remaining part is a plain CSS sub-selector; match within/against el
-      try {
-        if (el.matches?.(selectorRest)) {
-          this._hideElement(el, fullSelector);
-        }
-        for (const child of el.querySelectorAll(selectorRest)) {
-          this._hideElement(child, fullSelector);
-        }
-      } catch { /* invalid selector */ }
+  /** Run the remaining steps of a plan on a specific element. */
+  _runPlanOnElement(el, remainingPlan, fullSelector) {
+    if (remainingPlan.length === 0) {
+      this._hideElement(el, fullSelector);
       return;
     }
 
-    const result = this._applyOp(el, parsed.op, parsed.arg);
-    if (!result) return;
+    const step = remainingPlan[0];
+    const nextSteps = remainingPlan.slice(1);
 
-    if (parsed.rest) {
-      this._applyProceduralOnElement(result, parsed.rest, fullSelector);
-    } else {
-      this._hideElement(result, fullSelector);
+    if (step.type === 'op') {
+      const result = this._applyOp(el, step.op, step.arg);
+      if (result) {
+        this._runPlanOnElement(result, nextSteps, fullSelector);
+      }
+    } else if (step.type === 'css') {
+      // CSS sub-selector: match within or against el
+      try {
+        if (el.matches?.(step.selector)) {
+          this._runPlanOnElement(el, nextSteps, fullSelector);
+        }
+        for (const child of el.querySelectorAll(step.selector)) {
+          this._runPlanOnElement(child, nextSteps, fullSelector);
+        }
+      } catch { /* invalid selector */ }
     }
   }
 
@@ -400,32 +433,19 @@ export class CosmeticEngine {
     if (this._observer) return;
     if (this._cssSelectors.length === 0 && this._proceduralRules.length === 0) return;
 
-    // Build a combined CSS selector for fast matching of added nodes
-    const combinedSelector = this._cssSelectors.length > 0
-      ? this._cssSelectors.join(',')
-      : null;
-
     this._observer = new MutationObserver((mutations) => {
       let needsProcedural = false;
 
       for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (node.nodeType !== Node.ELEMENT_NODE) continue;
-
-          if (combinedSelector) {
-            try {
-              for (const sel of this._cssSelectors) {
-                if (node.matches?.(sel)) this._hideElement(node, sel);
-                for (const el of node.querySelectorAll(sel)) this._hideElement(el, sel);
-              }
-            } catch { /* invalid selector */ }
-          }
-
-          if (this._proceduralRules.length > 0) needsProcedural = true;
+        if (mutation.addedNodes.length > 0) {
+          needsProcedural = true;
+          break;
         }
       }
 
-      if (needsProcedural) this._scheduleProceduralRun();
+      if (needsProcedural && this._proceduralRules.length > 0) {
+        this._scheduleProceduralRun();
+      }
     });
 
     this._observer.observe(document.documentElement, {

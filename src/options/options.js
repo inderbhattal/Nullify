@@ -274,6 +274,120 @@ async function initSettings() {
 }
 
 // ---------------------------------------------------------------------------
+// Live Logger
+// ---------------------------------------------------------------------------
+class LiveLogger {
+  constructor() {
+    this.events = [];
+    this.maxEvents = 1000;
+    this.filter = 'all';
+    this.searchQuery = '';
+    this.container = $('loggerItems');
+    
+    if (!this.container) return;
+
+    this.bindEvents();
+    this.listen();
+  }
+
+  bindEvents() {
+    $('btnClearLogger')?.addEventListener('click', () => this.clear());
+    $('loggerFilter')?.addEventListener('change', (e) => {
+      this.filter = e.target.value;
+      this.render();
+    });
+    $('loggerSearch')?.addEventListener('input', (e) => {
+      this.searchQuery = e.target.value.toLowerCase();
+      this.render();
+    });
+  }
+
+  listen() {
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.type === 'LOGGER_EVENT') {
+        this.addEvent(message.payload);
+      }
+    });
+  }
+
+  addEvent(event) {
+    this.events.unshift(event);
+    if (this.events.length > this.maxEvents) {
+      this.events.pop();
+    }
+    
+    // Only render immediately if it matches current filters
+    if (this.matchesFilter(event)) {
+      const row = this.createLogRow(event);
+      this.container.prepend(row);
+      
+      // Limit DOM size too
+      if (this.container.children.length > this.maxEvents) {
+        this.container.lastElementChild.remove();
+      }
+    }
+  }
+
+  matchesFilter(event) {
+    if (this.filter !== 'all' && event.type !== this.filter) return false;
+    if (this.searchQuery) {
+      const text = (event.url || event.selector || '').toLowerCase();
+      if (!text.includes(this.searchQuery)) return false;
+    }
+    return true;
+  }
+
+  clear() {
+    this.events = [];
+    this.container.innerHTML = '';
+  }
+
+  render() {
+    this.container.innerHTML = '';
+    const filtered = this.events.filter(e => this.matchesFilter(e));
+    const fragment = document.createDocumentFragment();
+    
+    for (const event of filtered) {
+      fragment.appendChild(this.createLogRow(event));
+    }
+    this.container.appendChild(fragment);
+  }
+
+  createLogRow(e) {
+    const row = document.createElement('div');
+    row.className = 'log-entry';
+    
+    const time = new Date(e.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    
+    const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
+    const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : 'badge-hide';
+
+    let infoHtml = '';
+    if (e.type === 'network') {
+      infoHtml = `<span class="log-url">${this.esc(e.url)}</span>
+                  <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}</span>`;
+    } else {
+      infoHtml = `<span class="log-selector">${this.esc(e.selector)}</span>
+                  <span class="log-extra">${this.esc(e.hostname)}</span>`;
+    }
+
+    row.innerHTML = `
+      <div class="log-col-time">${time}</div>
+      <div class="log-col-type"><span class="log-badge ${typeBadge}">${e.type}</span></div>
+      <div class="log-col-action"><span class="log-badge ${actionBadge}">${e.action}</span></div>
+      <div class="log-col-info">${infoHtml}</div>
+    `;
+    
+    return row;
+  }
+
+  esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
 async function main() {
@@ -284,6 +398,9 @@ async function main() {
     initAllowlist(),
     initSettings(),
   ]);
+  
+  // Initialize Logger
+  new LiveLogger();
 }
 
 main().catch(console.error);

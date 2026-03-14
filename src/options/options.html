@@ -40,6 +40,12 @@
           </svg>
           Allowlist
         </li>
+        <li class="nav-item" data-tab="logger">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
+          </svg>
+          Live Logger
+        </li>
         <li class="nav-item" data-tab="settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
@@ -110,6 +116,35 @@
         <ul class="allowlist-items" id="allowlistItems">
           <!-- Populated by JS -->
         </ul>
+      </section>
+
+      <!-- ---- Live Logger ---- -->
+      <section id="tab-logger" class="tab-content">
+        <div class="section-header">
+          <h2>Live Logger</h2>
+          <div style="display:flex;gap:8px">
+            <input type="text" id="loggerSearch" class="text-input" style="padding: 4px 10px; width: 180px;" placeholder="Search logs...">
+            <select id="loggerFilter" class="text-input" style="padding: 4px 8px; width: auto; flex: none;">
+              <option value="all">All Types</option>
+              <option value="network">Network</option>
+              <option value="cosmetic">Cosmetic</option>
+            </select>
+            <button class="btn btn-secondary" id="btnClearLogger">Clear</button>
+          </div>
+        </div>
+        <p class="section-desc">Real-time view of network requests and cosmetic rules being processed.</p>
+        
+        <div class="logger-container">
+          <div class="logger-table-header">
+            <div class="log-col-time">Time</div>
+            <div class="log-col-type">Type</div>
+            <div class="log-col-action">Action</div>
+            <div class="log-col-info">Information</div>
+          </div>
+          <div id="loggerItems" class="logger-items">
+            <!-- Populated by JS -->
+          </div>
+        </div>
       </section>
 
       <!-- ---- Settings ---- -->

@@ -113,6 +113,7 @@ export class CosmeticEngine {
     this._watchAttrRules = [];      // { baseSelector, attrs, rule }
     this._exceptions = new Set();   // selectors from #@# rules
     this._hiddenCount = 0;
+    this._selectorHits = new Map(); // selector -> count
     this._reportTimer = null;
     this._proceduralDebounce = null;
   }
@@ -221,7 +222,7 @@ export class CosmeticEngine {
     if (!firstOp) {
       // Plain CSS — shouldn't be here normally, but handle gracefully
       try {
-        for (const el of document.querySelectorAll(selector)) this._hideElement(el);
+        for (const el of document.querySelectorAll(selector)) this._hideElement(el, selector);
       } catch { /* invalid selector */ }
       return;
     }
@@ -238,9 +239,9 @@ export class CosmeticEngine {
 
       if (rest) {
         // More operators in the chain
-        this._applyProceduralOnElement(result, rest);
+        this._applyProceduralOnElement(result, rest, selector);
       } else {
-        this._hideElement(result);
+        this._hideElement(result, selector);
       }
     }
   }
@@ -249,16 +250,16 @@ export class CosmeticEngine {
    * Continue applying a chained selector (rest part) starting from a
    * single already-resolved element.
    */
-  _applyProceduralOnElement(el, selectorRest) {
+  _applyProceduralOnElement(el, selectorRest, fullSelector) {
     const parsed = extractFirstOp(selectorRest);
     if (!parsed) {
       // Remaining part is a plain CSS sub-selector; match within/against el
       try {
         if (el.matches?.(selectorRest)) {
-          this._hideElement(el);
+          this._hideElement(el, fullSelector);
         }
         for (const child of el.querySelectorAll(selectorRest)) {
-          this._hideElement(child);
+          this._hideElement(child, fullSelector);
         }
       } catch { /* invalid selector */ }
       return;
@@ -268,9 +269,9 @@ export class CosmeticEngine {
     if (!result) return;
 
     if (parsed.rest) {
-      this._applyProceduralOnElement(result, parsed.rest);
+      this._applyProceduralOnElement(result, parsed.rest, fullSelector);
     } else {
-      this._hideElement(result);
+      this._hideElement(result, fullSelector);
     }
   }
 
@@ -352,7 +353,7 @@ export class CosmeticEngine {
       );
       for (let i = 0; i < result.snapshotLength; i++) {
         const node = result.snapshotItem(i);
-        if (node?.nodeType === Node.ELEMENT_NODE) this._hideElement(node);
+        if (node?.nodeType === Node.ELEMENT_NODE) this._hideElement(node, `xpath(${expr})`);
       }
     } catch { /* invalid XPath expression */ }
   }
@@ -413,9 +414,11 @@ export class CosmeticEngine {
 
           if (combinedSelector) {
             try {
-              if (node.matches?.(combinedSelector)) this._hideElement(node);
-              for (const el of node.querySelectorAll(combinedSelector)) this._hideElement(el);
-            } catch { /* invalid combined selector */ }
+              for (const sel of this._cssSelectors) {
+                if (node.matches?.(sel)) this._hideElement(node, sel);
+                for (const el of node.querySelectorAll(sel)) this._hideElement(el, sel);
+              }
+            } catch { /* invalid selector */ }
           }
 
           if (this._proceduralRules.length > 0) needsProcedural = true;
@@ -453,13 +456,16 @@ export class CosmeticEngine {
   // Element hiding
   // ---------------------------------------------------------------------------
 
-  _hideElement(el) {
+  _hideElement(el, selector = 'unknown') {
     if (!el || el.getAttribute(ELEMENT_ATTR)) return;
     if (this._exceptions.has(el.className) || this._isExcepted(el)) return;
     el.setAttribute(ELEMENT_ATTR, '1');
     el.style.setProperty('display', 'none', 'important');
     el.style.setProperty('visibility', 'hidden', 'important');
+    
     this._hiddenCount++;
+    this._selectorHits.set(selector, (this._selectorHits.get(selector) || 0) + 1);
+    
     this._scheduleReport();
   }
 
@@ -480,12 +486,20 @@ export class CosmeticEngine {
     this._reportTimer = setTimeout(() => {
       this._reportTimer = null;
       if (this._hiddenCount > 0) {
-        const count = this._hiddenCount;
+        const hostname = location.hostname.replace(/^www\./, '');
+        const total = this._hiddenCount;
+        const hits = Array.from(this._selectorHits.entries());
+        
         this._hiddenCount = 0;
-        chrome.runtime.sendMessage({
-          type: 'COSMETIC_HIDDEN',
-          payload: { count },
-        }).catch(() => {});
+        this._selectorHits.clear();
+
+        // One message per selector hit for the Logger
+        for (const [selector, count] of hits) {
+          chrome.runtime.sendMessage({
+            type: 'CONTENT_BLOCKED',
+            payload: { count, selector, hostname },
+          }).catch(() => {});
+        }
       }
     }, 500);
   }

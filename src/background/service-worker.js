@@ -144,6 +144,8 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 
 chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   const { request, rule } = info;
+  
+  // Track stats
   if (rule.rulesetId !== '_dynamic' && rule.rulesetId !== '_session') {
     if (!tabStats.has(request.tabId)) {
       tabStats.set(request.tabId, { blocked: 0, url: request.url });
@@ -151,7 +153,27 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     tabStats.get(request.tabId).blocked++;
     updateBadge(request.tabId);
   }
+
+  // Broadcast to Logger
+  broadcastLoggerEvent({
+    type: 'network',
+    action: rule.rulesetId.includes('allow') ? 'allow' : 'block',
+    url: request.url,
+    method: request.method,
+    resourceType: request.type,
+    rulesetId: rule.rulesetId,
+    ruleId: rule.ruleId,
+    timestamp: Date.now(),
+  });
 });
+
+function broadcastLoggerEvent(event) {
+  // Send to all open extension pages (options, popup)
+  chrome.runtime.sendMessage({
+    type: 'LOGGER_EVENT',
+    payload: event,
+  }).catch(() => {}); // Ignore if no one is listening
+}
 
 function updateBadge(tabId) {
   if (!tabId || tabId < 0) return; // ignore non-tab requests (tabId = -1)
@@ -500,6 +522,16 @@ async function handleMessage(message, sender) {
         entry.blocked += payload.count || 1;
         tabStats.set(tabId, entry);
         updateBadge(tabId);
+
+        // Broadcast to Logger
+        broadcastLoggerEvent({
+          type: 'cosmetic',
+          action: 'hide',
+          hostname: payload.hostname || sender.tab.url,
+          selector: payload.selector,
+          count: payload.count || 1,
+          timestamp: Date.now(),
+        });
       }
       return { ok: true };
     }

@@ -396,15 +396,21 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
  */
 function executeScriptlets(specs) {
   // The scriptlets bundle is injected separately as scriptlets-world.js
-  // which registers itself as window.__adblockScriptlets.
-  // Here we just call it.
-  if (typeof window.__adblockScriptlets === 'undefined') {
-    // Scriptlets bundle not yet loaded — skip silently
-    return;
+  // with a randomized registry name like __nu<random>.
+  // We find it by looking for the .run() signature.
+  let registry = null;
+  for (const key of Object.keys(window)) {
+    if (key.startsWith('__nu') && typeof window[key]?.run === 'function') {
+      registry = window[key];
+      break;
+    }
   }
+
+  if (!registry) return;
+
   for (const spec of specs) {
     try {
-      window.__adblockScriptlets.run(spec.name, spec.args);
+      registry.run(spec.name, spec.args);
     } catch (e) {
       // Individual scriptlet errors should not break others
     }

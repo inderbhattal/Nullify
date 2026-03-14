@@ -1,5 +1,6 @@
 node_modules/
 dist/
+_metadata/
 rules/*.json
 !rules/cosmetic-rules.json
 *.log

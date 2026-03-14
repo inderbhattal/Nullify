@@ -145,6 +145,9 @@ function run(name, args = []) {
 // ---------------------------------------------------------------------------
 // Public API — attached to window so MAIN-world injection can call it
 // ---------------------------------------------------------------------------
-window.__adblockScriptlets = { run };
+// Use a less predictable property name to make extension detection harder.
+const REGISTRY_NAME = '__nu' + Math.random().toString(36).slice(2, 8);
+window[REGISTRY_NAME] = { run };
 
-export { run };
+// Export the name so it can be used by the injector
+export { run, REGISTRY_NAME };

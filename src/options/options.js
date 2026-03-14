@@ -224,10 +224,14 @@ async function renderAllowlist() {
     const li = document.createElement('li');
     li.className = 'allowlist-item';
     li.innerHTML = `
-      <span class="allowlist-item-domain">${domain}</span>
-      <button class="allowlist-remove" data-domain="${domain}" title="Remove">×</button>
+      <span class="allowlist-item-domain"></span>
+      <button class="allowlist-remove" title="Remove">×</button>
     `;
-    li.querySelector('.allowlist-remove').addEventListener('click', async () => {
+    li.querySelector('.allowlist-item-domain').textContent = domain;
+    
+    const removeBtn = li.querySelector('.allowlist-remove');
+    removeBtn.dataset.domain = domain;
+    removeBtn.addEventListener('click', async () => {
       await chrome.runtime.sendMessage({
         type: 'DISALLOW_SITE',
         payload: { domain },

@@ -14,6 +14,8 @@ export const StorageKeys = {
   ENABLED_RULESETS: 'enabledRulesets',
   FILTER_LISTS_META: 'filterListsMeta',
   LAST_UPDATE_CHECK: 'lastUpdateCheck',
+  COSMETIC_RULES_VERSION: 'cosmeticRulesVersion',
+  COSMETIC_GENERIC_RULES: 'cosmeticGenericRules',
 };
 
 /** Get a single value from storage. Returns null if not found. */

@@ -14,6 +14,9 @@
  */
 
 import { StorageKeys, getStorage, setStorage, getAllowlist } from '../shared/storage.js';
+import { RulesDB } from '../shared/db.js';
+
+const db = new RulesDB();
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,8 +38,38 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     await initializeDefaults();
   }
 
+  await ingestCosmeticRules(); // Build initial rule index
   await applyPrivacySettings();
   await scheduleFilterUpdateAlarm();
+...
+
+/**
+ * Fetch the latest cosmetic-rules.json and index them into IndexedDB.
+ * This keeps the Service Worker's memory usage low by not holding rules in RAM.
+ */
+async function ingestCosmeticRules() {
+  try {
+    const url = chrome.runtime.getURL('rules/cosmetic-rules.json');
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    console.log(`[AdBlock] Indexing ${data.generic?.length || 0} generic and ${Object.keys(data.domainSpecific || {}).length} domain-specific rules...`);
+
+    // Store generic rules in storage.local (fast access, relatively small)
+    await setStorage(StorageKeys.COSMETIC_GENERIC_RULES, data.generic || []);
+
+    // Index domain-specific rules into IndexedDB
+    await db.clear();
+    if (data.domainSpecific) {
+      await db.putBulkCosmeticRules(data.domainSpecific);
+    }
+
+    await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
+    console.log('[AdBlock] Cosmetic rule indexing complete');
+  } catch (err) {
+    console.error('[AdBlock] Failed to ingest cosmetic rules:', err);
+  }
+}
 
   // Update badge for all existing tabs
   const tabs = await chrome.tabs.query({});
@@ -545,52 +578,26 @@ async function handleMessage(message, sender) {
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
 
-let cachedCosmeticRules = null;
-let cachedScriptletRules = null;
-
-async function loadCosmeticRules() {
-  if (cachedCosmeticRules) return cachedCosmeticRules;
-
-  try {
-    const url = chrome.runtime.getURL('rules/cosmetic-rules.json');
-    const resp = await fetch(url);
-    cachedCosmeticRules = await resp.json();
-  } catch {
-    cachedCosmeticRules = { generic: [], domainSpecific: {} };
-  }
-
-  return cachedCosmeticRules;
-}
-
-async function loadScriptletRules() {
-  if (cachedScriptletRules) return cachedScriptletRules;
-
-  try {
-    const url = chrome.runtime.getURL('rules/scriptlet-rules.json');
-    const resp = await fetch(url);
-    cachedScriptletRules = await resp.json();
-  } catch {
-    cachedScriptletRules = [];
-  }
-
-  return cachedScriptletRules;
-}
+// ---------------------------------------------------------------------------
+// Cosmetic + scriptlet rule lookup
+// ---------------------------------------------------------------------------
 
 async function getCosmeticRulesForPage(hostname) {
-  const rules = await loadCosmeticRules();
-  const generic = rules.generic || [];
+  // 1. Get static generic rules from storage
+  const generic = (await getStorage(StorageKeys.COSMETIC_GENERIC_RULES)) || [];
 
-  // Find domain-specific rules — check hostname and parent domains
+  // 2. Get static domain-specific rules from IndexedDB
   const domainSpecific = [];
   const parts = hostname.split('.');
   for (let i = 0; i < parts.length - 1; i++) {
     const domain = parts.slice(i).join('.');
-    if (rules.domainSpecific[domain]) {
-      domainSpecific.push(...rules.domainSpecific[domain]);
+    const domainRules = await db.getCosmeticRules(domain);
+    if (domainRules.length > 0) {
+      domainSpecific.push(...domainRules);
     }
   }
 
-  // Merge user-defined cosmetic rules from My Filters
+  // 3. Merge user-defined cosmetic rules from My Filters
   const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
   const userGeneric = userRules.generic || [];
   const userExceptions = new Set([...(userRules.genericExceptions || [])]);
@@ -613,10 +620,19 @@ async function getCosmeticRulesForPage(hostname) {
   };
 }
 
+let cachedScriptletRules = null;
 async function getScriptletRulesForPage(hostname) {
-  const rules = await loadScriptletRules();
+  if (!cachedScriptletRules) {
+    try {
+      const url = chrome.runtime.getURL('rules/scriptlet-rules.json');
+      const resp = await fetch(url);
+      cachedScriptletRules = await resp.json();
+    } catch {
+      cachedScriptletRules = [];
+    }
+  }
 
-  return rules.filter((rule) => {
+  return cachedScriptletRules.filter((rule) => {
     if (!rule.domains || rule.domains.length === 0) return true;
     return rule.domains.some((d) => hostname === d || hostname.endsWith('.' + d));
   });

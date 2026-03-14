@@ -16,7 +16,9 @@
     "dev": "npm run build:sample-rules && webpack --mode development --watch",
     "lint": "eslint src/ scripts/ --ext .js,.mjs",
     "clean": "rm -rf dist/ rules/*.json",
-    "clean:all": "npm run clean && rm -rf node_modules/"
+    "clean:all": "npm run clean && rm -rf node_modules/",
+    "version:sync": "node scripts/version.mjs",
+    "version:bump": "npm version --no-git-tag-version $1 && npm run version:sync && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to $(node -p \"require('./package.json').version\")\" && git tag v$(node -p \"require('./package.json').version\")"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.268",

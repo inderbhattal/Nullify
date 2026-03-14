@@ -23,13 +23,14 @@ export class RulesDB {
 
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
+        const transaction = event.target.transaction;
+
         if (!db.objectStoreNames.contains(STORE_COSMETIC)) {
           db.createObjectStore(STORE_COSMETIC, { keyPath: 'hostname' });
         }
         if (!db.objectStoreNames.contains(STORE_SCRIPTLET)) {
-          db.createObjectStore(STORE_SCRIPTLET, { keyPath: 'id', autoIncrement: true });
+          const store = db.createObjectStore(STORE_SCRIPTLET, { keyPath: 'id', autoIncrement: true });
           // Index by domain for faster lookup
-          const store = db.transaction.objectStore(STORE_SCRIPTLET);
           store.createIndex('domain', 'domains', { multiEntry: true, unique: false });
         }
       };

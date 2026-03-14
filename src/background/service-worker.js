@@ -41,7 +41,18 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   await ingestCosmeticRules(); // Build initial rule index
   await applyPrivacySettings();
   await scheduleFilterUpdateAlarm();
-...
+
+  // Update badge for all existing tabs
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    updateBadge(tab.id);
+  }
+});
+
+chrome.runtime.onStartup.addListener(async () => {
+  await applyPrivacySettings();
+  await scheduleFilterUpdateAlarm();
+});
 
 /**
  * Fetch the latest cosmetic-rules.json and index them into IndexedDB.
@@ -70,18 +81,6 @@ async function ingestCosmeticRules() {
     console.error('[AdBlock] Failed to ingest cosmetic rules:', err);
   }
 }
-
-  // Update badge for all existing tabs
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    updateBadge(tab.id);
-  }
-});
-
-chrome.runtime.onStartup.addListener(async () => {
-  await applyPrivacySettings();
-  await scheduleFilterUpdateAlarm();
-});
 
 // ---------------------------------------------------------------------------
 // Initialization
@@ -233,12 +232,6 @@ async function persistTabStats() {
 /**
  * Parse cosmetic (##) and exception (#@#) rules from a user filter text.
  * Returns a structure matching the cosmetic-rules.json shape, plus exceptions.
- *
- * Formats:
- *   example.com##.selector   → domain-specific hide
- *   ##.selector              → generic hide
- *   example.com#@#.selector  → domain-specific exception (un-hide)
- *   #@#.selector             → generic exception (un-hide)
  */
 function parseUserCosmeticRules(text) {
   const generic = [];
@@ -250,7 +243,7 @@ function parseUserCosmeticRules(text) {
     const t = line.trim();
     if (!t || t.startsWith('!') || t.startsWith('[')) continue;
 
-    // Exception first (#@# contains ## as substring, check #@# first via indexOf)
+    // Exception first
     const exIdx = t.indexOf('#@#');
     if (exIdx !== -1 && !t.slice(0, exIdx).includes('#')) {
       const domain = t.slice(0, exIdx).trim();
@@ -293,12 +286,10 @@ async function applyUserFilters(filtersText) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('!')) continue;
 
-    // Simple domain block: parse ||example.com^ pattern
     const rule = parseSimpleNetworkRule(trimmed, id++);
     if (rule) newRules.push(rule);
   }
 
-  // Get existing dynamic rules in user range
   const existing = await chrome.declarativeNetRequest.getDynamicRules();
   const userRuleIds = existing
     .filter((r) => r.id >= DNR_USER_RULES_START && r.id < DNR_ALLOWLIST_START)
@@ -309,16 +300,10 @@ async function applyUserFilters(filtersText) {
     addRules: newRules,
   });
 
-  // Extract and persist cosmetic rules so content scripts can use them
   const cosmeticRules = parseUserCosmeticRules(filtersText);
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
 
-  // Invalidate cache so next page load picks up new rules
-  cachedCosmeticRules = null;
-
-  console.log(`[AdBlock] Applied ${newRules.length} user network rules, ` +
-    `${cosmeticRules.generic.length} generic cosmetic rules, ` +
-    `${cosmeticRules.genericExceptions.length} generic exceptions`);
+  console.log(`[AdBlock] Applied ${newRules.length} user network rules`);
 }
 
 /** Parse a simple ABP-style network rule into a DNR rule object. */
@@ -327,8 +312,6 @@ function parseSimpleNetworkRule(line, id) {
   const pattern = isException ? line.slice(2) : line;
 
   if (!pattern || pattern.length < 3) return null;
-
-  // Check for cosmetic or scriptlet — skip (handled by content script)
   if (pattern.includes('##') || pattern.includes('#@#') || pattern.includes('##+js')) return null;
 
   const dollarPos = pattern.lastIndexOf('$');
@@ -437,7 +420,6 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
       args: [scriptletRules],
     });
   } catch (err) {
-    // Tab may have navigated away — ignore
     if (!err.message?.includes('No frame with id')) {
       console.warn('[AdBlock] Scriptlet injection failed:', err.message);
     }
@@ -446,13 +428,8 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
 
 /**
  * This function runs in the MAIN world of the page.
- * It receives serialized scriptlet specs and executes them.
- * Must be self-contained (no closures from SW context).
  */
 function executeScriptlets(specs) {
-  // The scriptlets bundle is injected separately as scriptlets-world.js
-  // with a randomized registry name like __nu<random>.
-  // We find it by looking for the .run() signature.
   let registry = null;
   for (const key of Object.keys(window)) {
     if (key.startsWith('__nu') && typeof window[key]?.run === 'function') {
@@ -466,9 +443,7 @@ function executeScriptlets(specs) {
   for (const spec of specs) {
     try {
       registry.run(spec.name, spec.args);
-    } catch (e) {
-      // Individual scriptlet errors should not break others
-    }
+    } catch (e) { }
   }
 }
 
@@ -479,7 +454,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleMessage(message, sender)
     .then(sendResponse)
     .catch((err) => sendResponse({ error: err.message }));
-  return true; // Keep channel open for async response
+  return true; 
 });
 
 async function handleMessage(message, sender) {
@@ -490,65 +465,49 @@ async function handleMessage(message, sender) {
       const tabId = payload?.tabId ?? sender.tab?.id;
       return tabStats.get(tabId) || { blocked: 0 };
     }
-
     case 'GET_SETTINGS':
       return (await getStorage(StorageKeys.SETTINGS)) || {};
-
     case 'SET_SETTINGS': {
       await setStorage(StorageKeys.SETTINGS, payload);
       await applyPrivacySettings();
       return { ok: true };
     }
-
     case 'GET_ALLOWLIST':
       return await getAllowlist();
-
     case 'ALLOW_SITE':
       await allowSite(payload.domain);
       return { ok: true };
-
     case 'DISALLOW_SITE':
       await disallowSite(payload.domain);
       return { ok: true };
-
     case 'IS_SITE_ALLOWED': {
       const allowlist = await getAllowlist();
       return { allowed: allowlist.includes(payload.domain) };
     }
-
     case 'GET_USER_FILTERS':
       return { filters: (await getStorage(StorageKeys.USER_FILTERS)) || '' };
-
     case 'SET_USER_FILTERS': {
       await setStorage(StorageKeys.USER_FILTERS, payload.filters);
       await applyUserFilters(payload.filters);
       return { ok: true };
     }
-
     case 'GET_COSMETIC_RULES': {
-      // Return cosmetic rules for the page's hostname
       return await getCosmeticRulesForPage(payload.hostname);
     }
-
     case 'GET_SCRIPTLET_RULES': {
-      // Return scriptlet specs for the page's hostname
       const rules = await getScriptletRulesForPage(payload.hostname);
       if (rules.length > 0 && sender.tab?.id) {
         await injectScriptlets(sender.tab.id, sender.frameId || 0, rules);
       }
       return { rules };
     }
-
     case 'SET_RULESET_ENABLED': {
       await setRulesetEnabled(payload.rulesetId, payload.enabled);
       return { ok: true };
     }
-
     case 'GET_ENABLED_RULESETS':
       return (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
-
     case 'CONTENT_BLOCKED': {
-      // Content script reports a cosmetically-hidden element
       const tabId = sender.tab?.id;
       if (tabId) {
         const entry = tabStats.get(tabId) || { blocked: 0 };
@@ -556,7 +515,6 @@ async function handleMessage(message, sender) {
         tabStats.set(tabId, entry);
         updateBadge(tabId);
 
-        // Broadcast to Logger
         broadcastLoggerEvent({
           type: 'cosmetic',
           action: 'hide',
@@ -568,7 +526,6 @@ async function handleMessage(message, sender) {
       }
       return { ok: true };
     }
-
     default:
       return { error: `Unknown message type: ${type}` };
   }
@@ -578,15 +535,8 @@ async function handleMessage(message, sender) {
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Cosmetic + scriptlet rule lookup
-// ---------------------------------------------------------------------------
-
 async function getCosmeticRulesForPage(hostname) {
-  // 1. Get static generic rules from storage
   const generic = (await getStorage(StorageKeys.COSMETIC_GENERIC_RULES)) || [];
-
-  // 2. Get static domain-specific rules from IndexedDB
   const domainSpecific = [];
   const parts = hostname.split('.');
   for (let i = 0; i < parts.length - 1; i++) {
@@ -597,7 +547,6 @@ async function getCosmeticRulesForPage(hostname) {
     }
   }
 
-  // 3. Merge user-defined cosmetic rules from My Filters
   const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
   const userGeneric = userRules.generic || [];
   const userExceptions = new Set([...(userRules.genericExceptions || [])]);

@@ -171,6 +171,19 @@ function removeOverlay() {
   document.getElementById(PICKER_OVERLAY_ID)?.remove();
 }
 
+/**
+ * Pierces Shadow DOM to find the deepest element at a given point.
+ */
+function getDeepElementFromPoint(x, y) {
+  let el = document.elementFromPoint(x, y);
+  while (el && el.shadowRoot) {
+    const deeper = el.shadowRoot.elementFromPoint(x, y);
+    if (!deeper || deeper === el) break;
+    el = deeper;
+  }
+  return el;
+}
+
 // ---------------------------------------------------------------------------
 // Event handlers
 // ---------------------------------------------------------------------------
@@ -184,7 +197,9 @@ function onMouseMove(e) {
   const highlight = document.getElementById(PICKER_HIGHLIGHT_ID);
   if (overlay) overlay.style.display = 'none';
   if (highlight) highlight.style.display = 'none';
-  const target = document.elementFromPoint(e.clientX, e.clientY);
+  
+  const target = getDeepElementFromPoint(e.clientX, e.clientY);
+  
   if (overlay) overlay.style.display = '';
   if (highlight) highlight.style.display = '';
 
@@ -206,7 +221,9 @@ function onClick(e) {
   const highlight = document.getElementById(PICKER_HIGHLIGHT_ID);
   if (overlay) overlay.style.display = 'none';
   if (highlight) highlight.style.display = 'none';
-  const target = document.elementFromPoint(e.clientX, e.clientY);
+  
+  const target = getDeepElementFromPoint(e.clientX, e.clientY);
+  
   if (overlay) overlay.style.display = '';
   if (highlight) highlight.style.display = '';
 
@@ -241,6 +258,25 @@ function isPickerDialog(el) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Finds all elements matching a selector, including those inside Shadow Roots.
+ */
+function deepQuerySelectorAll(selector, root = document) {
+  let results = [];
+  try {
+    results = [...root.querySelectorAll(selector)];
+  } catch { /* invalid selector */ }
+  
+  // Recursively check all elements for shadow roots
+  const all = root.querySelectorAll('*');
+  for (const el of all) {
+    if (el.shadowRoot) {
+      results.push(...deepQuerySelectorAll(selector, el.shadowRoot));
+    }
+  }
+  return results;
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
  */
@@ -252,10 +288,25 @@ function generateSelectors(el) {
   function add(label, selector, scope) {
     if (!selector || seen.has(selector)) return;
     // Validate selector
-    try { document.querySelectorAll(selector); } catch { return; }
+    try { document.querySelector(selector); } catch { return; }
     seen.add(selector);
-    const count = document.querySelectorAll(selector).length;
+    const count = deepQuerySelectorAll(selector).length;
     candidates.push({ label, selector, count, scope: scope || 'page', domain: hostname });
+  }
+
+  // Check if we are inside a shadow DOM
+  let root = el.getRootNode();
+  if (root instanceof ShadowRoot) {
+    const host = root.host;
+    const hostLabel = `Shadow Host <${host.tagName.toLowerCase()}>`;
+    
+    // Suggest host-level selectors first as they are the only way to hide 
+    // shadow content via global CSS.
+    if (host.id) add(`${hostLabel} ID`, `#${CSS.escape(host.id)}`);
+    for (const cls of Array.from(host.classList).slice(0, 2)) {
+      add(`${hostLabel} .${cls}`, `.${CSS.escape(cls)}`);
+    }
+    add(`${hostLabel} Tag`, host.tagName.toLowerCase());
   }
 
   // 1. By ID (most specific)
@@ -655,7 +706,7 @@ function updatePreviewForCustom(dialog, selector, hostname, count) {
 
   let elements = [];
   try {
-    elements = Array.from(document.querySelectorAll(selector)).slice(0, 5);
+    elements = deepQuerySelectorAll(selector).slice(0, 5);
   } catch {
     preview.innerHTML = '<span style="color:#f85149">⚠ Invalid CSS selector</span>';
     updateRulePreview(dialog, selector, hostname);
@@ -665,7 +716,7 @@ function updatePreviewForCustom(dialog, selector, hostname, count) {
   if (elements.length === 0) {
     preview.innerHTML = '<span style="color:#d29922">⚠ No elements match on this page</span>';
   } else {
-    const actualCount = document.querySelectorAll(selector).length;
+    const actualCount = deepQuerySelectorAll(selector).length;
     const items = elements.map((el) => {
       const tag = el.tagName.toLowerCase();
       const id = el.id ? `#${el.id}` : '';
@@ -734,7 +785,7 @@ async function savePickerRule(rule, selector, hostname, dialog) {
 
 function applyRuleImmediately(selector) {
   try {
-    document.querySelectorAll(selector).forEach((el) => {
+    deepQuerySelectorAll(selector).forEach((el) => {
       el.style.setProperty('display', 'none', 'important');
     });
   } catch {}

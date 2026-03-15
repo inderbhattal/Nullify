@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nullify",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Nullify — reduce ads to nothing. A powerful, privacy-focused ad blocker built on Manifest V3.",
   "author": "Nullify",
   "icons": {

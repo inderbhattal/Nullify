@@ -47,14 +47,25 @@ async function main() {
   }
 
   // ---- Request cosmetic rules and apply ----
-  let cosmeticRules = { generic: [], domainSpecific: [] };
+  let cosmeticRules = null;
   try {
     cosmeticRules = await chrome.runtime.sendMessage({
       type: 'GET_COSMETIC_RULES',
       payload: { hostname },
     });
   } catch {
-    // SW not ready — cosmetic rules unavailable
+    // SW not ready
+  }
+
+  // Skip engine initialization if there are no site-specific rules or exceptions.
+  // Note: Generic rules are now handled by the SW via insertCSS.
+  const hasDomainRules = cosmeticRules?.domainSpecific && cosmeticRules.domainSpecific.length > 0;
+  const hasExceptions = cosmeticRules?.exceptions && cosmeticRules.exceptions.length > 0;
+  const hasUserRules = cosmeticRules?.generic && cosmeticRules.generic.length > 0;
+
+  if (!hasDomainRules && !hasExceptions && !hasUserRules) {
+    console.log('[AdBlock] No site-specific cosmetic rules, skipping engine init.');
+    return;
   }
 
   const engine = new CosmeticEngine();

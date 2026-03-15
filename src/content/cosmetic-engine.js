@@ -143,8 +143,11 @@ export class CosmeticEngine {
     this._exceptions = new Set();   // selectors from #@# rules
     this._hiddenCount = 0;
     this._selectorHits = new Map(); // selector -> count
+    this._hideQueue = new Set();    // elements pending hide
+    this._matchCache = new Map();   // selector -> WeakMap(el -> bool)
     this._reportTimer = null;
     this._proceduralDebounce = null;
+    this._rafId = null;
   }
 
   /**
@@ -313,68 +316,87 @@ export class CosmeticEngine {
    * Returns the target element to hide, or null if this element should be
    * skipped (filter did not match).
    */
-  _applyOp(el, op, arg) {
-    switch (op) {
-      // ---- :upward(n) / :nth-ancestor(n) / :upward(selector) ----
-      case 'upward':
-      case 'nth-ancestor': {
-        const n = parseInt(arg, 10);
-        if (!isNaN(n)) {
-          let target = el;
-          for (let i = 0; i < n; i++) {
-            target = target?.parentElement;
-            if (!target) return null;
-          }
-          return target;
-        }
-        // Selector form: :upward(article)
-        try { return el.closest(arg.trim()) || null; } catch { return null; }
-      }
-
-      // ---- :has-text(text) or :has-text(/regex/flags) ----
-      case 'has-text': {
-        let pattern;
-        if (arg.startsWith('/')) {
-          const lastSlash = arg.lastIndexOf('/');
-          pattern = new RegExp(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
-        } else {
-          pattern = new RegExp(escapeRegex(arg), 'i');
-        }
-        return pattern.test(el.textContent) ? el : null;
-      }
-
-      // ---- :min-text-length(n) ----
-      case 'min-text-length': {
-        const n = parseInt(arg, 10);
-        return el.textContent.trim().length >= n ? el : null;
-      }
-
-      // ---- :matches-css(property: value) ----
-      case 'matches-css':
-      case 'matches-css-before':
-      case 'matches-css-after': {
-        const pseudo = op === 'matches-css' ? null
-          : op === 'matches-css-before' ? '::before' : '::after';
-        const colonIdx = arg.indexOf(':');
-        if (colonIdx === -1) return null;
-        const prop = arg.slice(0, colonIdx).trim();
-        const val = arg.slice(colonIdx + 1).trim();
-        const computed = getComputedStyle(el, pseudo).getPropertyValue(prop).trim();
-        if (val.startsWith('/')) {
-          const lastSlash = val.lastIndexOf('/');
-          const re = new RegExp(val.slice(1, lastSlash), val.slice(lastSlash + 1));
-          return re.test(computed) ? el : null;
-        }
-        return computed === val ? el : null;
-      }
-
-      // ---- :watch-attr(attr1,attr2) ---- (pass-through; observer handles re-eval) ----
-      case 'watch-attr':
-        return el;
-
-      default:
-        return el;
+  _getCachedMatch(el, op, arg, evaluator) {
+    const key = `${op}|${arg}`;
+    let opCache = this._matchCache.get(key);
+    if (!opCache) {
+      opCache = new WeakMap();
+      this._matchCache.set(key, opCache);
     }
+
+    if (opCache.has(el)) {
+      return opCache.get(el);
+    }
+
+    const result = evaluator();
+    opCache.set(el, result);
+    return result;
+  }
+
+  _applyOp(el, op, arg) {
+    return this._getCachedMatch(el, op, arg, () => {
+      switch (op) {
+        // ---- :upward(n) / :nth-ancestor(n) / :upward(selector) ----
+        case 'upward':
+        case 'nth-ancestor': {
+          const n = parseInt(arg, 10);
+          if (!isNaN(n)) {
+            let target = el;
+            for (let i = 0; i < n; i++) {
+              target = target?.parentElement;
+              if (!target) return null;
+            }
+            return target;
+          }
+          // Selector form: :upward(article)
+          try { return el.closest(arg.trim()) || null; } catch { return null; }
+        }
+
+        // ---- :has-text(text) or :has-text(/regex/flags) ----
+        case 'has-text': {
+          let pattern;
+          if (arg.startsWith('/')) {
+            const lastSlash = arg.lastIndexOf('/');
+            pattern = new RegExp(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
+          } else {
+            pattern = new RegExp(escapeRegex(arg), 'i');
+          }
+          return pattern.test(el.textContent) ? el : null;
+        }
+
+        // ---- :min-text-length(n) ----
+        case 'min-text-length': {
+          const n = parseInt(arg, 10);
+          return el.textContent.trim().length >= n ? el : null;
+        }
+
+        // ---- :matches-css(property: value) ----
+        case 'matches-css':
+        case 'matches-css-before':
+        case 'matches-css-after': {
+          const pseudo = op === 'matches-css' ? null
+            : op === 'matches-css-before' ? '::before' : '::after';
+          const colonIdx = arg.indexOf(':');
+          if (colonIdx === -1) return null;
+          const prop = arg.slice(0, colonIdx).trim();
+          const val = arg.slice(colonIdx + 1).trim();
+          const computed = getComputedStyle(el, pseudo).getPropertyValue(prop).trim();
+          if (val.startsWith('/')) {
+            const lastSlash = val.lastIndexOf('/');
+            const re = new RegExp(val.slice(1, lastSlash), val.slice(lastSlash + 1));
+            return re.test(computed) ? el : null;
+          }
+          return computed === val ? el : null;
+        }
+
+        // ---- :watch-attr(attr1,attr2) ---- (pass-through; observer handles re-eval) ----
+        case 'watch-attr':
+          return el;
+
+        default:
+          return el;
+      }
+    });
   }
 
   /** Apply an XPath expression directly to the document. */
@@ -459,6 +481,7 @@ export class CosmeticEngine {
     if (this._proceduralDebounce) return;
     this._proceduralDebounce = setTimeout(() => {
       this._proceduralDebounce = null;
+      this._matchCache.clear(); // Clear cache for the new run
       this._applyAllProcedural();
     }, 100);
   }
@@ -479,12 +502,22 @@ export class CosmeticEngine {
   _hideElement(el, selector = 'unknown') {
     if (!el || el.getAttribute(ELEMENT_ATTR)) return;
     if (this._exceptions.has(el.className) || this._isExcepted(el)) return;
-    el.setAttribute(ELEMENT_ATTR, '1');
-    el.style.setProperty('display', 'none', 'important');
-    el.style.setProperty('visibility', 'hidden', 'important');
     
+    this._hideQueue.add(el);
     this._hiddenCount++;
     this._selectorHits.set(selector, (this._selectorHits.get(selector) || 0) + 1);
+
+    if (!this._rafId) {
+      this._rafId = requestAnimationFrame(() => {
+        this._rafId = null;
+        for (const target of this._hideQueue) {
+          target.setAttribute(ELEMENT_ATTR, '1');
+          target.style.setProperty('display', 'none', 'important');
+          target.style.setProperty('visibility', 'hidden', 'important');
+        }
+        this._hideQueue.clear();
+      });
+    }
     
     this._scheduleReport();
   }

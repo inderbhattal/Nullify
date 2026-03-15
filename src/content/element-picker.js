@@ -20,6 +20,8 @@ const PICKER_STYLE_ID     = '__adblock_picker_style__';
 let pickerActive = false;
 let highlightEl = null;
 let lastTarget = null;
+let navStack = [];
+let currentNavTarget = null;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -27,6 +29,8 @@ let lastTarget = null;
 export function activatePicker() {
   if (pickerActive) return;
   pickerActive = true;
+  navStack = [];
+  currentNavTarget = null;
   injectPickerStyles();
   createOverlay();
   document.addEventListener('mousemove', onMouseMove, { capture: true, passive: true });
@@ -370,14 +374,23 @@ function buildSelectorPath(el, maxDepth) {
 function openPickerDialog(target) {
   removeDialog();
   removeHighlight();
-
-  const candidates = generateSelectors(target);
-  const hostname = location.hostname.replace(/^www\./, '');
+  currentNavTarget = target;
+  navStack = [];
 
   const dialog = document.createElement('div');
   dialog.id = PICKER_DIALOG_ID;
-  dialog.innerHTML = buildDialogHTML(candidates, target, hostname);
   document.documentElement.appendChild(dialog);
+  
+  updatePickerDialog(dialog);
+}
+
+function updatePickerDialog(dialog) {
+  const target = currentNavTarget;
+  const hostname = location.hostname.replace(/^www\./, '');
+  const candidates = generateSelectors(target);
+
+  updateHighlight(target);
+  dialog.innerHTML = buildDialogHTML(candidates, target, hostname);
 
   // Select first (best) candidate by default
   if (candidates.length > 0) {
@@ -405,7 +418,27 @@ function openPickerDialog(target) {
     } catch {}
   });
 
+  // Navigation events
+  dialog.querySelector('#adblock-picker-expand')?.addEventListener('click', () => {
+    if (currentNavTarget.parentElement && currentNavTarget.parentElement !== document.documentElement) {
+      navStack.push(currentNavTarget);
+      currentNavTarget = currentNavTarget.parentElement;
+      updatePickerDialog(dialog);
+    }
+  });
+
+  dialog.querySelector('#adblock-picker-shrink')?.addEventListener('click', () => {
+    if (navStack.length > 0) {
+      currentNavTarget = navStack.pop();
+      updatePickerDialog(dialog);
+    }
+  });
+
   dialog.querySelector('#adblock-picker-cancel')?.addEventListener('click', () => {
+    deactivatePicker();
+  });
+
+  dialog.querySelector('#adblock-picker-cancel2')?.addEventListener('click', () => {
     deactivatePicker();
   });
 
@@ -436,14 +469,23 @@ function buildDialogHTML(candidates, target, hostname) {
     </label>
   `).join('');
 
+  const canShrink = navStack.length > 0;
+  const canExpand = target.parentElement && target.parentElement !== document.documentElement;
+
   return `
     <div class="adblock-picker-header">
-      <div class="adblock-picker-title">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2">
-          <circle cx="12" cy="12" r="3"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
-          <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
-        </svg>
-        Create Blocking Rule
+      <div style="display:flex;align-items:center">
+        <div class="adblock-picker-title">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#58a6ff" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+          </svg>
+          Create Rule
+        </div>
+        <div class="adblock-picker-nav">
+          <button class="adblock-picker-nav-btn" id="adblock-picker-expand" title="Expand selection (parent)" ${!canExpand ? 'disabled' : ''}>△</button>
+          <button class="adblock-picker-nav-btn" id="adblock-picker-shrink" title="Shrink selection (child)" ${!canShrink ? 'disabled' : ''}>▽</button>
+        </div>
       </div>
       <button class="adblock-picker-x" id="adblock-picker-cancel">✕</button>
     </div>
@@ -493,6 +535,17 @@ function buildDialogHTML(candidates, target, hostname) {
       .adblock-picker-title {
         font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px;
       }
+      .adblock-picker-nav {
+        display: flex; gap: 4px; margin-left: 12px;
+      }
+      .adblock-picker-nav-btn {
+        background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+        border-radius: 4px; padding: 2px 8px; cursor: pointer; font-size: 14px;
+        display: flex; align-items: center; transition: background 0.1s;
+      }
+      .adblock-picker-nav-btn:hover:not(:disabled) { background: #30363d; }
+      .adblock-picker-nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+      
       .adblock-picker-x {
         background: none; border: none; color: #8b949e; cursor: pointer;
         font-size: 18px; line-height: 1; padding: 4px; border-radius: 4px;
@@ -641,13 +694,6 @@ function updateCustomInput(dialog, selector, hostname) {
   }
   updateRulePreview(dialog, selector, hostname);
 }
-
-// Cancel button (both)
-document.addEventListener('click', (e) => {
-  if (e.target.id === 'adblock-picker-cancel2') {
-    deactivatePicker();
-  }
-}, { capture: false });
 
 function buildCosmeticRule(selector, domain) {
   return domain ? `${domain}##${selector}` : `##${selector}`;

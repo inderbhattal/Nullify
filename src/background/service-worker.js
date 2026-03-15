@@ -164,6 +164,7 @@ async function initializeDefaults() {
     blockThirdPartyCookies: false,
     fingerprintProtection: true,
     stripTrackingHeaders: true,
+    enhancedStealth: false,
     enabled: true,
   });
 
@@ -212,9 +213,13 @@ async function applyPrivacySettings() {
 
   // Update header stripping rules
   await applyHeaderRules(settings.stripTrackingHeaders !== false);
+
+  // Update stealth rules (CSP stripping)
+  await applyStealthRules(settings.enhancedStealth === true);
 }
 
 const DNR_HEADER_RULES_START = 800_000;
+const DNR_STEALTH_RULES_START = 810_000;
 
 /** Apply DNR rules to strip tracking headers (Referer, Set-Cookie). */
 async function applyHeaderRules(enabled) {
@@ -237,7 +242,7 @@ async function applyHeaderRules(enabled) {
       },
       condition: {
         domainType: 'thirdParty',
-        resourceTypes: ['script', 'xmlhttprequest', 'fetch', 'other']
+        resourceTypes: ['script', 'xmlhttprequest', 'other']
       }
     },
     {
@@ -249,13 +254,48 @@ async function applyHeaderRules(enabled) {
       },
       condition: {
         domainType: 'thirdParty',
-        resourceTypes: ['script', 'xmlhttprequest', 'fetch', 'other']
+        resourceTypes: ['script', 'xmlhttprequest', 'other']
       }
     }
   ];
 
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: ruleIds,
+    addRules: rules,
+  });
+}
+
+/** Apply DNR rules to strip CSP headers for advanced scriptlet injection. */
+async function applyStealthRules(enabled) {
+  const ruleId = DNR_STEALTH_RULES_START;
+  
+  if (!enabled) {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: [ruleId],
+    });
+    return;
+  }
+
+  const rules = [
+    {
+      id: ruleId,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [
+          { header: 'content-security-policy', operation: 'remove' },
+          { header: 'x-content-security-policy', operation: 'remove' },
+          { header: 'content-security-policy-report-only', operation: 'remove' }
+        ]
+      },
+      condition: {
+        resourceTypes: ['main_frame', 'sub_frame']
+      }
+    }
+  ];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
     addRules: rules,
   });
 }

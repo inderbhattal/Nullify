@@ -258,6 +258,7 @@ async function initSettings() {
   $('settingCookies').checked = settings.blockThirdPartyCookies === true;
   $('settingFingerprint').checked = settings.fingerprintProtection !== false;
   $('settingHeaders').checked = settings.stripTrackingHeaders !== false;
+  $('settingStealth').checked = settings.enhancedStealth === true;
 
   const saveSettings = async () => {
     await chrome.runtime.sendMessage({
@@ -270,11 +271,12 @@ async function initSettings() {
         blockThirdPartyCookies: $('settingCookies').checked,
         fingerprintProtection: $('settingFingerprint').checked,
         stripTrackingHeaders: $('settingHeaders').checked,
+        enhancedStealth: $('settingStealth').checked,
       },
     });
   };
 
-  ['settingWebRTC', 'settingPing', 'settingHTTPS', 'settingBadge', 'settingCookies', 'settingFingerprint', 'settingHeaders'].forEach((id) => {
+  ['settingWebRTC', 'settingPing', 'settingHTTPS', 'settingBadge', 'settingCookies', 'settingFingerprint', 'settingHeaders', 'settingStealth'].forEach((id) => {
     $(id).addEventListener('change', saveSettings);
   });
 }

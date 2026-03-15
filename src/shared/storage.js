@@ -21,6 +21,7 @@ export const StorageKeys = {
   BLOCK_THIRD_PARTY_COOKIES: 'blockThirdPartyCookies',
   FINGERPRINT_PROTECTION: 'fingerprintProtection',
   STRIP_TRACKING_HEADERS: 'stripTrackingHeaders',
+  ENHANCED_STEALTH: 'enhancedStealth',
 };
 
 /** Get a single value from storage. Returns null if not found. */

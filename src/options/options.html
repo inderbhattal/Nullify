@@ -213,6 +213,35 @@
             </span>
             <input type="checkbox" id="settingStealth" class="toggle">
           </label>
+
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Browser Persona</strong>
+              <span class="toggle-desc">Spoof your User-Agent and Client Hints to look like a standard system</span>
+            </span>
+            <select id="settingPersona" class="text-input" style="width: 140px; padding: 4px 8px; flex: none;">
+              <option value="default">Default</option>
+              <option value="windows">Windows / Chrome</option>
+              <option value="mac">macOS / Chrome</option>
+              <option value="linux">Linux / Chrome</option>
+            </select>
+          </label>
+
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Enable Cache Tracking Protection</strong>
+              <span class="toggle-desc">Strips <code>ETag</code> and <code>Last-Modified</code> from third-party responses</span>
+            </span>
+            <input type="checkbox" id="settingCache" class="toggle">
+          </label>
+
+          <label class="toggle-row">
+            <span class="toggle-label">
+              <strong>Enforce strict Referrer-Policy</strong>
+              <span class="toggle-desc">Forces <code>strict-origin-when-cross-origin</code> on all sites</span>
+            </span>
+            <input type="checkbox" id="settingReferrer" class="toggle">
+          </label>
         </div>
 
         <div class="settings-group">

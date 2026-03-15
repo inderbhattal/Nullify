@@ -22,6 +22,9 @@ export const StorageKeys = {
   FINGERPRINT_PROTECTION: 'fingerprintProtection',
   STRIP_TRACKING_HEADERS: 'stripTrackingHeaders',
   ENHANCED_STEALTH: 'enhancedStealth',
+  STEALTH_PERSONA: 'stealthPersona',
+  CACHE_PROTECTION: 'cacheProtection',
+  REFERRER_CONTROL: 'referrerControl',
 };
 
 /** Get a single value from storage. Returns null if not found. */

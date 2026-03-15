@@ -165,6 +165,9 @@ async function initializeDefaults() {
     fingerprintProtection: true,
     stripTrackingHeaders: true,
     enhancedStealth: false,
+    stealthPersona: 'default',
+    cacheProtection: true,
+    referrerControl: true,
     enabled: true,
   });
 
@@ -216,6 +219,15 @@ async function applyPrivacySettings() {
 
   // Update stealth rules (CSP stripping)
   await applyStealthRules(settings.enhancedStealth === true);
+
+  // Update persona rules
+  await applyPersonaRules(settings.stealthPersona || 'default');
+
+  // Update cache protection rules
+  await applyCacheProtectionRules(settings.cacheProtection !== false);
+
+  // Update referrer control rules
+  await applyReferrerControlRules(settings.referrerControl !== false);
 }
 
 const DNR_HEADER_RULES_START = 800_000;
@@ -299,6 +311,118 @@ async function applyStealthRules(enabled) {
     addRules: rules,
   });
 }
+
+const PERSONAS = {
+  windows: {
+    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    platform: 'Windows'
+  },
+  mac: {
+    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    platform: 'macOS'
+  },
+  linux: {
+    ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+    platform: 'Linux'
+  }
+};
+
+/** Apply DNR rules to spoof User-Agent and Client Hints. */
+async function applyPersonaRules(personaId) {
+  const ruleId = DNR_PERSONA_RULES_START;
+  const persona = PERSONAS[personaId];
+
+  if (!persona || personaId === 'default') {
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    return;
+  }
+
+  const rules = [{
+    id: ruleId,
+    priority: 1,
+    action: {
+      type: 'modifyHeaders',
+      requestHeaders: [
+        { header: 'user-agent', operation: 'set', value: persona.ua },
+        { header: 'sec-ch-ua', operation: 'set', value: persona.chUA },
+        { header: 'sec-ch-ua-platform', operation: 'set', value: `"${persona.platform}"` },
+        { header: 'sec-ch-ua-mobile', operation: 'set', value: '?0' }
+      ]
+    },
+    condition: { resourceTypes: ['main_frame', 'sub_frame', 'script', 'xmlhttprequest', 'other'] }
+  }];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+    addRules: rules
+  });
+}
+
+/** Strip ETag and Last-Modified to prevent cache-based tracking. */
+async function applyCacheProtectionRules(enabled) {
+  const ruleId = DNR_CACHE_RULES_START;
+  
+  if (!enabled) {
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    return;
+  }
+
+  const rules = [{
+    id: ruleId,
+    priority: 1,
+    action: {
+      type: 'modifyHeaders',
+      responseHeaders: [
+        { header: 'etag', operation: 'remove' },
+        { header: 'last-modified', operation: 'remove' }
+      ]
+    },
+    condition: {
+      domainType: 'thirdParty',
+      resourceTypes: ['script', 'xmlhttprequest', 'other']
+    }
+  }];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+    addRules: rules
+  });
+}
+
+/** Enforce strict Referrer-Policy. */
+async function applyReferrerControlRules(enabled) {
+  const ruleId = DNR_REFERRER_RULES_START;
+  
+  if (!enabled) {
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    return;
+  }
+
+  const rules = [{
+    id: ruleId,
+    priority: 1,
+    action: {
+      type: 'modifyHeaders',
+      responseHeaders: [
+        { header: 'referrer-policy', operation: 'set', value: 'strict-origin-when-cross-origin' }
+      ]
+    },
+    condition: { resourceTypes: ['main_frame', 'sub_frame'] }
+  }];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+    addRules: rules
+  });
+}
+
+const DNR_PERSONA_RULES_START = 820_000;
+const DNR_CACHE_RULES_START = 830_000;
+const DNR_REFERRER_RULES_START = 840_000;
+
 
 // ---------------------------------------------------------------------------
 // Alarms — periodic filter list updates

@@ -37,9 +37,28 @@ function initNav() {
 // ---------------------------------------------------------------------------
 async function initFilterLists() {
   let enabled = {};
+  let lastUpdate = 0;
   try {
-    enabled = await chrome.runtime.sendMessage({ type: 'GET_ENABLED_RULESETS' }) || {};
+    const res = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'GET_ENABLED_RULESETS' }),
+      chrome.storage.local.get('lastUpdateCheck')
+    ]);
+    enabled = res[0] || {};
+    lastUpdate = res[1]?.lastUpdateCheck || 0;
   } catch {}
+
+  const updateStatusText = () => {
+    const el = $('lastUpdateText');
+    if (!el) return;
+    if (lastUpdate === 0) {
+      el.textContent = 'Never checked';
+    } else {
+      const date = new Date(lastUpdate);
+      el.textContent = `Last check: ${date.toLocaleDateString()} ${date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    }
+  };
+
+  updateStatusText();
 
   const grid = $('filterListGrid');
   grid.innerHTML = '';
@@ -81,12 +100,23 @@ async function initFilterLists() {
   $('btnUpdateAll').addEventListener('click', async () => {
     $('btnUpdateAll').textContent = 'Updating...';
     $('btnUpdateAll').disabled = true;
-    // Trigger background update check
-    await chrome.runtime.sendMessage({ type: 'CHECK_FILTER_UPDATES' }).catch(() => {});
+    
+    try {
+      // Trigger background update check
+      await chrome.runtime.sendMessage({ type: 'CHECK_FILTER_UPDATES' });
+      
+      // Refresh last update time
+      const res = await chrome.storage.local.get('lastUpdateCheck');
+      lastUpdate = res.lastUpdateCheck || Date.now();
+      updateStatusText();
+    } catch (err) {
+      console.error('Update failed:', err);
+    }
+
     setTimeout(() => {
       $('btnUpdateAll').textContent = 'Update All';
       $('btnUpdateAll').disabled = false;
-    }, 1500);
+    }, 1000);
   });
 }
 

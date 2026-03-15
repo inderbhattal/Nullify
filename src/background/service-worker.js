@@ -465,8 +465,11 @@ async function cleanupTabStats() {
 
 async function checkFilterListUpdates() {
   console.log('[AdBlock] Checking for filter list updates...');
-  // In production this would re-fetch and recompile filter lists.
-  // For now, log the check time.
+  
+  // Re-index bundled rules to ensure caches (IDB, Bloom Filter) are fresh.
+  // In a full production app, this would also fetch new .txt files from the web.
+  await ingestRules();
+  
   await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
 }
 
@@ -837,6 +840,12 @@ async function handleMessage(message, sender) {
     }
     case 'GET_ENABLED_RULESETS':
       return (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+
+    case 'CHECK_FILTER_UPDATES': {
+      await checkFilterListUpdates();
+      return { ok: true };
+    }
+
     case 'CONTENT_BLOCKED': {
       const tabId = sender.tab?.id;
       if (tabId) {

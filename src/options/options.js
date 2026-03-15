@@ -19,6 +19,11 @@ const FILTER_LISTS = [
 // Navigation
 // ---------------------------------------------------------------------------
 function initNav() {
+  // Display version from manifest
+  const manifest = chrome.runtime.getManifest();
+  const versionEl = $('extVersion');
+  if (versionEl) versionEl.textContent = manifest.version;
+
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', () => {
       const tabId = item.dataset.tab;
@@ -276,11 +281,6 @@ async function renderAllowlist() {
 // Settings
 // ---------------------------------------------------------------------------
 async function initSettings() {
-  // Display version from manifest
-  const manifest = chrome.runtime.getManifest();
-  const versionEl = $('extVersion');
-  if (versionEl) versionEl.textContent = manifest.version;
-
   let settings = {};
   try {
     settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }) || {};

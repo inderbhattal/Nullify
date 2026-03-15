@@ -404,7 +404,7 @@ class LiveLogger {
     const time = new Date(e.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     
     const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
-    const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : 'badge-hide';
+    const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : e.action === 'remove' ? 'badge-remove' : 'badge-hide';
     const trackerBadge = e.isTracker ? '<span class="log-badge" style="background:rgba(255,121,198,0.15);color:#ff79c6;margin-left:4px">tracker</span>' : '';
 
     let infoHtml = '';

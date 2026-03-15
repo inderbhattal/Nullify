@@ -39,6 +39,7 @@ const PROC_OPS = [
   'min-text-length',
   'xpath',
   'watch-attr',
+  'remove',
 ];
 
 // ---------------------------------------------------------------------------
@@ -142,8 +143,9 @@ export class CosmeticEngine {
     this._watchAttrRules = [];      // { baseSelector, attrs, rule }
     this._exceptions = new Set();   // selectors from #@# rules
     this._hiddenCount = 0;
-    this._selectorHits = new Map(); // selector -> count
+    this._selectorHits = new Map(); // selector -> { count, action }
     this._hideQueue = new Set();    // elements pending hide
+    this._removeQueue = new Set();  // elements pending physical removal
     this._matchCache = new Map();   // selector -> WeakMap(el -> bool)
     this._reportTimer = null;
     this._proceduralDebounce = null;
@@ -294,7 +296,7 @@ export class CosmeticEngine {
     const nextSteps = remainingPlan.slice(1);
 
     if (step.type === 'op') {
-      const result = this._applyOp(el, step.op, step.arg);
+      const result = this._applyOp(el, step.op, step.arg, fullSelector);
       if (result) {
         this._runPlanOnElement(result, nextSteps, fullSelector);
       }
@@ -333,7 +335,7 @@ export class CosmeticEngine {
     return result;
   }
 
-  _applyOp(el, op, arg) {
+  _applyOp(el, op, arg, fullSelector) {
     return this._getCachedMatch(el, op, arg, () => {
       switch (op) {
         // ---- :upward(n) / :nth-ancestor(n) / :upward(selector) ----
@@ -393,6 +395,11 @@ export class CosmeticEngine {
         case 'watch-attr':
           return el;
 
+        // ---- :remove() ---- (physical deletion) ----
+        case 'remove':
+          this._removeElement(el, fullSelector);
+          return null; // Stop chain
+
         default:
           return el;
       }
@@ -421,7 +428,7 @@ export class CosmeticEngine {
     const attrMap = new Map(); // attr → Set of selectors to re-evaluate
 
     for (const rule of this._proceduralRules) {
-      const parsed = extractFirstOp(rule);
+      const parsed = extractFirstOp(rule.selector);
       if (parsed?.op !== 'watch-attr') continue;
 
       const attrs = parsed.arg.split(',').map((a) => a.trim()).filter(Boolean);
@@ -431,7 +438,7 @@ export class CosmeticEngine {
         if (!attrMap.has(attr)) attrMap.set(attr, new Set());
         attrMap.get(attr).add(baseSelector || '*');
       }
-      this._watchAttrRules.push({ base: parsed.base, attrs, rest: parsed.rest });
+      this._watchAttrRules.push({ base: parsed.base, attrs, rest: parsed.rest, fullSelector: rule.selector });
     }
 
     if (attrMap.size === 0) return;
@@ -505,21 +512,49 @@ export class CosmeticEngine {
     
     this._hideQueue.add(el);
     this._hiddenCount++;
-    this._selectorHits.set(selector, (this._selectorHits.get(selector) || 0) + 1);
-
-    if (!this._rafId) {
-      this._rafId = requestAnimationFrame(() => {
-        this._rafId = null;
-        for (const target of this._hideQueue) {
-          target.setAttribute(ELEMENT_ATTR, '1');
-          target.style.setProperty('display', 'none', 'important');
-          target.style.setProperty('visibility', 'hidden', 'important');
-        }
-        this._hideQueue.clear();
-      });
-    }
     
+    const hit = this._selectorHits.get(selector) || { count: 0, action: 'hide' };
+    hit.count++;
+    this._selectorHits.set(selector, hit);
+
+    this._triggerRaf();
     this._scheduleReport();
+  }
+
+  _removeElement(el, selector = 'unknown') {
+    if (!el || !el.parentElement) return;
+    if (this._exceptions.has(el.className) || this._isExcepted(el)) return;
+
+    this._removeQueue.add(el);
+    this._hiddenCount++;
+    
+    const hit = this._selectorHits.get(selector) || { count: 0, action: 'remove' };
+    hit.count++;
+    this._selectorHits.set(selector, hit);
+
+    this._triggerRaf();
+    this._scheduleReport();
+  }
+
+  _triggerRaf() {
+    if (this._rafId) return;
+    this._rafId = requestAnimationFrame(() => {
+      this._rafId = null;
+      
+      // Process hiding
+      for (const target of this._hideQueue) {
+        target.setAttribute(ELEMENT_ATTR, '1');
+        target.style.setProperty('display', 'none', 'important');
+        target.style.setProperty('visibility', 'hidden', 'important');
+      }
+      this._hideQueue.clear();
+
+      // Process removal
+      for (const target of this._removeQueue) {
+        target.remove();
+      }
+      this._removeQueue.clear();
+    });
   }
 
   /** Check if any exception selector matches this element. */
@@ -547,10 +582,10 @@ export class CosmeticEngine {
         this._selectorHits.clear();
 
         // One message per selector hit for the Logger
-        for (const [selector, count] of hits) {
+        for (const [selector, hit] of hits) {
           chrome.runtime.sendMessage({
             type: 'CONTENT_BLOCKED',
-            payload: { count, selector, hostname },
+            payload: { count: hit.count, action: hit.action, selector, hostname },
           }).catch(() => {});
         }
       }

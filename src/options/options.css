@@ -358,6 +358,7 @@ body {
 .badge-block { color: var(--red); }
 .badge-allow { color: var(--accent2); }
 .badge-hide { color: var(--yellow); }
+.badge-remove { color: #f85149; font-style: italic; }
 
 .log-url { color: var(--text); }
 .log-selector { color: var(--accent); }

@@ -853,15 +853,15 @@ async function handleMessage(message, sender) {
         entry.blocked += payload.count || 1;
         tabStats.set(tabId, entry);
         updateBadge(tabId);
-
-        broadcastLoggerEvent({
-          type: 'cosmetic',
-          action: 'hide',
-          hostname: payload.hostname || sender.tab.url,
-          selector: payload.selector,
-          count: payload.count || 1,
-          timestamp: Date.now(),
-        });
+// Broadcast to Logger
+broadcastLoggerEvent({
+  type: 'cosmetic',
+  action: payload.action || 'hide',
+  hostname: payload.hostname || sender.tab.url,
+  selector: payload.selector,
+  count: payload.count || 1,
+  timestamp: Date.now(),
+});
       }
       return { ok: true };
     }

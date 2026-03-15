@@ -42,6 +42,8 @@ import { trustedReplaceFetchResponse, trustedReplaceXhrResponse } from './truste
 import { trustedClickElement } from './trusted-click-element.js';
 import { m3uPrune } from './m3u-prune.js';
 import { hideWindowError } from './hide-window-error.js';
+import { fingerprintNoise } from './fingerprint-noise.js';
+import { batterySpoof } from './battery-spoof.js';
 
 // ---------------------------------------------------------------------------
 // Registry — maps scriptlet name (and aliases) to implementation
@@ -124,6 +126,10 @@ const REGISTRY = new Map([
   ['trxr', trustedReplaceXhrResponse],
   ['hide-window-error', hideWindowError],
   ['hwe', hideWindowError],
+  ['fingerprint-noise', fingerprintNoise],
+  ['fpn', fingerprintNoise],
+  ['battery-spoof', batterySpoof],
+  ['bs', batterySpoof],
 ]);
 
 // ---------------------------------------------------------------------------

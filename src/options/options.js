@@ -255,6 +255,9 @@ async function initSettings() {
   $('settingPing').checked = settings.blockHyperlinkAuditing !== false;
   $('settingHTTPS').checked = settings.upgradeInsecureRequests !== false;
   $('settingBadge').checked = settings.showBadge !== false;
+  $('settingCookies').checked = settings.blockThirdPartyCookies === true;
+  $('settingFingerprint').checked = settings.fingerprintProtection !== false;
+  $('settingHeaders').checked = settings.stripTrackingHeaders !== false;
 
   const saveSettings = async () => {
     await chrome.runtime.sendMessage({
@@ -264,11 +267,14 @@ async function initSettings() {
         blockHyperlinkAuditing: $('settingPing').checked,
         upgradeInsecureRequests: $('settingHTTPS').checked,
         showBadge: $('settingBadge').checked,
+        blockThirdPartyCookies: $('settingCookies').checked,
+        fingerprintProtection: $('settingFingerprint').checked,
+        stripTrackingHeaders: $('settingHeaders').checked,
       },
     });
   };
 
-  ['settingWebRTC', 'settingPing', 'settingHTTPS', 'settingBadge'].forEach((id) => {
+  ['settingWebRTC', 'settingPing', 'settingHTTPS', 'settingBadge', 'settingCookies', 'settingFingerprint', 'settingHeaders'].forEach((id) => {
     $(id).addEventListener('change', saveSettings);
   });
 }
@@ -361,10 +367,12 @@ class LiveLogger {
     
     const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
     const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : 'badge-hide';
+    const trackerBadge = e.isTracker ? '<span class="log-badge" style="background:rgba(255,121,198,0.15);color:#ff79c6;margin-left:4px">tracker</span>' : '';
 
     let infoHtml = '';
     if (e.type === 'network') {
       infoHtml = `<span class="log-url">${this.esc(e.url)}</span>
+                  ${trackerBadge}
                   <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}</span>`;
     } else {
       infoHtml = `<span class="log-selector">${this.esc(e.selector)}</span>

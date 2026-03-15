@@ -18,6 +18,9 @@ export const StorageKeys = {
   COSMETIC_GENERIC_RULES: 'cosmeticGenericRules',
   BLOOM_FILTER: 'bloomFilter',
   GENERIC_CSS: 'genericCss',
+  BLOCK_THIRD_PARTY_COOKIES: 'blockThirdPartyCookies',
+  FINGERPRINT_PROTECTION: 'fingerprintProtection',
+  STRIP_TRACKING_HEADERS: 'stripTrackingHeaders',
 };
 
 /** Get a single value from storage. Returns null if not found. */

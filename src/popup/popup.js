@@ -48,8 +48,10 @@ async function loadTabStats() {
       payload: { tabId: currentTab.id },
     });
     $('blockedCount').textContent = stats?.blocked ?? 0;
+    $('trackerCount').textContent = stats?.trackers ?? 0;
   } catch {
     $('blockedCount').textContent = '—';
+    $('trackerCount').textContent = '—';
   }
 
   // Total today from storage

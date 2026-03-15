@@ -161,6 +161,9 @@ async function initializeDefaults() {
     blockWebRTC: true,
     upgradeInsecureRequests: true,
     blockHyperlinkAuditing: true,
+    blockThirdPartyCookies: false,
+    fingerprintProtection: true,
+    stripTrackingHeaders: true,
     enabled: true,
   });
 
@@ -199,6 +202,62 @@ async function applyPrivacySettings() {
   if (chrome.privacy && settings.blockHyperlinkAuditing !== false) {
     chrome.privacy.websites.hyperlinkAuditingEnabled.set({ value: false });
   }
+
+  // Block third-party cookies
+  if (chrome.privacy && settings.blockThirdPartyCookies) {
+    chrome.privacy.websites.thirdPartyCookiesAllowed.set({ value: false });
+  } else if (chrome.privacy) {
+    chrome.privacy.websites.thirdPartyCookiesAllowed.set({ value: true });
+  }
+
+  // Update header stripping rules
+  await applyHeaderRules(settings.stripTrackingHeaders !== false);
+}
+
+const DNR_HEADER_RULES_START = 800_000;
+
+/** Apply DNR rules to strip tracking headers (Referer, Set-Cookie). */
+async function applyHeaderRules(enabled) {
+  const ruleIds = [DNR_HEADER_RULES_START, DNR_HEADER_RULES_START + 1];
+  
+  if (!enabled) {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: ruleIds,
+    });
+    return;
+  }
+
+  const rules = [
+    {
+      id: DNR_HEADER_RULES_START,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [{ header: 'referer', operation: 'remove' }]
+      },
+      condition: {
+        domainType: 'thirdParty',
+        resourceTypes: ['script', 'xmlhttprequest', 'fetch', 'other']
+      }
+    },
+    {
+      id: DNR_HEADER_RULES_START + 1,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
+      },
+      condition: {
+        domainType: 'thirdParty',
+        resourceTypes: ['script', 'xmlhttprequest', 'fetch', 'other']
+      }
+    }
+  ];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: ruleIds,
+    addRules: rules,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +318,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading' && changeInfo.url) {
-    tabStats.set(tabId, { blocked: 0, url: changeInfo.url });
+    tabStats.set(tabId, { blocked: 0, trackers: 0, url: changeInfo.url });
     updateBadge(tabId);
   }
 });
@@ -270,9 +329,18 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   // Track stats
   if (rule.rulesetId !== '_dynamic' && rule.rulesetId !== '_session') {
     if (!tabStats.has(request.tabId)) {
-      tabStats.set(request.tabId, { blocked: 0, url: request.url });
+      tabStats.set(request.tabId, { blocked: 0, trackers: 0, url: request.url });
     }
-    tabStats.get(request.tabId).blocked++;
+    
+    const stats = tabStats.get(request.tabId);
+    stats.blocked++;
+    
+    // Classify as tracker if from privacy/malware lists
+    const isTracker = rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware';
+    if (isTracker) {
+      stats.trackers++;
+    }
+    
     updateBadge(request.tabId);
   }
 
@@ -280,6 +348,7 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   broadcastLoggerEvent({
     type: 'network',
     action: rule.rulesetId.includes('allow') ? 'allow' : 'block',
+    isTracker: rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware',
     url: request.url,
     method: request.method,
     resourceType: request.type,
@@ -590,6 +659,13 @@ async function handleMessage(message, sender) {
         await injectScriptlets(sender.tab.id, sender.frameId || 0, rules);
       }
       return { rules };
+    }
+
+    case 'RUN_SCRIPTLETS': {
+      if (payload.scriptlets?.length > 0 && sender.tab?.id) {
+        await injectScriptlets(sender.tab.id, sender.frameId || 0, payload.scriptlets);
+      }
+      return { ok: true };
     }
     case 'SET_RULESET_ENABLED': {
       await setRulesetEnabled(payload.rulesetId, payload.enabled);

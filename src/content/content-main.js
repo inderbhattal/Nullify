@@ -38,10 +38,26 @@ async function main() {
   // ---- Request scriptlets for this page ----
   // SW handles actual injection via chrome.scripting.executeScript(MAIN world)
   try {
+    const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
+    const scriptlets = [];
+    
+    if (settings.fingerprintProtection !== false) {
+      scriptlets.push({ name: 'fingerprint-noise', args: [] });
+      scriptlets.push({ name: 'battery-spoof', args: [] });
+    }
+
     await chrome.runtime.sendMessage({
       type: 'GET_SCRIPTLET_RULES',
       payload: { hostname },
     });
+
+    // If we have additional privacy scriptlets, run them
+    if (scriptlets.length > 0) {
+      await chrome.runtime.sendMessage({
+        type: 'RUN_SCRIPTLETS',
+        payload: { scriptlets }
+      });
+    }
   } catch {
     // SW might not be ready
   }

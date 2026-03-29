@@ -41,7 +41,13 @@
 | removeparam ($removeparam=) | ✅ | DNR queryTransform |
 | Blocked count badge | ✅ | Per-tab stats |
 | Dashboard UI | ✅ | Filter lists, My Filters, Allowlist, Settings |
-| CNAME uncloaking | ❌ | Not possible in MV3 |
+| Live Logger | ✅ | Real-time network & cosmetic event feed |
+| Shadow DOM support | ✅ | Element picker can see through shadow roots |
+| :remove() operator | ✅ | Physically delete elements from DOM |
+| Bloom Filter | ✅ | Instant $O(1)$ domain lookup optimization |
+| IndexedDB Indexing | ✅ | Offload rules from RAM to disk |
+| Stealth Mode | ✅ | Strip CSP & rotate Browser Personas |
+| CNAME uncloaking | ❌ | Partial via cloak lists |
 | Dynamic filtering matrix | ❌ | Requires webRequest (MV2 only) |
 | Response body inspection | ❌ | Not possible in MV3 |
 
@@ -135,6 +141,24 @@ npm run build:ext
 2. Enable **Developer mode**
 3. Click **Load unpacked**
 4. Select the `nullify/` root directory (not `dist/`)
+
+## Release & Versioning
+
+To release a new version, use the automated bump script. This will update `package.json`, `manifest.json`, and `package-lock.json`, commit the changes, and create a git tag.
+
+```bash
+# Bump a patch version (1.0.0 -> 1.0.1)
+npm run version:bump patch
+
+# Bump a minor version (1.0.0 -> 1.1.0)
+npm run version:bump minor
+
+# Bump a major version (1.0.0 -> 2.0.0)
+npm run version:bump major
+
+# Sync local branch and tags to GitHub
+git push origin main --follow-tags
+```
 
 ### Project Scripts
 

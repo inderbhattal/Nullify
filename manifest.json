@@ -69,6 +69,11 @@
         "path": "rules/ubo-unbreak.json"
       },
       {
+        "id": "system-unbreak",
+        "enabled": true,
+        "path": "rules/system-unbreak.json"
+      },
+      {
         "id": "anti-adblock",
         "enabled": true,
         "path": "rules/anti-adblock.json"

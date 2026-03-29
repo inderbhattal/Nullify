@@ -171,7 +171,8 @@ async function initializeDefaults() {
     enabled: true,
   });
 
-  await setStorage(StorageKeys.ALLOWLIST, []);
+  await setStorage(StorageKeys.ALLOWLIST, ['google.com', 'drive.google.com']);
+  await rebuildAllowlistRules(['google.com', 'drive.google.com']);
   await setStorage(StorageKeys.USER_FILTERS, '');
   await setStorage(StorageKeys.TAB_STATS, {});
   await setStorage(StorageKeys.FILTER_LISTS_META, {});
@@ -493,6 +494,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   const { request, rule } = info;
   
+  const ALLOW_RULESETS = ['ubo-unbreak', 'anti-adblock', 'system-unbreak', '_allowlist'];
+  const isAllow = ALLOW_RULESETS.some(id => rule.rulesetId.includes(id));
+
   // Track stats
   if (rule.rulesetId !== '_dynamic' && rule.rulesetId !== '_session') {
     if (!tabStats.has(request.tabId)) {
@@ -500,22 +504,26 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     }
     
     const stats = tabStats.get(request.tabId);
-    stats.blocked++;
     
-    // Classify as tracker if from privacy/malware lists
-    const isTracker = rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware';
-    if (isTracker) {
-      stats.trackers++;
+    // Only count as 'blocked' if it's an actual block rule
+    if (!isAllow) {
+      stats.blocked++;
+      
+      // Classify as tracker if from privacy/malware lists
+      const isTracker = rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware';
+      if (isTracker) {
+        stats.trackers++;
+      }
+      
+      updateBadge(request.tabId);
     }
-    
-    updateBadge(request.tabId);
   }
 
   // Broadcast to Logger
   broadcastLoggerEvent({
     type: 'network',
-    action: rule.rulesetId.includes('allow') ? 'allow' : 'block',
-    isTracker: rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware',
+    action: isAllow ? 'allow' : 'block',
+    isTracker: !isAllow && (rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware'),
     url: request.url,
     method: request.method,
     resourceType: request.type,
@@ -695,9 +703,9 @@ async function rebuildAllowlistRules(allowlist) {
 
   const newRules = allowlist.map((domain, i) => ({
     id: DNR_ALLOWLIST_START + i,
-    priority: 10,
+    priority: 500, // Systematic Priority for User Allowlist
     condition: {
-      requestDomains: [domain],
+      urlFilter: `||${domain}^`,
     },
     action: { type: 'allowAllRequests' },
   }));

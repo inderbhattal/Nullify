@@ -518,9 +518,14 @@ function networkFilterToDNR(parsed) {
     action = { type: 'block' };
   }
 
+  let rulePriority = options.important ? 2 : 1;
+  if (exception) {
+    rulePriority = 3;
+  }
+
   return {
     id: nextId(),
-    priority: options.important ? 2 : 1,
+    priority: rulePriority,
     condition,
     action,
   };

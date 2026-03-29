@@ -85,7 +85,8 @@ async function main() {
   }
 
   const engine = new CosmeticEngine();
-  engine.init(cosmeticRules);
+  // proceduralOnly=true since background script already injected static CSS
+  engine.init(cosmeticRules, true);
 
   // ---- Apply again after DOM is ready (for early-injected scripts) ----
   if (document.readyState === 'loading') {

@@ -25,6 +25,7 @@ body {
   color: var(--text);
   min-width: 320px;
   max-width: 340px;
+  overflow-x: hidden;
 }
 
 .popup { padding: 14px; }

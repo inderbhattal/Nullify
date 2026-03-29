@@ -341,6 +341,7 @@ class LiveLogger {
 
   bindEvents() {
     $('btnClearLogger')?.addEventListener('click', () => this.clear());
+    $('btnExportLogger')?.addEventListener('click', () => this.export());
     $('loggerFilter')?.addEventListener('change', (e) => {
       this.filter = e.target.value;
       this.render();
@@ -349,6 +350,43 @@ class LiveLogger {
       this.searchQuery = e.target.value.toLowerCase();
       this.render();
     });
+  }
+
+  export() {
+    if (this.events.length === 0) return;
+
+    const filtered = this.events.filter(e => this.matchesFilter(e));
+    if (filtered.length === 0) return;
+
+    let csvContent = 'Time,Type,Action,Info,Extra\n';
+    
+    for (const e of filtered) {
+      const time = new Date(e.timestamp).toISOString();
+      let info = '';
+      let extra = '';
+      
+      if (e.type === 'network') {
+        info = e.url;
+        extra = `${e.method} | ${e.resourceType} | ${e.rulesetId}${e.isTracker ? ' | tracker' : ''}`;
+      } else {
+        info = e.selector;
+        extra = e.hostname || 'generic';
+      }
+
+      // Escape quotes for CSV
+      const safeInfo = `"${info.replace(/"/g, '""')}"`;
+      const safeExtra = `"${extra.replace(/"/g, '""')}"`;
+      
+      csvContent += `${time},${e.type},${e.action},${safeInfo},${safeExtra}\n`;
+    }
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `nullify-log-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
   }
 
   listen() {
@@ -414,12 +452,12 @@ class LiveLogger {
 
     let infoHtml = '';
     if (e.type === 'network') {
-      infoHtml = `<span class="log-url">${this.esc(e.url)}</span>
+      infoHtml = `<span class="log-url" title="Click to copy: ${this.esc(e.url)}" data-copy="${this.esc(e.url)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.url)}</span>
                   ${trackerBadge}
                   <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}</span>`;
     } else {
-      infoHtml = `<span class="log-selector">${this.esc(e.selector)}</span>
-                  <span class="log-extra">${this.esc(e.hostname)}</span>`;
+      infoHtml = `<span class="log-selector" title="Click to copy: ${this.esc(e.selector)}" data-copy="${this.esc(e.selector)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.selector)}</span>
+                  <span class="log-extra" title="${this.esc(e.hostname)}">${this.esc(e.hostname)}</span>`;
     }
 
     row.innerHTML = `
@@ -428,6 +466,28 @@ class LiveLogger {
       <div class="log-col-action"><span class="log-badge ${actionBadge}">${e.action}</span></div>
       <div class="log-col-info">${infoHtml}</div>
     `;
+
+    // Add click-to-copy handler
+    const copyTarget = row.querySelector('[data-copy]');
+    if (copyTarget) {
+      copyTarget.addEventListener('click', async (ev) => {
+        try {
+          const textToCopy = ev.target.getAttribute('data-copy');
+          await navigator.clipboard.writeText(textToCopy);
+          
+          // Brief visual feedback
+          const originalTitle = ev.target.title;
+          ev.target.title = "Copied!";
+          ev.target.style.opacity = "0.5";
+          setTimeout(() => {
+            ev.target.title = originalTitle;
+            ev.target.style.opacity = "1";
+          }, 800);
+        } catch (err) {
+          console.error("Failed to copy", err);
+        }
+      });
+    }
     
     return row;
   }

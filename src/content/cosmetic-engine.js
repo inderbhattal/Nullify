@@ -40,6 +40,11 @@ const PROC_OPS = [
   'xpath',
   'watch-attr',
   'remove',
+  'style',
+  'matches-path',
+  'matches-attr',
+  'if-not',
+  'if',
 ];
 
 // ---------------------------------------------------------------------------
@@ -155,8 +160,9 @@ export class CosmeticEngine {
   /**
    * Initialize with rules from the background service worker.
    * @param {{ generic: string[], domainSpecific: string[], exceptions?: string[] }} rules
+   * @param {boolean} proceduralOnly If true, skip injecting static CSS (handled by SW)
    */
-  init(rules) {
+  init(rules, proceduralOnly = false) {
     const exceptions = new Set(rules.exceptions || []);
 
     // Ingest all selectors (now mostly domain-specific + user rules)
@@ -193,10 +199,10 @@ export class CosmeticEngine {
     this._cssSelectors = cssSelectors;
     this._exceptions = exceptions;
 
-    // Only inject extra CSS if we have site-specific or user rules.
-    // The massive generic list is now handled by service-worker.js via insertCSS.
-    if (cssSelectors.length > 0) this._injectCSS(cssSelectors);
-    if (exceptions.size > 0) this._injectExceptionCSS([...exceptions]);
+    // Only inject extra CSS if we have site-specific or user rules AND not in procedural mode.
+    if (!proceduralOnly && cssSelectors.length > 0) this._injectCSS(cssSelectors);
+    if (!proceduralOnly && exceptions.size > 0) this._injectExceptionCSS([...exceptions]);
+    
     if (this._proceduralRules.length > 0) this._applyAllProcedural();
 
     this._detectWatchAttrRules();
@@ -288,6 +294,9 @@ export class CosmeticEngine {
   /** Run the remaining steps of a plan on a specific element. */
   _runPlanOnElement(el, remainingPlan, fullSelector) {
     if (remainingPlan.length === 0) {
+      // Don't hide if the rule ended with a style application
+      if (fullSelector.includes(':style(')) return;
+      
       this._hideElement(el, fullSelector);
       return;
     }
@@ -389,6 +398,49 @@ export class CosmeticEngine {
             return re.test(computed) ? el : null;
           }
           return computed === val ? el : null;
+        }
+
+        // ---- :matches-path(/regex/) ----
+        case 'matches-path': {
+          const path = location.pathname + location.search;
+          if (arg.startsWith('/')) {
+            const lastSlash = arg.lastIndexOf('/');
+            const re = new RegExp(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
+            return re.test(path) ? el : null;
+          }
+          return path.includes(arg) ? el : null;
+        }
+
+        // ---- :matches-attr(attr="/regex/") ----
+        case 'matches-attr': {
+          const match = arg.match(/^([\w-]+)="?(.+?)"?$/);
+          if (!match) return null;
+          const [, attr, val] = match;
+          const actual = el.getAttribute(attr);
+          if (actual === null) return null;
+          if (val.startsWith('/')) {
+            const lastSlash = val.lastIndexOf('/');
+            const re = new RegExp(val.slice(1, lastSlash), val.slice(lastSlash + 1) || 'i');
+            return re.test(actual) ? el : null;
+          }
+          return actual === val ? el : null;
+        }
+
+        // ---- :style(prop: val; ...) ---- (apply custom CSS) ----
+        case 'style': {
+          const rules = arg.split(';').map(r => r.trim()).filter(Boolean);
+          for (const rule of rules) {
+            const colonIdx = rule.indexOf(':');
+            if (colonIdx === -1) continue;
+            const prop = rule.slice(0, colonIdx).trim();
+            const val = rule.slice(colonIdx + 1).trim();
+            el.style.setProperty(
+              prop, 
+              val.replace(/!important/g, '').trim(), 
+              val.includes('!important') ? 'important' : ''
+            );
+          }
+          return el;
         }
 
         // ---- :watch-attr(attr1,attr2) ---- (pass-through; observer handles re-eval) ----

@@ -13,12 +13,19 @@
  *  - Apply WebRTC/privacy settings
  */
 
-import { StorageKeys, getStorage, setStorage, getAllowlist } from '../shared/storage.js';
+import { StorageKeys, getStorage, setStorage, getAllowlist, isHostnameAllowed } from '../shared/storage.js';
 import { RulesDB } from '../shared/db.js';
 import { BloomFilter } from '../shared/bloom.js';
 
 const db = new RulesDB();
 let bloom = new BloomFilter();
+
+// ---- Memory Cache (High Performance) ----
+let cachedSettings = null;
+let cachedAllowlist = new Set();
+let cachedGenericCss = null;
+let domainRulesCache = new Map(); // hostname -> rules
+let genericCssLoaded = false;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -27,6 +34,33 @@ const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const FILTER_UPDATE_INTERVAL_MINUTES = 24 * 60; // 24 hours
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
+
+// All known procedural operators that require JS evaluation
+const PROC_OPS = [
+  'matches-css-before',
+  'matches-css-after',
+  'matches-css',
+  'has-text',
+  'nth-ancestor',
+  'upward',
+  'min-text-length',
+  'xpath',
+  'watch-attr',
+  'remove',
+  'style',
+  'matches-path',
+  'matches-attr',
+  'if-not',
+  'if',
+];
+
+/** Returns true if the selector string contains any procedural operator. */
+function isProceduralSelector(selector) {
+  for (const op of PROC_OPS) {
+    if (selector.includes(':' + op + '(')) return true;
+  }
+  return false;
+}
 
 // DNR rule ID ranges (avoid collisions between categories)
 const DNR_USER_RULES_START = 900_000;
@@ -43,6 +77,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   }
 
   await ingestRules(); // Build initial rule index
+  await refreshMemoryCache(); // Fill RAM cache for speed
   await applyPrivacySettings();
   await scheduleFilterUpdateAlarm();
 
@@ -55,9 +90,20 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 chrome.runtime.onStartup.addListener(async () => {
   await loadBloomFilter();
+  await refreshMemoryCache(); // Fill RAM cache for speed
   await applyPrivacySettings();
   await scheduleFilterUpdateAlarm();
 });
+
+async function refreshMemoryCache() {
+  cachedSettings = await getStorage(StorageKeys.SETTINGS);
+  const allowlist = await getAllowlist();
+  cachedAllowlist = new Set(allowlist);
+  cachedGenericCss = await getStorage(StorageKeys.GENERIC_CSS);
+  domainRulesCache.clear();
+  genericCssLoaded = !!cachedGenericCss;
+  console.log('[AdBlock] Memory caches refreshed (High-Performance mode)');
+}
 
 async function loadBloomFilter() {
   const data = await getStorage(StorageKeys.BLOOM_FILTER);
@@ -117,8 +163,9 @@ async function ingestRules() {
     // Pre-compile generic rules into a single CSS block
     if (cosData.generic && cosData.generic.length > 0) {
       // Chunking if too large for storage, but 2MB is usually okay for one key
-      const css = cosData.generic.join(',') + ' { display: none !important; }';
+      const css = cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
       await setStorage(StorageKeys.GENERIC_CSS, css);
+      cachedGenericCss = css; // Cache in RAM
     }
 
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
@@ -171,8 +218,8 @@ async function initializeDefaults() {
     enabled: true,
   });
 
-  await setStorage(StorageKeys.ALLOWLIST, ['google.com', 'drive.google.com']);
-  await rebuildAllowlistRules(['google.com', 'drive.google.com']);
+  await setStorage(StorageKeys.ALLOWLIST, []);
+  await rebuildAllowlistRules([]);
   await setStorage(StorageKeys.USER_FILTERS, '');
   await setStorage(StorageKeys.TAB_STATS, {});
   await setStorage(StorageKeys.FILTER_LISTS_META, {});
@@ -479,6 +526,32 @@ async function checkFilterListUpdates() {
 // ---------------------------------------------------------------------------
 const tabStats = new Map(); // tabId → { blocked: number, url: string }
 
+// Load existing tab stats when the service worker wakes up
+(async () => {
+  const stored = await getStorage(StorageKeys.TAB_STATS);
+  if (stored) {
+    for (const [key, val] of Object.entries(stored)) {
+      const numKey = Number(key);
+      if (!tabStats.has(numKey)) {
+        tabStats.set(numKey, val);
+      } else {
+        const current = tabStats.get(numKey);
+        current.blocked = (current.blocked || 0) + (val.blocked || 0);
+        current.trackers = (current.trackers || 0) + (val.trackers || 0);
+      }
+    }
+  }
+})();
+
+let _persistTimeout = null;
+function schedulePersistTabStats() {
+  if (_persistTimeout) clearTimeout(_persistTimeout);
+  _persistTimeout = setTimeout(() => {
+    persistTabStats();
+    _persistTimeout = null;
+  }, 1500);
+}
+
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabStats.delete(tabId);
   persistTabStats();
@@ -488,12 +561,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading' && changeInfo.url) {
     tabStats.set(tabId, { blocked: 0, trackers: 0, url: changeInfo.url });
     updateBadge(tabId);
+    schedulePersistTabStats();
   }
 });
 
 chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   const { request, rule } = info;
-  
+
   const ALLOW_RULESETS = ['ubo-unbreak', 'anti-adblock', 'system-unbreak', '_allowlist'];
   const isAllow = ALLOW_RULESETS.some(id => rule.rulesetId.includes(id));
 
@@ -502,23 +576,23 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     if (!tabStats.has(request.tabId)) {
       tabStats.set(request.tabId, { blocked: 0, trackers: 0, url: request.url });
     }
-    
+
     const stats = tabStats.get(request.tabId);
-    
+
     // Only count as 'blocked' if it's an actual block rule
     if (!isAllow) {
       stats.blocked++;
-      
+
       // Classify as tracker if from privacy/malware lists
       const isTracker = rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware';
       if (isTracker) {
         stats.trackers++;
       }
-      
+
       updateBadge(request.tabId);
+      schedulePersistTabStats();
     }
   }
-
   // Broadcast to Logger
   broadcastLoggerEvent({
     type: 'network',
@@ -706,6 +780,7 @@ async function rebuildAllowlistRules(allowlist) {
     priority: 500, // Systematic Priority for User Allowlist
     condition: {
       urlFilter: `||${domain}^`,
+      resourceTypes: ['main_frame', 'sub_frame'],
     },
     action: { type: 'allowAllRequests' },
   }));
@@ -803,26 +878,31 @@ async function handleMessage(message, sender) {
       return (await getStorage(StorageKeys.SETTINGS)) || {};
     case 'SET_SETTINGS': {
       await setStorage(StorageKeys.SETTINGS, payload);
+      cachedSettings = payload;
       await applyPrivacySettings();
       return { ok: true };
     }
     case 'GET_ALLOWLIST':
-      return await getAllowlist();
+      return Array.from(cachedAllowlist);
     case 'ALLOW_SITE':
       await allowSite(payload.domain);
+      cachedAllowlist.add(payload.domain);
+      domainRulesCache.delete(payload.domain);
       return { ok: true };
     case 'DISALLOW_SITE':
       await disallowSite(payload.domain);
+      cachedAllowlist.delete(payload.domain);
+      domainRulesCache.delete(payload.domain);
       return { ok: true };
     case 'IS_SITE_ALLOWED': {
-      const allowlist = await getAllowlist();
-      return { allowed: allowlist.includes(payload.domain) };
+      return { allowed: isHostnameAllowedCached(payload.domain) };
     }
     case 'GET_USER_FILTERS':
       return { filters: (await getStorage(StorageKeys.USER_FILTERS)) || '' };
     case 'SET_USER_FILTERS': {
       await setStorage(StorageKeys.USER_FILTERS, payload.filters);
       await applyUserFilters(payload.filters);
+      domainRulesCache.clear();
       return { ok: true };
     }
     case 'GET_COSMETIC_RULES': {
@@ -853,7 +933,6 @@ async function handleMessage(message, sender) {
       await checkFilterListUpdates();
       return { ok: true };
     }
-
     case 'CONTENT_BLOCKED': {
       const tabId = sender.tab?.id;
       if (tabId) {
@@ -861,16 +940,19 @@ async function handleMessage(message, sender) {
         entry.blocked += payload.count || 1;
         tabStats.set(tabId, entry);
         updateBadge(tabId);
-// Broadcast to Logger
-broadcastLoggerEvent({
-  type: 'cosmetic',
-  action: payload.action || 'hide',
-  hostname: payload.hostname || sender.tab.url,
-  selector: payload.selector,
-  count: payload.count || 1,
-  timestamp: Date.now(),
-});
+        schedulePersistTabStats();
       }
+
+      // Broadcast to Logger
+      broadcastLoggerEvent({
+        type: 'cosmetic',
+        action: payload.action || 'hide',
+        hostname: payload.hostname || sender.tab.url,
+        selector: payload.selector,
+        count: payload.count || 1,
+        timestamp: Date.now(),
+      });
+
       return { ok: true };
     }
     default:
@@ -939,23 +1021,92 @@ async function getScriptletRulesForPage(hostname) {
   return await db.getScriptletRules(hostname);
 }
 
+/** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
+function isHostnameAllowedCached(hostname) {
+  if (cachedAllowlist.size === 0) return false;
+  const parts = hostname.split('.');
+  for (let i = 0; i < parts.length - 1; i++) {
+    const domain = parts.slice(i).join('.');
+    if (cachedAllowlist.has(domain)) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------------------
-// Injection — Native Generic Hide
+// Injection — Native Generic + Domain-Specific Hide
 // ---------------------------------------------------------------------------
-chrome.webNavigation.onCommitted.addListener(async (details) => {
-  if (details.frameId !== 0) return; // Only main frame
+
+/**
+ * Pre-fetch rules into memory cache as soon as a navigation starts.
+ * This ensures they are ready by the time onCommitted fires.
+ */
+chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+  if (details.frameId !== 0) return;
   if (!details.url.startsWith('http')) return;
 
-  const css = await getStorage(StorageKeys.GENERIC_CSS);
-  if (!css) return;
+  const url = new URL(details.url);
+  const hostname = url.hostname.replace(/^www\./, '');
+  
+  // Warm up the cache
+  if (!domainRulesCache.has(hostname)) {
+    const rules = await getCosmeticRulesForPage(hostname);
+    domainRulesCache.set(hostname, rules);
+  }
+});
 
-  try {
-    await chrome.scripting.insertCSS({
-      target: { tabId: details.tabId },
-      css: css,
+chrome.webNavigation.onCommitted.addListener(async (details) => {
+  if (details.frameId !== 0) return; // Only main frame for injection triggers
+  if (!details.url.startsWith('http')) return;
+
+  const url = new URL(details.url);
+  const hostname = url.hostname.replace(/^www\./, '');
+
+  // Check if site is allowed (blocking enabled) using RAM cache
+  if (isHostnameAllowedCached(hostname)) return;
+
+  // 1. Inject Massive Generic CSS from RAM cache
+  if (cachedGenericCss) {
+    chrome.scripting.insertCSS({
+      target: { tabId: details.tabId, allFrames: true },
+      css: cachedGenericCss,
       origin: 'USER',
-    });
-  } catch (err) {
-    // Ignore restricted pages
+    }).catch(() => {});
+  }
+
+  // 2. Get rules from RAM cache (usually filled by onBeforeNavigate)
+  let rules = domainRulesCache.get(hostname);
+  if (!rules) {
+    rules = await getCosmeticRulesForPage(hostname);
+    domainRulesCache.set(hostname, rules);
+  }
+  
+  // 3. Filter and Inject CSS rules (skip procedural ones)
+  const cssSelectors = [];
+  const allSelectors = [...(rules.generic || []), ...(rules.domainSpecific || [])];
+  const exceptions = new Set(rules.exceptions || []);
+
+  for (const sel of allSelectors) {
+    if (!sel || exceptions.has(sel)) continue;
+    if (!isProceduralSelector(sel)) cssSelectors.push(sel);
+  }
+
+  if (cssSelectors.length > 0) {
+    const css = cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; opacity: 0 !important; height: 0 !important; overflow: hidden !important; }';
+    chrome.scripting.insertCSS({
+      target: { tabId: details.tabId, allFrames: true },
+      css,
+      origin: 'USER',
+    }).catch(() => {});
+  }
+
+  // 4. Inject Exceptions (un-hide)
+  const cssExceptions = rules.exceptions.filter(s => !isProceduralSelector(s));
+  if (cssExceptions.length > 0) {
+    const css = cssExceptions.join(',') + ' { display: revert !important; visibility: revert !important; opacity: revert !important; height: revert !important; overflow: revert !important; }';
+    chrome.scripting.insertCSS({
+      target: { tabId: details.tabId, allFrames: true },
+      css,
+      origin: 'USER',
+    }).catch(() => {});
   }
 });

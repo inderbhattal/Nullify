@@ -6,3 +6,5 @@ rules/*.json
 *.log
 .DS_Store
 release/
+.idea/
+.claude/

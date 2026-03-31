@@ -6,6 +6,7 @@ export function preventXhr(pattern) {
   if (!pattern) return;
 
   const re = patternToRegex(pattern);
+  if (!re) return;
   const OrigXHR = window.XMLHttpRequest;
 
   function PatchedXHR() {
@@ -45,8 +46,12 @@ export function preventXhr(pattern) {
 }
 
 function patternToRegex(pattern) {
-  if (pattern.startsWith('/') && pattern.endsWith('/')) {
-    return new RegExp(pattern.slice(1, -1));
+  try {
+    if (pattern.startsWith('/') && pattern.endsWith('/')) {
+      return new RegExp(pattern.slice(1, -1));
+    }
+    return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+  } catch {
+    return null;
   }
-  return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 }

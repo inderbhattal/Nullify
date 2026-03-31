@@ -24,7 +24,16 @@ let bloom = new BloomFilter();
 let cachedSettings = null;
 let cachedAllowlist = new Set();
 let cachedGenericCss = null;
-let domainRulesCache = new Map(); // hostname -> rules
+let domainRulesCache = new Map(); // hostname -> rules (LRU, max 100 entries)
+const DOMAIN_RULES_CACHE_MAX = 100;
+
+function setCachedDomainRules(hostname, rules) {
+  // Evict oldest entry when at capacity (Map preserves insertion order)
+  if (domainRulesCache.size >= DOMAIN_RULES_CACHE_MAX) {
+    domainRulesCache.delete(domainRulesCache.keys().next().value);
+  }
+  domainRulesCache.set(hostname, rules);
+}
 let genericCssLoaded = false;
 
 // ---------------------------------------------------------------------------
@@ -1050,7 +1059,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   // Warm up the cache
   if (!domainRulesCache.has(hostname)) {
     const rules = await getCosmeticRulesForPage(hostname);
-    domainRulesCache.set(hostname, rules);
+    setCachedDomainRules(hostname, rules);
   }
 });
 

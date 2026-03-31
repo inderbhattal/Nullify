@@ -281,7 +281,10 @@ export class CosmeticEngine {
       try {
         elements = [...document.querySelectorAll(first.selector)];
         planIdx = 1;
-      } catch { return; }
+      } catch (e) {
+        console.warn('[Nullify] Invalid selector in cosmetic rule:', first.selector, e.message);
+        return;
+      }
     } else {
       elements = [document.documentElement];
     }
@@ -469,7 +472,9 @@ export class CosmeticEngine {
         const node = result.snapshotItem(i);
         if (node?.nodeType === Node.ELEMENT_NODE) this._hideElement(node, `xpath(${expr})`);
       }
-    } catch { /* invalid XPath expression */ }
+    } catch (e) {
+      console.warn('[Nullify] Invalid XPath expression in cosmetic rule:', expr, e.message);
+    }
   }
 
   // ---------------------------------------------------------------------------

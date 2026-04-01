@@ -41,32 +41,32 @@
     "rule_resources": [
       {
         "id": "easylist",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/easylist.json"
       },
       {
         "id": "easyprivacy",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/easyprivacy.json"
       },
       {
         "id": "annoyances",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/annoyances.json"
       },
       {
         "id": "malware",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/malware.json"
       },
       {
         "id": "ubo-filters",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/ubo-filters.json"
       },
       {
         "id": "ubo-unbreak",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/ubo-unbreak.json"
       },
       {
@@ -76,7 +76,7 @@
       },
       {
         "id": "anti-adblock",
-        "enabled": true,
+        "enabled": false,
         "path": "rules/anti-adblock.json"
       }
     ]

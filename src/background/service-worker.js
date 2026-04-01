@@ -81,6 +81,15 @@ const DNR_ALLOWLIST_START = 990_000;
 chrome.runtime.onInstalled.addListener(async (details) => {
   console.log('[AdBlock] onInstalled:', details.reason);
 
+  // Register context menu on install/update
+  chrome.contextMenus.create({
+    id: 'nullify-block-element',
+    title: 'Block element...',
+    contexts: ['all'],
+  }, () => {
+    if (chrome.runtime.lastError) { /* ignore */ }
+  });
+
   try {
     if (details.reason === 'install') {
       await initializeDefaults();
@@ -89,6 +98,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     await ingestRules(); // Build initial rule index
     await refreshMemoryCache(); // Fill RAM cache for speed
     await applyPrivacySettings();
+    await applyRulesets();
     await scheduleFilterUpdateAlarm();
 
     // Update badge for all existing tabs
@@ -102,9 +112,19 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 });
 
 chrome.runtime.onStartup.addListener(async () => {
+  // Ensure context menu is present on startup
+  chrome.contextMenus.create({
+    id: 'nullify-block-element',
+    title: 'Block element...',
+    contexts: ['all'],
+  }, () => {
+    if (chrome.runtime.lastError) { /* ignore */ }
+  });
+
   await loadBloomFilter();
   await refreshMemoryCache(); // Fill RAM cache for speed
   await applyPrivacySettings();
+  await applyRulesets();
   await scheduleFilterUpdateAlarm();
 });
 
@@ -149,7 +169,7 @@ async function ingestRules() {
 
     // Wipe and rebuild index
     await db.clear();
-    
+
     // Build a new Bloom Filter for all hostnames
     const newBloom = new BloomFilter();
 
@@ -159,7 +179,7 @@ async function ingestRules() {
         newBloom.add(hostname);
       }
     }
-    
+
     if (scriptData) {
       await db.putBulkScriptletRules(scriptData);
       for (const rule of scriptData) {
@@ -191,15 +211,6 @@ async function ingestRules() {
 // ---------------------------------------------------------------------------
 // Context Menu — Quick Access to Picker
 // ---------------------------------------------------------------------------
-chrome.contextMenus.create({
-  id: 'nullify-block-element',
-  title: 'Block element...',
-  contexts: ['all'],
-}, () => {
-  if (chrome.runtime.lastError) {
-    // Ignore error if already exists
-  }
-});
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'nullify-block-element' && tab?.id) {
@@ -245,6 +256,8 @@ async function initializeDefaults() {
     malware: true,
     'ubo-filters': true,
     'ubo-unbreak': true,
+    'system-unbreak': true,
+    'anti-adblock': true,
   });
 
   console.log('[AdBlock] Defaults initialized');
@@ -297,7 +310,7 @@ const DNR_STEALTH_RULES_START = 810_000;
 /** Apply DNR rules to strip tracking headers (Referer, Set-Cookie). */
 async function applyHeaderRules(enabled) {
   const ruleIds = [DNR_HEADER_RULES_START, DNR_HEADER_RULES_START + 1];
-  
+
   if (!enabled) {
     await chrome.declarativeNetRequest.updateDynamicRules({
       removeRuleIds: ruleIds,
@@ -341,7 +354,7 @@ async function applyHeaderRules(enabled) {
 /** Apply DNR rules to strip CSP headers for advanced scriptlet injection. */
 async function applyStealthRules(enabled) {
   const ruleId = DNR_STEALTH_RULES_START;
-  
+
   if (!enabled) {
     await chrome.declarativeNetRequest.updateDynamicRules({
       removeRuleIds: [ruleId],
@@ -425,7 +438,7 @@ async function applyPersonaRules(personaId) {
 /** Strip ETag and Last-Modified to prevent cache-based tracking. */
 async function applyCacheProtectionRules(enabled) {
   const ruleId = DNR_CACHE_RULES_START;
-  
+
   if (!enabled) {
     await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
     return;
@@ -456,7 +469,7 @@ async function applyCacheProtectionRules(enabled) {
 /** Enforce strict Referrer-Policy. */
 async function applyReferrerControlRules(enabled) {
   const ruleId = DNR_REFERRER_RULES_START;
-  
+
   if (!enabled) {
     await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
     return;
@@ -513,7 +526,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
 async function cleanupTabStats() {
   const activeTabs = await chrome.tabs.query({});
   const activeTabIds = new Set(activeTabs.map(t => t.id));
-  
+
   let changed = false;
   for (const tabId of Array.from(tabStats.keys())) {
     if (!activeTabIds.has(tabId)) {
@@ -526,11 +539,11 @@ async function cleanupTabStats() {
 
 async function checkFilterListUpdates() {
   console.log('[AdBlock] Checking for filter list updates...');
-  
+
   // Re-index bundled rules to ensure caches (IDB, Bloom Filter) are fresh.
   // In a full production app, this would also fetch new .txt files from the web.
   await ingestRules();
-  
+
   await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
 }
 
@@ -625,7 +638,7 @@ function broadcastLoggerEvent(event) {
   chrome.runtime.sendMessage({
     type: 'LOGGER_EVENT',
     payload: event,
-  }).catch(() => {}); // Ignore if no one is listening
+  }).catch(() => { }); // Ignore if no one is listening
 }
 
 function updateBadge(tabId) {
@@ -634,8 +647,8 @@ function updateBadge(tabId) {
   const count = stats?.blocked || 0;
   const text = count > 999 ? '999+' : count > 0 ? String(count) : '';
 
-  chrome.action.setBadgeText({ text, tabId }).catch(() => {});
-  chrome.action.setBadgeBackgroundColor({ color: '#E74C3C', tabId }).catch(() => {});
+  chrome.action.setBadgeText({ text, tabId }).catch(() => { });
+  chrome.action.setBadgeBackgroundColor({ color: '#E74C3C', tabId }).catch(() => { });
 }
 
 async function persistTabStats() {
@@ -643,7 +656,7 @@ async function persistTabStats() {
   for (const [tabId, stats] of tabStats) {
     obj[tabId] = stats;
   }
-  await setStorage(StorageKeys.TAB_STATS, obj).catch(() => {});
+  await setStorage(StorageKeys.TAB_STATS, obj).catch(() => { });
 }
 
 // ---------------------------------------------------------------------------
@@ -804,8 +817,47 @@ async function rebuildAllowlistRules(allowlist) {
   });
 }
 
-/** Enable or disable a static ruleset by ID. */
-async function setRulesetEnabled(rulesetId, enabled) {
+/** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
+async function applyRulesets() {
+  const enabledMap = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+
+  const allKnownIds = [
+    'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist', 
+    'easyprivacy', 'malware', 'annoyances', 'anti-adblock'
+  ];
+  const enableRulesetIds = allKnownIds.filter(id => enabledMap[id] === true || id === 'system-unbreak');
+  const disableRulesetIds = allKnownIds.filter(id => !enableRulesetIds.includes(id));
+
+  try {
+    // 1. Try batch operation first (most efficient)
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      enableRulesetIds,
+      disableRulesetIds,
+    });
+  } catch (err) {
+    if (err.message?.includes('exceeds the rule count limit')) {
+      console.warn('[AdBlock] Batch enable failed due to rule limit. Falling back to sequential priority loading.');
+
+      // 2. Sequential fallback: Disable unwanted ones first
+      await chrome.declarativeNetRequest.updateEnabledRulesets({ disableRulesetIds });
+
+      for (const id of enableRulesetIds) {
+        try {
+          await chrome.declarativeNetRequest.updateEnabledRulesets({ enableRulesetIds: [id] });
+        } catch (seqErr) {
+          if (seqErr.message?.includes('exceeds the rule count limit')) {
+            console.warn(`[AdBlock] Limit reached at ruleset: ${id}`);
+            break;
+          }
+        }
+      }
+    } else {
+      console.error('[AdBlock] Failed to apply rulesets:', err);
+    }
+  }
+}
+
+/** Enable or disable a static ruleset by ID. */async function setRulesetEnabled(rulesetId, enabled) {
   if (enabled) {
     await chrome.declarativeNetRequest.updateEnabledRulesets({
       enableRulesetIds: [rulesetId],
@@ -876,7 +928,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   handleMessage(message, sender)
     .then(sendResponse)
     .catch((err) => sendResponse({ error: err.message }));
-  return true; 
+  return true;
 });
 
 async function handleMessage(message, sender) {
@@ -980,7 +1032,7 @@ async function handleMessage(message, sender) {
 async function getCosmeticRulesForPage(hostname) {
   const domainSpecific = [];
   const parts = hostname.split('.');
-  
+
   // 1. Check Bloom Filter before hitting IndexedDB
   for (let i = 0; i < parts.length - 1; i++) {
     const domain = parts.slice(i).join('.');
@@ -1017,7 +1069,7 @@ async function getCosmeticRulesForPage(hostname) {
 async function getScriptletRulesForPage(hostname) {
   const parts = hostname.split('.');
   let mightHaveRules = false;
-  
+
   // Check the empty string key for generic scriptlet rules
   if (bloom.has('')) mightHaveRules = true;
   else {
@@ -1030,7 +1082,7 @@ async function getScriptletRulesForPage(hostname) {
   }
 
   if (!mightHaveRules) return [];
-  
+
   return await db.getScriptletRules(hostname);
 }
 
@@ -1059,7 +1111,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
 
   const url = new URL(details.url);
   const hostname = url.hostname.replace(/^www\./, '');
-  
+
   // Warm up the cache
   if (!domainRulesCache.has(hostname)) {
     const rules = await getCosmeticRulesForPage(hostname);
@@ -1083,7 +1135,7 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
       target: { tabId: details.tabId, allFrames: true },
       css: cachedGenericCss,
       origin: 'USER',
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
   // 2. Get rules from RAM cache (usually filled by onBeforeNavigate)
@@ -1092,7 +1144,7 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
     rules = await getCosmeticRulesForPage(hostname);
     domainRulesCache.set(hostname, rules);
   }
-  
+
   // 3. Filter and Inject CSS rules (skip procedural ones)
   const cssSelectors = [];
   const allSelectors = [...(rules.generic || []), ...(rules.domainSpecific || [])];
@@ -1109,7 +1161,7 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
       target: { tabId: details.tabId, allFrames: true },
       css,
       origin: 'USER',
-    }).catch(() => {});
+    }).catch(() => { });
   }
 
   // 4. Inject Exceptions (un-hide)
@@ -1120,6 +1172,6 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
       target: { tabId: details.tabId, allFrames: true },
       css,
       origin: 'USER',
-    }).catch(() => {});
+    }).catch(() => { });
   }
 });

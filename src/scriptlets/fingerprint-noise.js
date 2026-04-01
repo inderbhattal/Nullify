@@ -23,7 +23,7 @@ export function fingerprintNoise() {
   const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.toDataURL = function () {
     const ctx = this.getContext('2d', { willReadFrequently: true });
-    if (ctx) {
+    if (ctx && this.width > 0 && this.height > 0) {
       const imageData = ctx.getImageData(0, 0, this.width, this.height);
       ctx.putImageData(imageData, 0, 0);
     }

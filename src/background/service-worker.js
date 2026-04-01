@@ -81,19 +81,23 @@ const DNR_ALLOWLIST_START = 990_000;
 chrome.runtime.onInstalled.addListener(async (details) => {
   console.log('[AdBlock] onInstalled:', details.reason);
 
-  if (details.reason === 'install') {
-    await initializeDefaults();
-  }
+  try {
+    if (details.reason === 'install') {
+      await initializeDefaults();
+    }
 
-  await ingestRules(); // Build initial rule index
-  await refreshMemoryCache(); // Fill RAM cache for speed
-  await applyPrivacySettings();
-  await scheduleFilterUpdateAlarm();
+    await ingestRules(); // Build initial rule index
+    await refreshMemoryCache(); // Fill RAM cache for speed
+    await applyPrivacySettings();
+    await scheduleFilterUpdateAlarm();
 
-  // Update badge for all existing tabs
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    updateBadge(tab.id);
+    // Update badge for all existing tabs
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      updateBadge(tab.id);
+    }
+  } catch (err) {
+    console.error('[Nullify] onInstalled handler failed:', err);
   }
 });
 
@@ -264,11 +268,11 @@ async function applyPrivacySettings() {
     chrome.privacy.websites.hyperlinkAuditingEnabled.set({ value: false });
   }
 
-  // Block third-party cookies
-  if (chrome.privacy && settings.blockThirdPartyCookies) {
-    chrome.privacy.websites.thirdPartyCookiesAllowed.set({ value: false });
-  } else if (chrome.privacy) {
-    chrome.privacy.websites.thirdPartyCookiesAllowed.set({ value: true });
+  // Block third-party cookies (thirdPartyCookiesAllowed removed in Chrome 112)
+  if (chrome.privacy?.websites?.thirdPartyCookiesAllowed) {
+    chrome.privacy.websites.thirdPartyCookiesAllowed.set({
+      value: !settings.blockThirdPartyCookies,
+    });
   }
 
   // Update header stripping rules

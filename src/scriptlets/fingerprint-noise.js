@@ -6,6 +6,16 @@
  * different websites.
  */
 export function fingerprintNoise() {
+  // 0. Ensure willReadFrequently is set for Canvas contexts to avoid warnings
+  const origGetContext = HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext = function (type, options) {
+    if (type === '2d') {
+      options = options || {};
+      options.willReadFrequently = true;
+    }
+    return origGetContext.call(this, type, options);
+  };
+
   // 1. Canvas Fingerprinting Protection
   const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
   CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
@@ -22,10 +32,25 @@ export function fingerprintNoise() {
 
   const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.toDataURL = function () {
-    const ctx = this.getContext('2d', { willReadFrequently: true });
-    if (ctx && this.width > 0 && this.height > 0) {
-      const imageData = ctx.getImageData(0, 0, this.width, this.height);
-      ctx.putImageData(imageData, 0, 0);
+    // To avoid modifying the original canvas and for better performance,
+    // we use a temporary canvas to generate the spoofed DataURL.
+    try {
+      const offscreen = document.createElement('canvas');
+      offscreen.width = this.width;
+      offscreen.height = this.height;
+      const octx = offscreen.getContext('2d');
+      if (octx) {
+        octx.drawImage(this, 0, 0);
+        const imageData = octx.getImageData(0, 0, offscreen.width, offscreen.height);
+        const data = imageData.data;
+        for (let i = 0; i < data.length; i += 4096) {
+          data[i] = data[i] + (Math.random() > 0.5 ? 1 : -1);
+        }
+        octx.putImageData(imageData, 0, 0);
+        return offscreen.toDataURL.apply(offscreen, arguments);
+      }
+    } catch (e) {
+      // Fallback to original if anything fails (e.g., cross-origin)
     }
     return origToDataURL.apply(this, arguments);
   };

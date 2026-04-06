@@ -223,7 +223,8 @@ export class CosmeticEngine {
                          sel.includes(':min-text-length') || sel.includes(':watch-attr') ||
                          sel.includes(':nth-ancestor(') || sel.includes(':matches-path(') ||
                          sel.includes(':matches-attr(') || sel.includes(':remove(') ||
-                         sel.includes(':style(');
+                         sel.includes(':style(') || sel.includes(':if(') ||
+                         sel.includes(':if-not(');
 
       if (!hasCustomOp) {
         cssSelectors.push(sel);

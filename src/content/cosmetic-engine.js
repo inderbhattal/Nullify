@@ -45,6 +45,10 @@ const PROC_OPS = [
   'matches-attr',
   'if-not',
   'if',
+  'has',
+  'not',
+  'is',
+  'where',
 ];
 
 // ---------------------------------------------------------------------------
@@ -53,6 +57,7 @@ const PROC_OPS = [
 
 /** Returns true if the selector string contains any procedural operator. */
 function isProceduralSelector(selector) {
+  // Simple check first
   for (const op of PROC_OPS) {
     if (selector.includes(':' + op + '(')) return true;
   }
@@ -61,13 +66,8 @@ function isProceduralSelector(selector) {
 
 /**
  * Depth-aware scan for the first procedural operator in a selector string.
- * Skips content inside parentheses (e.g. :not(...), :nth-child(...)).
- *
- * Returns { base, op, arg, rest } or null.
- *   base — CSS selector before the operator
- *   op   — operator name (without leading colon)
- *   arg  — text between the outermost parentheses
- *   rest — everything after the closing parenthesis (for chaining)
+ * This version properly handles nested parentheses (e.g. :has(...:has-text(...)))
+ * by recursively checking the content of standard CSS pseudo-classes.
  */
 function extractFirstOp(selector) {
   let depth = 0;
@@ -97,6 +97,48 @@ function extractFirstOp(selector) {
       }
     }
   }
+
+  // If no top-level procedural operator was found, check if there's one 
+  // nested inside a native pseudo-class like :has(), :not(), :is(), :where().
+  // We look for :name( ... ) and then recursively check the inside.
+  const nativePseudos = [':has(', ':not(', ':is(', ':where('];
+  for (const pseudo of nativePseudos) {
+    const idx = selector.indexOf(pseudo);
+    if (idx !== -1) {
+      // Find the content of this pseudo-class
+      let d = 1, j = idx + pseudo.length;
+      while (j < selector.length && d > 0) {
+        if (selector[j] === '(') d++;
+        else if (selector[j] === ')') d--;
+        j++;
+      }
+      const inner = selector.slice(idx + pseudo.length, j - 1);
+      if (isProceduralSelector(inner)) {
+        // We found a nested procedural operator.
+        // To handle this, we treat the entire pseudo-class as part of the 'base'
+        // for the NEXT procedural operator, OR if there's no more top-level ops,
+        // we must treat the entire selector as procedural.
+        //
+        // However, the easiest way to trigger the procedural engine for 
+        // nested cases is to return a special 'wrap' operator or just 
+        // ensure isProceduralSelector returns true (which it does).
+        //
+        // The real issue is that extractFirstOp is used by parseProceduralPlan 
+        // which expects to split the string. If we have:
+        // div:has(span:has-text(Foo))
+        // there is NO top-level procedural operator.
+        
+        // Let's implement a 'pseudo' operator that handles native pseudo-classes 
+        // containing procedural logic.
+        const base = selector.slice(0, idx).trimEnd();
+        const op = pseudo.slice(1, -1); // 'has', 'not', etc.
+        const arg = inner;
+        const rest = selector.slice(j).trimStart();
+        return { base, op, arg, rest };
+      }
+    }
+  }
+
   return null;
 }
 
@@ -347,6 +389,36 @@ export class CosmeticEngine {
     return result;
   }
 
+  /** Check if an element matches a procedural selector plan (used by :has, :not, etc). */
+  _matchesProcedural(el, proceduralSelector) {
+    const plan = parseProceduralPlan(proceduralSelector);
+    if (plan.length === 0) return true;
+
+    // We need to check if el or any of its children match the plan
+    // This is essentially a simplified _applyProcedural but starting from el
+    let results = [el];
+
+    for (const step of plan) {
+      const nextResults = [];
+      for (const res of results) {
+        if (step.type === 'op') {
+          const r = this._applyOp(res, step.op, step.arg, proceduralSelector);
+          if (r) nextResults.push(r);
+        } else if (step.type === 'css') {
+          if (res.matches?.(step.selector)) nextResults.push(res);
+          // Also check descendants if this is the start of a plan
+          for (const child of res.querySelectorAll(step.selector)) {
+            nextResults.push(child);
+          }
+        }
+      }
+      results = [...new Set(nextResults)];
+      if (results.length === 0) return false;
+    }
+
+    return results.length > 0;
+  }
+
   _applyOp(el, op, arg, fullSelector) {
     return this._getCachedMatch(el, op, arg, () => {
       switch (op) {
@@ -454,6 +526,26 @@ export class CosmeticEngine {
         case 'remove':
           this._removeElement(el, fullSelector);
           return null; // Stop chain
+
+        // ---- Native pseudo-classes used as procedural operators ----
+        case 'has': {
+          if (!isProceduralSelector(arg)) {
+            try { return el.querySelector(arg) ? el : null; } catch { return null; }
+          }
+          // Check if any descendant matches the procedural arg
+          const candidates = el.querySelectorAll('*');
+          for (const cand of candidates) {
+            if (this._matchesProcedural(cand, arg)) return el;
+          }
+          return null;
+        }
+
+        case 'not':
+          return !this._matchesProcedural(el, arg) ? el : null;
+
+        case 'is':
+        case 'where':
+          return this._matchesProcedural(el, arg) ? el : null;
 
         default:
           return el;

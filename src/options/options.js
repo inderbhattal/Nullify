@@ -22,7 +22,10 @@ function initNav() {
   // Display version from manifest
   const manifest = chrome.runtime.getManifest();
   const versionEl = $('extVersion');
+  const sidebarVersionEl = $('sidebarVersion');
+
   if (versionEl) versionEl.textContent = manifest.version;
+  if (sidebarVersionEl) sidebarVersionEl.textContent = `v${manifest.version}`;
 
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', () => {

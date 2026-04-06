@@ -763,12 +763,6 @@ function generateSampleCosmeticRules() {
         '.mnr-c > .O9S7Ff',
         '.pla-unit-container',
         '.pla-unit',
-        'div[data-asoch-extra-container]',
-        'div[data-hveid]:has(span:has-text(/Sponsored/))',
-        'div[data-hveid]:has(div:has-text(/Sponsored/))',
-        'div[data-hveid]:has([aria-label="Sponsored"])',
-        'div.sh-pd__pdp-link',
-        'div.sh-dlr__list-result',
       ],
       'youtube.com': [
         '.ytd-promoted-video-renderer',

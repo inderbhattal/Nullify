@@ -24,6 +24,9 @@ function initNav() {
   const versionEl = $('extVersion');
   if (versionEl) versionEl.textContent = manifest.version;
 
+  const sidebarVersionEl = document.querySelector('.sidebar-version');
+  if (sidebarVersionEl) sidebarVersionEl.textContent = `v${manifest.version}`;
+
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', () => {
       const tabId = item.dataset.tab;

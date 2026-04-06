@@ -1,6 +1,6 @@
 {
   "name": "nullify",
-  "version": "2.1.0",
+  "version": "2.0.1",
   "description": "A powerful MV3 Chrome ad blocker with uBlock Origin-level features",
   "type": "module",
   "engines": {

@@ -44,6 +44,18 @@ function updateJson(filePath, version) {
   console.log(`✅ Updated ${filePath} to version ${version}`);
 }
 
+function updateHtml(filePath, version) {
+  const fullPath = path.join(root, filePath);
+  if (!fs.existsSync(fullPath)) return;
+
+  const content = fs.readFileSync(fullPath, 'utf8');
+  const updated = content.replace(/<div class="sidebar-version">v[\d.]+<\/div>/, `<div class="sidebar-version">v${version}</div>`);
+  if (content === updated) return;
+
+  fs.writeFileSync(fullPath, updated);
+  console.log(`✅ Updated ${filePath} to version ${version}`);
+}
+
 // Use version from command line if provided, else fall back to git tag
 let version = process.argv[2];
 
@@ -66,5 +78,6 @@ if (process.argv[2]) {
 updateJson('package.json', version);
 updateJson('manifest.json', version);
 updateJson('package-lock.json', version);
+updateHtml('src/options/options.html', version);
 
 console.log('🎉 Version synchronization complete!');

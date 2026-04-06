@@ -61,10 +61,6 @@ const PROC_OPS = [
   'matches-attr',
   'if-not',
   'if',
-  'has',
-  'not',
-  'is',
-  'where',
 ];
 
 /** Returns true if the selector string contains any procedural operator. */

@@ -45,10 +45,6 @@ const PROC_OPS = [
   'matches-attr',
   'if-not',
   'if',
-  'has',
-  'not',
-  'is',
-  'where',
 ];
 
 // ---------------------------------------------------------------------------
@@ -220,10 +216,16 @@ export class CosmeticEngine {
       
       const isProcedural = isProceduralSelector(sel);
       
-      // Fast-path: Chrome supports :has() natively now. 
-      if (isProcedural && !sel.includes(':has-text(') && !sel.includes(':upward(') && 
-          !sel.includes(':xpath(') && !sel.includes(':matches-css') && 
-          !sel.includes(':min-text-length') && !sel.includes(':watch-attr')) {
+      // Fast-path: Chrome supports :has(), :not(), :is(), :where() natively now. 
+      // We only use the JS procedural engine if it contains custom Nullify operators.
+      const hasCustomOp = sel.includes(':has-text(') || sel.includes(':upward(') || 
+                         sel.includes(':xpath(') || sel.includes(':matches-css') || 
+                         sel.includes(':min-text-length') || sel.includes(':watch-attr') ||
+                         sel.includes(':nth-ancestor(') || sel.includes(':matches-path(') ||
+                         sel.includes(':matches-attr(') || sel.includes(':remove(') ||
+                         sel.includes(':style(');
+
+      if (!hasCustomOp) {
         cssSelectors.push(sel);
         continue;
       }

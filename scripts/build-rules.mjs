@@ -789,17 +789,40 @@ function generateSampleCosmeticRules() {
         '[data-testid="placementTracking"]',
       ],
       'cnn.com': [
+        // Physical removal — defeats inline style !important overrides by CNN's JS
+        '.ad-slot-header:remove()',
+        // Ad slot wrappers (all variants)
         'div.ad-slot-header',
         '.ad-slot',
         '.ad-slot-header',
         '[class*="ad-slot"]',
+        '.ad-slot__wrapper',
+        '.ad-slot__ad-wrapper',
+        '.ad-slot-dynamic',
+        '.ad-slot-header__wrapper',
+        '[class*="banner-ad"]',
+        '[data-ad-format]',
+        // Generic ad containers
         '.ad-container',
         '.el__ad',
         '.cnn-ad',
         '.commercialContent',
         '.ad-feedback-link',
+        '.ad-feedback__modal',
         '.zn-body__paragraph--sponsored',
+        // ID-based
         '#ad-slot-header',
+        '#js-outbrain-rightrail-ads-module',
+        '#partner-zone',
+        '#sponsored-outbrain-1',
+        // Zone/stack ads (new CNN layout)
+        '.stack__ads',
+        '.zone__ads',
+        '[data-zone-label="Paid Partner Content"]',
+        '[data-zone-label="PAID PARTNER CONTENT"]',
+        // Products/affiliate content
+        '.featured-product__card',
+        '.product-offer-card-container_related-products',
       ],
       'greenhouse.io': [
         'section:has(h2:has-text(Featured Jobs))',

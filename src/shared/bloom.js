@@ -11,10 +11,19 @@ export class BloomFilter {
    * @param {number} size - Size of the bitset in bits.
    * @param {number} hashes - Number of hash functions to use.
    */
-  constructor(size = 1024 * 1024, hashes = 4) {
+  constructor(size = 256 * 1024, hashes = 4) {
     this.size = size;
     this.hashes = hashes;
     this.bitset = new Uint32Array(Math.ceil(size / 32));
+  }
+
+  /**
+   * Create a filter sized appropriately for the expected number of items.
+   * Uses ~10 bits per item for ~1% false positive rate.
+   */
+  static forCapacity(itemCount, hashes = 4) {
+    const size = Math.max(64 * 1024, Math.ceil(itemCount * 10 / 32) * 32);
+    return new BloomFilter(size, hashes);
   }
 
   /** Add a key to the filter. */
@@ -38,25 +47,15 @@ export class BloomFilter {
     return true;
   }
 
-  /** Serialize to a base64 string for storage. */
+  /** Serialize to a storable object. */
   serialize() {
-    const bytes = new Uint8Array(this.bitset.buffer);
-    let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
+    return { size: this.size, hashes: this.hashes, data: Array.from(this.bitset) };
   }
 
-  /** Deserialize from a base64 string. */
-  static deserialize(base64, size = 1024 * 1024, hashes = 4) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    const filter = new BloomFilter(size, hashes);
-    filter.bitset.set(new Uint32Array(bytes.buffer));
+  /** Deserialize from a stored object. */
+  static deserialize(stored) {
+    const filter = new BloomFilter(stored.size, stored.hashes);
+    filter.bitset.set(stored.data);
     return filter;
   }
 

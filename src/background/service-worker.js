@@ -13,9 +13,19 @@
  *  - Apply WebRTC/privacy settings
  */
 
-import { StorageKeys, getStorage, setStorage, getAllowlist, isHostnameAllowed } from '../shared/storage.js';
-import { RulesDB } from '../shared/db.js';
-import { BloomFilter } from '../shared/bloom.js';
+import {getAllowlist, getStorage, setStorage, StorageKeys} from '../shared/storage.js';
+import {RulesDB} from '../shared/db.js';
+import {BloomFilter} from '../shared/bloom.js';
+import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
+
+// Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
+const REMOTE_FILTER_LISTS = [
+  { id: 'easylist',    url: 'https://easylist.to/easylist/easylist.txt' },
+  { id: 'easyprivacy', url: 'https://easylist.to/easylist/easyprivacy.txt' },
+  { id: 'ubo-filters', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt' },
+  { id: 'annoyances',  url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances.txt' },
+  { id: 'anti-adblock',url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt' },
+];
 
 const db = new RulesDB();
 let bloom = new BloomFilter();
@@ -111,8 +121,12 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   }
 });
 
-chrome.runtime.onStartup.addListener(async () => {
-  // Ensure context menu is present on startup
+// Promise that resolves when the SW has finished its startup initialization.
+// Message handlers that need caches populated can await this.
+let _startupReady = false;
+let _startupPromise = null;
+
+chrome.runtime.onStartup.addListener(() => {
   chrome.contextMenus.create({
     id: 'nullify-block-element',
     title: 'Block element...',
@@ -121,29 +135,56 @@ chrome.runtime.onStartup.addListener(async () => {
     if (chrome.runtime.lastError) { /* ignore */ }
   });
 
-  await loadBloomFilter();
-  await refreshMemoryCache(); // Fill RAM cache for speed
-  await applyPrivacySettings();
-  await applyRulesets();
-  await scheduleFilterUpdateAlarm();
+  // Run all startup tasks in parallel — do NOT await here so that the SW
+  // event loop stays unblocked and can handle queued content script messages
+  // as soon as the critical caches (bloom + memory) are ready.
+  _startupPromise = (async () => {
+    await Promise.all([
+      loadBloomFilter(),
+      refreshMemoryCache(),
+      applyPrivacySettings(),
+      applyRulesets(),
+      scheduleFilterUpdateAlarm(),
+    ]);
+    _startupReady = true;
+  })().catch(err => console.error('[Nullify] Startup failed:', err));
 });
 
 async function refreshMemoryCache() {
-  cachedSettings = await getStorage(StorageKeys.SETTINGS);
-  const allowlist = await getAllowlist();
+  const [settings, allowlist, genericSelectors] = await Promise.all([
+    getStorage(StorageKeys.SETTINGS),
+    getAllowlist(),
+    getStorage(StorageKeys.GENERIC_CSS),
+  ]);
+
+  cachedSettings = settings;
   cachedAllowlist = new Set(allowlist);
-  cachedGenericCss = await getStorage(StorageKeys.GENERIC_CSS);
+
+  // GENERIC_CSS is stored as a selector array; compile to CSS string in RAM.
+  if (Array.isArray(genericSelectors) && genericSelectors.length > 0) {
+    cachedGenericCss = genericSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
+  } else if (typeof genericSelectors === 'string' && genericSelectors.length > 0) {
+    // Backwards compat: old installs stored the full CSS string
+    cachedGenericCss = genericSelectors;
+  } else {
+    cachedGenericCss = null;
+  }
+
   domainRulesCache.clear();
   genericCssLoaded = !!cachedGenericCss;
-  console.log('[AdBlock] Memory caches refreshed (High-Performance mode)');
 }
 
 async function loadBloomFilter() {
   const data = await getStorage(StorageKeys.BLOOM_FILTER);
   if (data) {
     try {
+      // Old format was a base64 string — if so, re-ingest rules to rebuild.
+      if (typeof data === 'string') {
+        console.log('[AdBlock] Bloom Filter format outdated, rebuilding...');
+        await ingestRules();
+        return;
+      }
       bloom = BloomFilter.deserialize(data);
-      console.log('[AdBlock] Bloom Filter loaded');
     } catch (err) {
       console.error('[AdBlock] Failed to deserialize Bloom Filter:', err);
     }
@@ -170,8 +211,10 @@ async function ingestRules() {
     // Wipe and rebuild index
     await db.clear();
 
-    // Build a new Bloom Filter for all hostnames
-    const newBloom = new BloomFilter();
+    // Size the Bloom Filter for actual domain count (10 bits/item → ~1% FP rate)
+    const domainCount = Object.keys(cosData.domainSpecific || {}).length +
+      (scriptData || []).reduce((n, r) => n + (r.domains?.length || 0), 0);
+    const newBloom = BloomFilter.forCapacity(domainCount);
 
     if (cosData.domainSpecific) {
       await db.putBulkCosmeticRules(cosData.domainSpecific);
@@ -189,16 +232,15 @@ async function ingestRules() {
       }
     }
 
-    // Save Bloom Filter
+    // Save Bloom Filter (stored as plain object — no base64 encode/decode overhead)
     bloom = newBloom;
     await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
 
-    // Pre-compile generic rules into a single CSS block
+    // Generic CSS: store selector list only, compile to CSS string in RAM at runtime.
+    // Avoids storing/loading megabytes of CSS text from storage on every SW wake.
     if (cosData.generic && cosData.generic.length > 0) {
-      // Chunking if too large for storage, but 2MB is usually okay for one key
-      const css = cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
-      await setStorage(StorageKeys.GENERIC_CSS, css);
-      cachedGenericCss = css; // Cache in RAM
+      await setStorage(StorageKeys.GENERIC_CSS, cosData.generic);
+      cachedGenericCss = cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
     }
 
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
@@ -537,14 +579,132 @@ async function cleanupTabStats() {
   if (changed) await persistTabStats();
 }
 
+let _filterUpdateInProgress = false;
+
 async function checkFilterListUpdates() {
-  console.log('[AdBlock] Checking for filter list updates...');
+  if (_filterUpdateInProgress) {
+    console.log('[AdBlock] Filter update already in progress, skipping.');
+    return;
+  }
+  _filterUpdateInProgress = true;
 
-  // Re-index bundled rules to ensure caches (IDB, Bloom Filter) are fresh.
-  // In a full production app, this would also fetch new .txt files from the web.
-  await ingestRules();
+  try {
+    console.log('[AdBlock] Fetching remote filter lists...');
 
-  await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
+    // Start with bundled rules so curated fixes (e.g. CNN :remove()) take priority.
+    // Remote rules are merged in after, then deduplicated — bundled entries win
+    // because Set preserves first-seen order.
+    const mergedCosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
+    const mergedScriptlets = [];
+
+    // 1. Load bundled cosmetic rules first (highest priority)
+    try {
+      const bundledUrl = chrome.runtime.getURL('rules/cosmetic-rules.json');
+      const bundled = await (await fetch(bundledUrl)).json();
+      mergedCosmetic.generic.push(...(bundled.generic || []));
+      for (const [domain, selectors] of Object.entries(bundled.domainSpecific || {})) {
+        mergedCosmetic.domainSpecific[domain] = [...selectors];
+      }
+    } catch (err) {
+      console.warn('[AdBlock] Could not load bundled cosmetic rules:', err.message);
+    }
+
+    // 2. Load bundled scriptlet rules
+    try {
+      const scriptUrl = chrome.runtime.getURL('rules/scriptlet-rules.json');
+      const bundledScriptlets = await (await fetch(scriptUrl)).json();
+      mergedScriptlets.push(...bundledScriptlets);
+    } catch { /* non-fatal */ }
+
+    // 3. Fetch and merge remote filter lists
+    for (const list of REMOTE_FILTER_LISTS) {
+      try {
+        console.log(`[AdBlock] Fetching ${list.id}...`);
+        const text = await fetchAndExpand(list.url);
+        const { cosmeticRules, scriptletRules } = parseFilterList(text);
+
+        for (const r of cosmeticRules) {
+          if (r.domains.length === 0) {
+            if (r.exception) continue; // generic exceptions not supported
+            mergedCosmetic.generic.push(r.selector);
+          } else {
+            for (const d of r.domains) {
+              if (r.exception) {
+                if (!mergedCosmetic.exceptions[d]) mergedCosmetic.exceptions[d] = [];
+                mergedCosmetic.exceptions[d].push(r.selector);
+              } else {
+                if (!mergedCosmetic.domainSpecific[d]) mergedCosmetic.domainSpecific[d] = [];
+                mergedCosmetic.domainSpecific[d].push(r.selector);
+              }
+            }
+          }
+        }
+
+        for (const r of scriptletRules) mergedScriptlets.push(r);
+        console.log(`[AdBlock] ${list.id}: ${cosmeticRules.length} cosmetic, ${scriptletRules.length} scriptlets`);
+      } catch (err) {
+        console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
+      }
+    }
+
+    // 4. Deduplicate cosmetic rules (bundled entries win, appearing first in Set)
+    mergedCosmetic.generic = [...new Set(mergedCosmetic.generic)];
+    for (const d of Object.keys(mergedCosmetic.domainSpecific)) {
+      mergedCosmetic.domainSpecific[d] = [...new Set(mergedCosmetic.domainSpecific[d])];
+    }
+
+    // 5. Deduplicate scriptlets by name+domains fingerprint
+    const scriptletSeen = new Set();
+    const dedupedScriptlets = mergedScriptlets.filter(r => {
+      const key = r.name + '|' + (r.domains || []).sort().join(',') + '|' + (r.args || []).join(',');
+      if (scriptletSeen.has(key)) return false;
+      scriptletSeen.add(key);
+      return true;
+    });
+
+    // 6. Merge domain-specific exceptions into domainSpecific store for retrieval
+    // Store them with a special prefix so getCosmeticRulesForPage can identify them
+    for (const [d, selectors] of Object.entries(mergedCosmetic.exceptions)) {
+      if (!mergedCosmetic.domainSpecific[d]) mergedCosmetic.domainSpecific[d] = [];
+      // Prefix exception selectors so the engine can un-hide them
+      for (const sel of selectors) {
+        const exceptionKey = '__exception__' + sel;
+        if (!mergedCosmetic.domainSpecific[d].includes(exceptionKey)) {
+          mergedCosmetic.domainSpecific[d].push(exceptionKey);
+        }
+      }
+    }
+
+    // 7. Re-index into IndexedDB + rebuild Bloom Filter
+    await db.clear();
+    const totalDomains = Object.keys(mergedCosmetic.domainSpecific).length +
+      dedupedScriptlets.reduce((n, r) => n + (r.domains?.length || 0), 0);
+    const newBloom = BloomFilter.forCapacity(totalDomains);
+
+    await db.putBulkCosmeticRules(mergedCosmetic.domainSpecific);
+    for (const hostname of Object.keys(mergedCosmetic.domainSpecific)) newBloom.add(hostname);
+
+    await db.putBulkScriptletRules(dedupedScriptlets);
+    for (const r of dedupedScriptlets) {
+      if (r.domains) for (const d of r.domains) newBloom.add(d);
+    }
+
+    bloom = newBloom;
+    await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
+
+    // 8. Always update generic CSS — store selector array, compile string in RAM
+    await setStorage(StorageKeys.GENERIC_CSS, mergedCosmetic.generic);
+    cachedGenericCss = mergedCosmetic.generic.length > 0
+      ? mergedCosmetic.generic.join(',') + ' { display: none !important; visibility: hidden !important; }'
+      : null;
+
+    domainRulesCache.clear();
+
+    await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
+    console.log(`[AdBlock] Filter update complete — ${mergedCosmetic.generic.length} generic, ${Object.keys(mergedCosmetic.domainSpecific).length} domains, ${dedupedScriptlets.length} scriptlets`);
+  } finally {
+    _filterUpdateInProgress = false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -822,7 +982,7 @@ async function applyRulesets() {
   const enabledMap = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
 
   const allKnownIds = [
-    'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist', 
+    'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist',
     'easyprivacy', 'malware', 'annoyances', 'anti-adblock'
   ];
   const enableRulesetIds = allKnownIds.filter(id => enabledMap[id] === true || id === 'system-unbreak');
@@ -925,9 +1085,17 @@ function executeScriptlets(specs) {
 // Message bus
 // ---------------------------------------------------------------------------
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handleMessage(message, sender)
-    .then(sendResponse)
-    .catch((err) => sendResponse({ error: err.message }));
+  // For content-script critical-path messages, ensure caches are ready first.
+  // Non-critical messages (stats, settings UI) don't need to wait.
+  const needsCache = message.type === 'GET_COSMETIC_RULES' ||
+    message.type === 'GET_SCRIPTLET_RULES' ||
+    message.type === 'IS_SITE_ALLOWED';
+
+  const run = needsCache && _startupPromise && !_startupReady
+    ? _startupPromise.then(() => handleMessage(message, sender))
+    : handleMessage(message, sender);
+
+  run.then(sendResponse).catch((err) => sendResponse({ error: err.message }));
   return true;
 });
 
@@ -1031,6 +1199,7 @@ async function handleMessage(message, sender) {
 
 async function getCosmeticRulesForPage(hostname) {
   const domainSpecific = [];
+  const domainExceptions = new Set();
   const parts = hostname.split('.');
 
   // 1. Check Bloom Filter before hitting IndexedDB
@@ -1038,15 +1207,20 @@ async function getCosmeticRulesForPage(hostname) {
     const domain = parts.slice(i).join('.');
     if (bloom.has(domain)) {
       const domainRules = await db.getCosmeticRules(domain);
-      if (domainRules.length > 0) {
-        domainSpecific.push(...domainRules);
+      for (const rule of domainRules) {
+        // Decode exception selectors stored with __exception__ prefix
+        if (rule.startsWith('__exception__')) {
+          domainExceptions.add(rule.slice('__exception__'.length));
+        } else {
+          domainSpecific.push(rule);
+        }
       }
     }
   }
 
   const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
   const userGeneric = userRules.generic || [];
-  const userExceptions = new Set([...(userRules.genericExceptions || [])]);
+  const userExceptions = new Set([...(userRules.genericExceptions || []), ...domainExceptions]);
   const userDomainSelectors = [];
 
   for (let i = 0; i < parts.length - 1; i++) {
@@ -1060,7 +1234,7 @@ async function getCosmeticRulesForPage(hostname) {
   }
 
   return {
-    generic: userGeneric, // Massive static rules are now injected via SW
+    generic: userGeneric,
     domainSpecific: [...domainSpecific, ...userDomainSelectors],
     exceptions: [...userExceptions],
   };

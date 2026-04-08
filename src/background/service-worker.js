@@ -23,7 +23,9 @@ const REMOTE_FILTER_LISTS = [
   { id: 'easylist',    url: 'https://easylist.to/easylist/easylist.txt' },
   { id: 'easyprivacy', url: 'https://easylist.to/easylist/easyprivacy.txt' },
   { id: 'ubo-filters', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt' },
+  { id: 'ubo-unbreak', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt' },
   { id: 'annoyances',  url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances.txt' },
+  { id: 'malware',     url: 'https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt' },
   { id: 'anti-adblock',url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt' },
 ];
 
@@ -220,7 +222,9 @@ function startInitialization() {
 
     // Stage 2: Background tasks (non-blocking for messages)
     (async () => {
+      const userFilters = await getStorage(StorageKeys.USER_FILTERS);
       await Promise.all([
+        applyUserFilters(userFilters || ''),
         applyPrivacySettings(),
         applyRulesets(),
         scheduleFilterUpdateAlarm(),
@@ -1014,6 +1018,8 @@ async function applyUserFilters(filtersText) {
     .filter((r) => r.id >= DNR_USER_RULES_START && r.id < DNR_ALLOWLIST_START)
     .map((r) => r.id);
 
+  // Always clear the existing IDs in this range, then add new ones if any.
+  // This ensures that an empty filtersText results in zero active user rules.
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: userRuleIds,
     addRules: newRules,
@@ -1022,7 +1028,11 @@ async function applyUserFilters(filtersText) {
   const cosmeticRules = parseUserCosmeticRules(filtersText);
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
 
-  console.log(`[AdBlock] Applied ${newRules.length} user network rules`);
+  if (newRules.length > 0) {
+    console.log(`[AdBlock] Applied ${newRules.length} user network rules`);
+  } else if (userRuleIds.length > 0) {
+    console.log('[AdBlock] Cleared all user network rules');
+  }
 }
 
 /** Parse a simple ABP-style network rule into a DNR rule object. */
@@ -1312,6 +1322,17 @@ async function handleMessage(message, sender) {
     case 'GET_ENABLED_RULESETS':
       return (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
 
+    case 'FORCE_CLEAN_ALL_DYNAMIC_RULES': {
+      const existing = await chrome.declarativeNetRequest.getDynamicRules();
+      const ids = existing.map(r => r.id);
+      if (ids.length > 0) {
+        await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ids });
+      }
+      domainRulesCache.clear();
+      _inFlightRules.clear();
+      return { cleared: ids.length, rules: existing };
+    }
+
     case 'CHECK_FILTER_UPDATES': {
       await checkFilterListUpdates();
       return { ok: true };
@@ -1367,14 +1388,14 @@ async function getCosmeticRulesForPage(hostname) {
 
     // 1. Parallelize parent domain checks (Bloom + IndexedDB)
     const bloomHits = [];
-    let domain = hostname;
+    let curDomain = hostname;
     while (true) {
-      if (bloom.has(domain)) {
-        bloomHits.push(db.getCosmeticRules(domain));
+      if (bloom.has(curDomain)) {
+        bloomHits.push(db.getCosmeticRules(curDomain));
       }
-      const dotIdx = domain.indexOf('.');
+      const dotIdx = curDomain.indexOf('.');
       if (dotIdx === -1) break;
-      domain = domain.slice(dotIdx + 1);
+      curDomain = curDomain.slice(dotIdx + 1);
     }
 
     const allDomainRules = await Promise.all(bloomHits);
@@ -1395,17 +1416,17 @@ async function getCosmeticRulesForPage(hostname) {
     const userDomainSelectors = [];
 
     // Also check user rules for parent domains (no DB hit here, so loop is fine)
-    domain = hostname;
+    let userDom = hostname;
     while (true) {
-      if (userRules.domainSpecific?.[domain]) {
-        userDomainSelectors.push(...userRules.domainSpecific[domain].map(processSelector));
+      if (userRules.domainSpecific?.[userDom]) {
+        userDomainSelectors.push(...userRules.domainSpecific[userDom].map(processSelector));
       }
-      if (userRules.domainExceptions?.[domain]) {
-        for (const sel of userRules.domainExceptions[domain]) userExceptions.add(sel);
+      if (userRules.domainExceptions?.[userDom]) {
+        for (const sel of userRules.domainExceptions[userDom]) userExceptions.add(sel);
       }
-      const dotIdx = domain.indexOf('.');
+      const dotIdx = userDom.indexOf('.');
       if (dotIdx === -1) break;
-      domain = domain.slice(dotIdx + 1);
+      userDom = userDom.slice(dotIdx + 1);
     }
 
     return {
@@ -1446,7 +1467,7 @@ async function getScriptletRulesForPage(hostname) {
 function isHostnameAllowedCached(hostname) {
   if (!cachedAllowlist || cachedAllowlist.size === 0) return false;
   let d = hostname;
-  while (true) {
+  while (d) {
     if (cachedAllowlist.has(d)) return true;
     const dotIdx = d.indexOf('.');
     if (dotIdx === -1) break;

@@ -13,7 +13,7 @@
  *  - Apply WebRTC/privacy settings
  */
 
-import {getAllowlist, getStorage, setStorage, StorageKeys} from '../shared/storage.js';
+import {getAllowlist, getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
@@ -73,13 +73,95 @@ const PROC_OPS = [
   'if',
 ];
 
+// Compiled regex for high-performance detection (avoiding O(N) loops)
+const PROC_OP_REGEX = new RegExp(`:(?:${PROC_OPS.join('|')})\\(`, 'i');
+
 /** Returns true if the selector string contains any procedural operator. */
 function isProceduralSelector(selector) {
-  for (const op of PROC_OPS) {
-    if (selector.includes(':' + op + '(')) return true;
-  }
-  return false;
+  if (typeof selector !== 'string') return false;
+  return PROC_OP_REGEX.test(selector);
 }
+
+/**
+ * Depth-aware scan for the first procedural operator in a selector string.
+ */
+function extractFirstOp(selector) {
+  let depth = 0;
+
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector[i];
+    if (ch === '(') { depth++; continue; }
+    if (ch === ')') { depth--; continue; }
+    if (ch !== ':' || depth !== 0) continue;
+
+    for (const op of PROC_OPS) {
+      if (selector.startsWith(op + '(', i + 1)) {
+        const base = selector.slice(0, i).trimEnd();
+        const argStart = i + 1 + op.length + 1;
+
+        let d = 1, j = argStart;
+        while (j < selector.length && d > 0) {
+          if (selector[j] === '(') d++;
+          else if (selector[j] === ')') d--;
+          j++;
+        }
+
+        const arg = selector.slice(argStart, j - 1);
+        const rest = selector.slice(j).trimStart();
+        return { base, op, arg, rest };
+      }
+    }
+  }
+
+  const nativePseudos = [':has(', ':not(', ':is(', ':where('];
+  for (const pseudo of nativePseudos) {
+    const idx = selector.indexOf(pseudo);
+    if (idx !== -1) {
+      let d = 1, j = idx + pseudo.length;
+      while (j < selector.length && d > 0) {
+        if (selector[j] === '(') d++;
+        else if (selector[j] === ')') d--;
+        j++;
+      }
+      const inner = selector.slice(idx + pseudo.length, j - 1);
+      if (isProceduralSelector(inner)) {
+        const base = selector.slice(0, idx).trimEnd();
+        const op = pseudo.slice(1, -1);
+        const arg = inner;
+        const rest = selector.slice(j).trimStart();
+        return { base, op, arg, rest };
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Pre-parses a procedural selector into an execution plan.
+ */
+function parseProceduralPlan(selector) {
+  const plan = [];
+  let remaining = selector;
+
+  while (remaining) {
+    const firstOp = extractFirstOp(remaining);
+    if (!firstOp) {
+      plan.push({ type: 'css', selector: remaining.trim() });
+      break;
+    }
+    
+    if (firstOp.base) {
+      plan.push({ type: 'css', selector: firstOp.base });
+    }
+    
+    plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
+    remaining = firstOp.rest;
+  }
+  
+  return plan;
+}
+
 
 // DNR rule ID ranges (avoid collisions between categories)
 const DNR_USER_RULES_START = 900_000;
@@ -121,10 +203,37 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   }
 });
 
-// Promise that resolves when the SW has finished its startup initialization.
-// Message handlers that need caches populated can await this.
-let _startupReady = false;
-let _startupPromise = null;
+// ---- Startup Orchestration (Speed Optimized) ----
+let _criticalReady = false;
+let _criticalPromise = null;
+
+function startInitialization() {
+  if (_criticalPromise) return _criticalPromise;
+
+  _criticalPromise = (async () => {
+    // Stage 1: Critical data for responding to content scripts
+    await Promise.all([
+      loadBloomFilter(),
+      refreshMemoryCache(),
+    ]);
+    _criticalReady = true;
+
+    // Stage 2: Background tasks (non-blocking for messages)
+    (async () => {
+      await Promise.all([
+        applyPrivacySettings(),
+        applyRulesets(),
+        scheduleFilterUpdateAlarm(),
+      ]);
+    })().catch(err => console.error('[Nullify] Background startup failed:', err));
+
+  })().catch(err => console.error('[Nullify] Critical startup failed:', err));
+
+  return _criticalPromise;
+}
+
+// Ensure startup begins immediately
+startInitialization();
 
 chrome.runtime.onStartup.addListener(() => {
   chrome.contextMenus.create({
@@ -134,33 +243,49 @@ chrome.runtime.onStartup.addListener(() => {
   }, () => {
     if (chrome.runtime.lastError) { /* ignore */ }
   });
+  startInitialization();
+});
 
-  // Run all startup tasks in parallel — do NOT await here so that the SW
-  // event loop stays unblocked and can handle queued content script messages
-  // as soon as the critical caches (bloom + memory) are ready.
-  _startupPromise = (async () => {
-    await Promise.all([
-      loadBloomFilter(),
-      refreshMemoryCache(),
-      applyPrivacySettings(),
-      applyRulesets(),
-      scheduleFilterUpdateAlarm(),
-    ]);
-    _startupReady = true;
-  })().catch(err => console.error('[Nullify] Startup failed:', err));
+chrome.runtime.onInstalled.addListener(async (details) => {
+  console.log('[AdBlock] onInstalled:', details.reason);
+
+  chrome.contextMenus.create({
+    id: 'nullify-block-element',
+    title: 'Block element...',
+    contexts: ['all'],
+  }, () => {
+    if (chrome.runtime.lastError) { /* ignore */ }
+  });
+
+  try {
+    if (details.reason === 'install') {
+      await initializeDefaults();
+    }
+
+    await ingestRules(); // Build initial rule index
+    await startInitialization();
+
+    // Update badge for all existing tabs
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      updateBadge(tab.id);
+    }
+  } catch (err) {
+    console.error('[Nullify] onInstalled handler failed:', err);
+  }
 });
 
 async function refreshMemoryCache() {
-  const [settings, allowlist, genericSelectors] = await Promise.all([
-    getStorage(StorageKeys.SETTINGS),
-    getAllowlist(),
-    getStorage(StorageKeys.GENERIC_CSS),
+  const data = await getStorageBulk([
+    StorageKeys.SETTINGS,
+    StorageKeys.ALLOWLIST,
+    StorageKeys.GENERIC_CSS
   ]);
 
-  cachedSettings = settings;
-  cachedAllowlist = new Set(allowlist);
+  cachedSettings = data[StorageKeys.SETTINGS];
+  cachedAllowlist = new Set(data[StorageKeys.ALLOWLIST] || []);
 
-  // GENERIC_CSS is stored as a selector array; compile to CSS string in RAM.
+  const genericSelectors = data[StorageKeys.GENERIC_CSS];
   if (Array.isArray(genericSelectors) && genericSelectors.length > 0) {
     cachedGenericCss = genericSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
   } else if (typeof genericSelectors === 'string' && genericSelectors.length > 0) {
@@ -1089,10 +1214,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Non-critical messages (stats, settings UI) don't need to wait.
   const needsCache = message.type === 'GET_COSMETIC_RULES' ||
     message.type === 'GET_SCRIPTLET_RULES' ||
-    message.type === 'IS_SITE_ALLOWED';
+    message.type === 'IS_SITE_ALLOWED' ||
+    message.type === 'GET_INIT_DATA';
 
-  const run = needsCache && _startupPromise && !_startupReady
-    ? _startupPromise.then(() => handleMessage(message, sender))
+  const run = needsCache && !_criticalReady
+    ? _criticalPromise.then(() => handleMessage(message, sender))
     : handleMessage(message, sender);
 
   run.then(sendResponse).catch((err) => sendResponse({ error: err.message }));
@@ -1103,6 +1229,30 @@ async function handleMessage(message, sender) {
   const { type, payload } = message;
 
   switch (type) {
+    case 'GET_INIT_DATA': {
+      const { hostname } = payload;
+      const [isAllowed, settings, cosmeticRules, scriptletRules] = await Promise.all([
+        isHostnameAllowedCached(hostname),
+        (await getStorage(StorageKeys.SETTINGS)) || {},
+        getCosmeticRulesForPage(hostname),
+        getScriptletRulesForPage(hostname),
+      ]);
+
+      const hasScriptlets = scriptletRules.length > 0;
+
+      if (!isAllowed && sender.tab?.id) {
+        const scriptletsToRun = [...scriptletRules];
+        if (settings.fingerprintProtection !== false) {
+          scriptletsToRun.push({ name: 'fingerprint-noise', args: [] });
+          scriptletsToRun.push({ name: 'battery-spoof', args: [] });
+        }
+        if (scriptletsToRun.length > 0) {
+          await injectScriptlets(sender.tab.id, sender.frameId || 0, scriptletsToRun);
+        }
+      }
+
+      return { isAllowed, settings, cosmeticRules, hasScriptlets };
+    }
     case 'GET_TAB_STATS': {
       const tabId = payload?.tabId ?? sender.tab?.id;
       return tabStats.get(tabId) || { blocked: 0 };
@@ -1197,87 +1347,175 @@ async function handleMessage(message, sender) {
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
 
-async function getCosmeticRulesForPage(hostname) {
-  const domainSpecific = [];
-  const domainExceptions = new Set();
-  const parts = hostname.split('.');
+// In-flight rule requests to deduplicate redundant DB hits
+const _inFlightRules = new Map();
 
-  // 1. Check Bloom Filter before hitting IndexedDB
-  for (let i = 0; i < parts.length - 1; i++) {
-    const domain = parts.slice(i).join('.');
-    if (bloom.has(domain)) {
-      const domainRules = await db.getCosmeticRules(domain);
-      for (const rule of domainRules) {
-        // Decode exception selectors stored with __exception__ prefix
+async function getCosmeticRulesForPage(hostname) {
+  // Deduplicate: If we are already fetching rules for this domain, return the same promise.
+  if (_inFlightRules.has(hostname)) return _inFlightRules.get(hostname);
+
+  const promise = (async () => {
+    const domainSpecific = [];
+    const domainExceptions = new Set();
+
+    const processSelector = (s) => {
+      if (isProceduralSelector(s)) {
+        return { selector: s, plan: parseProceduralPlan(s) };
+      }
+      return s;
+    };
+
+    // 1. Parallelize parent domain checks (Bloom + IndexedDB)
+    const bloomHits = [];
+    let domain = hostname;
+    while (true) {
+      if (bloom.has(domain)) {
+        bloomHits.push(db.getCosmeticRules(domain));
+      }
+      const dotIdx = domain.indexOf('.');
+      if (dotIdx === -1) break;
+      domain = domain.slice(dotIdx + 1);
+    }
+
+    const allDomainRules = await Promise.all(bloomHits);
+    for (const rules of allDomainRules) {
+      if (!rules) continue;
+      for (const rule of rules) {
         if (rule.startsWith('__exception__')) {
           domainExceptions.add(rule.slice('__exception__'.length));
         } else {
-          domainSpecific.push(rule);
+          domainSpecific.push(processSelector(rule));
         }
       }
     }
-  }
 
-  const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
-  const userGeneric = userRules.generic || [];
-  const userExceptions = new Set([...(userRules.genericExceptions || []), ...domainExceptions]);
-  const userDomainSelectors = [];
+    const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
+    const userGeneric = (userRules.generic || []).map(processSelector);
+    const userExceptions = new Set([...(userRules.genericExceptions || []), ...domainExceptions]);
+    const userDomainSelectors = [];
 
-  for (let i = 0; i < parts.length - 1; i++) {
-    const domain = parts.slice(i).join('.');
-    if (userRules.domainSpecific?.[domain]) {
-      userDomainSelectors.push(...userRules.domainSpecific[domain]);
+    // Also check user rules for parent domains (no DB hit here, so loop is fine)
+    domain = hostname;
+    while (true) {
+      if (userRules.domainSpecific?.[domain]) {
+        userDomainSelectors.push(...userRules.domainSpecific[domain].map(processSelector));
+      }
+      if (userRules.domainExceptions?.[domain]) {
+        for (const sel of userRules.domainExceptions[domain]) userExceptions.add(sel);
+      }
+      const dotIdx = domain.indexOf('.');
+      if (dotIdx === -1) break;
+      domain = domain.slice(dotIdx + 1);
     }
-    if (userRules.domainExceptions?.[domain]) {
-      for (const sel of userRules.domainExceptions[domain]) userExceptions.add(sel);
-    }
-  }
 
-  return {
-    generic: userGeneric,
-    domainSpecific: [...domainSpecific, ...userDomainSelectors],
-    exceptions: [...userExceptions],
-  };
+    return {
+      generic: userGeneric,
+      domainSpecific: [...domainSpecific, ...userDomainSelectors],
+      exceptions: [...userExceptions],
+    };
+  })();
+
+  _inFlightRules.set(hostname, promise);
+  try {
+    return await promise;
+  } finally {
+    _inFlightRules.delete(hostname);
+  }
 }
 
 async function getScriptletRulesForPage(hostname) {
-  const parts = hostname.split('.');
-  let mightHaveRules = false;
-
-  // Check the empty string key for generic scriptlet rules
-  if (bloom.has('')) mightHaveRules = true;
-  else {
-    for (let i = 0; i < parts.length - 1; i++) {
-      if (bloom.has(parts.slice(i).join('.'))) {
+  let mightHaveRules = bloom.has(''); // check generic
+  if (!mightHaveRules) {
+    let d = hostname;
+    while (true) {
+      if (bloom.has(d)) {
         mightHaveRules = true;
         break;
       }
+      const dotIdx = d.indexOf('.');
+      if (dotIdx === -1) break;
+      d = d.slice(dotIdx + 1);
     }
   }
 
   if (!mightHaveRules) return [];
-
   return await db.getScriptletRules(hostname);
 }
 
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
 function isHostnameAllowedCached(hostname) {
-  if (cachedAllowlist.size === 0) return false;
-  const parts = hostname.split('.');
-  for (let i = 0; i < parts.length - 1; i++) {
-    const domain = parts.slice(i).join('.');
-    if (cachedAllowlist.has(domain)) return true;
+  if (!cachedAllowlist || cachedAllowlist.size === 0) return false;
+  let d = hostname;
+  while (true) {
+    if (cachedAllowlist.has(d)) return true;
+    const dotIdx = d.indexOf('.');
+    if (dotIdx === -1) break;
+    d = d.slice(dotIdx + 1);
   }
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// Injection — Native Generic + Domain-Specific Hide
-// ---------------------------------------------------------------------------
+/** 
+ * Reusable core injection logic.
+ * Ensures CSS is injected as early as possible.
+ */
+async function performEarlyInjection(tabId, urlStr) {
+  if (!urlStr?.startsWith('http')) return;
+  const url = new URL(urlStr);
+  const hostname = url.hostname.replace(/^www\./, '');
+
+  if (isHostnameAllowedCached(hostname)) return;
+
+  // 1. Inject Generic CSS
+  if (cachedGenericCss) {
+    chrome.scripting.insertCSS({
+      target: { tabId, allFrames: true },
+      css: cachedGenericCss,
+      origin: 'USER',
+    }).catch(() => { });
+  }
+
+  // 2. Inject Domain Rules
+  let rules = domainRulesCache.get(hostname);
+  if (!rules) {
+    rules = await getCosmeticRulesForPage(hostname);
+    setCachedDomainRules(hostname, rules);
+  }
+
+  const cssSelectors = [];
+  const allRules = [...(rules.generic || []), ...(rules.domainSpecific || [])];
+  const exceptions = new Set(rules.exceptions || []);
+
+  for (const rule of allRules) {
+    if (!rule) continue;
+    if (typeof rule === 'object' && rule.plan) continue; // skip procedural
+    if (exceptions.has(rule)) continue;
+    if (!isProceduralSelector(rule)) cssSelectors.push(rule);
+  }
+
+  if (cssSelectors.length > 0) {
+    const css = cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; opacity: 0 !important; height: 0 !important; overflow: hidden !important; }';
+    chrome.scripting.insertCSS({
+      target: { tabId, allFrames: true },
+      css,
+      origin: 'USER',
+    }).catch(() => { });
+  }
+
+  // 3. Inject Exceptions
+  const cssExceptions = rules.exceptions.filter(s => !isProceduralSelector(s));
+  if (cssExceptions.length > 0) {
+    const css = cssExceptions.join(',') + ' { display: revert !important; visibility: revert !important; opacity: revert !important; height: revert !important; overflow: revert !important; }';
+    chrome.scripting.insertCSS({
+      target: { tabId, allFrames: true },
+      css,
+      origin: 'USER',
+    }).catch(() => { });
+  }
+}
 
 /**
- * Pre-fetch rules into memory cache as soon as a navigation starts.
- * This ensures they are ready by the time onCommitted fires.
+ * Stage 1: onBeforeNavigate (Warm up the cache)
  */
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (details.frameId !== 0) return;
@@ -1286,66 +1524,17 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   const url = new URL(details.url);
   const hostname = url.hostname.replace(/^www\./, '');
 
-  // Warm up the cache
   if (!domainRulesCache.has(hostname)) {
     const rules = await getCosmeticRulesForPage(hostname);
     setCachedDomainRules(hostname, rules);
   }
 });
 
+/**
+ * Stage 2: onCommitted (Reliability fallback)
+ */
 chrome.webNavigation.onCommitted.addListener(async (details) => {
-  if (details.frameId !== 0) return; // Only main frame for injection triggers
-  if (!details.url.startsWith('http')) return;
-
-  const url = new URL(details.url);
-  const hostname = url.hostname.replace(/^www\./, '');
-
-  // Check if site is allowed (blocking enabled) using RAM cache
-  if (isHostnameAllowedCached(hostname)) return;
-
-  // 1. Inject Massive Generic CSS from RAM cache
-  if (cachedGenericCss) {
-    chrome.scripting.insertCSS({
-      target: { tabId: details.tabId, allFrames: true },
-      css: cachedGenericCss,
-      origin: 'USER',
-    }).catch(() => { });
-  }
-
-  // 2. Get rules from RAM cache (usually filled by onBeforeNavigate)
-  let rules = domainRulesCache.get(hostname);
-  if (!rules) {
-    rules = await getCosmeticRulesForPage(hostname);
-    domainRulesCache.set(hostname, rules);
-  }
-
-  // 3. Filter and Inject CSS rules (skip procedural ones)
-  const cssSelectors = [];
-  const allSelectors = [...(rules.generic || []), ...(rules.domainSpecific || [])];
-  const exceptions = new Set(rules.exceptions || []);
-
-  for (const sel of allSelectors) {
-    if (!sel || exceptions.has(sel)) continue;
-    if (!isProceduralSelector(sel)) cssSelectors.push(sel);
-  }
-
-  if (cssSelectors.length > 0) {
-    const css = cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; opacity: 0 !important; height: 0 !important; overflow: hidden !important; }';
-    chrome.scripting.insertCSS({
-      target: { tabId: details.tabId, allFrames: true },
-      css,
-      origin: 'USER',
-    }).catch(() => { });
-  }
-
-  // 4. Inject Exceptions (un-hide)
-  const cssExceptions = rules.exceptions.filter(s => !isProceduralSelector(s));
-  if (cssExceptions.length > 0) {
-    const css = cssExceptions.join(',') + ' { display: revert !important; visibility: revert !important; opacity: revert !important; height: revert !important; overflow: revert !important; }';
-    chrome.scripting.insertCSS({
-      target: { tabId: details.tabId, allFrames: true },
-      css,
-      origin: 'USER',
-    }).catch(() => { });
-  }
+  if (details.frameId !== 0) return;
+  performEarlyInjection(details.tabId, details.url);
 });
+

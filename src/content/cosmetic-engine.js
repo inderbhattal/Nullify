@@ -197,47 +197,57 @@ export class CosmeticEngine {
 
   /**
    * Initialize with rules from the background service worker.
-   * @param {{ generic: string[], domainSpecific: string[], exceptions?: string[] }} rules
+   * @param {{ generic: (string|object)[], domainSpecific: (string|object)[], exceptions?: string[] }} rules
    * @param {boolean} proceduralOnly If true, skip injecting static CSS (handled by SW)
    */
   init(rules, proceduralOnly = false) {
     const exceptions = new Set(rules.exceptions || []);
 
     // Ingest all selectors (now mostly domain-specific + user rules)
-    const allSelectors = [
+    const allRules = [
       ...(rules.generic || []),
       ...(rules.domainSpecific || []),
     ];
 
     const cssSelectors = [];
-    for (const sel of allSelectors) {
-      if (!sel || !sel.trim()) continue;
-      if (exceptions.has(sel)) continue; // user excepted this selector
+    for (const rule of allRules) {
+      if (!rule) continue;
       
-      const isProcedural = isProceduralSelector(sel);
+      const isPreParsed = typeof rule === 'object' && rule.plan;
+      const selector = isPreParsed ? rule.selector : rule;
+      
+      if (!selector || !selector.trim()) continue;
+      if (exceptions.has(selector)) continue; // user excepted this selector
+      
+      if (isPreParsed) {
+        this._proceduralRules.push(rule);
+        continue;
+      }
+
+      const isProcedural = isProceduralSelector(selector);
       
       // Fast-path: Chrome supports :has(), :not(), :is(), :where() natively now. 
       // We only use the JS procedural engine if it contains custom Nullify operators.
-      const hasCustomOp = sel.includes(':has-text(') || sel.includes(':upward(') || 
-                         sel.includes(':xpath(') || sel.includes(':matches-css') || 
-                         sel.includes(':min-text-length') || sel.includes(':watch-attr') ||
-                         sel.includes(':nth-ancestor(') || sel.includes(':matches-path(') ||
-                         sel.includes(':matches-attr(') || sel.includes(':remove(') ||
-                         sel.includes(':style(') || sel.includes(':if(') ||
-                         sel.includes(':if-not(');
+      const hasCustomOp = selector.includes(':has-text(') || selector.includes(':upward(') || 
+                         selector.includes(':xpath(') || selector.includes(':matches-css') || 
+                         selector.includes(':min-text-length') || selector.includes(':watch-attr') ||
+                         selector.includes(':nth-ancestor(') || selector.includes(':matches-path(') ||
+                         selector.includes(':matches-attr(') || selector.includes(':remove(') ||
+                         selector.includes(':style(') || selector.includes(':if(') ||
+                         selector.includes(':if-not(');
 
       if (!hasCustomOp) {
-        cssSelectors.push(sel);
+        cssSelectors.push(selector);
         continue;
       }
 
       if (isProcedural) {
         this._proceduralRules.push({
-          selector: sel,
-          plan: parseProceduralPlan(sel)
+          selector: selector,
+          plan: parseProceduralPlan(selector)
         });
       } else {
-        cssSelectors.push(sel);
+        cssSelectors.push(selector);
       }
     }
 
@@ -394,11 +404,11 @@ export class CosmeticEngine {
 
   /** Check if an element matches a procedural selector plan (used by :has, :not, etc). */
   _matchesProcedural(el, proceduralSelector) {
-    const plan = parseProceduralPlan(proceduralSelector);
+    const isPreParsed = typeof proceduralSelector === 'object' && proceduralSelector.plan;
+    const plan = isPreParsed ? proceduralSelector.plan : parseProceduralPlan(proceduralSelector);
     if (plan.length === 0) return true;
 
-    // We need to check if el or any of its children match the plan
-    // This is essentially a simplified _applyProcedural but starting from el
+    // Fast-path: check if any descendant matches the plan starting with its first step
     let results = [el];
 
     for (const step of plan) {
@@ -409,9 +419,11 @@ export class CosmeticEngine {
           if (r) nextResults.push(r);
         } else if (step.type === 'css') {
           if (res.matches?.(step.selector)) nextResults.push(res);
-          // Also check descendants if this is the start of a plan
-          for (const child of res.querySelectorAll(step.selector)) {
-            nextResults.push(child);
+          // Only search children for the very first step if it's a CSS selector
+          if (step === plan[0]) {
+            for (const child of res.querySelectorAll(step.selector)) {
+              nextResults.push(child);
+            }
           }
         }
       }
@@ -425,7 +437,8 @@ export class CosmeticEngine {
   _applyOp(el, op, arg, fullSelector) {
     return this._getCachedMatch(el, op, arg, () => {
       switch (op) {
-        // ---- :upward(n) / :nth-ancestor(n) / :upward(selector) ----
+        // ... (previous cases)
+        // (Note: I'm replacing the whole _applyOp switch block for safety)
         case 'upward':
         case 'nth-ancestor': {
           const n = parseInt(arg, 10);
@@ -437,11 +450,9 @@ export class CosmeticEngine {
             }
             return target;
           }
-          // Selector form: :upward(article)
           try { return el.closest(arg.trim()) || null; } catch { return null; }
         }
 
-        // ---- :has-text(text) or :has-text(/regex/flags) ----
         case 'has-text': {
           let pattern;
           if (arg.startsWith('/')) {
@@ -453,13 +464,11 @@ export class CosmeticEngine {
           return pattern.test(el.textContent) ? el : null;
         }
 
-        // ---- :min-text-length(n) ----
         case 'min-text-length': {
           const n = parseInt(arg, 10);
           return el.textContent.trim().length >= n ? el : null;
         }
 
-        // ---- :matches-css(property: value) ----
         case 'matches-css':
         case 'matches-css-before':
         case 'matches-css-after': {
@@ -478,7 +487,6 @@ export class CosmeticEngine {
           return computed === val ? el : null;
         }
 
-        // ---- :matches-path(/regex/) ----
         case 'matches-path': {
           const path = location.pathname + location.search;
           if (arg.startsWith('/')) {
@@ -489,7 +497,6 @@ export class CosmeticEngine {
           return path.includes(arg) ? el : null;
         }
 
-        // ---- :matches-attr(attr="/regex/") ----
         case 'matches-attr': {
           const match = arg.match(/^([\w-]+)="?(.+?)"?$/);
           if (!match) return null;
@@ -504,7 +511,6 @@ export class CosmeticEngine {
           return actual === val ? el : null;
         }
 
-        // ---- :style(prop: val; ...) ---- (apply custom CSS) ----
         case 'style': {
           const rules = arg.split(';').map(r => r.trim()).filter(Boolean);
           for (const rule of rules) {
@@ -521,24 +527,31 @@ export class CosmeticEngine {
           return el;
         }
 
-        // ---- :watch-attr(attr1,attr2) ---- (pass-through; observer handles re-eval) ----
         case 'watch-attr':
           return el;
 
-        // ---- :remove() ---- (physical deletion) ----
         case 'remove':
           this._removeElement(el, fullSelector);
-          return null; // Stop chain
+          return null;
 
-        // ---- Native pseudo-classes used as procedural operators ----
         case 'has': {
+          // If the argument is not procedural, we can use a fast native check
           if (!isProceduralSelector(arg)) {
             try { return el.querySelector(arg) ? el : null; } catch { return null; }
           }
-          // Check if any descendant matches the procedural arg
-          const candidates = el.querySelectorAll('*');
+          // For procedural :has(), we only need to check candidates that match the first CSS part
+          const plan = parseProceduralPlan(arg);
+          const first = plan[0];
+          let candidates = [];
+          if (first?.type === 'css') {
+            candidates = el.querySelectorAll(first.selector);
+          } else {
+            // No base CSS selector, must check all (rare for :has)
+            candidates = el.querySelectorAll('*');
+          }
+          
           for (const cand of candidates) {
-            if (this._matchesProcedural(cand, arg)) return el;
+            if (this._matchesProcedural(cand, { selector: arg, plan })) return el;
           }
           return null;
         }
@@ -612,7 +625,10 @@ export class CosmeticEngine {
 
   _startObserver() {
     if (this._observer) return;
-    if (this._cssSelectors.length === 0 && this._proceduralRules.length === 0) return;
+    
+    // Only start MutationObserver if we have procedural rules or watch-attr rules.
+    // Static CSS rules injected via SW already work for dynamic elements natively.
+    if (this._proceduralRules.length === 0 && this._watchAttrRules.length === 0) return;
 
     this._observer = new MutationObserver((mutations) => {
       let needsProcedural = false;

@@ -70,37 +70,33 @@ export class RulesDB {
       const store = transaction.objectStore(STORE_SCRIPTLET);
       const index = store.index('domain');
       
-      const results = [];
       const parts = hostname.split('.');
-      let pending = parts.length;
-
-      // Check all parent domains + generic (no domain)
       const domainsToCheck = ['', ...parts.map((_, i) => parts.slice(i).join('.'))];
       
       const allRules = [];
-      
-      // Since we can't easily do a multi-key index join in simple IDB, 
-      // we query generic rules once and domain-specific ones in a loop.
-      // Better: fetch all and filter in memory if the count is low, 
-      // or use a smarter index. For now, let's keep it robust.
-      
-      const request = store.openCursor();
-      request.onsuccess = (event) => {
-        const cursor = event.target.result;
-        if (cursor) {
-          const rule = cursor.value;
-          const isGeneric = !rule.domains || rule.domains.length === 0;
-          const matchesDomain = rule.domains?.some(d => hostname === d || hostname.endsWith('.' + d));
-          
-          if (isGeneric || matchesDomain) {
-            allRules.push(rule);
+      let completed = 0;
+
+      for (const domain of domainsToCheck) {
+        const request = index.getAll(domain);
+        request.onsuccess = (event) => {
+          const rules = event.target.result;
+          if (rules) {
+            allRules.push(...rules);
           }
-          cursor.continue();
-        } else {
-          resolve(allRules);
-        }
-      };
-      request.onerror = (event) => reject(event.target.error);
+          completed++;
+          if (completed === domainsToCheck.length) {
+            // Deduplicate rules by ID in case they were indexed under multiple parent domains
+            const seen = new Set();
+            const uniqueRules = allRules.filter(r => {
+              if (seen.has(r.id)) return false;
+              seen.add(r.id);
+              return true;
+            });
+            resolve(uniqueRules);
+          }
+        };
+        request.onerror = (event) => reject(event.target.error);
+      }
     });
   }
 

@@ -259,18 +259,28 @@ function isPickerDialog(el) {
 
 /**
  * Finds all elements matching a selector, including those inside Shadow Roots.
+ * Iterative version for better performance and safety.
  */
 function deepQuerySelectorAll(selector, root = document) {
-  let results = [];
-  try {
-    results = [...root.querySelectorAll(selector)];
-  } catch { /* invalid selector */ }
-  
-  // Recursively check all elements for shadow roots
-  const all = root.querySelectorAll('*');
-  for (const el of all) {
-    if (el.shadowRoot) {
-      results.push(...deepQuerySelectorAll(selector, el.shadowRoot));
+  const results = [];
+  const queue = [root];
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    
+    // Query current root
+    try {
+      const matches = current.querySelectorAll(selector);
+      for (const m of matches) results.push(m);
+    } catch { /* invalid selector */ }
+
+    // Find children with shadow roots to continue traversal
+    // Note: we only need to find elements that COULD have a shadowRoot
+    const children = current.querySelectorAll('*');
+    for (const el of children) {
+      if (el.shadowRoot) {
+        queue.push(el.shadowRoot);
+      }
     }
   }
   return results;

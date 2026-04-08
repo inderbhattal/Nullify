@@ -27,13 +27,18 @@ export const StorageKeys = {
   REFERRER_CONTROL: 'referrerControl',
 };
 
-/** Get a single value from storage. Returns null if not found. */
-export async function getStorage(key) {
+/** Get multiple values from storage in one call. */
+export async function getStorageBulk(keys) {
   return new Promise((resolve) => {
-    chrome.storage.local.get(key, (result) => {
-      resolve(result[key] ?? null);
+    chrome.storage.local.get(keys, (result) => {
+      resolve(result);
     });
   });
+}
+
+/** Get a single value from storage. Returns null if not found. */
+export async function getStorage(key) {
+  return (await getStorageBulk([key]))[key] ?? null;
 }
 
 /** Set a single value in storage. */

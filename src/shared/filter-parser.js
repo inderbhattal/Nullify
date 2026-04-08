@@ -43,25 +43,44 @@ function parseLine(line) {
   if (!line || line.startsWith('!') || line.startsWith('[') ||
     line.startsWith('%') || line.startsWith('@@#')) return null;
 
+  // Find the separator index first (#)
+  const hashIdx = line.indexOf('#');
+  if (hashIdx === -1) return null; // Network rule — skip
+
   // Scriptlet: example.com##+js(name, args)
-  const scriptletMatch = line.match(/^([^#]*)##\+js\((.+)\)$/) ||
-    line.match(/^([^#]*)#\+js\((.+)\)$/);
-  if (scriptletMatch) {
-    const [, domains, scriptletStr] = scriptletMatch;
-    const args = parseScriptletArgs(scriptletStr);
-    const [name, ...rest] = args;
+  if (line.includes('##+js(') || line.includes('#+js(')) {
+    const match = line.match(/^([^#]*)#(?:#\+js\(|\+js\()(.+)\)$/);
+    if (match) {
+      const [, domains, scriptletStr] = match;
+      const args = parseScriptletArgs(scriptletStr);
+      const [name, ...rest] = args;
+      return {
+        type: 'scriptlet',
+        domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+        name: name.trim(),
+        args: rest,
+      };
+    }
+  }
+
+  // Cosmetic exception: example.com#@#.selector
+  if (line.includes('#@#')) {
+    const idx = line.indexOf('#@#');
+    const domains = line.slice(0, idx);
+    const selector = line.slice(idx + 3);
     return {
-      type: 'scriptlet',
+      type: 'cosmetic',
       domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
-      name: name.trim(),
-      args: rest,
+      selector,
+      exception: true,
     };
   }
 
   // ABP extended CSS (#?#) — treat as cosmetic
-  const abpMatch = line.match(/^([^#]*)#\?#(.+)$/);
-  if (abpMatch) {
-    const [, domains, selector] = abpMatch;
+  if (line.includes('#?#')) {
+    const idx = line.indexOf('#?#');
+    const domains = line.slice(0, idx);
+    const selector = line.slice(idx + 3);
     return {
       type: 'cosmetic',
       domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
@@ -71,26 +90,15 @@ function parseLine(line) {
   }
 
   // Cosmetic hide: ##.selector or example.com##.selector
-  const cosmeticMatch = line.match(/^([^#]*)##(.+)$/);
-  if (cosmeticMatch) {
-    const [, domains, selector] = cosmeticMatch;
+  if (line.includes('##')) {
+    const idx = line.indexOf('##');
+    const domains = line.slice(0, idx);
+    const selector = line.slice(idx + 2);
     return {
       type: 'cosmetic',
       domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
       selector,
       exception: false,
-    };
-  }
-
-  // Cosmetic exception: example.com#@#.selector
-  const exceptionMatch = line.match(/^([^#]*)#@#(.+)$/);
-  if (exceptionMatch) {
-    const [, domains, selector] = exceptionMatch;
-    return {
-      type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
-      selector,
-      exception: true,
     };
   }
 
@@ -126,22 +134,22 @@ export async function fetchAndExpand(url, depth = 0) {
   const text = await res.text();
 
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
-  const lines = [];
+  const lines = text.split('\n');
 
-  for (const line of text.split('\n')) {
+  const expandedLines = await Promise.all(lines.map(async (line) => {
     const m = line.trim().match(/^!#include\s+(.+)$/);
     if (m) {
       const includePath = m[1].trim();
       const includeUrl = includePath.startsWith('http') ? includePath : baseUrl + includePath;
       try {
-        lines.push(await fetchAndExpand(includeUrl, depth + 1));
+        return await fetchAndExpand(includeUrl, depth + 1);
       } catch (e) {
         console.warn('[AdBlock] Skipping include:', includeUrl, e.message);
+        return '';
       }
-    } else {
-      lines.push(line);
     }
-  }
+    return line;
+  }));
 
-  return lines.join('\n');
+  return expandedLines.join('\n');
 }

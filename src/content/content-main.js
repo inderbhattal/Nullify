@@ -16,57 +16,34 @@ import { activatePicker, deactivatePicker } from './element-picker.js';
 const hostname = location.hostname.replace(/^www\./, '');
 
 async function main() {
-  // Fire all independent SW requests in parallel to avoid sequential round-trip delay.
-  // A cold SW wake-up can take 300-700ms per message — serializing them causes 1-3s freezes.
-  let isAllowedRes, settingsRes, cosmeticRes;
+  // Fire a single consolidated request to avoid messaging overhead and SW wake-up contention.
+  let initRes;
   try {
-    [isAllowedRes, settingsRes, cosmeticRes] = await Promise.all([
-      chrome.runtime.sendMessage({ type: 'IS_SITE_ALLOWED', payload: { domain: hostname } }),
-      chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }),
-      chrome.runtime.sendMessage({ type: 'GET_COSMETIC_RULES', payload: { hostname } }),
-    ]);
+    initRes = await chrome.runtime.sendMessage({ type: 'GET_INIT_DATA', payload: { hostname } });
   } catch {
-    // SW not ready — proceed with no rules
+    // SW not ready — proceed with defaults
   }
 
-  if (isAllowedRes?.allowed === true) return;
+  const { isAllowed, settings, cosmeticRules, hasScriptlets } = initRes || {};
 
-  // Inject scriptlets bundle asynchronously — page-intercepting scriptlets are
-  // injected by the SW via chrome.scripting.executeScript (MAIN world), which is
-  // independent of this bundle. async=false was blocking HTML parsing for ~200ms.
-  injectScriptletsBundleIntoMainWorld();
+  if (isAllowed === true) return;
 
-  // Request scriptlet injection from SW (fire-and-forget, non-blocking)
-  const scriptlets = [];
-  if (settingsRes?.fingerprintProtection !== false) {
-    scriptlets.push({ name: 'fingerprint-noise', args: [] });
-    scriptlets.push({ name: 'battery-spoof', args: [] });
+  // Only inject scriptlets bundle if we actually have scriptlets to run or fingerprinting is on.
+  // This saves substantial memory and parsing time on "clean" pages.
+  if (hasScriptlets || settings?.fingerprintProtection !== false) {
+    injectScriptletsBundleIntoMainWorld();
   }
-
-  const scriptletMessages = [
-    chrome.runtime.sendMessage({ type: 'GET_SCRIPTLET_RULES', payload: { hostname } }),
-  ];
-  if (scriptlets.length > 0) {
-    scriptletMessages.push(
-      chrome.runtime.sendMessage({ type: 'RUN_SCRIPTLETS', payload: { scriptlets } })
-    );
-  }
-  // Don't await — scriptlet injection is handled by SW in MAIN world independently
-  Promise.all(scriptletMessages).catch(() => {});
 
   // Apply cosmetic rules
-  const cosmeticRules = cosmeticRes;
-  const hasDomainRules = cosmeticRules?.domainSpecific?.length > 0;
+  const hasProcedural = cosmeticRules?.generic?.some(r => typeof r === 'object') || 
+                       cosmeticRules?.domainSpecific?.some(r => typeof r === 'object');
   const hasExceptions = cosmeticRules?.exceptions?.length > 0;
-  const hasUserRules = cosmeticRules?.generic?.length > 0;
-
-  if (!hasDomainRules && !hasExceptions && !hasUserRules) return;
+  
+  if (!hasProcedural && !hasExceptions) return;
 
   const engine = new CosmeticEngine();
-  // proceduralOnly=true since SW already injected static CSS via insertCSS
   engine.init(cosmeticRules, true);
 
-  // Re-apply procedural rules after DOM is fully built
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       engine._applyProceduralRules?.();

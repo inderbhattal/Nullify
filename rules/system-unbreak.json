@@ -64,5 +64,11 @@
     "priority": 1100,
     "condition": { "urlFilter": "||youtube.com/youtubei/v1/ad_break" },
     "action": { "type": "block" }
+  },
+  {
+    "id": 12,
+    "priority": 1000,
+    "condition": { "urlFilter": "||chatgpt.com/cdn/assets/*" },
+    "action": { "type": "allow" }
   }
 ]

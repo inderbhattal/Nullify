@@ -33,7 +33,7 @@ import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experi
   // 2. High-Speed WASM Initialization
   const bootstrapWasm = (url) => {
     if (wasmReady || !url) return;
-    init(url).then(() => { 
+    init({ module_or_path: url }).then(() => {
       wasmReady = true; 
       console.log('%c[Nullify] WASM God-Mode Active (High Performance)', 'color: #00ff00; font-weight: bold;');
     }).catch((err) => {

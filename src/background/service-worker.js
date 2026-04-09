@@ -29,7 +29,8 @@ import init, {
   resolve_entity,
   is_semantic_ad,
   sanitize_and_compact_selectors,
-  anonymize_stats_json
+  anonymize_stats_json,
+  check_allowlist_csv
 } from '../shared/wasm/nullify_core.js';
 
 // Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
@@ -1687,7 +1688,7 @@ function isHostnameAllowedCached(hostname) {
   
   if (wasmReady) {
     // Pass the cached array to WASM for fast checking
-    return check_allowlist(hostname, Array.from(cachedAllowlist));
+    return check_allowlist_csv(hostname, Array.from(cachedAllowlist).join(','));
   }
 
   let d = hostname;

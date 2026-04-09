@@ -21,6 +21,7 @@ export default {
     filename: '[name].js',
     clean: true,
     assetModuleFilename: '[name][ext]', // Keep filenames static for WASM
+    publicPath: '',  // Prevent webpack's auto-detection IIFE (fails in extension MAIN world content scripts)
   },
 
   module: {

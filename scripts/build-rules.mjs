@@ -885,7 +885,20 @@ async function main() {
 
         console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skipped} skipped`);
 
-        const dnrRules = buildDNRRules(parsed.networkRules);
+        let networkRules = parsed.networkRules;
+        const RULE_LIMIT = 25000;
+        if (networkRules.length > RULE_LIMIT) {
+          console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit. Truncating to ${RULE_LIMIT}...`);
+          // Prioritize: Exceptions first, then 'important' rules, then others.
+          networkRules.sort((a, b) => {
+            const priorityA = a.exception ? 3 : (a.options.important ? 2 : 1);
+            const priorityB = b.exception ? 3 : (b.options.important ? 2 : 1);
+            return priorityB - priorityA;
+          });
+          networkRules = networkRules.slice(0, RULE_LIMIT);
+        }
+
+        const dnrRules = buildDNRRules(networkRules);
         const outPath = path.join(RULES_DIR, `${list.id}.json`);
         fs.writeFileSync(outPath, JSON.stringify(dnrRules, null, 2));
         console.log(`✅ ${list.id}.json — ${dnrRules.length} DNR rules written\n`);

@@ -17,6 +17,7 @@ import {getAllowlist, getStorage, getStorageBulk, setStorage, StorageKeys} from 
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
+import init, { BloomFilter as WasmBloom, parse_filter_list } from '../shared/wasm/nullify_core.js';
 
 // Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
 const REMOTE_FILTER_LISTS = [
@@ -30,7 +31,8 @@ const REMOTE_FILTER_LISTS = [
 ];
 
 const db = new RulesDB();
-let bloom = new BloomFilter();
+let bloom = null;
+let wasmReady = false;
 
 // ---- Memory Cache (High Performance) ----
 let cachedSettings = null;
@@ -213,6 +215,17 @@ function startInitialization() {
   if (_criticalPromise) return _criticalPromise;
 
   _criticalPromise = (async () => {
+    // Stage 0: Initialize WASM
+    try {
+      const wasmUrl = chrome.runtime.getURL('src/shared/wasm/nullify_core_bg.wasm');
+      // Pass as an object to satisfy modern wasm-bindgen requirements
+      await init({ module_or_path: wasmUrl });
+      wasmReady = true;
+      console.log('[Nullify] WASM Core initialized');
+    } catch (err) {
+      console.error('[Nullify] WASM initialization failed:', err);
+    }
+
     // Stage 1: Critical data for responding to content scripts
     await Promise.all([
       loadBloomFilter(),
@@ -313,10 +326,19 @@ async function loadBloomFilter() {
         await ingestRules();
         return;
       }
-      bloom = BloomFilter.deserialize(data);
+      if (wasmReady) {
+        bloom = WasmBloom.deserialize(data);
+      } else {
+        bloom = BloomFilter.deserialize(data);
+      }
     } catch (err) {
       console.error('[AdBlock] Failed to deserialize Bloom Filter:', err);
+      // Fallback: create fresh if loading failed
+      bloom = wasmReady ? new WasmBloom(256 * 1024, 4) : new BloomFilter(256 * 1024, 4);
     }
+  } else {
+    // Initial load: create empty
+    bloom = wasmReady ? new WasmBloom(256 * 1024, 4) : new BloomFilter(256 * 1024, 4);
   }
 }
 
@@ -335,15 +357,15 @@ async function ingestRules() {
     const scriptData = await (await fetch(scriptUrl)).json();
 
     console.log(`[AdBlock] Indexing ${cosData.generic?.length || 0} generic and ${Object.keys(cosData.domainSpecific || {}).length} domain-specific cosmetic rules...`);
-    console.log(`[AdBlock] Indexing ${scriptData.length || 0} scriptlet rules...`);
-
+    
     // Wipe and rebuild index
     await db.clear();
 
     // Size the Bloom Filter for actual domain count (10 bits/item → ~1% FP rate)
     const domainCount = Object.keys(cosData.domainSpecific || {}).length +
-      (scriptData || []).reduce((n, r) => n + (r.domains?.length || 0), 0);
-    const newBloom = BloomFilter.forCapacity(domainCount);
+      (scriptData || []).reduce((n, r) => n + (r.domains?.length || 0), 0) + 1; // +1 for generic ''
+    
+    const newBloom = wasmReady ? new WasmBloom(domainCount * 10, 4) : BloomFilter.forCapacity(domainCount);
 
     if (cosData.domainSpecific) {
       await db.putBulkCosmeticRules(cosData.domainSpecific);
@@ -361,12 +383,13 @@ async function ingestRules() {
       }
     }
 
-    // Save Bloom Filter (stored as plain object — no base64 encode/decode overhead)
+    // Always add empty string to mark presence of generic rules
+    newBloom.add('');
+
+    // Save Bloom Filter
     bloom = newBloom;
     await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
 
-    // Generic CSS: store selector list only, compile to CSS string in RAM at runtime.
-    // Avoids storing/loading megabytes of CSS text from storage on every SW wake.
     if (cosData.generic && cosData.generic.length > 0) {
       await setStorage(StorageKeys.GENERIC_CSS, cosData.generic);
       cachedGenericCss = cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
@@ -750,7 +773,10 @@ async function checkFilterListUpdates() {
       try {
         console.log(`[AdBlock] Fetching ${list.id}...`);
         const text = await fetchAndExpand(list.url);
-        const { cosmeticRules, scriptletRules } = parseFilterList(text);
+        
+        const { cosmeticRules, scriptletRules } = wasmReady 
+          ? parse_filter_list(text) 
+          : parseFilterList(text);
 
         for (const r of cosmeticRules) {
           if (r.domains.length === 0) {
@@ -807,8 +833,9 @@ async function checkFilterListUpdates() {
     // 7. Re-index into IndexedDB + rebuild Bloom Filter
     await db.clear();
     const totalDomains = Object.keys(mergedCosmetic.domainSpecific).length +
-      dedupedScriptlets.reduce((n, r) => n + (r.domains?.length || 0), 0);
-    const newBloom = BloomFilter.forCapacity(totalDomains);
+      dedupedScriptlets.reduce((n, r) => n + (r.domains?.length || 0), 0) + 1;
+    
+    const newBloom = wasmReady ? new WasmBloom(totalDomains * 10, 4) : BloomFilter.forCapacity(totalDomains);
 
     await db.putBulkCosmeticRules(mergedCosmetic.domainSpecific);
     for (const hostname of Object.keys(mergedCosmetic.domainSpecific)) newBloom.add(hostname);
@@ -817,6 +844,9 @@ async function checkFilterListUpdates() {
     for (const r of dedupedScriptlets) {
       if (r.domains) for (const d of r.domains) newBloom.add(d);
     }
+
+    // Mark that we have generic rules
+    newBloom.add('');
 
     bloom = newBloom;
     await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
@@ -1388,14 +1418,14 @@ async function getCosmeticRulesForPage(hostname) {
 
     // 1. Parallelize parent domain checks (Bloom + IndexedDB)
     const bloomHits = [];
-    let curDomain = hostname;
-    while (true) {
-      if (bloom.has(curDomain)) {
-        bloomHits.push(db.getCosmeticRules(curDomain));
+    let d = hostname;
+    while (d) {
+      if (bloom.has(d)) {
+        bloomHits.push(db.getCosmeticRules(d));
       }
-      const dotIdx = curDomain.indexOf('.');
+      const dotIdx = d.indexOf('.');
       if (dotIdx === -1) break;
-      curDomain = curDomain.slice(dotIdx + 1);
+      d = d.slice(dotIdx + 1);
     }
 
     const allDomainRules = await Promise.all(bloomHits);
@@ -1445,19 +1475,20 @@ async function getCosmeticRulesForPage(hostname) {
 }
 
 async function getScriptletRulesForPage(hostname) {
-  let mightHaveRules = bloom.has(''); // check generic
-  if (!mightHaveRules) {
-    let d = hostname;
-    while (true) {
-      if (bloom.has(d)) {
-        mightHaveRules = true;
-        break;
-      }
-      const dotIdx = d.indexOf('.');
-      if (dotIdx === -1) break;
-      d = d.slice(dotIdx + 1);
-    }
-  }
+  if (!bloom) return [];
+  
+  const mightHaveRules = wasmReady 
+    ? bloom.check_hostname(hostname)
+    : (bloom.has('') || (() => {
+        let d = hostname;
+        while (d) {
+          if (bloom.has(d)) return true;
+          const dotIdx = d.indexOf('.');
+          if (dotIdx === -1) break;
+          d = d.slice(dotIdx + 1);
+        }
+        return false;
+      })());
 
   if (!mightHaveRules) return [];
   return await db.getScriptletRules(hostname);
@@ -1466,6 +1497,12 @@ async function getScriptletRulesForPage(hostname) {
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
 function isHostnameAllowedCached(hostname) {
   if (!cachedAllowlist || cachedAllowlist.size === 0) return false;
+  
+  if (wasmReady) {
+    // Pass the cached array to WASM for fast checking
+    return check_allowlist(hostname, Array.from(cachedAllowlist));
+  }
+
   let d = hostname;
   while (d) {
     if (cachedAllowlist.has(d)) return true;

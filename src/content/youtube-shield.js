@@ -1,6 +1,6 @@
 /**
- * youtube-shield.js - Hyper-Speed Omni Shield (Hardened)
- * Registered as a static MAIN-world script at document_start.
+ * youtube-shield.js - Zero-Allocation Architecture
+ * Optimized for stability and zero memory leaks.
  */
 
 import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experiments } from '../shared/wasm/nullify_core.js';
@@ -8,17 +8,29 @@ import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experi
 (function() {
   let wasmReady = false;
   const adKeys = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams', 'adClientParams'];
-  // Hardened regex to catch variations in JSON formatting
   const adRegex = new RegExp(`"(${adKeys.join('|')})":\\s*(\\[|\\{)`, 'g');
 
-  // 1. Storage Access API Trap-Defuser (STOPS "Permission denied" error)
-  const grantAccess = () => Promise.resolve({ state: 'granted' });
-  try {
-    if (document.requestStorageAccess) document.requestStorageAccess = grantAccess;
-    if (document.requestStorageAccessFor) document.requestStorageAccessFor = grantAccess;
-  } catch (e) {}
+  // 1. WeakMap Cache — Fixes Memory Leak by reusing proxies
+  const proxyCache = new WeakMap();
 
-  // 2. High-Speed WASM Initialization (Race-Condition Proof)
+  const createProxy = (obj) => {
+    if (!obj || typeof obj !== 'object' || obj.__isProxy) return obj;
+    if (proxyCache.has(obj)) return proxyCache.get(obj);
+
+    const proxy = new Proxy(obj, {
+      get: (target, prop) => {
+        if (adKeys.includes(prop)) return undefined;
+        const val = Reflect.get(target, prop);
+        return (typeof val === 'object' && val !== null) ? createProxy(val) : val;
+      },
+      __isProxy: true
+    });
+    
+    proxyCache.set(obj, proxy);
+    return proxy;
+  };
+
+  // 2. High-Speed WASM Initialization
   const bootstrapWasm = (url) => {
     if (wasmReady || !url) return;
     init(url).then(() => { 
@@ -28,21 +40,20 @@ import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experi
       console.error('[Nullify] WASM Shield Failed to Load:', err);
     });
   };
-
-  const observer = new MutationObserver(() => {
+  const obs = new MutationObserver(() => {
     const url = document.documentElement.getAttribute('data-nullify-wasm');
-    if (url) { bootstrapWasm(url); observer.disconnect(); }
+    if (url) { bootstrapWasm(url); obs.disconnect(); }
   });
-  observer.observe(document.documentElement, { attributes: true });
+  obs.observe(document.documentElement, { attributes: true });
   const initialUrl = document.documentElement.getAttribute('data-nullify-wasm');
   if (initialUrl) bootstrapWasm(initialUrl);
 
-  // 3. High-Speed Scrubber with "Micro-second Guard"
+  // 3. Selective Scrubber
   const scrub = (data) => {
     if (!data) return data;
     try {
       if (data instanceof Uint8Array) {
-        if (!wasmReady || data.length < 5000) return data;
+        if (!wasmReady || data.length < 5000 || data.length > 500000) return data;
         return clean_youtube_binary(data);
       }
       if (typeof data === 'string') {
@@ -54,22 +65,49 @@ import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experi
     } catch (e) { return data; }
   };
 
-  // 4. Selective JSON.parse Hijack (Guarded)
-  const origParse = JSON.parse;
-  JSON.parse = function(text, reviver) {
-    if (typeof text === 'string' && text.length > 20 && text.includes('"ad')) {
-      return origParse.call(this, scrub(text), reviver);
-    }
-    return origParse.call(this, text, reviver);
+  // 4. Identity Trap-Defuser
+  const ok = () => Promise.resolve({ state: 'granted' });
+  if (document.requestStorageAccess) document.requestStorageAccess = ok;
+  if (document.requestStorageAccessFor) document.requestStorageAccessFor = ok;
+
+  // 5. Network Interceptor (No-Proxy Version for Stability)
+  const origFetch = window.fetch;
+  window.fetch = async function(input, init) {
+    const url = typeof input === 'string' ? input : input?.url || '';
+    if (url.includes('/ad_break') || url.includes('/get_attestation')) return new Response('{}', { status: 200 });
+
+    const res = await origFetch.call(this, input, init);
+    if (!url.includes('/v1/player') && !url.includes('/get_watch')) return res;
+
+    const text = await res.text();
+    const headers = new Headers(res.headers);
+    headers.delete('content-encoding');
+    headers.delete('content-length');
+
+    return new Response(scrub(text), { status: res.status, headers });
   };
 
-  // 5. ytcfg & Experiment Poisoning
+  // 6. Variable Shield (Setter Hijacking with Cache)
+  const shield = (prop) => {
+    let _val = window[prop];
+    Object.defineProperty(window, prop, {
+      get: () => _val,
+      set: (v) => { _val = createProxy(v); },
+      configurable: true
+    });
+    if (_val) _val = createProxy(_val);
+  };
+  ['ytInitialPlayerResponse', 'playerResponse', 'ytInitialData', 'initialPlayerResponse'].forEach(shield);
+
+  // 7. ytcfg Experiment Poisoning
   const poison = (cfg) => {
     if (!cfg || !cfg.EXPERIMENT_FLAGS) return;
     if (wasmReady) {
       try {
         const sanitized = JSON.parse(sanitize_youtube_experiments(JSON.stringify(cfg)));
-        Object.assign(cfg.EXPERIMENT_FLAGS, sanitized.EXPERIMENT_FLAGS);
+        if (sanitized && sanitized.EXPERIMENT_FLAGS) {
+          Object.assign(cfg.EXPERIMENT_FLAGS, sanitized.EXPERIMENT_FLAGS);
+        }
       } catch (e) {}
     } else {
       const f = cfg.EXPERIMENT_FLAGS;
@@ -82,50 +120,11 @@ import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experi
   if (window.ytcfg && window.ytcfg.set) {
     const origSet = window.ytcfg.set;
     window.ytcfg.set = function(cfg, ...args) {
-      if (cfg && cfg.EXPERIMENT_FLAGS) poison(cfg);
+      if (cfg) poison(cfg);
       return origSet.apply(this, [cfg, ...args]);
     };
     if (window.ytcfg.config_) poison(window.ytcfg.config_);
   }
-
-  // 6. Ghost Network Proxy (Identity Preserving)
-  const origFetch = window.fetch;
-  window.fetch = async function(input, init) {
-    const url = typeof input === 'string' ? input : input?.url || '';
-    if (url.includes('/ad_break') || url.includes('/get_attestation')) return new Response('{}', { status: 200 });
-
-    const res = await origFetch.call(this, input, init);
-    if (!url.includes('/v1/player') && !url.includes('/get_watch')) return res;
-
-    // Proxy the response to scrub data while keeping 'identity' context
-    return new Proxy(res, {
-      get(target, prop) {
-        if (prop === 'text') return async () => scrub(await target.text());
-        if (prop === 'json') return async () => JSON.parse(scrub(await target.text()));
-        if (prop === 'arrayBuffer') return async () => scrub(new Uint8Array(await target.arrayBuffer())).buffer;
-        const val = Reflect.get(target, prop);
-        return typeof val === 'function' ? val.bind(target) : val;
-      }
-    });
-  };
-
-  // 7. Variable Shield (Deep Recursive Proxy)
-  const shield = (prop) => {
-    let _val = window[prop];
-    Object.defineProperty(window, prop, {
-      get: () => _val,
-      set: (v) => { 
-        if (typeof v === 'object' && v !== null) {
-          _val = JSON.parse(scrub(JSON.stringify(v)));
-        } else {
-          _val = v;
-        }
-      },
-      configurable: true
-    });
-    if (_val) _val = JSON.parse(scrub(JSON.stringify(_val)));
-  };
-  ['ytInitialPlayerResponse', 'playerResponse', 'ytInitialData', 'initialPlayerResponse'].forEach(shield);
 
   // 8. Zero-Latency Atomic Skipper
   const skip = () => {
@@ -139,5 +138,5 @@ import init, { clean_youtube_json, clean_youtube_binary, sanitize_youtube_experi
       if (video.duration > 0 && isFinite(video.duration)) video.currentTime = video.duration - 0.1;
     }
   };
-  setInterval(skip, 150);
+  setInterval(skip, 200);
 })();

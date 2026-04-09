@@ -15,6 +15,39 @@ import { activatePicker, deactivatePicker } from './element-picker.js';
 
 const hostname = location.hostname.replace(/^www\./, '');
 
+/**
+ * Fast binary decoder for ruleset data.
+ * @param {Uint8Array} buffer
+ */
+function decodeBinaryRules(buffer) {
+  const rules = { generic: [], domainSpecific: [], exceptions: [] };
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  let offset = 0;
+
+  const readStringList = () => {
+    if (offset + 4 > buffer.byteLength) return [];
+    const count = view.getUint32(offset, true);
+    offset += 4;
+    const list = [];
+    const decoder = new TextDecoder();
+    
+    for (let i = 0; i < count; i++) {
+      let start = offset;
+      while (offset < buffer.byteLength && buffer[offset] !== 0) {
+        offset++;
+      }
+      list.push(decoder.decode(buffer.slice(start, offset)));
+      offset++; // skip null
+    }
+    return list;
+  };
+
+  rules.generic = readStringList();
+  rules.domainSpecific = readStringList();
+  rules.exceptions = readStringList();
+  return rules;
+}
+
 async function main() {
   // Fire a single consolidated request to avoid messaging overhead and SW wake-up contention.
   let initRes;
@@ -24,9 +57,14 @@ async function main() {
     // SW not ready — proceed with defaults
   }
 
-  const { isAllowed, settings, cosmeticRules, hasScriptlets } = initRes || {};
+  const { isAllowed, settings, cosmeticRules, cosmeticRulesBinary, hasScriptlets } = initRes || {};
 
   if (isAllowed === true) return;
+
+  // Use binary rules if available, otherwise fallback to JSON
+  const finalRules = cosmeticRulesBinary 
+    ? decodeBinaryRules(cosmeticRulesBinary)
+    : cosmeticRules;
 
   // Only inject scriptlets bundle if we actually have scriptlets to run or fingerprinting is on.
   // This saves substantial memory and parsing time on "clean" pages.
@@ -35,14 +73,14 @@ async function main() {
   }
 
   // Apply cosmetic rules
-  const hasProcedural = cosmeticRules?.generic?.some(r => typeof r === 'object') || 
-                       cosmeticRules?.domainSpecific?.some(r => typeof r === 'object');
-  const hasExceptions = cosmeticRules?.exceptions?.length > 0;
+  const hasProcedural = finalRules?.generic?.some(r => typeof r === 'object' || (typeof r === 'string' && r.includes(':'))) || 
+                       finalRules?.domainSpecific?.some(r => typeof r === 'object' || (typeof r === 'string' && r.includes(':')));
+  const hasExceptions = finalRules?.exceptions?.length > 0;
   
   if (!hasProcedural && !hasExceptions) return;
 
   const engine = new CosmeticEngine();
-  engine.init(cosmeticRules, true);
+  engine.init(finalRules, true);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {

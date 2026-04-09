@@ -17,7 +17,16 @@ import {getAllowlist, getStorage, getStorageBulk, setStorage, StorageKeys} from 
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
-import init, { BloomFilter as WasmBloom, parse_filter_list } from '../shared/wasm/nullify_core.js';
+import init, { 
+  BloomFilter as WasmBloom, 
+  parse_filter_list_to_json, 
+  compile_filters_to_dnr_json, 
+  KeywordMatcher, 
+  generate_gaussian_noise, 
+  optimize_cosmetic_rules_csv, 
+  serialize_rules_to_binary_from_json, 
+  sanitize_url_with_csv 
+} from '../shared/wasm/nullify_core.js';
 
 // Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
 const REMOTE_FILTER_LISTS = [
@@ -33,6 +42,12 @@ const REMOTE_FILTER_LISTS = [
 const db = new RulesDB();
 let bloom = null;
 let wasmReady = false;
+let trackerMatcher = null;
+const trackerKeywordsCsv = [
+  'telemetry', 'analytics', 'tracking', 'pixel', 'beacon', 'metrics',
+  'collect', 'segment', 'mixpanel', 'hotjar', 'amplitude', 'doubleclick',
+  'googletagmanager', 'facebook.com/tr', 'fbevents', 'clickid', 'utm_'
+].join(',');
 
 // ---- Memory Cache (High Performance) ----
 let cachedSettings = null;
@@ -218,9 +233,12 @@ function startInitialization() {
     // Stage 0: Initialize WASM
     try {
       const wasmUrl = chrome.runtime.getURL('src/shared/wasm/nullify_core_bg.wasm');
-      // Pass as an object to satisfy modern wasm-bindgen requirements
       await init({ module_or_path: wasmUrl });
       wasmReady = true;
+
+      // Initialize tracker detector using string-based interface
+      trackerMatcher = new KeywordMatcher(trackerKeywordsCsv);
+
       console.log('[Nullify] WASM Core initialized');
     } catch (err) {
       console.error('[Nullify] WASM initialization failed:', err);
@@ -320,24 +338,28 @@ async function loadBloomFilter() {
   const data = await getStorage(StorageKeys.BLOOM_FILTER);
   if (data) {
     try {
-      // Old format was a base64 string — if so, re-ingest rules to rebuild.
       if (typeof data === 'string') {
-        console.log('[AdBlock] Bloom Filter format outdated, rebuilding...');
-        await ingestRules();
+        // Base64 format check removed - logic now handles JSON strings via WASM
+        if (wasmReady) {
+          bloom = WasmBloom.deserialize_from_json(data);
+        } else {
+          // Re-ingest if WASM not ready but we have a string
+          await ingestRules();
+        }
         return;
       }
+      
       if (wasmReady) {
-        bloom = WasmBloom.deserialize(data);
+        // Data is a raw object, but WASM needs a JSON string
+        bloom = WasmBloom.deserialize_from_json(JSON.stringify(data));
       } else {
         bloom = BloomFilter.deserialize(data);
       }
     } catch (err) {
       console.error('[AdBlock] Failed to deserialize Bloom Filter:', err);
-      // Fallback: create fresh if loading failed
       bloom = wasmReady ? new WasmBloom(256 * 1024, 4) : new BloomFilter(256 * 1024, 4);
     }
   } else {
-    // Initial load: create empty
     bloom = wasmReady ? new WasmBloom(256 * 1024, 4) : new BloomFilter(256 * 1024, 4);
   }
 }
@@ -388,7 +410,11 @@ async function ingestRules() {
 
     // Save Bloom Filter
     bloom = newBloom;
-    await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
+    if (wasmReady) {
+      await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize_to_json());
+    } else {
+      await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
+    }
 
     if (cosData.generic && cosData.generic.length > 0) {
       await setStorage(StorageKeys.GENERIC_CSS, cosData.generic);
@@ -775,7 +801,7 @@ async function checkFilterListUpdates() {
         const text = await fetchAndExpand(list.url);
         
         const { cosmeticRules, scriptletRules } = wasmReady 
-          ? parse_filter_list(text) 
+          ? JSON.parse(parse_filter_list_to_json(text))
           : parseFilterList(text);
 
         for (const r of cosmeticRules) {
@@ -827,6 +853,20 @@ async function checkFilterListUpdates() {
         if (!mergedCosmetic.domainSpecific[d].includes(exceptionKey)) {
           mergedCosmetic.domainSpecific[d].push(exceptionKey);
         }
+      }
+    }
+
+    // 6.5. Optimize Rules via WASM (Remove redundant site-specific rules)
+    if (wasmReady) {
+      try {
+        const optimizedJson = optimize_cosmetic_rules_csv(
+          mergedCosmetic.generic.join('\n'), 
+          JSON.stringify(mergedCosmetic.domainSpecific)
+        );
+        mergedCosmetic.domainSpecific = JSON.parse(optimizedJson);
+        console.log('[Nullify] Ruleset optimized via WASM Core');
+      } catch (err) {
+        console.error('[Nullify] Rule optimization failed:', err);
       }
     }
 
@@ -928,8 +968,9 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     if (!isAllow) {
       stats.blocked++;
 
-      // Classify as tracker if from privacy/malware lists
-      const isTracker = rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware';
+      // Classify as tracker if from privacy/malware lists OR matches tracker keywords
+      const isTracker = (rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware') ||
+                        (trackerMatcher?.matches(request.url));
       if (isTracker) {
         stats.trackers++;
       }
@@ -1032,15 +1073,27 @@ function parseUserCosmeticRules(text) {
 /** Apply user-defined filters as dynamic DNR rules + cosmetic rules. */
 async function applyUserFilters(filtersText) {
   const lines = (filtersText || '').split('\n').filter(Boolean);
-  const newRules = [];
-  let id = DNR_USER_RULES_START;
+  
+  // Use high-performance WASM compiler if available
+  let newRules = [];
+  if (wasmReady) {
+    try {
+      const rulesJson = compile_filters_to_dnr_json(filtersText || '', DNR_USER_RULES_START);
+      newRules = JSON.parse(rulesJson);
+    } catch (err) {
+      console.error('[Nullify] WASM DNR compilation failed:', err);
+    }
+  }
 
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('!')) continue;
-
-    const rule = parseSimpleNetworkRule(trimmed, id++);
-    if (rule) newRules.push(rule);
+  // Fallback to JS if WASM failed or is not ready
+  if (newRules.length === 0 && lines.length > 0) {
+    let id = DNR_USER_RULES_START;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('!')) continue;
+      const rule = parseSimpleNetworkRule(trimmed, id++);
+      if (rule) newRules.push(rule);
+    }
   }
 
   const existing = await chrome.declarativeNetRequest.getDynamicRules();
@@ -1049,20 +1102,64 @@ async function applyUserFilters(filtersText) {
     .map((r) => r.id);
 
   // Always clear the existing IDs in this range, then add new ones if any.
-  // This ensures that an empty filtersText results in zero active user rules.
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: userRuleIds,
-    addRules: newRules,
-  });
+  try {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: userRuleIds,
+      addRules: newRules,
+    });
+  } catch (err) {
+    console.error('[Nullify] Failed to update dynamic DNR rules:', err);
+  }
 
-  const cosmeticRules = parseUserCosmeticRules(filtersText);
+  let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
+  
+  if (wasmReady) {
+    try {
+      const parsed = JSON.parse(parse_filter_list_to_json(filtersText || ''));
+      const allCosmetic = parsed.cosmeticRules || [];
+      const genericExceptions = new Set();
+
+      for (const rule of allCosmetic) {
+        if (rule.domains.length === 0) {
+          if (rule.exception) genericExceptions.add(rule.selector);
+          else cosmeticRules.generic.push(rule.selector);
+        } else {
+          for (const d of rule.domains) {
+            if (rule.exception) {
+              cosmeticRules.domainExceptions = cosmeticRules.domainExceptions || {};
+              (cosmeticRules.domainExceptions[d] = cosmeticRules.domainExceptions[d] || []).push(rule.selector);
+            } else {
+              cosmeticRules.domainSpecific[d] = cosmeticRules.domainSpecific[d] || [];
+              cosmeticRules.domainSpecific[d].push(rule.selector);
+            }
+          }
+        }
+      }
+      cosmeticRules.genericExceptions = Array.from(genericExceptions);
+    } catch (err) {
+      console.error('[Nullify] WASM cosmetic parsing failed:', err);
+      cosmeticRules = parseUserCosmeticRules(filtersText);
+    }
+  } else {
+    cosmeticRules = parseUserCosmeticRules(filtersText);
+  }
+    
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
 
-  if (newRules.length > 0) {
-    console.log(`[AdBlock] Applied ${newRules.length} user network rules`);
-  } else if (userRuleIds.length > 0) {
-    console.log('[AdBlock] Cleared all user network rules');
-  }
+  // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately
+  domainRulesCache.clear();
+  _inFlightRules.clear();
+
+  const totalDomainSpecificRules = Object.values(cosmeticRules.domainSpecific || {})
+    .reduce((sum, rules) => sum + (rules?.length || 0), 0);
+
+  const counts = {
+    network: newRules.length,
+    cosmetic: (cosmeticRules.generic?.length || 0) + totalDomainSpecificRules
+  };
+
+  console.log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic`);
+  return counts;
 }
 
 /** Parse a simple ABP-style network rule into a DNR rule object. */
@@ -1291,7 +1388,27 @@ async function handleMessage(message, sender) {
         }
       }
 
-      return { isAllowed, settings, cosmeticRules, hasScriptlets };
+      let responseData = { isAllowed, settings, cosmeticRules, hasScriptlets };
+
+      if (wasmReady && !isAllowed) {
+        try {
+          responseData.cosmeticRulesBinary = serialize_rules_to_binary_from_json(
+            JSON.stringify(cosmeticRules.generic || []),
+            JSON.stringify(cosmeticRules.domainSpecific || []),
+            JSON.stringify(cosmeticRules.exceptions || [])
+          );
+          delete responseData.cosmeticRules;
+          
+          // Also provide a sanitized URL for privacy reporting/cleanup
+          if (trackerMatcher && sender.tab?.url) {
+            responseData.sanitizedUrl = sanitize_url_with_csv(sender.tab.url, trackerKeywordsCsv);
+          }
+        } catch (err) {
+          console.error('[Nullify] Rule serialization/sanitization failed:', err);
+        }
+      }
+
+      return responseData;
     }
     case 'GET_TAB_STATS': {
       const tabId = payload?.tabId ?? sender.tab?.id;
@@ -1324,9 +1441,7 @@ async function handleMessage(message, sender) {
       return { filters: (await getStorage(StorageKeys.USER_FILTERS)) || '' };
     case 'SET_USER_FILTERS': {
       await setStorage(StorageKeys.USER_FILTERS, payload.filters);
-      await applyUserFilters(payload.filters);
-      domainRulesCache.clear();
-      return { ok: true };
+      return await applyUserFilters(payload.filters);
     }
     case 'GET_COSMETIC_RULES': {
       return await getCosmeticRulesForPage(payload.hostname);
@@ -1351,6 +1466,16 @@ async function handleMessage(message, sender) {
     }
     case 'GET_ENABLED_RULESETS':
       return (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+
+    case 'GET_NOISE': {
+      const { mean = 0, stdDev = 1 } = payload || {};
+      if (wasmReady) {
+        // Provide entropy from JS side to avoid getrandom environment issues
+        const seed = Date.now() * Math.random();
+        return { noise: generate_gaussian_noise(mean, stdDev, seed) };
+      }
+      return { noise: (Math.random() - 0.5) * 2 * stdDev + mean }; // JS fallback
+    }
 
     case 'FORCE_CLEAN_ALL_DYNAMIC_RULES': {
       const existing = await chrome.declarativeNetRequest.getDynamicRules();
@@ -1402,6 +1527,10 @@ async function handleMessage(message, sender) {
 const _inFlightRules = new Map();
 
 async function getCosmeticRulesForPage(hostname) {
+  // Wait for critical caches if they aren't ready yet
+  if (!_criticalReady && _criticalPromise) await _criticalPromise;
+  if (!bloom) return { generic: [], domainSpecific: [], exceptions: [] };
+
   // Deduplicate: If we are already fetching rules for this domain, return the same promise.
   if (_inFlightRules.has(hostname)) return _inFlightRules.get(hostname);
 

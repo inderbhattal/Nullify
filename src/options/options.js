@@ -137,23 +137,28 @@ async function initMyFilters() {
     $('userFiltersArea').value = res?.filters || '';
   } catch {}
 
-  $('btnApplyFilters').addEventListener('click', async () => {
+  const saveFilters = async () => {
     const filters = $('userFiltersArea').value;
     try {
-      await chrome.runtime.sendMessage({
+      const counts = await chrome.runtime.sendMessage({
         type: 'SET_USER_FILTERS',
         payload: { filters },
       });
-      showFilterStatus('✓ Filters applied successfully', 'success');
+      const msg = counts 
+        ? `✓ Applied ${counts.network} network and ${counts.cosmetic} cosmetic rules`
+        : '✓ Filters applied successfully';
+      showFilterStatus(msg, 'success');
     } catch (err) {
       showFilterStatus('✗ Error: ' + err.message, 'error');
     }
-  });
+  };
+
+  $('btnApplyFilters').addEventListener('click', saveFilters);
 
   // Ctrl+Enter / Cmd+Enter to apply
   $('userFiltersArea').addEventListener('keydown', (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-      $('btnApplyFilters').click();
+      saveFilters();
     }
   });
 
@@ -199,8 +204,16 @@ async function initMyFilters() {
         }
         const area = $('userFiltersArea');
         const existing = area.value.trim();
-        area.value = existing ? existing + '\n' + filtered : filtered;
-        showFilterStatus(`✓ Imported ${file.name} — click Apply to activate`, 'success');
+        const newRules = filtered.split('\n').map(r => r.trim()).filter(Boolean);
+        const existingRules = existing.split('\n').map(r => r.trim()).filter(Boolean);
+        
+        // Merge and deduplicate
+        const merged = [...new Set([...existingRules, ...newRules])].join('\n');
+        area.value = merged;
+        
+        // Auto-apply for better UX
+        await saveFilters();
+        showFilterStatus(`✓ Imported ${file.name} (${newRules.length} rules added)`, 'success');
       } catch (err) {
         showFilterStatus('✗ Import failed: ' + err.message, 'error');
       }

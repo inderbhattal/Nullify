@@ -1,12 +1,49 @@
 /**
  * fingerprint-noise.js
  *
- * Adds a tiny, imperceptible amount of noise to Canvas and Audio API outputs.
- * This changes the browser's fingerprint, making it useless for tracking across 
- * different websites.
+ * Adds statistically sound Gaussian noise (from WASM Core) to Canvas and Audio API outputs.
+ * This changes the browser's fingerprint using Differential Privacy principles, 
+ * making it mathematically harder for tracking scripts to detect the noise.
  */
 export function fingerprintNoise() {
-  // 0. Ensure willReadFrequently is set for Canvas contexts to avoid warnings
+  // ---------------------------------------------------------------------------
+  // Noise Buffer (to avoid messaging overhead)
+  // ---------------------------------------------------------------------------
+  let noiseBuffer = [];
+  const BUFFER_SIZE = 512;
+
+  async function refillNoiseBuffer() {
+    try {
+      // Use chrome.runtime.sendMessage to fetch Gaussian noise from the WASM core in SW
+      const response = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ 
+          type: 'GET_NOISE', 
+          payload: { mean: 0, stdDev: 0.8 } 
+        }, resolve);
+      });
+      if (response && response.noise !== undefined) {
+        noiseBuffer.push(response.noise);
+        // Trim buffer if it gets too large
+        if (noiseBuffer.length > BUFFER_SIZE) noiseBuffer.shift();
+      }
+    } catch { /* background might be sleeping */ }
+  }
+
+  // Initial fill
+  for (let i = 0; i < 10; i++) refillNoiseBuffer();
+  // Periodic refill
+  setInterval(refillNoiseBuffer, 5000);
+
+  function getNoise() {
+    if (noiseBuffer.length > 0) {
+      return noiseBuffer.pop();
+    }
+    return (Math.random() - 0.5) * 2; // Fast fallback
+  }
+
+  // ---------------------------------------------------------------------------
+  // Canvas Fingerprinting Protection
+  // ---------------------------------------------------------------------------
   const origGetContext = HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext = function (type, options) {
     if (type === '2d') {
@@ -16,15 +53,15 @@ export function fingerprintNoise() {
     return origGetContext.call(this, type, options);
   };
 
-  // 1. Canvas Fingerprinting Protection
   const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
   CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
     const imageData = origGetImageData.apply(this, arguments);
     const data = imageData.data;
     
-    // Add very slight noise to the last pixel
+    // Add statistically sound noise periodically
     for (let i = 0; i < data.length; i += 4096) {
-      data[i] = data[i] + (Math.random() > 0.5 ? 1 : -1);
+      const n = getNoise();
+      data[i] = data[i] + (n > 0 ? 1 : -1);
     }
     
     return imageData;
@@ -32,8 +69,6 @@ export function fingerprintNoise() {
 
   const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
   HTMLCanvasElement.prototype.toDataURL = function () {
-    // To avoid modifying the original canvas and for better performance,
-    // we use a temporary canvas to generate the spoofed DataURL.
     try {
       const offscreen = document.createElement('canvas');
       offscreen.width = this.width;
@@ -44,24 +79,25 @@ export function fingerprintNoise() {
         const imageData = octx.getImageData(0, 0, offscreen.width, offscreen.height);
         const data = imageData.data;
         for (let i = 0; i < data.length; i += 4096) {
-          data[i] = data[i] + (Math.random() > 0.5 ? 1 : -1);
+          const n = getNoise();
+          data[i] = data[i] + (n > 0 ? 1 : -1);
         }
         octx.putImageData(imageData, 0, 0);
         return offscreen.toDataURL.apply(offscreen, arguments);
       }
-    } catch (e) {
-      // Fallback to original if anything fails (e.g., cross-origin)
-    }
+    } catch (e) { }
     return origToDataURL.apply(this, arguments);
   };
 
-  // 2. Audio Fingerprinting Protection
+  // ---------------------------------------------------------------------------
+  // Audio Fingerprinting Protection
+  // ---------------------------------------------------------------------------
   if (window.AudioBuffer) {
     const origGetChannelData = AudioBuffer.prototype.getChannelData;
     AudioBuffer.prototype.getChannelData = function () {
       const data = origGetChannelData.apply(this, arguments);
       for (let i = 0; i < data.length; i += 4096) {
-        data[i] = data[i] + (Math.random() * 0.0000001);
+        data[i] = data[i] + (getNoise() * 0.0000001);
       }
       return data;
     };

@@ -406,6 +406,21 @@ function getQuantMult(pattern, i) {
   return [1, i];
 }
 
+// ---------------------------------------------------------------------------
+// Safe Path Guard — prevents blocking critical infrastructure
+// ---------------------------------------------------------------------------
+const CRITICAL_SAFE_PATHS = [
+  'youtube.com/youtubei/v1/player',
+  'youtube.com/youtubei/v1/next',
+  'youtube.com/youtubei/v1/browse',
+  'youtube.com/youtubei/v1/log_event',
+  'youtube.com/api/stats/',
+  'googlevideo.com/videoplayback',
+  'accounts.google.com/',
+  'login.microsoftonline.com',
+  'aexp-static.com',
+];
+
 /**
  * Convert a parsed network filter into a DNR rule object.
  * Returns null if conversion is not possible.
@@ -414,6 +429,19 @@ function networkFilterToDNR(parsed) {
   if (parsed.type !== 'network') return null;
 
   const { pattern, options, exception } = parsed;
+
+  // Safe Path Guard: If this pattern matches a critical path, 
+  // and it's a block rule, skip it or convert to allow if it's an exception.
+  const lowerPattern = pattern.toLowerCase();
+  for (const safePath of CRITICAL_SAFE_PATHS) {
+    if (lowerPattern.includes(safePath)) {
+      if (exception) return null; // already handled by allow rule
+      if (!options.important) {
+        // console.log(`   🛡️  Neutralizing critical path block: ${pattern}`);
+        return null; // Skip this block rule
+      }
+    }
+  }
 
   // Build URL condition
   let urlFilter = null;
@@ -500,9 +528,9 @@ function networkFilterToDNR(parsed) {
     action = { type: 'allow' };
   } else if (options.redirect) {
     // Redirect to blank resource types
-    const blankUrl = getBlankRedirectUrl(options.resourceTypes[0]);
-    if (!blankUrl) action = { type: 'block' };
-    else action = { type: 'redirect', redirect: { url: blankUrl } };
+    const resType = options.resourceTypes[0] || 'other';
+    const blankUrl = getBlankRedirectUrl(resType);
+    action = { type: 'redirect', redirect: { url: blankUrl } };
   } else if (options.removeparam) {
     action = {
       type: 'redirect',
@@ -580,8 +608,14 @@ function getBlankRedirectUrl(resourceType) {
     stylesheet: 'data:text/css,',
     xmlhttprequest: 'data:text/plain,',
     media: 'data:video/mp4,',
+    font: 'data:application/x-font-ttf,',
+    sub_frame: 'about:blank',
+    main_frame: 'about:blank',
+    ping: 'data:text/plain,',
+    websocket: 'data:text/plain,',
+    other: 'data:text/plain,',
   };
-  return blanks[resourceType] || null;
+  return blanks[resourceType] || 'data:text/plain,';
 }
 
 // ---------------------------------------------------------------------------

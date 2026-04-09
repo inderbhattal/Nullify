@@ -42,8 +42,8 @@ export function setConstant(prop, value) {
   Object.defineProperty(obj, lastProp, {
     configurable: false,
     enumerable: true,
-    get: () => resolvedValue,
-    set: () => {},
+    writable: false, // Prevents overwriting
+    value: resolvedValue
   });
 }
 

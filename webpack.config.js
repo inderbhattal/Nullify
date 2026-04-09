@@ -11,6 +11,7 @@ export default {
     'content': './src/content/content-main.js',
     'popup': './src/popup/popup.js',
     'options': './src/options/options.js',
+    'youtube-shield': './src/content/youtube-shield.js',
     // Scriptlets bundle injected into MAIN world — must be self-contained
     'scriptlets-world': './src/scriptlets/index.js',
   },
@@ -19,6 +20,7 @@ export default {
     path: path.resolve(__dirname, 'dist'),
     filename: '[name].js',
     clean: true,
+    assetModuleFilename: '[name][ext]', // Keep filenames static for WASM
   },
 
   module: {

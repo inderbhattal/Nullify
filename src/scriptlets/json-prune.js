@@ -26,6 +26,20 @@ export function jsonPrune(paths, requiredPaths) {
     }
     return result;
   };
+
+  // Modern sites use Fetch API + Response.json()
+  if (window.Response && Response.prototype.json) {
+    const originalJson = Response.prototype.json;
+    Response.prototype.json = async function (...args) {
+      const result = await originalJson.apply(this, args);
+      if (result && typeof result === 'object') {
+        if (required.length === 0 || hasAllPaths(result, required)) {
+          pruneObject(result, prune);
+        }
+      }
+      return result;
+    };
+  }
 }
 
 function parsePrunePaths(pathsStr) {

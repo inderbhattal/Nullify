@@ -45,6 +45,7 @@ const PROC_OPS = [
   'matches-attr',
   'if-not',
   'if',
+  'semantic',
 ];
 
 // ---------------------------------------------------------------------------
@@ -554,6 +555,31 @@ export class CosmeticEngine {
             if (this._matchesProcedural(cand, { selector: arg, plan })) return el;
           }
           return null;
+        }
+
+        case 'semantic': {
+          const text = el.textContent || '';
+          if (!text || text.length < 3) return null;
+          
+          // Use cache to avoid redundant messages
+          const cacheKey = `semantic|${text.slice(0, 100)}`;
+          const cached = this._matchCache.get(cacheKey);
+          if (cached !== undefined) return cached ? el : null;
+
+          // Perform async check
+          chrome.runtime.sendMessage({
+            type: 'CHECK_SEMANTIC_AD',
+            payload: { text }
+          }).then(res => {
+            if (res && res.isAd) {
+              this._matchCache.set(cacheKey, true);
+              this._removeElement(el, fullSelector);
+            } else {
+              this._matchCache.set(cacheKey, false);
+            }
+          }).catch(() => {});
+
+          return null; // Return null initially, will hide later if detected
         }
 
         case 'not':

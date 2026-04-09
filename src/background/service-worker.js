@@ -25,7 +25,11 @@ import init, {
   generate_gaussian_noise, 
   optimize_cosmetic_rules_csv, 
   serialize_rules_to_binary_from_json, 
-  sanitize_url_with_csv 
+  sanitize_url_with_csv,
+  resolve_entity,
+  is_semantic_ad,
+  sanitize_and_compact_selectors,
+  anonymize_stats_json
 } from '../shared/wasm/nullify_core.js';
 
 // Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
@@ -418,7 +422,9 @@ async function ingestRules() {
 
     if (cosData.generic && cosData.generic.length > 0) {
       await setStorage(StorageKeys.GENERIC_CSS, cosData.generic);
-      cachedGenericCss = cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
+      cachedGenericCss = wasmReady 
+        ? sanitize_and_compact_selectors(cosData.generic.join('\n'), 100)
+        : cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
     }
 
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
@@ -894,7 +900,9 @@ async function checkFilterListUpdates() {
     // 8. Always update generic CSS — store selector array, compile string in RAM
     await setStorage(StorageKeys.GENERIC_CSS, mergedCosmetic.generic);
     cachedGenericCss = mergedCosmetic.generic.length > 0
-      ? mergedCosmetic.generic.join(',') + ' { display: none !important; visibility: hidden !important; }'
+      ? (wasmReady 
+          ? sanitize_and_compact_selectors(mergedCosmetic.generic.join('\n'), 100) 
+          : mergedCosmetic.generic.join(',') + ' { display: none !important; visibility: hidden !important; }')
       : null;
 
     domainRulesCache.clear();
@@ -980,6 +988,12 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     }
   }
   // Broadcast to Logger
+  let entity = '';
+  try {
+    const hostname = new URL(request.url).hostname.replace(/^www\./, '');
+    entity = wasmReady ? resolve_entity(hostname) : '';
+  } catch {}
+
   broadcastLoggerEvent({
     type: 'network',
     action: isAllow ? 'allow' : 'block',
@@ -989,6 +1003,7 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     resourceType: request.type,
     rulesetId: rule.rulesetId,
     ruleId: rule.ruleId,
+    entity,
     timestamp: Date.now(),
   });
 });
@@ -1379,7 +1394,32 @@ async function handleMessage(message, sender) {
 
       if (!isAllowed && sender.tab?.id) {
         const scriptletsToRun = [...scriptletRules];
-        if (settings.fingerprintProtection !== false) {
+
+        // Targeted YouTube Anti-Adblock (uBO-grade)
+        if (hostname.includes('youtube.com')) {
+          // 1. Force ad flags to undefined
+          scriptletsToRun.push({ name: 'set-constant', args: ['yt.config_.ADS_DATA', 'undefined'] });
+          scriptletsToRun.push({ name: 'set-constant', args: ['ytInitialPlayerResponse.adPlacements', 'undefined'] });
+          scriptletsToRun.push({ name: 'set-constant', args: ['playerResponse.adPlacements', 'undefined'] });
+          
+          // 2. Intercept and neutralize Fetch/XHR ad data
+          scriptletsToRun.push({ 
+            name: 'trusted-replace-fetch-response', 
+            args: ['/youtubei/v1/player', '"adPlacements"', '"no_ads"'] 
+          });
+          scriptletsToRun.push({ 
+            name: 'trusted-replace-xhr-response', 
+            args: ['/youtubei/v1/player', '"adPlacements"', '"no_ads"'] 
+          });
+          
+          // 3. Prune ad-related keys from JSON
+          scriptletsToRun.push({ 
+            name: 'json-prune', 
+            args: ['playerResponse.adPlacements playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots adClientParams'] 
+          });
+          }
+
+          if (settings.fingerprintProtection !== false) {
           scriptletsToRun.push({ name: 'fingerprint-noise', args: [] });
           scriptletsToRun.push({ name: 'battery-spoof', args: [] });
         }
@@ -1475,6 +1515,24 @@ async function handleMessage(message, sender) {
         return { noise: generate_gaussian_noise(mean, stdDev, seed) };
       }
       return { noise: (Math.random() - 0.5) * 2 * stdDev + mean }; // JS fallback
+    }
+
+    case 'GET_ANONYMIZED_STATS': {
+      const stats = await getStorage(StorageKeys.TAB_STATS) || {};
+      if (!wasmReady) return { stats };
+      
+      const json = JSON.stringify(stats);
+      const noiseScale = payload?.noiseScale || 2.0;
+      const seed = Date.now() * Math.random();
+      
+      const anonymizedJson = anonymize_stats_json(json, noiseScale, seed);
+      return { stats: JSON.parse(anonymizedJson) };
+    }
+
+    case 'CHECK_SEMANTIC_AD': {
+      const { text } = payload;
+      if (!text) return { isAd: false };
+      return { isAd: wasmReady ? is_semantic_ad(text) : false };
     }
 
     case 'FORCE_CLEAN_ALL_DYNAMIC_RULES': {

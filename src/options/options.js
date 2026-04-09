@@ -465,11 +465,12 @@ class LiveLogger {
     const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
     const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : e.action === 'remove' ? 'badge-remove' : 'badge-hide';
     const trackerBadge = e.isTracker ? '<span class="log-badge" style="background:rgba(255,121,198,0.15);color:#ff79c6;margin-left:4px">tracker</span>' : '';
+    const entityBadge = e.entity ? `<span class="log-badge" style="background:rgba(88,166,255,0.15);color:#58a6ff;margin-left:4px">${this.esc(e.entity)}</span>` : '';
 
     let infoHtml = '';
     if (e.type === 'network') {
       infoHtml = `<span class="log-url" title="Click to copy: ${this.esc(e.url)}" data-copy="${this.esc(e.url)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.url)}</span>
-                  ${trackerBadge}
+                  ${trackerBadge} ${entityBadge}
                   <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}</span>`;
     } else {
       infoHtml = `<span class="log-selector" title="Click to copy: ${this.esc(e.selector)}" data-copy="${this.esc(e.selector)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.selector)}</span>

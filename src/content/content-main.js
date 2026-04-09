@@ -49,6 +49,17 @@ function decodeBinaryRules(buffer) {
 }
 
 async function main() {
+  // 0. Handle YouTube-specific initialization (always active)
+  if (hostname.includes('youtube.com')) {
+    try {
+      const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
+      document.documentElement.setAttribute('data-nullify-yt', '1');
+      document.documentElement.setAttribute('data-nullify-wasm', wasmUrl);
+    } catch {
+      // Background worker may not be ready yet
+    }
+  }
+
   // Fire a single consolidated request to avoid messaging overhead and SW wake-up contention.
   let initRes;
   try {
@@ -100,13 +111,12 @@ chrome.runtime.onMessage.addListener((message) => {
 
 /**
  * Inject the scriptlets MAIN-world bundle via a <script> tag.
- * async=true so it doesn't block HTML parsing.
  */
 function injectScriptletsBundleIntoMainWorld() {
   try {
     const script = document.createElement('script');
     script.src = chrome.runtime.getURL('dist/scriptlets-world.js');
-    (document.head || document.documentElement).prepend(script);
+    (document.head || document.documentElement).appendChild(script);
     script.addEventListener('load', () => script.remove());
   } catch {
     // Blocked by CSP or other restrictions — skip

@@ -52,5 +52,17 @@
     "priority": 1000,
     "condition": { "urlFilter": "||login.microsoftonline.com^" },
     "action": { "type": "allow" }
+  },
+  {
+    "id": 10,
+    "priority": 1000,
+    "condition": { "urlFilter": "||youtube.com/youtubei/v1/*" },
+    "action": { "type": "allow" }
+  },
+  {
+    "id": 11,
+    "priority": 1100,
+    "condition": { "urlFilter": "||youtube.com/youtubei/v1/ad_break" },
+    "action": { "type": "block" }
   }
 ]

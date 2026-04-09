@@ -56,6 +56,7 @@ const REGISTRY = new Map([
   ['aopw', abortOnPropertyWrite],
   ['set-constant', setConstant],
   ['sc', setConstant],
+  ['set', setConstant], // alias
   ['abort-current-inline-script', abortCurrentInlineScript],
   ['acis', abortCurrentInlineScript],
   ['abort-on-stack-trace', abortOnStackTrace],
@@ -89,6 +90,7 @@ const REGISTRY = new Map([
   ['no-set-interval-if', noSetInterval],
   ['nosiif', noSetInterval],
   ['prevent-addEventListener', preventAddEventListener],
+  ['aeld', preventAddEventListener], // alias
   ['addeventlistener-logger', preventAddEventListener],
   ['adjust-set-timeout', adjustSetTimeout],
   ['ast', adjustSetTimeout],
@@ -115,6 +117,7 @@ const REGISTRY = new Map([
   // Trusted (privileged) variants
   ['trusted-set-constant', trustedSetConstant],
   ['tsc', trustedSetConstant],
+  ['trusted-set', trustedSetConstant], // alias
   ['trusted-click-element', trustedClickElement],
   ['tce', trustedClickElement],
 
@@ -157,11 +160,50 @@ function run(name, args = []) {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-Shield — Early activation for critical sites
+// ---------------------------------------------------------------------------
+function activateShields() {
+  const isYT = document.documentElement.hasAttribute('data-nullify-yt');
+  if (isYT) {
+    // 1. Instant variable protection
+    run('set-constant', ['yt.config_.ADS_DATA', 'undefined']);
+    run('set-constant', ['ytInitialPlayerResponse.adPlacements', 'undefined']);
+    run('set-constant', ['playerResponse.adPlacements', 'undefined']);
+    
+    // 2. High-speed network interception (broadened)
+    run('trusted-replace-fetch-response', ['/youtubei/v1/player', '"adPlacements"', '"no_ads"']);
+    run('trusted-replace-xhr-response', ['/youtubei/v1/player', '"adPlacements"', '"no_ads"']);
+    run('trusted-replace-fetch-response', ['/youtubei/v1/get_watch', '"adPlacements"', '"no_ads"']);
+    
+    // 2.5. 'Poison' any ad-heartbeat or ad-related metadata requests
+    run('prevent-fetch', ['/youtubei/v1/ad_break']);
+    run('prevent-xhr', ['/youtubei/v1/ad_break']);
+    run('prevent-fetch', ['/youtubei/v1/att/get_attestation']); // also prevents ad-attestation checks
+    run('prevent-xhr', ['/youtubei/v1/att/get_attestation']);
+    
+    // 2.6. Brute-force JSON pruning for ad-related keys
+    run('json-prune', ['playerResponse.adPlacements playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots adClientParams']);
+
+    
+    // 3. Fail-safe skipper
+    run('youtube-ad-skipper', []);
+
+    // 4. Handle SPA Navigations (YouTube doesn't reload page)
+    window.addEventListener('yt-navigate-start', () => {
+      run('set-constant', ['ytInitialPlayerResponse.adPlacements', 'undefined']);
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Public API — attached to window so MAIN-world injection can call it
 // ---------------------------------------------------------------------------
 // Use a less predictable property name to make extension detection harder.
 const REGISTRY_NAME = '__nu' + Math.random().toString(36).slice(2, 8);
 window[REGISTRY_NAME] = { run };
+
+// Activate shields immediately upon bundle execution
+activateShields();
 
 // Export the name so it can be used by the injector
 export { run, REGISTRY_NAME };

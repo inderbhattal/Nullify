@@ -17,71 +17,88 @@ export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = ''
   if (!urlPattern) return;
 
   const matchUrl = toMatcher(urlPattern);
-
   const origFetch = window.fetch;
+
   window.fetch = async function (input, init) {
     const url = typeof input === 'string' ? input : input?.url || '';
     if (!matchUrl(url)) return origFetch.call(this, input, init);
 
-    const response = await origFetch.call(this, input, init);
-    if (!response.ok) return response;
-
     try {
-      const text = await response.clone().text();
-      if (!findStr || text.includes(findStr)) {
-        const modified = findStr
-          ? text.split(findStr).join(replaceStr)
-          : replaceStr;
-        return new Response(modified, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: response.headers,
-        });
-      }
-    } catch { /* leave original response untouched */ }
+      const response = await origFetch.call(this, input, init);
+      if (!response.ok) return response;
 
-    return response;
+      const text = await response.text();
+      const findRe = toRegex(findStr);
+      const modified = findRe.test(text) ? text.replace(findRe, replaceStr) : text;
+
+      // When returning a NEW response from text, we MUST strip encoding/length headers
+      // because the new payload is raw text, not the original (likely compressed) byte-stream.
+      const headers = new Headers(response.headers);
+      headers.delete('content-encoding');
+      headers.delete('content-length');
+
+      return new Response(modified, {
+        status: response.status,
+        statusText: response.statusText,
+        headers
+      });
+    } catch (e) {
+      return origFetch.call(this, input, init);
+    }
   };
 }
 
-/**
- * trusted-replace-xhr-response.js logic (bundled here).
- * Intercepts XMLHttpRequest responses matching a URL pattern.
- */
 export function trustedReplaceXhrResponse(urlPattern, findStr, replaceStr = '') {
   if (!urlPattern) return;
 
   const matchUrl = toMatcher(urlPattern);
-
+  const findRe = toRegex(findStr);
   const OrigXHR = window.XMLHttpRequest;
-  function PatchedXHR() {
-    const xhr = new OrigXHR();
-    const origOpen = xhr.open.bind(xhr);
-    let interceptUrl = false;
 
-    xhr.open = function (method, url, ...rest) {
-      interceptUrl = matchUrl(url);
-      return origOpen(method, url, ...rest);
+  window.XMLHttpRequest = function () {
+    const xhr = new OrigXHR();
+    const origOpen = xhr.open;
+    let intercepted = false;
+
+    xhr.open = function (method, url, ...args) {
+      if (matchUrl(url)) intercepted = true;
+      return origOpen.call(this, method, url, ...args);
     };
 
-    if (interceptUrl) {
-      Object.defineProperty(xhr, 'responseText', {
+    const patch = (prop) => {
+      const desc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, prop);
+      Object.defineProperty(xhr, prop, {
         get() {
-          const text = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText').get.call(this);
-          if (!findStr || text.includes(findStr)) {
-            return findStr ? text.split(findStr).join(replaceStr) : replaceStr;
+          const val = desc.get.call(this);
+          if (intercepted && typeof val === 'string') {
+            return val.replace(findRe, replaceStr);
           }
-          return text;
+          return val;
         },
-        configurable: true,
+        configurable: true
       });
-    }
+    };
+
+    patch('responseText');
+    patch('response');
 
     return xhr;
-  }
-  PatchedXHR.prototype = OrigXHR.prototype;
-  window.XMLHttpRequest = PatchedXHR;
+  };
 }
+
+function toRegex(s) {
+  if (s instanceof RegExp) return s;
+  if (s.startsWith('/') && s.lastIndexOf('/') > 0) {
+    const lastSlash = s.lastIndexOf('/');
+    return new RegExp(s.slice(1, lastSlash), s.slice(lastSlash + 1));
+  }
+  return new RegExp(escapeRegex(s), 'g');
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 
 function toMatcher(pattern) {
   if (typeof pattern === 'string' && pattern.startsWith('/')) {

@@ -30,18 +30,18 @@ import init, {
   // JS-only fallback regex (used before WASM is ready in the text scrubber)
   const adRegex = new RegExp(`"(${AD_KEYS.join('|')})":\\s*(\\[|\\{)`, 'g');
 
-  // 1. Primary prevention — delete ad keys from any parsed object.
+  // 1. Primary prevention — set ad keys to false in any parsed object.
   //
-  // Deletion is PERMANENT and UNDETECTABLE: YouTube cannot recover the data via
-  // property reads, 'in' checks, Object.keys, destructuring, or any other means.
-  // This is categorically stronger than the previous Proxy approach, which only
-  // blocked property reads while leaving the key present (detectable via 'in').
-  //
-  // Also recurses into .playerResponse: /v1/next (SPA navigation) embeds a full
-  // player response as a nested object alongside the page/browse data.
+  // Setting to false is safer than deletion or renaming. It keeps the exact
+  // keys YouTube's player logic expects, but disables the ads.
   function pruneAdKeys(obj) {
     if (!obj || typeof obj !== 'object') return;
-    for (let i = 0; i < AD_KEYS.length; i++) delete obj[AD_KEYS[i]];
+    for (let i = 0; i < AD_KEYS.length; i++) {
+      const key = AD_KEYS[i];
+      if (obj[key] !== undefined) {
+        obj[key] = false;
+      }
+    }
     if (obj.playerResponse) pruneAdKeys(obj.playerResponse);
   }
 
@@ -143,7 +143,7 @@ import init, {
           return cleaned || data;
         }
         if (!data.includes('"ad')) return data;
-        return data.replace(adRegex, '"disabled_$1":$2');
+        return data.replace(adRegex, '"$1":false,"disabled_$1":$2');
       }
       return data;
     } catch (e) { return data; }

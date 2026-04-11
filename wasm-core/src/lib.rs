@@ -878,11 +878,11 @@ pub fn clean_youtube_binary(data: &[u8]) -> Vec<u8> {
         b"\"adClientParams\":",
     ];
     let replacement_bytes: &[&[u8]] = &[
-        b"\"disabled_adPlacements\":",
-        b"\"disabled_adSlots\":",
-        b"\"disabled_playerAds\":",
-        b"\"disabled_adBreakHeartbeatParams\":",
-        b"\"disabled_adClientParams\":",
+        b"\"adPlacements\":false,\"disabled_adPlacements\":",
+        b"\"adSlots\":false,\"disabled_adSlots\":",
+        b"\"playerAds\":false,\"disabled_playerAds\":",
+        b"\"adBreakHeartbeatParams\":false,\"disabled_adBreakHeartbeatParams\":",
+        b"\"adClientParams\":false,\"disabled_adClientParams\":",
     ];
     // For binary we still need a byte-pattern AC (same patterns, different type)
     static AC: OnceLock<AhoCorasick> = OnceLock::new();

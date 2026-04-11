@@ -108,6 +108,42 @@ body {
 .site-bar.paused .site-status { color: var(--yellow); }
 .site-bar.disabled .site-status { color: var(--red); }
 
+/* ---- Persona Bar ---- */
+.persona-bar {
+  background: var(--bg2);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  border: 1px solid rgba(255,255,255,0.05);
+}
+
+.persona-icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent2);
+  flex-shrink: 0;
+}
+
+.persona-select {
+  background: transparent;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+  width: 100%;
+  cursor: pointer;
+  outline: none;
+  padding: 2px 0;
+}
+
+.persona-select option {
+  background: var(--bg2);
+  color: var(--text);
+}
+
 /* ---- Stats ---- */
 .stats-grid {
   display: grid;

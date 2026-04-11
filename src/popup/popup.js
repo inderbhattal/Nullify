@@ -36,9 +36,19 @@ async function init() {
     loadTabStats(),
     loadSiteStatus(),
     loadFilterLists(),
+    loadSettings(),
   ]);
 
   bindEvents();
+}
+
+async function loadSettings() {
+  try {
+    const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
+    if (settings?.stealthPersona) {
+      $('selectPersona').value = settings.stealthPersona;
+    }
+  } catch {}
 }
 
 async function loadTabStats() {
@@ -148,6 +158,22 @@ function bindEvents() {
     if (!currentTab?.id) return;
     await chrome.tabs.sendMessage(currentTab.id, { type: 'ACTIVATE_PICKER' }).catch(() => {});
     window.close();
+  });
+
+  // Persona selector
+  $('selectPersona').addEventListener('change', async (e) => {
+    const persona = e.target.value;
+    try {
+      const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
+      settings.stealthPersona = persona;
+      await chrome.runtime.sendMessage({ type: 'SET_SETTINGS', payload: settings });
+      
+      // Reload the tab to apply the new User-Agent immediately
+      chrome.tabs.reload(currentTab.id);
+      window.close();
+    } catch (err) {
+      console.error('Failed to update persona:', err);
+    }
   });
 }
 

@@ -309,7 +309,7 @@ body {
   background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  overflow: hidden;
+  overflow: auto; /* Enable both horizontal and vertical scroll if needed */
   display: flex;
   flex-direction: column;
   max-height: 600px;
@@ -324,11 +324,19 @@ body {
   text-transform: uppercase;
   color: var(--text-muted);
   border-bottom: 1px solid var(--border);
+  min-width: 100%;
+  width: max-content;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
 }
 
 .logger-items {
-  overflow-y: auto;
   min-height: 200px;
+  min-width: 100%;
+  width: max-content;
+  flex: 1;
 }
 
 .log-entry {
@@ -338,6 +346,8 @@ body {
   border-bottom: 1px solid var(--border);
   font-family: 'Fira Code', 'Consolas', monospace;
   transition: var(--transition);
+  min-width: 100%;
+  width: max-content;
 }
 .log-entry:hover { background: rgba(255,255,255,0.03); }
 .log-entry:last-child { border-bottom: none; }
@@ -345,7 +355,11 @@ body {
 .log-col-time { width: 70px; flex-shrink: 0; color: var(--text-muted); font-size: 11px; }
 .log-col-type { width: 80px; flex-shrink: 0; }
 .log-col-action { width: 80px; flex-shrink: 0; }
-.log-col-info { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-col-info {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+}
 
 .log-badge {
   display: inline-block;

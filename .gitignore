@@ -8,3 +8,4 @@ rules/*.json
 release/
 .idea/
 .claude/
+wasm-core/target/

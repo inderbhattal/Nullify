@@ -121,6 +121,11 @@
         "id": "anti-adblock",
         "enabled": false,
         "path": "rules/anti-adblock.json"
+      },
+      {
+        "id": "ubo-cookie-annoyances",
+        "enabled": true,
+        "path": "rules/ubo-cookie-annoyances.json"
       }
     ]
   },

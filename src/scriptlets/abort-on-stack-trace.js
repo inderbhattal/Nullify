@@ -17,7 +17,8 @@ export function abortOnStackTrace(prop, search) {
   obj[lastProp] = function (...args) {
     const stack = new Error().stack || '';
     if (re.test(stack)) {
-      throw new ReferenceError(`AdBlock: ${prop} aborted (stack trace match)`);
+      console.log(`[Nullify] Silently aborted ${prop} via stack trace match`);
+      return undefined;
     }
     return original.apply(this, args);
   };

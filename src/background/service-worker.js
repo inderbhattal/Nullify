@@ -507,6 +507,7 @@ async function initializeDefaults() {
     'ubo-unbreak': true,
     'system-unbreak': true,
     'anti-adblock': true,
+    'ubo-cookie-annoyances': true,
   });
 
   console.log('[AdBlock] Defaults initialized');
@@ -567,6 +568,12 @@ async function applyHeaderRules(enabled) {
     return;
   }
 
+  // Security domains that MUST see original headers to pass human verification
+  const excludedDomains = [
+    'px-cloud.net', 'perimeterx.net', 'cloudflare.com', 'hcaptcha.com', 
+    'google.com', 'gstatic.com', 'recaptcha.net', 'akamai.com'
+  ];
+
   const rules = [
     {
       id: DNR_HEADER_RULES_START,
@@ -577,7 +584,8 @@ async function applyHeaderRules(enabled) {
       },
       condition: {
         domainType: 'thirdParty',
-        resourceTypes: ['script', 'xmlhttprequest', 'other']
+        resourceTypes: ['script', 'xmlhttprequest', 'other'],
+        excludedRequestDomains: excludedDomains
       }
     },
     {
@@ -589,7 +597,8 @@ async function applyHeaderRules(enabled) {
       },
       condition: {
         domainType: 'thirdParty',
-        resourceTypes: ['script', 'xmlhttprequest', 'other']
+        resourceTypes: ['script', 'xmlhttprequest', 'other'],
+        excludedRequestDomains: excludedDomains
       }
     }
   ];
@@ -984,11 +993,35 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   const { request, rule } = info;
 
-  const ALLOW_RULESETS = ['ubo-unbreak', 'anti-adblock', 'system-unbreak', '_allowlist'];
-  const isAllow = ALLOW_RULESETS.some(id => rule.rulesetId.includes(id));
+  // 1. Determine action from ID ranges (new robust system)
+  let actionLabel = 'block';
+  let isAllow = false;
+
+  const id = rule.ruleId;
+  const ruleset = rule.rulesetId;
+
+  // Check static rulesets (exceptions assigned 1,000,000+ range by compiler)
+  if (id >= 1000000) {
+    isAllow = true;
+    actionLabel = 'allow';
+  } 
+  // Check known allow-only static rulesets
+  else if (['ubo-unbreak', 'anti-adblock', 'system-unbreak', '_allowlist'].some(r => ruleset.includes(r))) {
+    isAllow = true;
+    actionLabel = 'allow';
+  }
+  // Handle Dynamic Rules categorization
+  else if (ruleset === '_dynamic') {
+    if (id >= 990000) {
+      isAllow = true;
+      actionLabel = 'allow';
+    } else if (id >= 800000 && id < 900000) {
+      actionLabel = 'modify';
+    }
+  }
 
   // Track stats
-  if (rule.rulesetId !== '_dynamic' && rule.rulesetId !== '_session') {
+  if (ruleset !== '_dynamic' && ruleset !== '_session') {
     if (!tabStats.has(request.tabId)) {
       tabStats.set(request.tabId, { blocked: 0, trackers: 0, url: request.url });
     }
@@ -996,7 +1029,7 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
     const stats = tabStats.get(request.tabId);
 
     // Only count as 'blocked' if it's an actual block rule
-    if (!isAllow) {
+    if (actionLabel === 'block') {
       stats.blocked++;
 
       // Classify as tracker if from privacy/malware lists OR matches tracker keywords
@@ -1019,8 +1052,8 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
 
   broadcastLoggerEvent({
     type: 'network',
-    action: isAllow ? 'allow' : 'block',
-    isTracker: !isAllow && (rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware'),
+    action: actionLabel,
+    isTracker: actionLabel === 'block' && (rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware'),
     url: request.url,
     method: request.method,
     resourceType: request.type,
@@ -1150,11 +1183,15 @@ async function applyUserFilters(filtersText) {
   }
 
   let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
-  
+  let userScriptlets = [];
+
   if (wasmReady) {
     try {
       const parsed = JSON.parse(parse_filter_list_to_json(filtersText || ''));
       const allCosmetic = parsed.cosmeticRules || [];
+      const allScriptlets = parsed.scriptletRules || [];
+
+      userScriptlets = allScriptlets;
       const genericExceptions = new Set();
 
       for (const rule of allCosmetic) {
@@ -1183,6 +1220,7 @@ async function applyUserFilters(filtersText) {
   }
     
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
+  await setStorage('userScriptletRules', userScriptlets);
 
   // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately
   domainRulesCache.clear();
@@ -1299,7 +1337,7 @@ async function applyRulesets() {
 
   const allKnownListIds = [
     'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist',
-    'easyprivacy', 'malware', 'annoyances', 'anti-adblock'
+    'easyprivacy', 'malware', 'annoyances', 'anti-adblock', 'ubo-cookie-annoyances'
   ];
   
   const enableRulesetIds = [];
@@ -1725,9 +1763,15 @@ async function getCosmeticRulesForPage(hostname) {
 }
 
 async function getScriptletRulesForPage(hostname) {
-  if (!bloom) return [];
-  
-  const mightHaveRules = wasmReady 
+  const userScriptlets = (await getStorage('userScriptletRules')) || [];
+  const activeUserScriptlets = userScriptlets.filter(r => {
+    if (r.domains.length === 0) return true;
+    return r.domains.some(d => hostname === d || hostname.endsWith('.' + d));
+  });
+
+  if (!bloom) return activeUserScriptlets;
+
+  const mightHaveRules = wasmReady
     ? bloom.check_hostname(hostname)
     : (bloom.has('') || (() => {
         let d = hostname;
@@ -1740,10 +1784,10 @@ async function getScriptletRulesForPage(hostname) {
         return false;
       })());
 
-  if (!mightHaveRules) return [];
-  return await db.getScriptletRules(hostname);
+  if (!mightHaveRules) return activeUserScriptlets;
+  const dbRules = await db.getScriptletRules(hostname);
+  return [...dbRules, ...activeUserScriptlets];
 }
-
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
 function isHostnameAllowedCached(hostname) {
   if (!cachedAllowlist || cachedAllowlist.size === 0) return false;

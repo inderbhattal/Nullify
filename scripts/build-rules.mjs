@@ -10,7 +10,6 @@
  *
  * Usage:
  *   node scripts/build-rules.mjs            # Full build (downloads lists from internet)
- *   node scripts/build-rules.mjs --sample   # Generate minimal sample rules for dev/testing
  */
 
 import fs from 'fs';
@@ -20,8 +19,6 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
-
-const isSample = process.argv.includes('--sample');
 
 // ---------------------------------------------------------------------------
 // Filter list sources
@@ -39,7 +36,7 @@ const FILTER_LISTS = [
   },
   {
     id: 'annoyances',
-    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances.txt',
+    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/annoyances.txt',
     description: 'uBO Annoyances — Popups, cookie banners, social overlays',
   },
   {
@@ -49,18 +46,23 @@ const FILTER_LISTS = [
   },
   {
     id: 'ubo-filters',
-    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt',
+    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/filters.txt',
     description: 'uBlock Origin default filters',
   },
   {
     id: 'ubo-unbreak',
-    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt',
+    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/unbreak.txt',
     description: 'uBlock Origin unbreak list',
   },
   {
     id: 'anti-adblock',
-    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt',
+    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/badware.txt',
     description: 'uBlock Origin Anti-Adblock / Badware Filters',
+  },
+  {
+    id: 'ubo-cookie-annoyances',
+    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/annoyances-cookies.txt',
+    description: 'uBO Cookie Annoyances — Cookie banners and consent popups',
   },
 ];
 
@@ -94,8 +96,38 @@ async function fetchAndExpand(url, depth = 0) {
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
   const lines = [];
 
+  // Simple state machine for !#if / !#else / !#endif
+  // We assume we are in a 'chromium' environment
+  const stack = [true];
+
   for (const line of text.split('\n')) {
-    const m = line.trim().match(/^!#include\s+(.+)$/);
+    const trimmed = line.trim();
+
+    // 1. Handle conditionals
+    if (trimmed.startsWith('!#if')) {
+      const condition = trimmed.slice(4).trim();
+      // Simple logic: if it mentions 'chromium' or 'cap_dnr', it's true for us
+      const isTrue = condition.includes('env_chromium') || condition.includes('cap_dnr') || !condition.includes('env_');
+      stack.push(isTrue && stack[stack.length - 1]);
+      continue;
+    }
+    if (trimmed.startsWith('!#else')) {
+      const prev = stack.pop();
+      const parent = stack[stack.length - 1];
+      stack.push(!prev && parent);
+      continue;
+    }
+    if (trimmed.startsWith('!#endif')) {
+      stack.pop();
+      if (stack.length === 0) stack.push(true); // safety
+      continue;
+    }
+
+    // Skip if current branch is inactive
+    if (!stack[stack.length - 1]) continue;
+
+    // 2. Handle includes
+    const m = trimmed.match(/^!#include\s+(.+)$/);
     if (m) {
       const includePath = m[1].trim();
       const includeUrl = includePath.startsWith('http') ? includePath : baseUrl + includePath;
@@ -136,7 +168,11 @@ const RESOURCE_TYPE_MAP = {
 const ALL_RESOURCE_TYPES = Object.values(RESOURCE_TYPE_MAP);
 
 let ruleIdCounter = 1;
-function nextId() { return ruleIdCounter++; }
+let exceptionIdCounter = 1000000;
+
+function nextId(isException = false) { 
+  return isException ? exceptionIdCounter++ : ruleIdCounter++; 
+}
 
 /**
  * Parse scriptlet argument string, respecting quoted commas.
@@ -173,7 +209,7 @@ function parseLine(line) {
   // Skip comments and empty lines
   if (!line || line.startsWith('!') || line.startsWith('[')) return null;
   // Skip Adblock Plus-specific directives
-  if (line.startsWith('%') || line.startsWith('@@#')) return null;
+  if (line.startsWith('@@#')) return null;
 
   // ---- Scriptlet injections (MUST come before generic ## check) ----
   // example.com##+js(scriptlet-name, arg1, arg2)
@@ -316,12 +352,15 @@ function parseOptions(optionsStr) {
     } else if (optName === 'popup') {
       options.resourceTypes.push('main_frame');
     } else if (optName === 'inline-script') {
-      // Can't block inline scripts in MV3, skip
-      return null;
+      // Manifest V3 can't block inline scripts.
+      // We don't skip the rule, we just ignore this specific option
+      // so other options in the same rule (like $script) still apply.
     } else if (optName === 'genericblock' || optName === 'generichide') {
-      return null; // Complex, skip
+      // Treat as a general exception for the pattern
+      options.important = true; 
     } else if (optName === 'elemhide' || optName === 'specifichide') {
-      return null; // Handled in cosmetic engine
+      // Treat as a general exception
+      options.important = true;
     }
     // Ignore unknown options silently (many are optional/metadata)
   }
@@ -447,6 +486,16 @@ function networkFilterToDNR(parsed) {
   let urlFilter = null;
   let regexFilter = null;
 
+  // Blacklist: Reject known broken/overly-broad upstream patterns
+  const patternBlacklist = [
+    '://www.*.com/*.css|',
+    'www.*.com/*.css',
+  ];
+  if (patternBlacklist.includes(pattern)) {
+    // console.log(`   🚫 Rejecting blacklisted broad pattern: ${pattern}`);
+    return null;
+  }
+
   if (pattern.startsWith('/') && pattern.endsWith('/')) {
     // Regex filter — Chrome DNR compiles with RE2 under a 2KB program memory limit.
     //
@@ -552,7 +601,7 @@ function networkFilterToDNR(parsed) {
   }
 
   return {
-    id: nextId(),
+    id: nextId(exception),
     priority: rulePriority,
     condition,
     action,
@@ -574,7 +623,16 @@ const KNOWN_TLDS = new Set([
 /** Convert ABP-style URL pattern to DNR urlFilter */
 function convertPatternToUrlFilter(pattern) {
   if (!pattern || pattern === '*') return null; // Too broad
-  if (pattern.length < 4) return null; // Too short
+  
+  // 1. Decode URL-encoded characters (e.g. %2F -> /)
+  if (pattern.includes('%')) {
+    try {
+      const decoded = decodeURIComponent(pattern);
+      if (decoded && decoded.trim().length > 0) pattern = decoded;
+    } catch (e) {}
+  }
+
+  if (pattern.length < 2) return null; // Allow shorter path rules (e.g. /a)
 
   // DNR urlFilter must be ASCII-only
   if (/[^\x00-\x7F]/.test(pattern)) return null;
@@ -625,16 +683,24 @@ function getBlankRedirectUrl(resourceType) {
 /**
  * Parse a complete filter list text into categorized rule sets.
  */
-function parseFilterList(text) {
+function parseFilterList(text, listId = 'unknown') {
   const networkRules = [];
   const cosmeticRules = [];
   const cosmeticExceptions = [];
   const scriptletRules = [];
   let skipped = 0;
+  const skippedExamples = [];
 
   for (const line of text.split('\n')) {
     const parsed = parseLine(line);
-    if (!parsed) { skipped++; continue; }
+    if (!parsed) { 
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('!') && !trimmed.startsWith('[')) {
+        skipped++; 
+        if (skippedExamples.length < 50) skippedExamples.push(trimmed);
+      }
+      continue; 
+    }
 
     if (parsed.type === 'network') {
       networkRules.push(parsed);
@@ -644,6 +710,11 @@ function parseFilterList(text) {
     } else if (parsed.type === 'scriptlet') {
       scriptletRules.push(parsed);
     }
+  }
+
+  if (skipped > 0) {
+    console.log(`   ℹ️  Examples of skipped rules for ${listId}:`);
+    skippedExamples.slice(0, 5).forEach(s => console.log(`      - ${s.slice(0, 100)}${s.length > 100 ? '...' : ''}`));
   }
 
   return { networkRules, cosmeticRules, cosmeticExceptions, scriptletRules, skipped };
@@ -678,86 +749,6 @@ function buildDNRRules(networkRules) {
 // ---------------------------------------------------------------------------
 // Sample rules generator (for development without internet access)
 // ---------------------------------------------------------------------------
-function generateSampleRules(listId) {
-  const SAMPLE_NETWORK_RULES = [
-    { id: nextId(), priority: 1, condition: { urlFilter: '||doubleclick.net^', resourceTypes: ['script','image','xmlhttprequest'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||googlesyndication.com^', resourceTypes: ['script','image'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||googleadservices.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||adnxs.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||adsystem.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||advertising.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||tracking.com^', resourceTypes: ['xmlhttprequest', 'image'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||analytics.google.com^', resourceTypes: ['xmlhttprequest'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||facebook.com/tr*', resourceTypes: ['image','xmlhttprequest'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||google-analytics.com/collect*' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||pagead2.googlesyndication.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||ads.yahoo.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||quantserve.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||scorecardresearch.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||taboola.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||outbrain.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||criteo.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||rubiconproject.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||openx.net^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||pubmatic.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||33across.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||amazon-adsystem.com^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||bing.com/fd/ls/lsp.aspx' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||hotjar.com^', resourceTypes: ['script','xmlhttprequest'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||mixpanel.com^', resourceTypes: ['xmlhttprequest'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '*/beacon*', resourceTypes: ['ping','xmlhttprequest'] }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||segment.io^' }, action: { type: 'block' } },
-    { id: nextId(), priority: 1, condition: { urlFilter: '||amplitude.com^', resourceTypes: ['xmlhttprequest'] }, action: { type: 'block' } },
-    // HTTP→HTTPS upgrade
-    { id: nextId(), priority: 1, condition: { urlFilter: 'http://' }, action: { type: 'upgradeScheme' } },
-  ];
-
-  if (listId === 'easylist') return SAMPLE_NETWORK_RULES;
-
-  if (listId === 'easyprivacy') {
-    return [
-      { id: nextId(), priority: 1, condition: { urlFilter: '||graph.facebook.com/*/activities*' }, action: { type: 'block' } },
-      { id: nextId(), priority: 1, condition: { urlFilter: '||pixel.twitter.com^' }, action: { type: 'block' } },
-      { id: nextId(), priority: 1, condition: { urlFilter: '||connect.facebook.net/*/sdk.js' }, action: { type: 'block' } },
-      { id: nextId(), priority: 1, condition: { urlFilter: '||bat.bing.com^' }, action: { type: 'block' } },
-      { id: nextId(), priority: 1, condition: { urlFilter: '||tealiumiq.com^' }, action: { type: 'block' } },
-      { id: nextId(), priority: 1, condition: { urlFilter: '||go.microsoft.com/fwlink/?LinkID=*&clcid=*' }, action: { type: 'block' } },
-    ];
-  }
-
-  if (listId === 'annoyances') {
-    return [
-      { id: nextId(), priority: 1, condition: { urlFilter: '||widgets.outbrain.com^' }, action: { type: 'block' } },
-      { id: nextId(), priority: 1, condition: { urlFilter: '||cdn.syndication.twimg.com^' }, action: { type: 'block' } },
-    ];
-  }
-
-  if (listId === 'malware') {
-    return [
-      { id: nextId(), priority: 1, condition: { urlFilter: '||malware.example.com^' }, action: { type: 'block' } },
-    ];
-  }
-
-  if (listId === 'ubo-filters') {
-    return [
-      { id: nextId(), priority: 1, condition: { urlFilter: '||cdn.jsdelivr.net/*/pubfig.min.js' }, action: { type: 'block' } },
-      { id: nextId(), priority: 2, condition: { urlFilter: '||fonts.googleapis.com^' }, action: { type: 'allow' } },
-    ];
-  }
-
-  if (listId === 'ubo-unbreak') {
-    return [
-      // Unbreak rules are mostly exceptions
-      { id: nextId(), priority: 3, condition: { urlFilter: '||cdn.jsdelivr.net/npm/*' }, action: { type: 'allow' } },
-    ];
-  }
-
-  if (listId === 'anti-adblock') {
-    return [];  // No network rules in sample — scriptlets handle anti-adblock
-  }
-
-  return [];
-}
 
 function generateSampleCosmeticRules() {
   return {
@@ -1023,74 +1014,57 @@ async function main() {
     'malware': { parts: 1, totalLimit: 30000 },
     'ubo-unbreak': { parts: 1, totalLimit: 30000 },
     'anti-adblock': { parts: 1, totalLimit: 30000 },
+    'ubo-cookie-annoyances': { parts: 1, totalLimit: 30000 },
   };
 
   const MAX_PER_FILE = 25000;
 
-  if (isSample) {
-    console.log('🔧 Generating sample rules (no network fetch)...\n');
+  console.log('📡 Downloading filter lists...\n');
 
-    for (const list of FILTER_LISTS) {
+  for (const list of FILTER_LISTS) {
+    try {
+      console.log(`⬇️  Fetching ${list.description}...`);
+      const text = await fetchAndExpand(list.url);
+      const parsed = parseFilterList(text, list.id);
+
+      console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skipped} skipped`);
       const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
-      const dnrRules = generateSampleRules(list.id);
+      let networkRules = parsed.networkRules;
       
+      if (networkRules.length > config.totalLimit) {
+        console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
+        networkRules = smartTruncate(networkRules, config.totalLimit);
+        console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept`);
+      }
+
+      const dnrRules = buildDNRRules(networkRules);
+      
+      // Split and write rules
       for (let i = 0; i < config.parts; i++) {
-        const chunk = i === 0 ? dnrRules : []; // Only put samples in the first file
+        const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
         const suffix = i === 0 ? '' : `_${i + 1}`;
         const outPath = path.join(RULES_DIR, `${list.id}${suffix}.json`);
         fs.writeFileSync(outPath, JSON.stringify(chunk, null, 2));
-        console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} rules`);
+        console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules written`);
       }
-    }
-  } else {
-    console.log('📡 Downloading filter lists...\n');
+      console.log('');
 
-    for (const list of FILTER_LISTS) {
-      try {
-        console.log(`⬇️  Fetching ${list.description}...`);
-        const text = await fetchAndExpand(list.url);
-        const parsed = parseFilterList(text);
-
-        console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skipped} skipped`);
-
-        const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
-        let networkRules = parsed.networkRules;
-        
-        if (networkRules.length > config.totalLimit) {
-          console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
-          networkRules = smartTruncate(networkRules, config.totalLimit);
-          console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept`);
-        }
-
-        const dnrRules = buildDNRRules(networkRules);
-        
-        // Split and write rules
-        for (let i = 0; i < config.parts; i++) {
-          const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
-          const suffix = i === 0 ? '' : `_${i + 1}`;
-          const outPath = path.join(RULES_DIR, `${list.id}${suffix}.json`);
-          fs.writeFileSync(outPath, JSON.stringify(chunk, null, 2));
-          console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules written`);
-        }
-        console.log('');
-
-        // Merge cosmetic/scriptlet rules
-        for (const r of parsed.cosmeticRules) {
-          if (r.domains.length === 0) {
-            allCosmeticRules.generic.push(r.selector);
-          } else {
-            for (const d of r.domains) {
-              if (!allCosmeticRules.domainSpecific[d]) allCosmeticRules.domainSpecific[d] = [];
-              allCosmeticRules.domainSpecific[d].push(r.selector);
-            }
+      // Merge cosmetic/scriptlet rules
+      for (const r of parsed.cosmeticRules) {
+        if (r.domains.length === 0) {
+          allCosmeticRules.generic.push(r.selector);
+        } else {
+          for (const d of r.domains) {
+            if (!allCosmeticRules.domainSpecific[d]) allCosmeticRules.domainSpecific[d] = [];
+            allCosmeticRules.domainSpecific[d].push(r.selector);
           }
         }
-        for (const r of parsed.scriptletRules) {
-          allScriptletRules.push(r);
-        }
-      } catch (err) {
-        console.error(`❌ Failed to process ${list.id}: ${err.message}`);
       }
+      for (const r of parsed.scriptletRules) {
+        allScriptletRules.push(r);
+      }
+    } catch (err) {
+      console.error(`❌ Failed to process ${list.id}: ${err.message}`);
     }
   }
 

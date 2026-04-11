@@ -10,6 +10,7 @@ const FILTER_LIST_NAMES = {
   easylist: 'EasyList',
   easyprivacy: 'EasyPrivacy',
   annoyances: 'Annoyances',
+  'ubo-cookie-annoyances': 'Cookie Annoyances',
   malware: 'Malware',
   'ubo-filters': 'uBO Filters',
   'ubo-unbreak': 'uBO Unbreak',

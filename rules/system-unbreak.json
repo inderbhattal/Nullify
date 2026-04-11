@@ -66,9 +66,45 @@
     "action": { "type": "block" }
   },
   {
-    "id": 12,
+    "id": 100,
+    "priority": 1100,
+    "condition": { "urlFilter": "||datadome.co^" },
+    "action": { "type": "block" }
+  },
+  {
+    "id": 101,
+    "priority": 1100,
+    "condition": { "urlFilter": "||fingerprintjs.com^" },
+    "action": { "type": "block" }
+  },
+  {
+    "id": 102,
+    "priority": 1100,
+    "condition": { "urlFilter": "||fpjs.io^" },
+    "action": { "type": "block" }
+  },
+  {
+    "id": 200,
     "priority": 1000,
-    "condition": { "urlFilter": "||chatgpt.com/cdn/assets/*" },
+    "condition": { "urlFilter": "||cloudflare.com/cdn-cgi/challenge-platform/*" },
+    "action": { "type": "allow" }
+  },
+  {
+    "id": 201,
+    "priority": 1000,
+    "condition": { "urlFilter": "||challenges.cloudflare.com/*" },
+    "action": { "type": "allow" }
+  },
+  {
+    "id": 202,
+    "priority": 1000,
+    "condition": { "urlFilter": "||px-cloud.net/*" },
+    "action": { "type": "allow" }
+  },
+  {
+    "id": 203,
+    "priority": 1000,
+    "condition": { "urlFilter": "||perimeterx.net/*" },
     "action": { "type": "allow" }
   }
 ]

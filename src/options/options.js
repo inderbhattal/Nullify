@@ -10,6 +10,7 @@ const FILTER_LISTS = [
   { id: 'easylist',     name: 'EasyList',        desc: 'The most widely used ad-blocking filter list' },
   { id: 'easyprivacy',  name: 'EasyPrivacy',      desc: 'Tracker, analytics, and surveillance blocking' },
   { id: 'annoyances',   name: 'Fanboy Annoyances', desc: 'Cookie notices, popups, social overlays' },
+  { id: 'ubo-cookie-annoyances', name: 'uBO Cookie Annoyances', desc: 'Surgically targets cookie consent and tracking notices' },
   { id: 'malware',      name: 'Malware Blocklist', desc: 'Blocks malware and phishing URLs' },
   { id: 'ubo-filters',  name: 'uBO Filters',       desc: 'uBlock Origin default filter list' },
   { id: 'ubo-unbreak',  name: 'uBO Unbreak',       desc: 'Fixes over-blocking by other lists' },
@@ -463,7 +464,7 @@ class LiveLogger {
     const time = new Date(e.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
     
     const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
-    const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : e.action === 'remove' ? 'badge-remove' : 'badge-hide';
+    const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : e.action === 'modify' ? 'badge-modify' : e.action === 'remove' ? 'badge-remove' : 'badge-hide';
     const trackerBadge = e.isTracker ? '<span class="log-badge" style="background:rgba(255,121,198,0.15);color:#ff79c6;margin-left:4px">tracker</span>' : '';
     const entityBadge = e.entity ? `<span class="log-badge" style="background:rgba(88,166,255,0.15);color:#58a6ff;margin-left:4px">${this.esc(e.entity)}</span>` : '';
 
@@ -471,7 +472,7 @@ class LiveLogger {
     if (e.type === 'network') {
       infoHtml = `<span class="log-url" title="Click to copy: ${this.esc(e.url)}" data-copy="${this.esc(e.url)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.url)}</span>
                   ${trackerBadge} ${entityBadge}
-                  <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}</span>`;
+                  <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}#${e.ruleId}</span>`;
     } else {
       infoHtml = `<span class="log-selector" title="Click to copy: ${this.esc(e.selector)}" data-copy="${this.esc(e.selector)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.selector)}</span>
                   <span class="log-extra" title="${this.esc(e.hostname)}">${this.esc(e.hostname)}</span>`;

@@ -374,6 +374,7 @@ body {
 .badge-cosmetic { background: rgba(210,153,34,0.15); color: var(--yellow); }
 .badge-block { color: var(--red); }
 .badge-allow { color: var(--accent2); }
+.badge-modify { color: var(--accent); font-style: italic; }
 .badge-hide { color: var(--yellow); }
 .badge-remove { color: #f85149; font-style: italic; }
 

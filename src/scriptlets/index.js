@@ -44,6 +44,7 @@ import { m3uPrune } from './m3u-prune.js';
 import { hideWindowError } from './hide-window-error.js';
 import { fingerprintNoise } from './fingerprint-noise.js';
 import { batterySpoof } from './battery-spoof.js';
+import { botStealth } from './bot-stealth.js';
 
 // ---------------------------------------------------------------------------
 // Registry — maps scriptlet name (and aliases) to implementation
@@ -133,6 +134,8 @@ const REGISTRY = new Map([
   ['fpn', fingerprintNoise],
   ['battery-spoof', batterySpoof],
   ['bs', batterySpoof],
+  ['bot-stealth', botStealth],
+  ['stealth', botStealth],
 ]);
 
 // ---------------------------------------------------------------------------

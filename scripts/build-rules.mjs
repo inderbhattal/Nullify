@@ -891,6 +891,121 @@ function generateSampleScriptletRules() {
 }
 
 // ---------------------------------------------------------------------------
+// Smart rule selection (used when a filter list exceeds the DNR rule limit)
+// ---------------------------------------------------------------------------
+
+/**
+ * Score a parsed network rule by its expected coverage breadth.
+ * Higher score = block more traffic = keep when budget is tight.
+ *
+ * Tiers:
+ *   10000 — Exception (allow) rules: must keep to prevent false positives
+ *    500  — !important flag
+ *    300  — Domain-only anchor (||domain.com^ covers all paths/types)
+ *    150  — Domain anchor with path (||domain.com/path)
+ *    100  — No resource-type restriction (matches every request type)
+ *     80  — Non-anchored double-pipe (covers subdomains too)
+ *     50  — No initiator/request domain restrictions
+ *     50  — 3+ resource types listed
+ *     20  — Generic substring / other pattern
+ *    -10  — Third-party-only restriction (reduces coverage)
+ *    -30  — Regex rule (narrow, Chrome NFA budget is tight)
+ */
+function scoreNetworkRule(rule) {
+  const { pattern, options, exception } = rule;
+  let score = 0;
+
+  if (exception) return 10000;                 // Always keep allow rules
+  if (options.important) score += 500;
+
+  // Pattern breadth
+  if (/^\|\|[^/*?^]+\^?$/.test(pattern)) {
+    score += 300;                              // Domain-only anchor (broadest)
+  } else if (pattern.startsWith('||')) {
+    score += 150;                              // Domain anchor + path
+  } else if (pattern.startsWith('|https://') || pattern.startsWith('|http://')) {
+    score += 50;
+  } else {
+    score += 20;                               // Generic / substring
+  }
+
+  // Resource-type breadth
+  if (options.resourceTypes.length === 0) {
+    score += 100;
+  } else if (options.resourceTypes.length >= 3) {
+    score += 50;
+  } else {
+    score += 10;
+  }
+
+  // Domain restriction breadth
+  if (options.initiatorDomains.length === 0 && options.requestDomains.length === 0) {
+    score += 50;
+  }
+
+  // Penalties
+  if (options.thirdParty !== null && options.thirdParty !== undefined) score -= 10;
+  if (pattern.startsWith('/') && pattern.endsWith('/')) score -= 30;
+
+  return score;
+}
+
+/**
+ * Trim `networkRules` (parsed ABP objects) to at most `limit` entries
+ * using three passes:
+ *
+ *  1. Early dedup — drop rules with identical (pattern + exception + important + types)
+ *     before scoring, so duplicates don't consume budget.
+ *
+ *  2. Score & sort — rank surviving rules by coverage breadth (see scoreNetworkRule).
+ *
+ *  3. Subsumption filter — once we have a domain-only anchor rule (||domain.com^),
+ *     skip any more-specific rule whose pattern is anchored to the same domain
+ *     (e.g. ||domain.com/specific/path) — it's already covered.
+ */
+function smartTruncate(networkRules, limit) {
+  // Pass 1: early ABP-level dedup
+  const abpSeen = new Set();
+  networkRules = networkRules.filter(r => {
+    const key = `${r.pattern}|${r.exception ? 1 : 0}|${r.options.important ? 1 : 0}|${r.options.resourceTypes.join(',')}`;
+    if (abpSeen.has(key)) return false;
+    abpSeen.add(key);
+    return true;
+  });
+  console.log(`   🔍 After early dedup: ${networkRules.length} rules`);
+
+  if (networkRules.length <= limit) return networkRules;
+
+  // Pass 2: score & sort descending
+  networkRules.sort((a, b) => scoreNetworkRule(b) - scoreNetworkRule(a));
+
+  // Pass 3: subsumption — domain-only anchors subsume path-specific anchors
+  const dominantDomains = new Set();
+  const selected = [];
+
+  for (const r of networkRules) {
+    if (selected.length >= limit) break;
+
+    const isDomainOnly = /^\|\|([^/*?^]+)\^?$/.exec(r.pattern);
+    if (isDomainOnly && !r.exception) {
+      dominantDomains.add(isDomainOnly[1]);
+      selected.push(r);
+      continue;
+    }
+
+    // Skip if a broader rule for this domain is already selected
+    if (!r.exception && r.pattern.startsWith('||')) {
+      const domainMatch = /^\|\|([^/*?^]+)/.exec(r.pattern);
+      if (domainMatch && dominantDomains.has(domainMatch[1])) continue;
+    }
+
+    selected.push(r);
+  }
+
+  return selected;
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 async function main() {
@@ -922,14 +1037,9 @@ async function main() {
         let networkRules = parsed.networkRules;
         const RULE_LIMIT = 25000;
         if (networkRules.length > RULE_LIMIT) {
-          console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit. Truncating to ${RULE_LIMIT}...`);
-          // Prioritize: Exceptions first, then 'important' rules, then others.
-          networkRules.sort((a, b) => {
-            const priorityA = a.exception ? 3 : (a.options.important ? 2 : 1);
-            const priorityB = b.exception ? 3 : (b.options.important ? 2 : 1);
-            return priorityB - priorityA;
-          });
-          networkRules = networkRules.slice(0, RULE_LIMIT);
+          console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit. Applying smart selection to ${RULE_LIMIT}...`);
+          networkRules = smartTruncate(networkRules, RULE_LIMIT);
+          console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept`);
         }
 
         const dnrRules = buildDNRRules(networkRules);

@@ -17,14 +17,18 @@ import {getAllowlist, getStorage, getStorageBulk, setStorage, StorageKeys} from 
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
-import init, { 
-  BloomFilter as WasmBloom, 
-  parse_filter_list_to_json, 
-  compile_filters_to_dnr_json, 
-  KeywordMatcher, 
-  generate_gaussian_noise, 
-  optimize_cosmetic_rules_csv, 
-  serialize_rules_to_binary_from_json, 
+import init, {
+  BloomFilter as WasmBloom,
+  parse_filter_list_to_json,
+  compile_filters_to_dnr_json,
+  KeywordMatcher,
+  AllowlistMatcher,
+  UrlSanitizer,
+  classify_selectors_batch,
+  build_css_from_selectors,
+  generate_gaussian_noise,
+  optimize_cosmetic_rules_csv,
+  serialize_rules_to_binary_from_json,
   sanitize_url_with_csv,
   resolve_entity,
   is_semantic_ad,
@@ -48,6 +52,9 @@ const db = new RulesDB();
 let bloom = null;
 let wasmReady = false;
 let trackerMatcher = null;
+// Stateful WASM objects — built once, never rebuilt unless data changes.
+let allowlistMatcher = null;  // AllowlistMatcher: O(1) allowlist checks
+let urlSanitizer = null;      // UrlSanitizer: AC built once for tracking-param stripping
 const trackerKeywordsCsv = [
   'telemetry', 'analytics', 'tracking', 'pixel', 'beacon', 'metrics',
   'collect', 'segment', 'mixpanel', 'hotjar', 'amplitude', 'doubleclick',
@@ -243,6 +250,9 @@ function startInitialization() {
 
       // Initialize tracker detector using string-based interface
       trackerMatcher = new KeywordMatcher(trackerKeywordsCsv);
+      // Pre-build stateful objects — these never need rebuilding unless data changes.
+      urlSanitizer = new UrlSanitizer(trackerKeywordsCsv);
+      rebuildAllowlistMatcher();
 
       console.log('[Nullify] WASM Core initialized');
     } catch (err) {
@@ -315,6 +325,15 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   }
 });
 
+/** Rebuild the AllowlistMatcher after any allowlist mutation. */
+function rebuildAllowlistMatcher() {
+  if (!wasmReady) return;
+  if (allowlistMatcher) { allowlistMatcher.free(); allowlistMatcher = null; }
+  if (cachedAllowlist.size > 0) {
+    allowlistMatcher = new AllowlistMatcher(Array.from(cachedAllowlist).join(','));
+  }
+}
+
 async function refreshMemoryCache() {
   const data = await getStorageBulk([
     StorageKeys.SETTINGS,
@@ -324,12 +343,15 @@ async function refreshMemoryCache() {
 
   cachedSettings = data[StorageKeys.SETTINGS];
   cachedAllowlist = new Set(data[StorageKeys.ALLOWLIST] || []);
+  rebuildAllowlistMatcher(); // Rebuild with fresh allowlist data
 
   const genericSelectors = data[StorageKeys.GENERIC_CSS];
   if (Array.isArray(genericSelectors) && genericSelectors.length > 0) {
-    cachedGenericCss = genericSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
+    // Use WASM builder when ready for chunked, deduped CSS
+    cachedGenericCss = wasmReady
+      ? build_css_from_selectors(genericSelectors.join('\n'), '', 100)
+      : genericSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
   } else if (typeof genericSelectors === 'string' && genericSelectors.length > 0) {
-    // Backwards compat: old installs stored the full CSS string
     cachedGenericCss = genericSelectors;
   } else {
     cachedGenericCss = null;
@@ -1441,8 +1463,11 @@ async function handleMessage(message, sender) {
           delete responseData.cosmeticRules;
           
           // Also provide a sanitized URL for privacy reporting/cleanup
-          if (trackerMatcher && sender.tab?.url) {
-            responseData.sanitizedUrl = sanitize_url_with_csv(sender.tab.url, trackerKeywordsCsv);
+          if (sender.tab?.url) {
+            // urlSanitizer has the AC pre-built — no reconstruction per call.
+            responseData.sanitizedUrl = urlSanitizer
+              ? urlSanitizer.sanitize(sender.tab.url)
+              : sanitize_url_with_csv(sender.tab.url, trackerKeywordsCsv);
           }
         } catch (err) {
           console.error('[Nullify] Rule serialization/sanitization failed:', err);
@@ -1469,11 +1494,13 @@ async function handleMessage(message, sender) {
       await allowSite(payload.domain);
       cachedAllowlist.add(payload.domain);
       domainRulesCache.delete(payload.domain);
+      rebuildAllowlistMatcher();
       return { ok: true };
     case 'DISALLOW_SITE':
       await disallowSite(payload.domain);
       cachedAllowlist.delete(payload.domain);
       domainRulesCache.delete(payload.domain);
+      rebuildAllowlistMatcher();
       return { ok: true };
     case 'IS_SITE_ALLOWED': {
       return { allowed: isHostnameAllowedCached(payload.domain) };
@@ -1590,6 +1617,10 @@ async function getCosmeticRulesForPage(hostname) {
   if (!_criticalReady && _criticalPromise) await _criticalPromise;
   if (!bloom) return { generic: [], domainSpecific: [], exceptions: [] };
 
+  // Cache hit — onBeforeNavigate pre-warms this; GET_INIT_DATA reuses it.
+  const cached = domainRulesCache.get(hostname);
+  if (cached) return cached;
+
   // Deduplicate: If we are already fetching rules for this domain, return the same promise.
   if (_inFlightRules.has(hostname)) return _inFlightRules.get(hostname);
 
@@ -1656,7 +1687,9 @@ async function getCosmeticRulesForPage(hostname) {
 
   _inFlightRules.set(hostname, promise);
   try {
-    return await promise;
+    const result = await promise;
+    setCachedDomainRules(hostname, result); // Populate cache so GET_INIT_DATA skips IndexedDB
+    return result;
   } finally {
     _inFlightRules.delete(hostname);
   }
@@ -1685,11 +1718,9 @@ async function getScriptletRulesForPage(hostname) {
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
 function isHostnameAllowedCached(hostname) {
   if (!cachedAllowlist || cachedAllowlist.size === 0) return false;
-  
-  if (wasmReady) {
-    // Pass the cached array to WASM for fast checking
-    return check_allowlist_csv(hostname, Array.from(cachedAllowlist).join(','));
-  }
+
+  // AllowlistMatcher is built once and checks in O(1) — no Array/string alloc per call.
+  if (allowlistMatcher) return allowlistMatcher.check(hostname);
 
   let d = hostname;
   while (d) {
@@ -1728,19 +1759,16 @@ async function performEarlyInjection(tabId, urlStr) {
     setCachedDomainRules(hostname, rules);
   }
 
-  const cssSelectors = [];
+  // Rules from getCosmeticRulesForPage are already classified:
+  // strings = CSS-safe, objects with .plan = procedural. No re-scan needed.
   const allRules = [...(rules.generic || []), ...(rules.domainSpecific || [])];
   const exceptions = new Set(rules.exceptions || []);
-
-  for (const rule of allRules) {
-    if (!rule) continue;
-    if (typeof rule === 'object' && rule.plan) continue; // skip procedural
-    if (exceptions.has(rule)) continue;
-    if (!isProceduralSelector(rule)) cssSelectors.push(rule);
-  }
+  const cssSelectors = allRules.filter(r => typeof r === 'string' && !exceptions.has(r));
 
   if (cssSelectors.length > 0) {
-    const css = cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; opacity: 0 !important; height: 0 !important; overflow: hidden !important; }';
+    const css = wasmReady
+      ? build_css_from_selectors(cssSelectors.join('\n'), '', 150)
+      : cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
     chrome.scripting.insertCSS({
       target: { tabId, allFrames: true },
       css,
@@ -1748,10 +1776,10 @@ async function performEarlyInjection(tabId, urlStr) {
     }).catch(() => { });
   }
 
-  // 3. Inject Exceptions
-  const cssExceptions = rules.exceptions.filter(s => !isProceduralSelector(s));
+  // 3. Inject Exceptions — only CSS-safe ones (strings, not procedural objects)
+  const cssExceptions = (rules.exceptions || []).filter(s => typeof s === 'string');
   if (cssExceptions.length > 0) {
-    const css = cssExceptions.join(',') + ' { display: revert !important; visibility: revert !important; opacity: revert !important; height: revert !important; overflow: revert !important; }';
+    const css = cssExceptions.join(',') + ' { display: revert !important; visibility: revert !important; }';
     chrome.scripting.insertCSS({
       target: { tabId, allFrames: true },
       css,

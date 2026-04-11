@@ -1277,16 +1277,42 @@ async function rebuildAllowlistRules(allowlist) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Ruleset Groups (for split filter lists)
+// ---------------------------------------------------------------------------
+const RULESET_GROUPS = {
+  'easylist': ['easylist', 'easylist_2', 'easylist_3', 'easylist_4'],
+  'easyprivacy': ['easyprivacy', 'easyprivacy_2', 'easyprivacy_3'],
+  'ubo-filters': ['ubo-filters', 'ubo-filters_2'],
+};
+
+/**
+ * Get all underlying DNR ruleset IDs for a given list ID (UI-level ID).
+ */
+function getRulesetIdsForList(listId) {
+  return RULESET_GROUPS[listId] || [listId];
+}
+
 /** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
 async function applyRulesets() {
   const enabledMap = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
 
-  const allKnownIds = [
+  const allKnownListIds = [
     'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist',
     'easyprivacy', 'malware', 'annoyances', 'anti-adblock'
   ];
-  const enableRulesetIds = allKnownIds.filter(id => enabledMap[id] === true || id === 'system-unbreak');
-  const disableRulesetIds = allKnownIds.filter(id => !enableRulesetIds.includes(id));
+  
+  const enableRulesetIds = [];
+  const disableRulesetIds = [];
+
+  for (const listId of allKnownListIds) {
+    const rulesets = getRulesetIdsForList(listId);
+    if (enabledMap[listId] === true || listId === 'system-unbreak') {
+      enableRulesetIds.push(...rulesets);
+    } else {
+      disableRulesetIds.push(...rulesets);
+    }
+  }
 
   try {
     // 1. Try batch operation first (most efficient)
@@ -1317,16 +1343,19 @@ async function applyRulesets() {
   }
 }
 
-/** Enable or disable a static ruleset by ID. */async function setRulesetEnabled(rulesetId, enabled) {
+/** Enable or disable a static ruleset (or group) by ID. */
+async function setRulesetEnabled(rulesetId, enabled) {
+  const idsToChange = getRulesetIdsForList(rulesetId);
+
   if (enabled) {
     await chrome.declarativeNetRequest.updateEnabledRulesets({
-      enableRulesetIds: [rulesetId],
+      enableRulesetIds: idsToChange,
       disableRulesetIds: [],
     });
   } else {
     await chrome.declarativeNetRequest.updateEnabledRulesets({
       enableRulesetIds: [],
-      disableRulesetIds: [rulesetId],
+      disableRulesetIds: idsToChange,
     });
   }
 

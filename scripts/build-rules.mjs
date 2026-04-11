@@ -1014,14 +1014,33 @@ async function main() {
   const allCosmeticRules = generateSampleCosmeticRules();
   const allScriptletRules = generateSampleScriptletRules();
 
+  // Define how many parts each list is split into (matching manifest.json)
+  const LIST_CONFIG = {
+    'easylist': { parts: 4, totalLimit: 100000 },
+    'easyprivacy': { parts: 3, totalLimit: 75000 },
+    'ubo-filters': { parts: 2, totalLimit: 40000 },
+    'annoyances': { parts: 1, totalLimit: 30000 },
+    'malware': { parts: 1, totalLimit: 30000 },
+    'ubo-unbreak': { parts: 1, totalLimit: 30000 },
+    'anti-adblock': { parts: 1, totalLimit: 30000 },
+  };
+
+  const MAX_PER_FILE = 25000;
+
   if (isSample) {
     console.log('🔧 Generating sample rules (no network fetch)...\n');
 
     for (const list of FILTER_LISTS) {
+      const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
       const dnrRules = generateSampleRules(list.id);
-      const outPath = path.join(RULES_DIR, `${list.id}.json`);
-      fs.writeFileSync(outPath, JSON.stringify(dnrRules, null, 2));
-      console.log(`✅ ${list.id}.json — ${dnrRules.length} rules`);
+      
+      for (let i = 0; i < config.parts; i++) {
+        const chunk = i === 0 ? dnrRules : []; // Only put samples in the first file
+        const suffix = i === 0 ? '' : `_${i + 1}`;
+        const outPath = path.join(RULES_DIR, `${list.id}${suffix}.json`);
+        fs.writeFileSync(outPath, JSON.stringify(chunk, null, 2));
+        console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} rules`);
+      }
     }
   } else {
     console.log('📡 Downloading filter lists...\n');
@@ -1034,18 +1053,26 @@ async function main() {
 
         console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skipped} skipped`);
 
+        const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
         let networkRules = parsed.networkRules;
-        const RULE_LIMIT = 25000;
-        if (networkRules.length > RULE_LIMIT) {
-          console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit. Applying smart selection to ${RULE_LIMIT}...`);
-          networkRules = smartTruncate(networkRules, RULE_LIMIT);
+        
+        if (networkRules.length > config.totalLimit) {
+          console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
+          networkRules = smartTruncate(networkRules, config.totalLimit);
           console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept`);
         }
 
         const dnrRules = buildDNRRules(networkRules);
-        const outPath = path.join(RULES_DIR, `${list.id}.json`);
-        fs.writeFileSync(outPath, JSON.stringify(dnrRules, null, 2));
-        console.log(`✅ ${list.id}.json — ${dnrRules.length} DNR rules written\n`);
+        
+        // Split and write rules
+        for (let i = 0; i < config.parts; i++) {
+          const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
+          const suffix = i === 0 ? '' : `_${i + 1}`;
+          const outPath = path.join(RULES_DIR, `${list.id}${suffix}.json`);
+          fs.writeFileSync(outPath, JSON.stringify(chunk, null, 2));
+          console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules written`);
+        }
+        console.log('');
 
         // Merge cosmetic/scriptlet rules
         for (const r of parsed.cosmeticRules) {

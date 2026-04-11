@@ -58,9 +58,34 @@
         "path": "rules/easylist.json"
       },
       {
+        "id": "easylist_2",
+        "enabled": false,
+        "path": "rules/easylist_2.json"
+      },
+      {
+        "id": "easylist_3",
+        "enabled": false,
+        "path": "rules/easylist_3.json"
+      },
+      {
+        "id": "easylist_4",
+        "enabled": false,
+        "path": "rules/easylist_4.json"
+      },
+      {
         "id": "easyprivacy",
         "enabled": false,
         "path": "rules/easyprivacy.json"
+      },
+      {
+        "id": "easyprivacy_2",
+        "enabled": false,
+        "path": "rules/easyprivacy_2.json"
+      },
+      {
+        "id": "easyprivacy_3",
+        "enabled": false,
+        "path": "rules/easyprivacy_3.json"
       },
       {
         "id": "annoyances",
@@ -76,6 +101,11 @@
         "id": "ubo-filters",
         "enabled": false,
         "path": "rules/ubo-filters.json"
+      },
+      {
+        "id": "ubo-filters_2",
+        "enabled": false,
+        "path": "rules/ubo-filters_2.json"
       },
       {
         "id": "ubo-unbreak",

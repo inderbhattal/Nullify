@@ -24,10 +24,10 @@ import init, {
   KeywordMatcher,
   AllowlistMatcher,
   UrlSanitizer,
-  classify_selectors_batch,
   build_css_from_selectors,
   generate_gaussian_noise,
-  optimize_cosmetic_rules_csv,
+  plan_selector_rules_json,
+  reduce_cosmetic_rules_json,
   serialize_rules_to_binary_from_json,
   sanitize_url_with_csv,
   resolve_entity,
@@ -65,15 +65,15 @@ const trackerKeywordsCsv = [
 let cachedSettings = null;
 let cachedAllowlist = new Set();
 let cachedGenericCss = null;
-let domainRulesCache = new Map(); // hostname -> rules (LRU, max 100 entries)
+let domainRulesCache = new Map(); // hostname -> packaged page bundle (LRU, max 100 entries)
 const DOMAIN_RULES_CACHE_MAX = 100;
 
-function setCachedDomainRules(hostname, rules) {
+function setCachedDomainRules(hostname, bundle) {
   // Evict oldest entry when at capacity (Map preserves insertion order)
   if (domainRulesCache.size >= DOMAIN_RULES_CACHE_MAX) {
     domainRulesCache.delete(domainRulesCache.keys().next().value);
   }
-  domainRulesCache.set(hostname, rules);
+  domainRulesCache.set(hostname, bundle);
 }
 let genericCssLoaded = false;
 
@@ -198,6 +198,125 @@ function parseProceduralPlan(selector) {
 const DNR_USER_RULES_START = 900_000;
 const DNR_ALLOWLIST_START = 990_000;
 
+function classifyAndPlanSelectors(selectors) {
+  const cleanSelectors = selectors
+    .filter((selector) => typeof selector === 'string')
+    .map((selector) => selector.trim())
+    .filter(Boolean);
+
+  if (wasmReady) {
+    try {
+      return JSON.parse(plan_selector_rules_json(JSON.stringify(cleanSelectors)));
+    } catch (err) {
+      console.error('[Nullify] WASM selector planning failed:', err);
+    }
+  }
+
+  const cssSelectors = [];
+  const proceduralRules = [];
+  for (const selector of cleanSelectors) {
+    if (isProceduralSelector(selector)) {
+      proceduralRules.push({ selector, plan: parseProceduralPlan(selector) });
+    } else {
+      cssSelectors.push(selector);
+    }
+  }
+
+  return { cssSelectors, proceduralRules };
+}
+
+function reduceCosmeticRules(cosmetic) {
+  if (wasmReady) {
+    try {
+      return JSON.parse(reduce_cosmetic_rules_json(
+        JSON.stringify(cosmetic.generic || []),
+        JSON.stringify(cosmetic.domainSpecific || {}),
+        JSON.stringify(cosmetic.exceptions || {})
+      ));
+    } catch (err) {
+      console.error('[Nullify] WASM cosmetic reduction failed:', err);
+    }
+  }
+
+  const generic = [...new Set((cosmetic.generic || []).filter(Boolean))];
+  const genericSet = new Set(generic);
+  const domainSpecific = {};
+
+  for (const [domain, selectors] of Object.entries(cosmetic.domainSpecific || {})) {
+    const deduped = [...new Set((selectors || []).filter((selector) => selector && !genericSet.has(selector)))];
+    if (deduped.length > 0) {
+      domainSpecific[domain] = deduped;
+    }
+  }
+
+  for (const [domain, selectors] of Object.entries(cosmetic.exceptions || {})) {
+    if (!domainSpecific[domain]) domainSpecific[domain] = [];
+    const seen = new Set(domainSpecific[domain]);
+    for (const selector of selectors || []) {
+      const prefixed = '__exception__' + selector;
+      if (!seen.has(prefixed)) {
+        seen.add(prefixed);
+        domainSpecific[domain].push(prefixed);
+      }
+    }
+  }
+
+  Object.keys(domainSpecific).forEach((domain) => {
+    if (domainSpecific[domain].length === 0) delete domainSpecific[domain];
+  });
+
+  return { generic, domainSpecific };
+}
+
+function buildPageBundle(rawRules) {
+  const exceptions = [...new Set((rawRules.exceptions || []).filter((selector) => typeof selector === 'string' && selector.trim()))];
+  const exceptionSet = new Set(exceptions);
+  const activeSelectors = [
+    ...(rawRules.generic || []),
+    ...(rawRules.domainSpecific || []),
+  ].filter((selector) => typeof selector === 'string' && selector.trim() && !exceptionSet.has(selector));
+
+  const planned = classifyAndPlanSelectors(activeSelectors);
+  const proceduralRules = planned.proceduralRules || [];
+  const cssSelectors = planned.cssSelectors || [];
+
+  const rules = {
+    generic: [],
+    domainSpecific: proceduralRules,
+    exceptions,
+  };
+
+  const cssText = cssSelectors.length > 0
+    ? (wasmReady
+        ? build_css_from_selectors(cssSelectors.join('\n'), '', 150)
+        : cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }')
+    : '';
+
+  const exceptionCss = exceptions.length > 0
+    ? exceptions.join(',') + ' { display: revert !important; visibility: revert !important; }'
+    : '';
+
+  let cosmeticRulesBinary = null;
+  if (wasmReady) {
+    try {
+      cosmeticRulesBinary = serialize_rules_to_binary_from_json(
+        JSON.stringify([]),
+        JSON.stringify(proceduralRules.map((rule) => JSON.stringify(rule))),
+        JSON.stringify(exceptions)
+      );
+    } catch (err) {
+      console.error('[Nullify] WASM page bundle serialization failed:', err);
+    }
+  }
+
+  return {
+    rules,
+    cssText,
+    exceptionCss,
+    cosmeticRulesBinary,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Install / startup
 // ---------------------------------------------------------------------------
@@ -244,7 +363,7 @@ function startInitialization() {
   _criticalPromise = (async () => {
     // Stage 0: Initialize WASM
     try {
-      const wasmUrl = chrome.runtime.getURL('src/shared/wasm/nullify_core_bg.wasm');
+      const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
       await init({ module_or_path: wasmUrl });
       wasmReady = true;
 
@@ -294,35 +413,6 @@ chrome.runtime.onStartup.addListener(() => {
     if (chrome.runtime.lastError) { /* ignore */ }
   });
   startInitialization();
-});
-
-chrome.runtime.onInstalled.addListener(async (details) => {
-  console.log('[AdBlock] onInstalled:', details.reason);
-
-  chrome.contextMenus.create({
-    id: 'nullify-block-element',
-    title: 'Block element...',
-    contexts: ['all'],
-  }, () => {
-    if (chrome.runtime.lastError) { /* ignore */ }
-  });
-
-  try {
-    if (details.reason === 'install') {
-      await initializeDefaults();
-    }
-
-    await ingestRules(); // Build initial rule index
-    await startInitialization();
-
-    // Update badge for all existing tabs
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      updateBadge(tab.id);
-    }
-  } catch (err) {
-    console.error('[Nullify] onInstalled handler failed:', err);
-  }
 });
 
 /** Rebuild the AllowlistMatcher after any allowlist mutation. */
@@ -866,12 +956,6 @@ async function checkFilterListUpdates() {
       }
     }
 
-    // 4. Deduplicate cosmetic rules (bundled entries win, appearing first in Set)
-    mergedCosmetic.generic = [...new Set(mergedCosmetic.generic)];
-    for (const d of Object.keys(mergedCosmetic.domainSpecific)) {
-      mergedCosmetic.domainSpecific[d] = [...new Set(mergedCosmetic.domainSpecific[d])];
-    }
-
     // 5. Deduplicate scriptlets by name+domains fingerprint
     const scriptletSeen = new Set();
     const dedupedScriptlets = mergedScriptlets.filter(r => {
@@ -881,32 +965,10 @@ async function checkFilterListUpdates() {
       return true;
     });
 
-    // 6. Merge domain-specific exceptions into domainSpecific store for retrieval
-    // Store them with a special prefix so getCosmeticRulesForPage can identify them
-    for (const [d, selectors] of Object.entries(mergedCosmetic.exceptions)) {
-      if (!mergedCosmetic.domainSpecific[d]) mergedCosmetic.domainSpecific[d] = [];
-      // Prefix exception selectors so the engine can un-hide them
-      for (const sel of selectors) {
-        const exceptionKey = '__exception__' + sel;
-        if (!mergedCosmetic.domainSpecific[d].includes(exceptionKey)) {
-          mergedCosmetic.domainSpecific[d].push(exceptionKey);
-        }
-      }
-    }
-
-    // 6.5. Optimize Rules via WASM (Remove redundant site-specific rules)
-    if (wasmReady) {
-      try {
-        const optimizedJson = optimize_cosmetic_rules_csv(
-          mergedCosmetic.generic.join('\n'), 
-          JSON.stringify(mergedCosmetic.domainSpecific)
-        );
-        mergedCosmetic.domainSpecific = JSON.parse(optimizedJson);
-        console.log('[Nullify] Ruleset optimized via WASM Core');
-      } catch (err) {
-        console.error('[Nullify] Rule optimization failed:', err);
-      }
-    }
+    // 6. Deduplicate/fold exceptions/remove generic overlaps in one pass.
+    const reducedCosmetic = reduceCosmeticRules(mergedCosmetic);
+    mergedCosmetic.generic = reducedCosmetic.generic;
+    mergedCosmetic.domainSpecific = reducedCosmetic.domainSpecific;
 
     // 7. Re-index into IndexedDB + rebuild Bloom Filter
     await db.clear();
@@ -927,7 +989,10 @@ async function checkFilterListUpdates() {
     newBloom.add('');
 
     bloom = newBloom;
-    await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
+    await setStorage(
+      StorageKeys.BLOOM_FILTER,
+      wasmReady ? bloom.serialize_to_json() : bloom.serialize()
+    );
 
     // 8. Always update generic CSS — store selector array, compile string in RAM
     await setStorage(StorageKeys.GENERIC_CSS, mergedCosmetic.generic);
@@ -1324,11 +1389,61 @@ const RULESET_GROUPS = {
   'ubo-filters': ['ubo-filters', 'ubo-filters_2'],
 };
 
+// Estimated static DNR rule counts for packaged rulesets. These let us make
+// budget-aware enable decisions before Chrome rejects an oversized shard.
+const RULESET_RULE_COUNTS = {
+  'system-unbreak': 18,
+  'ubo-unbreak': 1479,
+  'anti-adblock': 4172,
+  'malware': 5236,
+  'ubo-filters': 4579,
+  'ubo-filters_2': 0,
+  'ubo-cookie-annoyances': 46,
+  'annoyances': 272,
+  'easyprivacy': 25000,
+  'easyprivacy_2': 25000,
+  'easyprivacy_3': 3411,
+  'easylist': 25000,
+  'easylist_2': 25000,
+  'easylist_3': 15183,
+  'easylist_4': 0,
+};
+
+// Prefer high-signal smaller lists before secondary large shards so Chrome's
+// static-rule cap does not crowd out anti-adblock, malware, and unbreak lists.
+const RULESET_ENABLE_PRIORITY = [
+  'system-unbreak',
+  'ubo-unbreak',
+  'anti-adblock',
+  'malware',
+  'ubo-filters',
+  'ubo-cookie-annoyances',
+  'annoyances',
+  'easylist',
+  'easylist_2',
+  'easylist_3',
+  'easyprivacy',
+  'easyprivacy_3',
+  'easyprivacy_2',
+  'easylist_4',
+  'ubo-filters_2',
+];
+
 /**
  * Get all underlying DNR ruleset IDs for a given list ID (UI-level ID).
  */
 function getRulesetIdsForList(listId) {
   return RULESET_GROUPS[listId] || [listId];
+}
+
+function orderRulesetIdsByPriority(rulesetIds) {
+  const priority = new Map(RULESET_ENABLE_PRIORITY.map((id, index) => [id, index]));
+  return [...rulesetIds].sort((a, b) => {
+    const aPriority = priority.get(a) ?? Number.MAX_SAFE_INTEGER;
+    const bPriority = priority.get(b) ?? Number.MAX_SAFE_INTEGER;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    return a.localeCompare(b);
+  });
 }
 
 /** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
@@ -1362,22 +1477,47 @@ async function applyRulesets() {
     if (err.message?.includes('exceeds the rule count limit')) {
       console.warn('[AdBlock] Batch enable failed due to rule limit. Falling back to sequential priority loading.');
 
-      // 2. Sequential fallback: Disable unwanted ones first
-      await chrome.declarativeNetRequest.updateEnabledRulesets({ disableRulesetIds });
+      // 2. Reset our static rulesets so budget checks start from a clean slate.
+      await chrome.declarativeNetRequest.updateEnabledRulesets({
+        disableRulesetIds: [...new Set(enableRulesetIds.concat(disableRulesetIds))],
+      });
 
-      for (const id of enableRulesetIds) {
+      const prioritizedRulesetIds = orderRulesetIdsByPriority(enableRulesetIds);
+      const skippedRulesetIds = [];
+      let availableStaticRuleCount = await chrome.declarativeNetRequest.getAvailableStaticRuleCount();
+
+      for (const id of prioritizedRulesetIds) {
+        const estimatedRuleCount = RULESET_RULE_COUNTS[id] ?? 0;
+        if (estimatedRuleCount > 0 && estimatedRuleCount > availableStaticRuleCount) {
+          skippedRulesetIds.push(id);
+          continue;
+        }
+
         try {
           await chrome.declarativeNetRequest.updateEnabledRulesets({ enableRulesetIds: [id] });
+          availableStaticRuleCount = await chrome.declarativeNetRequest.getAvailableStaticRuleCount();
         } catch (seqErr) {
           if (seqErr.message?.includes('exceeds the rule count limit')) {
             console.warn(`[AdBlock] Limit reached at ruleset: ${id}`);
-            break;
+            skippedRulesetIds.push(id);
+            continue;
           }
         }
+      }
+
+      if (skippedRulesetIds.length > 0) {
+        console.warn('[AdBlock] Skipped rulesets due to Chrome static rule limit:', skippedRulesetIds.join(', '));
       }
     } else {
       console.error('[AdBlock] Failed to apply rulesets:', err);
     }
+  }
+
+  try {
+    const enabledRulesets = await chrome.declarativeNetRequest.getEnabledRulesets();
+    console.log('[AdBlock] Enabled static rulesets:', enabledRulesets.join(', '));
+  } catch (err) {
+    console.warn('[AdBlock] Failed to read enabled static rulesets:', err);
   }
 }
 
@@ -1473,10 +1613,10 @@ async function handleMessage(message, sender) {
   switch (type) {
     case 'GET_INIT_DATA': {
       const { hostname } = payload;
-      const [isAllowed, settings, cosmeticRules, scriptletRules] = await Promise.all([
+      const [isAllowed, settings, cosmeticBundle, scriptletRules] = await Promise.all([
         isHostnameAllowedCached(hostname),
         (await getStorage(StorageKeys.SETTINGS)) || {},
-        getCosmeticRulesForPage(hostname),
+        getCosmeticBundleForPage(hostname),
         getScriptletRulesForPage(hostname),
       ]);
 
@@ -1518,15 +1658,11 @@ async function handleMessage(message, sender) {
         }
       }
 
-      let responseData = { isAllowed, settings, cosmeticRules, hasScriptlets };
+      let responseData = { isAllowed, settings, cosmeticRules: cosmeticBundle.rules, hasScriptlets };
 
-      if (wasmReady && !isAllowed) {
+      if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
         try {
-          responseData.cosmeticRulesBinary = serialize_rules_to_binary_from_json(
-            JSON.stringify(cosmeticRules.generic || []),
-            JSON.stringify(cosmeticRules.domainSpecific || []),
-            JSON.stringify(cosmeticRules.exceptions || [])
-          );
+          responseData.cosmeticRulesBinary = cosmeticBundle.cosmeticRulesBinary;
           delete responseData.cosmeticRules;
           
           // Also provide a sanitized URL for privacy reporting/cleanup
@@ -1579,7 +1715,8 @@ async function handleMessage(message, sender) {
       return await applyUserFilters(payload.filters);
     }
     case 'GET_COSMETIC_RULES': {
-      return await getCosmeticRulesForPage(payload.hostname);
+      const bundle = await getCosmeticBundleForPage(payload.hostname);
+      return bundle.rules;
     }
     case 'GET_SCRIPTLET_RULES': {
       const rules = await getScriptletRulesForPage(payload.hostname);
@@ -1680,9 +1817,16 @@ async function handleMessage(message, sender) {
 const _inFlightRules = new Map();
 
 async function getCosmeticRulesForPage(hostname) {
+  const bundle = await getCosmeticBundleForPage(hostname);
+  return bundle.rules;
+}
+
+async function getCosmeticBundleForPage(hostname) {
   // Wait for critical caches if they aren't ready yet
   if (!_criticalReady && _criticalPromise) await _criticalPromise;
-  if (!bloom) return { generic: [], domainSpecific: [], exceptions: [] };
+  if (!bloom) {
+    return buildPageBundle({ generic: [], domainSpecific: [], exceptions: [] });
+  }
 
   // Cache hit — onBeforeNavigate pre-warms this; GET_INIT_DATA reuses it.
   const cached = domainRulesCache.get(hostname);
@@ -1694,13 +1838,6 @@ async function getCosmeticRulesForPage(hostname) {
   const promise = (async () => {
     const domainSpecific = [];
     const domainExceptions = new Set();
-
-    const processSelector = (s) => {
-      if (isProceduralSelector(s)) {
-        return { selector: s, plan: parseProceduralPlan(s) };
-      }
-      return s;
-    };
 
     // 1. Parallelize parent domain checks (Bloom + IndexedDB)
     const bloomHits = [];
@@ -1721,13 +1858,13 @@ async function getCosmeticRulesForPage(hostname) {
         if (rule.startsWith('__exception__')) {
           domainExceptions.add(rule.slice('__exception__'.length));
         } else {
-          domainSpecific.push(processSelector(rule));
+          domainSpecific.push(rule);
         }
       }
     }
 
     const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
-    const userGeneric = (userRules.generic || []).map(processSelector);
+    const userGeneric = userRules.generic || [];
     const userExceptions = new Set([...(userRules.genericExceptions || []), ...domainExceptions]);
     const userDomainSelectors = [];
 
@@ -1735,7 +1872,7 @@ async function getCosmeticRulesForPage(hostname) {
     let userDom = hostname;
     while (true) {
       if (userRules.domainSpecific?.[userDom]) {
-        userDomainSelectors.push(...userRules.domainSpecific[userDom].map(processSelector));
+        userDomainSelectors.push(...userRules.domainSpecific[userDom]);
       }
       if (userRules.domainExceptions?.[userDom]) {
         for (const sel of userRules.domainExceptions[userDom]) userExceptions.add(sel);
@@ -1745,18 +1882,18 @@ async function getCosmeticRulesForPage(hostname) {
       userDom = userDom.slice(dotIdx + 1);
     }
 
-    return {
+    return buildPageBundle({
       generic: userGeneric,
-      domainSpecific: [...domainSpecific, ...userDomainSelectors],
+      domainSpecific: domainSpecific.concat(userDomainSelectors),
       exceptions: [...userExceptions],
-    };
+    });
   })();
 
   _inFlightRules.set(hostname, promise);
   try {
-    const result = await promise;
-    setCachedDomainRules(hostname, result); // Populate cache so GET_INIT_DATA skips IndexedDB
-    return result;
+    const bundle = await promise;
+    setCachedDomainRules(hostname, bundle); // Populate cache so GET_INIT_DATA skips IndexedDB
+    return bundle;
   } finally {
     _inFlightRules.delete(hostname);
   }
@@ -1826,36 +1963,25 @@ async function performEarlyInjection(tabId, urlStr) {
   }
 
   // 2. Inject Domain Rules
-  let rules = domainRulesCache.get(hostname);
-  if (!rules) {
-    rules = await getCosmeticRulesForPage(hostname);
-    setCachedDomainRules(hostname, rules);
+  let bundle = domainRulesCache.get(hostname);
+  if (!bundle) {
+    bundle = await getCosmeticBundleForPage(hostname);
+    setCachedDomainRules(hostname, bundle);
   }
 
-  // Rules from getCosmeticRulesForPage are already classified:
-  // strings = CSS-safe, objects with .plan = procedural. No re-scan needed.
-  const allRules = [...(rules.generic || []), ...(rules.domainSpecific || [])];
-  const exceptions = new Set(rules.exceptions || []);
-  const cssSelectors = allRules.filter(r => typeof r === 'string' && !exceptions.has(r));
-
-  if (cssSelectors.length > 0) {
-    const css = wasmReady
-      ? build_css_from_selectors(cssSelectors.join('\n'), '', 150)
-      : cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
+  if (bundle.cssText) {
     chrome.scripting.insertCSS({
       target: { tabId, allFrames: true },
-      css,
+      css: bundle.cssText,
       origin: 'USER',
     }).catch(() => { });
   }
 
-  // 3. Inject Exceptions — only CSS-safe ones (strings, not procedural objects)
-  const cssExceptions = (rules.exceptions || []).filter(s => typeof s === 'string');
-  if (cssExceptions.length > 0) {
-    const css = cssExceptions.join(',') + ' { display: revert !important; visibility: revert !important; }';
+  // 3. Inject Exceptions
+  if (bundle.exceptionCss) {
     chrome.scripting.insertCSS({
       target: { tabId, allFrames: true },
-      css,
+      css: bundle.exceptionCss,
       origin: 'USER',
     }).catch(() => { });
   }
@@ -1872,8 +1998,8 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   const hostname = url.hostname.replace(/^www\./, '');
 
   if (!domainRulesCache.has(hostname)) {
-    const rules = await getCosmeticRulesForPage(hostname);
-    setCachedDomainRules(hostname, rules);
+    const bundle = await getCosmeticBundleForPage(hostname);
+    setCachedDomainRules(hostname, bundle);
   }
 });
 
@@ -1884,4 +2010,3 @@ chrome.webNavigation.onCommitted.addListener(async (details) => {
   if (details.frameId !== 0) return;
   performEarlyInjection(details.tabId, details.url);
 });
-

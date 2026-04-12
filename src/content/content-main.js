@@ -23,20 +23,30 @@ function decodeBinaryRules(buffer) {
   const rules = { generic: [], domainSpecific: [], exceptions: [] };
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   let offset = 0;
+  const decoder = new TextDecoder();
+
+  const decodeRuleEntry = (text) => {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('{')) return text;
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      return text;
+    }
+  };
 
   const readStringList = () => {
     if (offset + 4 > buffer.byteLength) return [];
     const count = view.getUint32(offset, true);
     offset += 4;
     const list = [];
-    const decoder = new TextDecoder();
     
     for (let i = 0; i < count; i++) {
       let start = offset;
       while (offset < buffer.byteLength && buffer[offset] !== 0) {
         offset++;
       }
-      list.push(decoder.decode(buffer.slice(start, offset)));
+      list.push(decodeRuleEntry(decoder.decode(buffer.slice(start, offset))));
       offset++; // skip null
     }
     return list;
@@ -95,7 +105,7 @@ async function main() {
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
-      engine._applyProceduralRules?.();
+      engine._applyAllProcedural?.();
     });
   }
 }

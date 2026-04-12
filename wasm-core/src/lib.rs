@@ -466,6 +466,182 @@ fn proc_op_ac() -> &'static AhoCorasick {
     ]).unwrap())
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct ProceduralPlanStep {
+    #[serde(rename = "type")]
+    step_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    op: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arg: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PlannedSelectorRule {
+    selector: String,
+    plan: Vec<ProceduralPlanStep>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PlannedSelectorBundle {
+    #[serde(rename = "cssSelectors")]
+    css_selectors: Vec<String>,
+    #[serde(rename = "proceduralRules")]
+    procedural_rules: Vec<PlannedSelectorRule>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ReducedCosmeticRules {
+    generic: Vec<String>,
+    #[serde(rename = "domainSpecific")]
+    domain_specific: HashMap<String, Vec<String>>,
+}
+
+struct FirstOp {
+    base: String,
+    op: String,
+    arg: String,
+    rest: String,
+}
+
+fn contains_proc_op(selector: &str) -> bool {
+    proc_op_ac().is_match(selector)
+}
+
+fn find_matching_paren(selector: &str, start: usize) -> Option<usize> {
+    let mut depth = 1;
+    for (offset, ch) in selector[start..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(start + offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn extract_first_op(selector: &str) -> Option<FirstOp> {
+    let proc_ops = [
+        "matches-css-before",
+        "matches-css-after",
+        "matches-css",
+        "has-text",
+        "nth-ancestor",
+        "upward",
+        "min-text-length",
+        "xpath",
+        "watch-attr",
+        "remove",
+        "style",
+        "matches-path",
+        "matches-attr",
+        "if-not",
+        "if",
+        "semantic",
+    ];
+
+    let mut depth = 0i32;
+    for (idx, ch) in selector.char_indices() {
+        match ch {
+            '(' => {
+                depth += 1;
+                continue;
+            }
+            ')' => {
+                depth -= 1;
+                continue;
+            }
+            ':' if depth == 0 => {}
+            _ => continue,
+        }
+
+        let after_colon = idx + ch.len_utf8();
+        for op in proc_ops {
+            let needle = format!("{op}(");
+            if selector[after_colon..].starts_with(&needle) {
+                let base = selector[..idx].trim_end().to_string();
+                let arg_start = after_colon + op.len() + 1;
+                let close = find_matching_paren(selector, arg_start)?;
+                let arg = selector[arg_start..close].to_string();
+                let rest = selector[close + 1..].trim_start().to_string();
+                return Some(FirstOp {
+                    base,
+                    op: op.to_string(),
+                    arg,
+                    rest,
+                });
+            }
+        }
+    }
+
+    for pseudo in [":has(", ":not(", ":is(", ":where("] {
+        if let Some(idx) = selector.find(pseudo) {
+            let arg_start = idx + pseudo.len();
+            let close = find_matching_paren(selector, arg_start)?;
+            let inner = &selector[arg_start..close];
+            if contains_proc_op(inner) {
+                return Some(FirstOp {
+                    base: selector[..idx].trim_end().to_string(),
+                    op: pseudo[1..pseudo.len() - 1].to_string(),
+                    arg: inner.to_string(),
+                    rest: selector[close + 1..].trim_start().to_string(),
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_procedural_plan(selector: &str) -> Vec<ProceduralPlanStep> {
+    let mut plan = Vec::new();
+    let mut remaining = selector.trim().to_string();
+
+    while !remaining.is_empty() {
+        let Some(first) = extract_first_op(&remaining) else {
+            plan.push(ProceduralPlanStep {
+                step_type: "css".to_string(),
+                selector: Some(remaining.trim().to_string()),
+                op: None,
+                arg: None,
+            });
+            break;
+        };
+
+        if !first.base.is_empty() {
+            plan.push(ProceduralPlanStep {
+                step_type: "css".to_string(),
+                selector: Some(first.base),
+                op: None,
+                arg: None,
+            });
+        }
+
+        plan.push(ProceduralPlanStep {
+            step_type: "op".to_string(),
+            selector: None,
+            op: Some(first.op),
+            arg: Some(first.arg),
+        });
+
+        remaining = first.rest;
+    }
+
+    plan
+}
+
+fn is_valid_selector(selector: &str) -> bool {
+    let trimmed = selector.trim();
+    !trimmed.is_empty() && !trimmed.contains('{') && !trimmed.contains('}') && !trimmed.contains(';')
+}
+
 /// Classify a newline-separated list of CSS selectors into CSS-safe vs procedural
 /// in a single O(total_chars) AhoCorasick pass — much faster than calling
 /// isProceduralSelector() per selector in JS.
@@ -490,6 +666,31 @@ pub fn classify_selectors_batch(selectors: &str) -> String {
     }
 
     format!("{}\x01{}", css.join("\n"), procedural.join("\n"))
+}
+
+/// Batch-classify selectors and pre-plan procedural selectors for the content
+/// script so it does not have to parse operator chains at page load.
+#[wasm_bindgen]
+pub fn plan_selector_rules_json(selectors_json: &str) -> String {
+    let selectors: Vec<String> = serde_json::from_str(selectors_json).unwrap_or_default();
+    let mut bundle = PlannedSelectorBundle::default();
+
+    for selector in selectors {
+        let selector = selector.trim();
+        if !is_valid_selector(selector) {
+            continue;
+        }
+        if contains_proc_op(selector) {
+            bundle.procedural_rules.push(PlannedSelectorRule {
+                selector: selector.to_string(),
+                plan: parse_procedural_plan(selector),
+            });
+        } else {
+            bundle.css_selectors.push(selector.to_string());
+        }
+    }
+
+    serde_json::to_string(&bundle).unwrap_or_else(|_| "{\"cssSelectors\":[],\"proceduralRules\":[]}".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -557,6 +758,65 @@ pub fn optimize_cosmetic_rules_csv(generic_csv: &str, domain_specific_json: &str
     }
     domain_map.retain(|_, rules| !rules.is_empty());
     serde_json::to_string(&domain_map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Deduplicate cosmetic rules, fold exceptions into the domain map, and remove
+/// selectors already covered by the generic set.
+#[wasm_bindgen]
+pub fn reduce_cosmetic_rules_json(generic_json: &str, domain_specific_json: &str, exceptions_json: &str) -> String {
+    let generic_in: Vec<String> = serde_json::from_str(generic_json).unwrap_or_default();
+    let mut domain_map: HashMap<String, Vec<String>> = serde_json::from_str(domain_specific_json).unwrap_or_default();
+    let exceptions_map: HashMap<String, Vec<String>> = serde_json::from_str(exceptions_json).unwrap_or_default();
+
+    let mut generic = Vec::new();
+    let mut generic_seen = HashSet::new();
+    for selector in generic_in {
+        let selector = selector.trim();
+        if !is_valid_selector(selector) {
+            continue;
+        }
+        if generic_seen.insert(selector.to_string()) {
+            generic.push(selector.to_string());
+        }
+    }
+
+    let generic_set: HashSet<&str> = generic.iter().map(String::as_str).collect();
+    for selectors in domain_map.values_mut() {
+        let mut deduped = Vec::new();
+        let mut seen = HashSet::new();
+        for selector in selectors.iter() {
+            let selector = selector.trim();
+            if !is_valid_selector(selector) || generic_set.contains(selector) {
+                continue;
+            }
+            if seen.insert(selector.to_string()) {
+                deduped.push(selector.to_string());
+            }
+        }
+        *selectors = deduped;
+    }
+
+    for (domain, selectors) in exceptions_map {
+        let entry = domain_map.entry(domain).or_default();
+        let mut seen: HashSet<String> = entry.iter().cloned().collect();
+        for selector in selectors {
+            let selector = selector.trim();
+            if !is_valid_selector(selector) {
+                continue;
+            }
+            let prefixed = format!("__exception__{selector}");
+            if seen.insert(prefixed.clone()) {
+                entry.push(prefixed);
+            }
+        }
+    }
+
+    domain_map.retain(|_, selectors| !selectors.is_empty());
+
+    serde_json::to_string(&ReducedCosmeticRules {
+        generic,
+        domain_specific: domain_map,
+    }).unwrap_or_else(|_| "{\"generic\":[],\"domainSpecific\":{}}".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -985,6 +1245,33 @@ mod tests {
     #[test]
     fn process_youtube_player_bytes_skips_clean_payloads() {
         assert!(process_youtube_player_bytes(b"{\"streamingData\":{}}").is_empty());
+    }
+
+    #[test]
+    fn plan_selector_rules_separates_css_and_procedural() {
+        let planned = plan_selector_rules_json(
+            "[\".ad-slot\",\"div:has-text(Sponsored):upward(article)\"]"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&planned).unwrap();
+
+        assert_eq!(parsed["cssSelectors"][0], ".ad-slot");
+        assert_eq!(parsed["proceduralRules"][0]["selector"], "div:has-text(Sponsored):upward(article)");
+        assert_eq!(parsed["proceduralRules"][0]["plan"][0]["type"], "css");
+        assert_eq!(parsed["proceduralRules"][0]["plan"][1]["type"], "op");
+    }
+
+    #[test]
+    fn reduce_cosmetic_rules_folds_exceptions_and_drops_generic_duplicates() {
+        let reduced = reduce_cosmetic_rules_json(
+            "[\".global-ad\", \".global-ad\", \".hero-ad\"]",
+            "{\"example.com\":[\".hero-ad\", \".sidebar-ad\", \".sidebar-ad\"]}",
+            "{\"example.com\":[\".allow-me\"]}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&reduced).unwrap();
+
+        assert_eq!(parsed["generic"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["domainSpecific"]["example.com"].as_array().unwrap()[0], ".sidebar-ad");
+        assert_eq!(parsed["domainSpecific"]["example.com"].as_array().unwrap()[1], "__exception__.allow-me");
     }
 
     #[test]

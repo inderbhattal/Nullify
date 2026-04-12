@@ -15,6 +15,16 @@ import init, {
 (function() {
   let wasmReady = false;
   let wasmInitStarted = false;
+  const getRuntimeWasmUrl = () => {
+    try {
+      return globalThis.chrome?.runtime?.getURL?.('dist/nullify_core_bg.wasm') || null;
+    } catch {
+      return null;
+    }
+  };
+  const isPlayerResponseUrl = (url) => url.includes('/v1/player');
+  const textEncoder = new TextEncoder();
+  const textDecoder = new TextDecoder();
 
   // ---- Ad key constants ----
   const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams', 'adClientParams'];
@@ -72,27 +82,49 @@ import init, {
     return result;
   };
 
-  // 1b. Response.prototype.json hook — covers fetch().then(r => r.json()) paths.
+  // 1b. Response hooks — cover fetch consumers using json(), text(), or arrayBuffer().
   if (window.Response?.prototype) {
     const _origResponseJson = Response.prototype.json;
     Response.prototype.json = async function(...args) {
       const result = await _origResponseJson.apply(this, args);
-      if (result !== null && typeof result === 'object' &&
+      if (isPlayerResponseUrl(this.url) &&
+          result !== null && typeof result === 'object' &&
           (result.adPlacements !== undefined || result.playerAds !== undefined ||
            result.adSlots !== undefined)) {
         pruneAdKeys(result);
       }
       return result;
     };
+
+    const _origResponseText = Response.prototype.text;
+    Response.prototype.text = async function(...args) {
+      const text = await _origResponseText.apply(this, args);
+      return isPlayerResponseUrl(this.url) ? scrub(text) : text;
+    };
+
+    const _origResponseArrayBuffer = Response.prototype.arrayBuffer;
+    Response.prototype.arrayBuffer = async function(...args) {
+      const buffer = await _origResponseArrayBuffer.apply(this, args);
+      if (!isPlayerResponseUrl(this.url)) return buffer;
+      const bytes = new Uint8Array(buffer);
+      if (wasmReady) {
+        const cleaned = process_youtube_player_bytes(bytes);
+        if (cleaned.length !== 0) return cleaned.buffer;
+        return buffer;
+      }
+      const decoded = textDecoder.decode(bytes);
+      const scrubbed = scrub(decoded);
+      return scrubbed === decoded
+        ? buffer
+        : textEncoder.encode(scrubbed).buffer;
+    };
   }
 
   // 2. WASM Initialization
   const bootstrapWasm = (url) => {
-    if (wasmReady || wasmInitStarted) return;
+    if (wasmReady || wasmInitStarted || !url) return;
     wasmInitStarted = true;
-    const initPromise = url
-      ? init({ module_or_path: url })
-      : init();
+    const initPromise = init({ module_or_path: url });
     initPromise.then(() => {
       wasmReady = true;
       console.log('%c[Nullify] WASM Active', 'color: #00ff00; font-weight: bold;');
@@ -101,7 +133,7 @@ import init, {
       console.error('[Nullify] WASM init failed:', err);
     });
   };
-  bootstrapWasm();
+  bootstrapWasm(getRuntimeWasmUrl());
   const attrObs = new MutationObserver(() => {
     const url = document.documentElement.getAttribute('data-nullify-wasm');
     if (url) { bootstrapWasm(url); attrObs.disconnect(); }
@@ -114,13 +146,13 @@ import init, {
   }
 
   // 3. Response Scrubber
-  // For player responses: use combined process_youtube_player (one WASM call).
-  // For fetch byte streams: use process_youtube_player_bytes.
-  // Fallback: JS regex when WASM not yet ready.
+  // String scrubbers are kept for XHR/JSON-backed fallback paths. For fetch, we
+  // avoid replaying `/v1/player` bodies because YouTube appears to retry when
+  // the transport payload is modified, even though parse-time hooks are enough
+  // to neutralize ad fields after the response is consumed by the page.
   //
   // JS string pre-check is still useful for XHR/responseText paths, where the
-  // browser has already materialized a string. Fetch body interception now uses
-  // the byte-oriented Rust scrubber to avoid JS decode/re-encode on the hot path.
+  // browser has already materialized a string.
   const _ytMutations = [
     '"adPlacements"', '"playerAds"', '"adSlots"',
     '"adBreakHeartbeatParams"', '"adClientParams"',
@@ -153,11 +185,6 @@ import init, {
   const scrub = (data) => {
     if (!data) return data;
     try {
-      if (data instanceof Uint8Array) {
-        if (!wasmReady || data.length < 20) return data;
-        const cleaned = process_youtube_player_bytes(data);
-        return cleaned.length === 0 ? data : cleaned;
-      }
       if (typeof data === 'string') {
         if (data.length < 20) return data;
         if (wasmReady) {
@@ -197,41 +224,7 @@ import init, {
       });
     }
 
-    // Only intercept player/watch responses — everything else passes through untouched.
-    if (!url.includes('/v1/player') && !url.includes('/get_watch')) {
-      return origFetch.call(this, input, init);
-    }
-
-    const res = await origFetch.call(this, input, init);
-    const headers = new Headers(res.headers);
-    headers.delete('content-encoding');
-    headers.delete('content-length');
-
-    // Stream the body through a scrubbing TransformStream so the response body
-    // is only held once in memory. The hot path stays in bytes all the way into
-    // Rust, avoiding TextDecoder/TextEncoder churn for large player payloads.
-    if (res.body) {
-      // Store raw Uint8Array chunks and hand the merged payload straight to the
-      // Rust byte scrubber. Clean payloads come back as the original bytes.
-      let rawChunks = [];
-      let rawTotal = 0;
-      const { readable, writable } = new TransformStream({
-        transform(chunk) { rawChunks.push(chunk); rawTotal += chunk.byteLength; },
-        flush(controller) {
-          const merged = new Uint8Array(rawTotal);
-          let off = 0;
-          for (const c of rawChunks) { merged.set(c, off); off += c.byteLength; }
-          rawChunks = null;
-          const scrubbed = scrub(merged);
-          controller.enqueue(scrubbed);
-        },
-      });
-      res.body.pipeTo(writable).catch(() => {});
-      return new Response(readable, { status: res.status, statusText: res.statusText, headers });
-    }
-
-    // Fallback: body streaming unavailable (rare).
-    return new Response(scrub(await res.text()), { status: res.status, statusText: res.statusText, headers });
+    return origFetch.call(this, input, init);
   };
 
   // 5b. Network Interceptor — XMLHttpRequest
@@ -279,13 +272,18 @@ import init, {
     _isPlayer() {
       return this.readyState === 4 &&
              (this.responseType === '' || this.responseType === 'text') &&
-             (this._nUrl.includes('/v1/player') || this._nUrl.includes('/get_watch'));
+             isPlayerResponseUrl(this._nUrl);
     }
 
     _scrubbed() {
       if (this._nCached === null) {
-        try { this._nCached = scrub(super.responseText); }
-        catch (e) { this._nCached = super.responseText; }
+        let original = '';
+        try {
+          original = super.responseText;
+          this._nCached = scrub(original);
+        } catch (e) {
+          this._nCached = original || super.responseText;
+        }
       }
       return this._nCached;
     }

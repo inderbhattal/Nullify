@@ -7,28 +7,31 @@
 
 import init, {
   process_youtube_player,
-  clean_youtube_binary,
+  process_youtube_player_bytes,
   sanitize_youtube_experiments,
   should_block_youtube_url,
 } from '../shared/wasm/nullify_core.js';
 
 (function() {
   let wasmReady = false;
-  // Cold-start gate: resolves when WASM is ready (or on a safety timeout).
-  // The fetch scrubber awaits this for /v1/player responses so the first
-  // player request uses the full WASM path instead of the incomplete regex
-  // fallback — which would otherwise cause YouTube to retry/stall.
-  let _wasmResolve;
-  const wasmReadyPromise = new Promise((resolve) => {
-    _wasmResolve = resolve;
-    // Safety: never block a response longer than 1500ms if WASM fails to load.
-    setTimeout(resolve, 1500);
-  });
+  let wasmInitStarted = false;
 
   // ---- Ad key constants ----
   const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams', 'adClientParams'];
-  // JS-only fallback regex (used before WASM is ready in the text scrubber)
+  // JS-only fallback rewrites used before WASM is ready on the very first
+  // player response. This avoids stalling the request behind WASM startup.
   const adRegex = new RegExp(`"(${AD_KEYS.join('|')})":\\s*(\\[|\\{)`, 'g');
+  const YT_FLAG_REPLACEMENTS = [
+    ['"web_player_api_v2_server_side_ad_injection":true', '"web_player_api_v2_server_side_ad_injection":false'],
+    ['"web_enable_ab_wv_edu":true', '"web_enable_ab_wv_edu":false'],
+    ['"web_enable_ad_signals":true', '"web_enable_ad_signals":false'],
+    ['"web_player_api_v2_ad_break_heartbeat_params":true', '"web_player_api_v2_ad_break_heartbeat_params":false'],
+    ['"web_disable_midroll_ads":false', '"web_disable_midroll_ads":true'],
+    ['"web_enable_ab_wv_edu_v2":true', '"web_enable_ab_wv_edu_v2":false'],
+    ['"web_enable_ab_wv_edu_v3":true', '"web_enable_ab_wv_edu_v3":false'],
+    ['"web_player_api_v2_ads_metadata":true', '"web_player_api_v2_ads_metadata":false'],
+    ['"web_enable_ad_break_heartbeat":true', '"web_enable_ad_break_heartbeat":false'],
+  ];
 
   // 1. Primary prevention — set ad keys to false in any parsed object.
   //
@@ -85,65 +88,87 @@ import init, {
 
   // 2. WASM Initialization
   const bootstrapWasm = (url) => {
-    if (wasmReady || !url) return;
-    init({ module_or_path: url }).then(() => {
+    if (wasmReady || wasmInitStarted) return;
+    wasmInitStarted = true;
+    const initPromise = url
+      ? init({ module_or_path: url })
+      : init();
+    initPromise.then(() => {
       wasmReady = true;
-      _wasmResolve();
       console.log('%c[Nullify] WASM Active', 'color: #00ff00; font-weight: bold;');
     }).catch((err) => {
-      // Release the gate so responses don't stall on WASM load failure;
-      // scrub() will degrade to the regex fallback path.
-      _wasmResolve();
+      wasmInitStarted = false;
       console.error('[Nullify] WASM init failed:', err);
     });
   };
+  bootstrapWasm();
   const attrObs = new MutationObserver(() => {
     const url = document.documentElement.getAttribute('data-nullify-wasm');
     if (url) { bootstrapWasm(url); attrObs.disconnect(); }
   });
   attrObs.observe(document.documentElement, { attributes: true });
   const initialUrl = document.documentElement.getAttribute('data-nullify-wasm');
-  if (initialUrl) bootstrapWasm(initialUrl);
+  if (initialUrl) {
+    bootstrapWasm(initialUrl);
+    attrObs.disconnect();
+  }
 
   // 3. Response Scrubber
   // For player responses: use combined process_youtube_player (one WASM call).
-  // For binary: use clean_youtube_binary.
+  // For fetch byte streams: use process_youtube_player_bytes.
   // Fallback: JS regex when WASM not yet ready.
   //
-  // JS pre-check: String.prototype.includes() runs in-place (SIMD, zero allocation)
-  // and avoids the full JS→WASM string copy for clean responses entirely.
-  // For 60+ min videos the player JSON can be 1–2 MB; skipping the WASM boundary
-  // copy when there are no ad markers saves ~100–400 ms per intercepted request.
-  const _adMarkers = [
+  // JS string pre-check is still useful for XHR/responseText paths, where the
+  // browser has already materialized a string. Fetch body interception now uses
+  // the byte-oriented Rust scrubber to avoid JS decode/re-encode on the hot path.
+  const _ytMutations = [
     '"adPlacements"', '"playerAds"', '"adSlots"',
     '"adBreakHeartbeatParams"', '"adClientParams"',
+    '"web_player_api_v2_server_side_ad_injection":true',
+    '"web_enable_ab_wv_edu":true',
+    '"web_enable_ad_signals":true',
+    '"web_player_api_v2_ad_break_heartbeat_params":true',
     '"web_disable_midroll_ads":false',
+    '"web_enable_ab_wv_edu_v2":true',
+    '"web_enable_ab_wv_edu_v3":true',
+    '"web_player_api_v2_ads_metadata":true',
+    '"web_enable_ad_break_heartbeat":true',
   ];
-  const _hasAdContent = (text) => {
-    for (let i = 0; i < _adMarkers.length; i++) {
-      if (text.includes(_adMarkers[i])) return true;
+  const _hasYoutubeMutations = (text) => {
+    for (let i = 0; i < _ytMutations.length; i++) {
+      if (text.includes(_ytMutations[i])) return true;
     }
     return false;
+  };
+
+  const fallbackScrub = (text) => {
+    let mutated = text.replace(adRegex, '"$1":false,"disabled_$1":$2');
+    for (let i = 0; i < YT_FLAG_REPLACEMENTS.length; i++) {
+      const [from, to] = YT_FLAG_REPLACEMENTS[i];
+      if (mutated.includes(from)) mutated = mutated.replaceAll(from, to);
+    }
+    return mutated;
   };
 
   const scrub = (data) => {
     if (!data) return data;
     try {
       if (data instanceof Uint8Array) {
-        if (!wasmReady || data.length < 5000 || data.length > 500000) return data;
-        return clean_youtube_binary(data);
+        if (!wasmReady || data.length < 20) return data;
+        const cleaned = process_youtube_player_bytes(data);
+        return cleaned.length === 0 ? data : cleaned;
       }
       if (typeof data === 'string') {
         if (data.length < 20) return data;
         if (wasmReady) {
           // Fast JS pre-check: skip WASM boundary copy entirely for clean responses.
           // process_youtube_player() still handles the replacement pass when needed.
-          if (!_hasAdContent(data)) return data;
+          if (!_hasYoutubeMutations(data)) return data;
           const cleaned = process_youtube_player(data);
           return cleaned || data;
         }
-        if (!data.includes('"ad')) return data;
-        return data.replace(adRegex, '"$1":false,"disabled_$1":$2');
+        if (!_hasYoutubeMutations(data)) return data;
+        return fallbackScrub(data);
       }
       return data;
     } catch (e) { return data; }
@@ -164,7 +189,13 @@ import init, {
     const blocked = wasmReady
       ? should_block_youtube_url(url)
       : (url.includes('/ad_break') || url.includes('/get_attestation') || url.includes('/ad_slot_logging'));
-    if (blocked) return new Response('{}', { status: 200 });
+    if (blocked) {
+      return new Response('{}', {
+        status: 200,
+        statusText: 'OK',
+        headers: { 'content-type': 'application/json' },
+      });
+    }
 
     // Only intercept player/watch responses — everything else passes through untouched.
     if (!url.includes('/v1/player') && !url.includes('/get_watch')) {
@@ -177,44 +208,30 @@ import init, {
     headers.delete('content-length');
 
     // Stream the body through a scrubbing TransformStream so the response body
-    // is only held once in memory (avoids the res.text() double-allocation for
-    // 200–500 KB player responses). Chunks accumulate in `acc`; scrubbing fires
-    // in flush() the instant the last byte arrives — identical wall-clock latency
-    // to await res.text() but half the peak heap usage.
+    // is only held once in memory. The hot path stays in bytes all the way into
+    // Rust, avoiding TextDecoder/TextEncoder churn for large player payloads.
     if (res.body) {
-      // Store raw Uint8Array chunks — no per-chunk decode overhead.
-      // Single decode in flush() handles multi-byte sequences that span chunk
-      // boundaries correctly (no streaming decoder state needed).
-      // For clean responses scrub() returns the same string reference, so we
-      // pass the original merged bytes through without re-encoding.
+      // Store raw Uint8Array chunks and hand the merged payload straight to the
+      // Rust byte scrubber. Clean payloads come back as the original bytes.
       let rawChunks = [];
       let rawTotal = 0;
       const { readable, writable } = new TransformStream({
         transform(chunk) { rawChunks.push(chunk); rawTotal += chunk.byteLength; },
-        async flush(controller) {
-          // Cold-start gate: on the first /v1/player request after page load,
-          // WASM is often still compiling. Await the ready promise (capped at
-          // 1500ms) so the first response uses the full WASM scrubber instead
-          // of the partial regex fallback — which otherwise causes YouTube to
-          // see inconsistent ad state and trigger retry/stall paths.
-          if (!wasmReady) await wasmReadyPromise;
+        flush(controller) {
           const merged = new Uint8Array(rawTotal);
           let off = 0;
           for (const c of rawChunks) { merged.set(c, off); off += c.byteLength; }
           rawChunks = null;
-          const text = new TextDecoder().decode(merged);
-          const scrubbed = scrub(text);
-          // Same reference → nothing changed → send original bytes, skip re-encode.
-          controller.enqueue(scrubbed === text ? merged : new TextEncoder().encode(scrubbed));
+          const scrubbed = scrub(merged);
+          controller.enqueue(scrubbed);
         },
       });
       res.body.pipeTo(writable).catch(() => {});
-      return new Response(readable, { status: res.status, headers });
+      return new Response(readable, { status: res.status, statusText: res.statusText, headers });
     }
 
-    // Fallback: body streaming unavailable (rare). Same cold-start gate applies.
-    if (!wasmReady) await wasmReadyPromise;
-    return new Response(scrub(await res.text()), { status: res.status, headers });
+    // Fallback: body streaming unavailable (rare).
+    return new Response(scrub(await res.text()), { status: res.status, statusText: res.statusText, headers });
   };
 
   // 5b. Network Interceptor — XMLHttpRequest
@@ -227,13 +244,15 @@ import init, {
   window.XMLHttpRequest = class extends OrigXHR {
     constructor() {
       super();
-      this._nUrl    = '';
+      this._nUrl = '';
       this._nCached = null;
+      this._nBlocked = false;
     }
 
     open(method, url, ...args) {
-      this._nUrl    = typeof url === 'string' ? url : '';
+      this._nUrl = typeof url === 'string' ? url : '';
       this._nCached = null;
+      this._nBlocked = false;
       return super.open(method, url, ...args);
     }
 
@@ -244,19 +263,14 @@ import init, {
         ? should_block_youtube_url(url)
         : (url.includes('/ad_break') || url.includes('/get_attestation') || url.includes('/ad_slot_logging'));
       if (block) {
-        // Synthesise an empty successful response so callers don't hang.
+        this._nBlocked = true;
+        this._nCached = '{}';
+        // Synthesize a completed empty JSON response for ad-only endpoints.
         setTimeout(() => {
+          this.dispatchEvent(new Event('readystatechange'));
           this.dispatchEvent(new ProgressEvent('load'));
           this.dispatchEvent(new ProgressEvent('loadend'));
         }, 0);
-        return;
-      }
-      // Cold-start gate: defer the network send for player URLs until WASM
-      // is ready so the lazy scrub on responseText uses the full WASM path.
-      // The lazy scrub is synchronous (invoked from a getter) so we can't
-      // await inside it — we must gate the request itself instead.
-      if (!wasmReady && (url.includes('/v1/player') || url.includes('/get_watch'))) {
-        wasmReadyPromise.then(() => super.send(...args));
         return;
       }
       return super.send(...args);
@@ -277,25 +291,45 @@ import init, {
     }
 
     get responseText() {
+      if (this._nBlocked) return this._nCached;
       return this._isPlayer() ? this._scrubbed() : super.responseText;
     }
 
     get response() {
+      if (this._nBlocked) {
+        if (this.responseType === 'json') return JSON.parse(this._nCached);
+        return this._nCached;
+      }
       const r = super.response;
       return (this._isPlayer() && typeof r === 'string') ? this._scrubbed() : r;
     }
+
+    get readyState() {
+      return this._nBlocked ? 4 : super.readyState;
+    }
+
+    get status() {
+      return this._nBlocked ? 200 : super.status;
+    }
+
+    get statusText() {
+      return this._nBlocked ? 'OK' : super.statusText;
+    }
+
+    get responseURL() {
+      return this._nBlocked ? this._nUrl : super.responseURL;
+    }
   };
 
-  // 6. Variable Shield — direct deletion on assignment.
+  // 6. Variable Shield — neutralize ad fields on assignment.
   //
   // youtube-shield.js runs at document_start before YouTube's inline <script>
   // tags, so Object.defineProperty is called before YouTube's code assigns
   // ytInitialPlayerResponse. When the assignment fires, the setter pruneAdKeys
   // the object in-place before storing it — the player never sees ad data.
   //
-  // Direct deletion is strictly better than the previous Proxy approach:
-  //   Proxy: hides reads but keys remain present — detectable via 'in', Object.keys
-  //   Delete: keys are gone entirely — no recovery path exists
+  // Keeping the keys present but forcing them to false matches the network/WASM
+  // scrubbers and avoids YouTube fallback paths that key off schema changes.
   const shield = (prop) => {
     let _val = window[prop];
     if (_val) pruneAdKeys(_val);

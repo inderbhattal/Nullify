@@ -716,11 +716,11 @@ const YT_AD_KEYS: &[&str] = &[
     "\"adClientParams\":",
 ];
 const YT_AD_REPLACEMENTS: &[&str] = &[
-    "\"disabled_adPlacements\":",
-    "\"disabled_adSlots\":",
-    "\"disabled_playerAds\":",
-    "\"disabled_adBreakHeartbeatParams\":",
-    "\"disabled_adClientParams\":",
+    "\"adPlacements\":false,\"disabled_adPlacements\":",
+    "\"adSlots\":false,\"disabled_adSlots\":",
+    "\"playerAds\":false,\"disabled_playerAds\":",
+    "\"adBreakHeartbeatParams\":false,\"disabled_adBreakHeartbeatParams\":",
+    "\"adClientParams\":false,\"disabled_adClientParams\":",
 ];
 
 const YT_POISON_FLAGS: &[&str] = &[
@@ -765,11 +765,11 @@ const YT_ALL_PATTERNS: &[&str] = &[
     "\"web_enable_ad_break_heartbeat\":true",
 ];
 const YT_ALL_REPLACEMENTS: &[&str] = &[
-    "\"disabled_adPlacements\":",
-    "\"disabled_adSlots\":",
-    "\"disabled_playerAds\":",
-    "\"disabled_adBreakHeartbeatParams\":",
-    "\"disabled_adClientParams\":",
+    "\"adPlacements\":false,\"disabled_adPlacements\":",
+    "\"adSlots\":false,\"disabled_adSlots\":",
+    "\"playerAds\":false,\"disabled_playerAds\":",
+    "\"adBreakHeartbeatParams\":false,\"disabled_adBreakHeartbeatParams\":",
+    "\"adClientParams\":false,\"disabled_adClientParams\":",
     "\"web_player_api_v2_server_side_ad_injection\":false",
     "\"web_enable_ab_wv_edu\":false",
     "\"web_enable_ad_signals\":false",
@@ -779,6 +779,38 @@ const YT_ALL_REPLACEMENTS: &[&str] = &[
     "\"web_enable_ab_wv_edu_v3\":false",
     "\"web_player_api_v2_ads_metadata\":false",
     "\"web_enable_ad_break_heartbeat\":false",
+];
+const YT_ALL_BYTE_PATTERNS: &[&[u8]] = &[
+    b"\"adPlacements\":",
+    b"\"adSlots\":",
+    b"\"playerAds\":",
+    b"\"adBreakHeartbeatParams\":",
+    b"\"adClientParams\":",
+    b"\"web_player_api_v2_server_side_ad_injection\":true",
+    b"\"web_enable_ab_wv_edu\":true",
+    b"\"web_enable_ad_signals\":true",
+    b"\"web_player_api_v2_ad_break_heartbeat_params\":true",
+    b"\"web_disable_midroll_ads\":false",
+    b"\"web_enable_ab_wv_edu_v2\":true",
+    b"\"web_enable_ab_wv_edu_v3\":true",
+    b"\"web_player_api_v2_ads_metadata\":true",
+    b"\"web_enable_ad_break_heartbeat\":true",
+];
+const YT_ALL_BYTE_REPLACEMENTS: &[&[u8]] = &[
+    b"\"adPlacements\":false,\"disabled_adPlacements\":",
+    b"\"adSlots\":false,\"disabled_adSlots\":",
+    b"\"playerAds\":false,\"disabled_playerAds\":",
+    b"\"adBreakHeartbeatParams\":false,\"disabled_adBreakHeartbeatParams\":",
+    b"\"adClientParams\":false,\"disabled_adClientParams\":",
+    b"\"web_player_api_v2_server_side_ad_injection\":false",
+    b"\"web_enable_ab_wv_edu\":false",
+    b"\"web_enable_ad_signals\":false",
+    b"\"web_player_api_v2_ad_break_heartbeat_params\":false",
+    b"\"web_disable_midroll_ads\":true",
+    b"\"web_enable_ab_wv_edu_v2\":false",
+    b"\"web_enable_ab_wv_edu_v3\":false",
+    b"\"web_player_api_v2_ads_metadata\":false",
+    b"\"web_enable_ad_break_heartbeat\":false",
 ];
 
 /// Single automaton covering all 14 patterns — built once, reused forever.
@@ -797,6 +829,11 @@ fn yt_ad_ac() -> &'static AhoCorasick {
 fn yt_exp_ac() -> &'static AhoCorasick {
     static AC: OnceLock<AhoCorasick> = OnceLock::new();
     AC.get_or_init(|| AhoCorasick::new(YT_POISON_FLAGS).unwrap())
+}
+
+fn yt_combined_bytes_ac() -> &'static AhoCorasick {
+    static AC: OnceLock<AhoCorasick> = OnceLock::new();
+    AC.get_or_init(|| AhoCorasick::new(YT_ALL_BYTE_PATTERNS).unwrap())
 }
 
 /// Fast pre-request URL check: should this YouTube URL be blocked entirely?
@@ -825,7 +862,7 @@ pub fn should_block_youtube_url(url: &str) -> bool {
     yt_block_ac().is_match(url)
 }
 
-/// Combined single-pass processor: renames ad keys AND flips experiment flags.
+/// Combined single-pass processor: neutralizes ad keys AND flips experiment flags.
 ///
 /// Uses a single merged AhoCorasick automaton (yt_combined_ac) so the text is
 /// scanned twice at most — once for the fast-path `is_match` check and once for
@@ -836,8 +873,9 @@ pub fn should_block_youtube_url(url: &str) -> bool {
 /// must treat that as "use the original text" to avoid a pointless 500 KB
 /// copy-out across the WASM boundary on every clean (ad-free) response.
 ///
-/// We RENAME ad keys, not delete them — completely removing a key causes
-/// YouTube to detect its absence and trigger the fallback ad-fetch path.
+/// We keep the original ad keys present but set them to `false`, while moving
+/// the original payload behind a `disabled_` prefix. This preserves the schema
+/// YouTube expects without leaving active ad data in place.
 #[wasm_bindgen]
 pub fn process_youtube_player(text: &str) -> String {
     // Single combined pre-check: one O(n) scan over all 14 patterns.
@@ -846,11 +884,29 @@ pub fn process_youtube_player(text: &str) -> String {
         return String::new();
     }
 
-    // Single replacement pass: ad-key renames AND experiment-flag flips
+    // Single replacement pass: ad-key neutralization AND experiment-flag flips
     // in one O(n) walk — no intermediate buffer, no second allocation.
     let mut result = String::with_capacity(text.len());
     yt_combined_ac().replace_all_with(text, &mut result, |mat, _, dst| {
         dst.push_str(YT_ALL_REPLACEMENTS[mat.pattern().as_usize()]);
+        true
+    });
+    result
+}
+
+/// Byte-oriented variant for fetch/XHR body interception.
+///
+/// Returns an empty `Vec` when the payload does not need mutation so the JS
+/// caller can forward the original bytes without cloning or re-encoding.
+#[wasm_bindgen]
+pub fn process_youtube_player_bytes(data: &[u8]) -> Vec<u8> {
+    if !yt_combined_bytes_ac().is_match(data) {
+        return Vec::new();
+    }
+
+    let mut result = Vec::with_capacity(data.len());
+    yt_combined_bytes_ac().replace_all_with_bytes(data, &mut result, |mat, _, dst| {
+        dst.extend_from_slice(YT_ALL_BYTE_REPLACEMENTS[mat.pattern().as_usize()]);
         true
     });
     result
@@ -869,30 +925,7 @@ pub fn clean_youtube_json(text: &str) -> String {
 
 #[wasm_bindgen]
 pub fn clean_youtube_binary(data: &[u8]) -> Vec<u8> {
-    // Reuse the same automaton — AhoCorasick operates on raw bytes.
-    let ad_key_bytes: &[&[u8]] = &[
-        b"\"adPlacements\":",
-        b"\"adSlots\":",
-        b"\"playerAds\":",
-        b"\"adBreakHeartbeatParams\":",
-        b"\"adClientParams\":",
-    ];
-    let replacement_bytes: &[&[u8]] = &[
-        b"\"adPlacements\":false,\"disabled_adPlacements\":",
-        b"\"adSlots\":false,\"disabled_adSlots\":",
-        b"\"playerAds\":false,\"disabled_playerAds\":",
-        b"\"adBreakHeartbeatParams\":false,\"disabled_adBreakHeartbeatParams\":",
-        b"\"adClientParams\":false,\"disabled_adClientParams\":",
-    ];
-    // For binary we still need a byte-pattern AC (same patterns, different type)
-    static AC: OnceLock<AhoCorasick> = OnceLock::new();
-    let ac = AC.get_or_init(|| AhoCorasick::new(ad_key_bytes).unwrap());
-    let mut result = Vec::with_capacity(data.len());
-    ac.replace_all_with_bytes(data, &mut result, |mat, _, dst| {
-        dst.extend_from_slice(replacement_bytes[mat.pattern().as_usize()]);
-        true
-    });
-    result
+    process_youtube_player_bytes(data)
 }
 
 #[wasm_bindgen]
@@ -903,6 +936,64 @@ pub fn sanitize_youtube_experiments(json_text: &str) -> String {
         true
     });
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_youtube_player_keeps_keys_but_neutralizes_values() {
+        let input = concat!(
+            "{\"adPlacements\":[{\"slot\":1}],",
+            "\"playerAds\":{\"ad\":\"yes\"},",
+            "\"web_disable_midroll_ads\":false,",
+            "\"web_enable_ad_break_heartbeat\":true}"
+        );
+
+        let output = process_youtube_player(input);
+
+        assert!(output.contains("\"adPlacements\":false,\"disabled_adPlacements\":["));
+        assert!(output.contains("\"playerAds\":false,\"disabled_playerAds\":{"));
+        assert!(output.contains("\"web_disable_midroll_ads\":true"));
+        assert!(output.contains("\"web_enable_ad_break_heartbeat\":false"));
+    }
+
+    #[test]
+    fn process_youtube_player_skips_clean_payloads() {
+        assert_eq!(process_youtube_player("{\"streamingData\":{}}"), "");
+    }
+
+    #[test]
+    fn process_youtube_player_bytes_matches_string_scrubber() {
+        let input = concat!(
+            "{\"adPlacements\":[{\"slot\":1}],",
+            "\"playerAds\":{\"ad\":\"yes\"},",
+            "\"web_disable_midroll_ads\":false,",
+            "\"web_enable_ad_break_heartbeat\":true}"
+        );
+
+        let bytes = process_youtube_player_bytes(input.as_bytes());
+        let output = String::from_utf8(bytes).unwrap();
+
+        assert!(output.contains("\"adPlacements\":false,\"disabled_adPlacements\":["));
+        assert!(output.contains("\"playerAds\":false,\"disabled_playerAds\":{"));
+        assert!(output.contains("\"web_disable_midroll_ads\":true"));
+        assert!(output.contains("\"web_enable_ad_break_heartbeat\":false"));
+    }
+
+    #[test]
+    fn process_youtube_player_bytes_skips_clean_payloads() {
+        assert!(process_youtube_player_bytes(b"{\"streamingData\":{}}").is_empty());
+    }
+
+    #[test]
+    fn youtube_url_blocklist_only_matches_ad_endpoints() {
+        assert!(should_block_youtube_url("https://www.youtube.com/youtubei/v1/ad_break?x=1"));
+        assert!(should_block_youtube_url("https://www.youtube.com/youtubei/v1/att/get_attestation"));
+        assert!(!should_block_youtube_url("https://www.youtube.com/youtubei/v1/log_event"));
+        assert!(!should_block_youtube_url("https://rr1---sn.googlevideo.com/videoplayback?id=abc"));
+    }
 }
 
 // ---------------------------------------------------------------------------

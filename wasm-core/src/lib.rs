@@ -124,7 +124,7 @@ pub fn parse_filter_list_to_json(text: &str) -> String {
 
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('!') || line.starts_with('[') {
+        if should_skip_filter_line(line) {
             continue;
         }
 
@@ -149,14 +149,340 @@ pub fn compile_filters_to_dnr_json(text: &str, mut start_id: u32) -> String {
     let mut rules = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('!') || line.starts_with('[') { continue; }
-        if line.contains("##") || line.contains("#@#") { continue; }
+        if should_skip_filter_line(line) { continue; }
+        if line.contains("##") || line.contains("#@#") || line.contains("#?#") { continue; }
 
         if let Some(dnr_rule) = parse_network_rule_to_dnr(line, start_id) {
             rules.push(dnr_rule);
             start_id += 1;
         }
     }
+    serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct BucketedCosmeticRules {
+    generic: Vec<String>,
+    #[serde(rename = "domainSpecific")]
+    domain_specific: HashMap<String, Vec<String>>,
+    #[serde(rename = "genericExceptions")]
+    generic_exceptions: Vec<String>,
+    #[serde(rename = "domainExceptions")]
+    domain_exceptions: HashMap<String, Vec<String>>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct CompiledUserFilters {
+    #[serde(rename = "dnrRules")]
+    dnr_rules: Vec<DnrRule>,
+    #[serde(rename = "cosmeticRules")]
+    cosmetic_rules: BucketedCosmeticRules,
+    #[serde(rename = "scriptletRules")]
+    scriptlet_rules: Vec<ParsedRule>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct MergedFilterData {
+    generic: Vec<String>,
+    #[serde(rename = "domainSpecific")]
+    domain_specific: HashMap<String, Vec<String>>,
+    #[serde(rename = "scriptletRules")]
+    scriptlet_rules: Vec<ParsedRule>,
+}
+
+fn should_skip_filter_line(line: &str) -> bool {
+    line.is_empty()
+        || line.starts_with('!')
+        || line.starts_with('[')
+        || line.starts_with('%')
+        || line.starts_with("@@#")
+}
+
+fn push_unique(list: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    let trimmed = value.trim();
+    if !is_valid_selector(trimmed) {
+        return;
+    }
+    let owned = trimmed.to_string();
+    if seen.insert(owned.clone()) {
+        list.push(owned);
+    }
+}
+
+fn push_unique_domain_selector(
+    map: &mut HashMap<String, Vec<String>>,
+    seen_map: &mut HashMap<String, HashSet<String>>,
+    domain: &str,
+    selector: &str,
+) {
+    let domain = domain.trim().to_lowercase();
+    let selector = selector.trim();
+    if domain.is_empty() || !is_valid_selector(selector) {
+        return;
+    }
+
+    let selector_owned = selector.to_string();
+    let domain_seen = seen_map.entry(domain.clone()).or_default();
+    if !domain_seen.insert(selector_owned.clone()) {
+        return;
+    }
+
+    map.entry(domain).or_default().push(selector_owned);
+}
+
+fn scriptlet_fingerprint(rule: &ParsedRule) -> String {
+    let mut domains = rule.domains.clone();
+    domains.sort();
+    format!(
+        "{}|{}|{}",
+        rule.name.as_deref().unwrap_or_default(),
+        domains.join(","),
+        rule.args.as_deref().unwrap_or(&[]).join(","),
+    )
+}
+
+fn compile_user_filters_internal(text: &str, start_id: u32) -> CompiledUserFilters {
+    let mut compiled = CompiledUserFilters::default();
+    let mut next_id = start_id;
+    let mut network_seen = HashSet::new();
+    let mut generic_seen = HashSet::new();
+    let mut generic_exception_seen = HashSet::new();
+    let mut domain_seen: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut domain_exception_seen: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut scriptlet_seen = HashSet::new();
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if should_skip_filter_line(line) {
+            continue;
+        }
+
+        if let Some(rule) = parse_line(line) {
+            if rule.rule_type == "scriptlet" {
+                let fingerprint = scriptlet_fingerprint(&rule);
+                if scriptlet_seen.insert(fingerprint) {
+                    compiled.scriptlet_rules.push(rule);
+                }
+                continue;
+            }
+
+            let Some(selector) = rule.selector.as_deref() else {
+                continue;
+            };
+            if rule.domains.is_empty() {
+                if rule.exception.unwrap_or(false) {
+                    push_unique(
+                        &mut compiled.cosmetic_rules.generic_exceptions,
+                        &mut generic_exception_seen,
+                        selector,
+                    );
+                } else {
+                    push_unique(
+                        &mut compiled.cosmetic_rules.generic,
+                        &mut generic_seen,
+                        selector,
+                    );
+                }
+            } else {
+                for domain in &rule.domains {
+                    if rule.exception.unwrap_or(false) {
+                        push_unique_domain_selector(
+                            &mut compiled.cosmetic_rules.domain_exceptions,
+                            &mut domain_exception_seen,
+                            domain,
+                            selector,
+                        );
+                    } else {
+                        push_unique_domain_selector(
+                            &mut compiled.cosmetic_rules.domain_specific,
+                            &mut domain_seen,
+                            domain,
+                            selector,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        if line.contains("##") || line.contains("#@#") || line.contains("#?#") {
+            continue;
+        }
+
+        if let Some(rule) = parse_network_rule_to_dnr(line, next_id) {
+            if network_seen.insert(line.to_string()) {
+                compiled.dnr_rules.push(rule);
+                next_id += 1;
+            }
+        }
+    }
+
+    compiled
+}
+
+#[wasm_bindgen]
+pub fn compile_user_filters_to_json(text: &str, start_id: u32) -> String {
+    serde_json::to_string(&compile_user_filters_internal(text, start_id))
+        .unwrap_or_else(|_| "{\"dnrRules\":[],\"cosmeticRules\":{\"generic\":[],\"domainSpecific\":{},\"genericExceptions\":[],\"domainExceptions\":{}},\"scriptletRules\":[]}".to_string())
+}
+
+fn merge_filter_sources_internal(
+    bundled_generic_in: Vec<String>,
+    bundled_domain_specific_in: HashMap<String, Vec<String>>,
+    bundled_scriptlets_in: Vec<ParsedRule>,
+    remote_texts_in: Vec<String>,
+) -> MergedFilterData {
+    let mut merged = MergedFilterData::default();
+    let mut generic_seen = HashSet::new();
+    let mut domain_seen: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut scriptlet_seen = HashSet::new();
+
+    for selector in bundled_generic_in {
+        push_unique(&mut merged.generic, &mut generic_seen, &selector);
+    }
+
+    for (domain, selectors) in bundled_domain_specific_in {
+        for selector in selectors {
+            push_unique_domain_selector(
+                &mut merged.domain_specific,
+                &mut domain_seen,
+                &domain,
+                &selector,
+            );
+        }
+    }
+
+    for rule in bundled_scriptlets_in {
+        let fingerprint = scriptlet_fingerprint(&rule);
+        if scriptlet_seen.insert(fingerprint) {
+            merged.scriptlet_rules.push(rule);
+        }
+    }
+
+    let mut exceptions: HashMap<String, Vec<String>> = HashMap::new();
+    let mut exception_seen: HashMap<String, HashSet<String>> = HashMap::new();
+
+    for text in remote_texts_in {
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if should_skip_filter_line(line) {
+                continue;
+            }
+
+            let Some(rule) = parse_line(line) else {
+                continue;
+            };
+
+            match rule.rule_type.as_str() {
+                "scriptlet" => {
+                    let fingerprint = scriptlet_fingerprint(&rule);
+                    if scriptlet_seen.insert(fingerprint) {
+                        merged.scriptlet_rules.push(rule);
+                    }
+                }
+                "cosmetic" => {
+                    let Some(selector) = rule.selector.as_deref() else {
+                        continue;
+                    };
+                    if rule.domains.is_empty() {
+                        if !rule.exception.unwrap_or(false) {
+                            push_unique(&mut merged.generic, &mut generic_seen, selector);
+                        }
+                        continue;
+                    }
+
+                    for domain in &rule.domains {
+                        if rule.exception.unwrap_or(false) {
+                            push_unique_domain_selector(
+                                &mut exceptions,
+                                &mut exception_seen,
+                                domain,
+                                selector,
+                            );
+                        } else {
+                            push_unique_domain_selector(
+                                &mut merged.domain_specific,
+                                &mut domain_seen,
+                                domain,
+                                selector,
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let generic_set: HashSet<&str> = merged.generic.iter().map(String::as_str).collect();
+    for selectors in merged.domain_specific.values_mut() {
+        selectors.retain(|selector| !generic_set.contains(selector.as_str()));
+    }
+
+    for (domain, selectors) in exceptions {
+        let entry = merged.domain_specific.entry(domain).or_default();
+        let mut local_seen: HashSet<String> = entry.iter().cloned().collect();
+        for selector in selectors {
+            let prefixed = format!("__exception__{selector}");
+            if local_seen.insert(prefixed.clone()) {
+                entry.push(prefixed);
+            }
+        }
+    }
+
+    merged.domain_specific.retain(|_, selectors| !selectors.is_empty());
+    merged
+}
+
+#[wasm_bindgen]
+pub fn merge_filter_sources_to_json(
+    bundled_generic_json: &str,
+    bundled_domain_specific_json: &str,
+    bundled_scriptlets_json: &str,
+    remote_texts_json: &str,
+) -> String {
+    let bundled_generic_in: Vec<String> = serde_json::from_str(bundled_generic_json).unwrap_or_default();
+    let bundled_domain_specific_in: HashMap<String, Vec<String>> =
+        serde_json::from_str(bundled_domain_specific_json).unwrap_or_default();
+    let bundled_scriptlets_in: Vec<ParsedRule> = serde_json::from_str(bundled_scriptlets_json).unwrap_or_default();
+    let remote_texts_in: Vec<String> = serde_json::from_str(remote_texts_json).unwrap_or_default();
+
+    serde_json::to_string(&merge_filter_sources_internal(
+        bundled_generic_in,
+        bundled_domain_specific_in,
+        bundled_scriptlets_in,
+        remote_texts_in,
+    )).unwrap_or_else(|_| "{\"generic\":[],\"domainSpecific\":{},\"scriptletRules\":[]}".to_string())
+}
+
+#[wasm_bindgen]
+pub fn build_allowlist_rules_json(allowlist_json: &str, start_id: u32) -> String {
+    let allowlist: Vec<String> = serde_json::from_str(allowlist_json).unwrap_or_default();
+    let mut seen = HashSet::new();
+    let mut rules = Vec::new();
+
+    for (index, domain) in allowlist
+        .into_iter()
+        .map(|domain| domain.trim().to_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .filter(|domain| seen.insert(domain.clone()))
+        .enumerate()
+    {
+        rules.push(DnrRule {
+            id: start_id + index as u32,
+            priority: 500,
+            action: DnrAction {
+                action_type: "allowAllRequests".to_string(),
+                redirect: None,
+            },
+            condition: DnrCondition {
+                url_filter: Some(format!("||{domain}^")),
+                resource_types: Some(vec!["main_frame".to_string(), "sub_frame".to_string()]),
+                ..Default::default()
+            },
+        });
+    }
+
     serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
 }
 
@@ -179,6 +505,9 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
     if line.contains("##+js(") || line.contains("#+js(") { return parse_scriptlet(line); }
     if let Some(idx) = line.find("#@#") {
         return Some(ParsedRule { rule_type: "cosmetic".into(), domains: parse_domains(&line[..idx]), selector: Some(line[idx+3..].into()), exception: Some(true), name: None, args: None });
+    }
+    if let Some(idx) = line.find("#?#") {
+        return Some(ParsedRule { rule_type: "cosmetic".into(), domains: parse_domains(&line[..idx]), selector: Some(line[idx+3..].into()), exception: Some(false), name: None, args: None });
     }
     if let Some(idx) = line.find("##") {
         return Some(ParsedRule { rule_type: "cosmetic".into(), domains: parse_domains(&line[..idx]), selector: Some(line[idx+2..].into()), exception: Some(false), name: None, args: None });
@@ -222,7 +551,7 @@ fn parse_scriptlet_args(s: &str) -> Vec<String> {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DnrRule { id: u32, priority: u8, action: DnrAction, condition: DnrCondition }
+pub struct DnrRule { id: u32, priority: u16, action: DnrAction, condition: DnrCondition }
 #[derive(Serialize, Deserialize)]
 pub struct DnrAction { #[serde(rename = "type")] action_type: String, #[serde(skip_serializing_if = "Option::is_none")] redirect: Option<DnrRedirect> }
 #[derive(Serialize, Deserialize)]
@@ -322,7 +651,7 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         }
     }
 
-    let priority = if is_exception { 10u8 } else if is_important { 5u8 } else { 1u8 };
+    let priority = if is_exception { 10u16 } else if is_important { 5u16 } else { 1u16 };
 
     Some(DnrRule {
         id,
@@ -1447,6 +1776,85 @@ mod tests {
         assert_eq!(bundle.rules.exceptions, vec![".allow-me".to_string()]);
         assert!(bundle.exception_css.contains(".allow-me"));
         assert!(bundle.cosmetic_rules_binary.len() > 12);
+    }
+
+    #[test]
+    fn compile_user_filters_batches_network_cosmetic_and_scriptlets() {
+        let compiled = compile_user_filters_internal(
+            concat!(
+                "||ads.example^\n",
+                "||ads.example^\n",
+                "example.com##.hero-ad\n",
+                "example.com#@#.allow-ad\n",
+                "##.global-ad\n",
+                "##+js(set-constant, ads.enabled, false)\n",
+                "example.com#?#div:has(.sponsor)\n",
+            ),
+            900000,
+        );
+
+        assert_eq!(compiled.dnr_rules.len(), 1);
+        assert_eq!(compiled.cosmetic_rules.generic, vec![".global-ad".to_string()]);
+        assert_eq!(
+            compiled.cosmetic_rules.domain_specific["example.com"],
+            vec![".hero-ad".to_string(), "div:has(.sponsor)".to_string()]
+        );
+        assert_eq!(
+            compiled.cosmetic_rules.domain_exceptions["example.com"],
+            vec![".allow-ad".to_string()]
+        );
+        assert_eq!(compiled.scriptlet_rules.len(), 1);
+    }
+
+    #[test]
+    fn merge_filter_sources_preserves_bundled_priority_and_folds_exceptions() {
+        let merged = merge_filter_sources_internal(
+            vec![".global-ad".into()],
+            HashMap::from([("example.com".to_string(), vec![".hero-ad".to_string()])]),
+            vec![ParsedRule {
+                rule_type: "scriptlet".into(),
+                domains: vec!["example.com".into()],
+                selector: None,
+                exception: None,
+                name: Some("abort-current-script".into()),
+                args: Some(vec!["ads".into()]),
+            }],
+            vec![concat!(
+                "##.global-ad\n",
+                "example.com##.hero-ad\n",
+                "example.com##.sidebar-ad\n",
+                "example.com#@#.sidebar-ad\n",
+                "example.com##+js(abort-current-script, ads)\n",
+                "news.example.com##.sponsor\n"
+            )
+            .to_string()],
+        );
+
+        assert_eq!(merged.generic, vec![".global-ad".to_string()]);
+        assert_eq!(
+            merged.domain_specific["example.com"],
+            vec![".hero-ad".to_string(), ".sidebar-ad".to_string(), "__exception__.sidebar-ad".to_string()]
+        );
+        assert_eq!(
+            merged.domain_specific["news.example.com"],
+            vec![".sponsor".to_string()]
+        );
+        assert_eq!(merged.scriptlet_rules.len(), 1);
+    }
+
+    #[test]
+    fn build_allowlist_rules_dedupes_and_normalizes_domains() {
+        let rules: Vec<serde_json::Value> = serde_json::from_str(&build_allowlist_rules_json(
+            "[\" Example.com \",\"example.com\",\"news.example.com\"]",
+            990000,
+        ))
+        .unwrap();
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["id"], 990000);
+        assert_eq!(rules[0]["priority"], 500);
+        assert_eq!(rules[0]["condition"]["urlFilter"], "||example.com^");
+        assert_eq!(rules[1]["condition"]["urlFilter"], "||news.example.com^");
     }
 
     #[test]

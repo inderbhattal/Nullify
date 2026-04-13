@@ -19,14 +19,15 @@ import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import init, {
   BloomFilter as WasmBloom,
-  parse_filter_list_to_json,
-  compile_filters_to_dnr_json,
   KeywordMatcher,
   AllowlistMatcher,
   UrlSanitizer,
   build_css_from_selectors,
   build_page_bundle_from_json,
+  build_allowlist_rules_json,
+  compile_user_filters_to_json,
   generate_gaussian_noise,
+  merge_filter_sources_to_json,
   plan_selector_rules_json,
   reduce_cosmetic_rules_json,
   serialize_rules_to_binary_from_json,
@@ -34,8 +35,7 @@ import init, {
   resolve_entity,
   is_semantic_ad,
   sanitize_and_compact_selectors,
-  anonymize_stats_json,
-  check_allowlist_csv
+  anonymize_stats_json
 } from '../shared/wasm/nullify_core.js';
 
 // Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
@@ -930,19 +930,17 @@ async function checkFilterListUpdates() {
   try {
     console.log('[AdBlock] Fetching remote filter lists...');
 
-    // Start with bundled rules so curated fixes (e.g. CNN :remove()) take priority.
-    // Remote rules are merged in after, then deduplicated — bundled entries win
-    // because Set preserves first-seen order.
-    const mergedCosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
-    const mergedScriptlets = [];
+    const bundledCosmetic = { generic: [], domainSpecific: {} };
+    let bundledScriptlets = [];
+    const remoteTexts = [];
 
     // 1. Load bundled cosmetic rules first (highest priority)
     try {
       const bundledUrl = chrome.runtime.getURL('rules/cosmetic-rules.json');
       const bundled = await (await fetch(bundledUrl)).json();
-      mergedCosmetic.generic.push(...(bundled.generic || []));
+      bundledCosmetic.generic.push(...(bundled.generic || []));
       for (const [domain, selectors] of Object.entries(bundled.domainSpecific || {})) {
-        mergedCosmetic.domainSpecific[domain] = [...selectors];
+        bundledCosmetic.domainSpecific[domain] = [...selectors];
       }
     } catch (err) {
       console.warn('[AdBlock] Could not load bundled cosmetic rules:', err.message);
@@ -951,8 +949,7 @@ async function checkFilterListUpdates() {
     // 2. Load bundled scriptlet rules
     try {
       const scriptUrl = chrome.runtime.getURL('rules/scriptlet-rules.json');
-      const bundledScriptlets = await (await fetch(scriptUrl)).json();
-      mergedScriptlets.push(...bundledScriptlets);
+      bundledScriptlets = await (await fetch(scriptUrl)).json();
     } catch { /* non-fatal */ }
 
     // 3. Fetch and merge remote filter lists
@@ -960,10 +957,46 @@ async function checkFilterListUpdates() {
       try {
         console.log(`[AdBlock] Fetching ${list.id}...`);
         const text = await fetchAndExpand(list.url);
-        
-        const { cosmeticRules, scriptletRules } = wasmReady 
-          ? JSON.parse(parse_filter_list_to_json(text))
-          : parseFilterList(text);
+        remoteTexts.push(text);
+      } catch (err) {
+        console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
+      }
+    }
+
+    let mergedCosmetic;
+    let dedupedScriptlets;
+
+    if (wasmReady) {
+      try {
+        const reduced = JSON.parse(merge_filter_sources_to_json(
+          JSON.stringify(bundledCosmetic.generic || []),
+          JSON.stringify(bundledCosmetic.domainSpecific || {}),
+          JSON.stringify(bundledScriptlets || []),
+          JSON.stringify(remoteTexts)
+        ));
+        mergedCosmetic = {
+          generic: reduced.generic || [],
+          domainSpecific: reduced.domainSpecific || {},
+        };
+        dedupedScriptlets = reduced.scriptletRules || [];
+      } catch (err) {
+        console.error('[Nullify] WASM filter-source merge failed:', err);
+      }
+    }
+
+    if (!mergedCosmetic || !dedupedScriptlets) {
+      // Start with bundled rules so curated fixes (e.g. CNN :remove()) take priority.
+      // Remote rules are merged in after, then deduplicated — bundled entries win
+      // because Set preserves first-seen order.
+      mergedCosmetic = {
+        generic: [...(bundledCosmetic.generic || [])],
+        domainSpecific: { ...(bundledCosmetic.domainSpecific || {}) },
+        exceptions: {},
+      };
+      const mergedScriptlets = [...(bundledScriptlets || [])];
+
+      for (const text of remoteTexts) {
+        const { cosmeticRules, scriptletRules } = parseFilterList(text);
 
         for (const r of cosmeticRules) {
           if (r.domains.length === 0) {
@@ -983,25 +1016,20 @@ async function checkFilterListUpdates() {
         }
 
         for (const r of scriptletRules) mergedScriptlets.push(r);
-        console.log(`[AdBlock] ${list.id}: ${cosmeticRules.length} cosmetic, ${scriptletRules.length} scriptlets`);
-      } catch (err) {
-        console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
       }
+
+      const scriptletSeen = new Set();
+      dedupedScriptlets = mergedScriptlets.filter(r => {
+        const key = r.name + '|' + (r.domains || []).sort().join(',') + '|' + (r.args || []).join(',');
+        if (scriptletSeen.has(key)) return false;
+        scriptletSeen.add(key);
+        return true;
+      });
+
+      const reducedCosmetic = reduceCosmeticRules(mergedCosmetic);
+      mergedCosmetic.generic = reducedCosmetic.generic;
+      mergedCosmetic.domainSpecific = reducedCosmetic.domainSpecific;
     }
-
-    // 5. Deduplicate scriptlets by name+domains fingerprint
-    const scriptletSeen = new Set();
-    const dedupedScriptlets = mergedScriptlets.filter(r => {
-      const key = r.name + '|' + (r.domains || []).sort().join(',') + '|' + (r.args || []).join(',');
-      if (scriptletSeen.has(key)) return false;
-      scriptletSeen.add(key);
-      return true;
-    });
-
-    // 6. Deduplicate/fold exceptions/remove generic overlaps in one pass.
-    const reducedCosmetic = reduceCosmeticRules(mergedCosmetic);
-    mergedCosmetic.generic = reducedCosmetic.generic;
-    mergedCosmetic.domainSpecific = reducedCosmetic.domainSpecific;
 
     // 7. Re-index into IndexedDB + rebuild Bloom Filter
     await db.clear();
@@ -1242,15 +1270,18 @@ function parseUserCosmeticRules(text) {
 /** Apply user-defined filters as dynamic DNR rules + cosmetic rules. */
 async function applyUserFilters(filtersText) {
   const lines = (filtersText || '').split('\n').filter(Boolean);
-  
-  // Use high-performance WASM compiler if available
   let newRules = [];
+  let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
+  let userScriptlets = [];
+
   if (wasmReady) {
     try {
-      const rulesJson = compile_filters_to_dnr_json(filtersText || '', DNR_USER_RULES_START);
-      newRules = JSON.parse(rulesJson);
+      const compiled = JSON.parse(compile_user_filters_to_json(filtersText || '', DNR_USER_RULES_START));
+      newRules = compiled.dnrRules || [];
+      cosmeticRules = compiled.cosmeticRules || cosmeticRules;
+      userScriptlets = compiled.scriptletRules || [];
     } catch (err) {
-      console.error('[Nullify] WASM DNR compilation failed:', err);
+      console.error('[Nullify] WASM user filter compilation failed:', err);
     }
   }
 
@@ -1280,40 +1311,13 @@ async function applyUserFilters(filtersText) {
     console.error('[Nullify] Failed to update dynamic DNR rules:', err);
   }
 
-  let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
-  let userScriptlets = [];
-
-  if (wasmReady) {
-    try {
-      const parsed = JSON.parse(parse_filter_list_to_json(filtersText || ''));
-      const allCosmetic = parsed.cosmeticRules || [];
-      const allScriptlets = parsed.scriptletRules || [];
-
-      userScriptlets = allScriptlets;
-      const genericExceptions = new Set();
-
-      for (const rule of allCosmetic) {
-        if (rule.domains.length === 0) {
-          if (rule.exception) genericExceptions.add(rule.selector);
-          else cosmeticRules.generic.push(rule.selector);
-        } else {
-          for (const d of rule.domains) {
-            if (rule.exception) {
-              cosmeticRules.domainExceptions = cosmeticRules.domainExceptions || {};
-              (cosmeticRules.domainExceptions[d] = cosmeticRules.domainExceptions[d] || []).push(rule.selector);
-            } else {
-              cosmeticRules.domainSpecific[d] = cosmeticRules.domainSpecific[d] || [];
-              cosmeticRules.domainSpecific[d].push(rule.selector);
-            }
-          }
-        }
-      }
-      cosmeticRules.genericExceptions = Array.from(genericExceptions);
-    } catch (err) {
-      console.error('[Nullify] WASM cosmetic parsing failed:', err);
-      cosmeticRules = parseUserCosmeticRules(filtersText);
-    }
-  } else {
+  if (!wasmReady) {
+    cosmeticRules = parseUserCosmeticRules(filtersText);
+  } else if (
+    (!cosmeticRules.generic?.length && !Object.keys(cosmeticRules.domainSpecific || {}).length &&
+    !cosmeticRules.genericExceptions?.length && !Object.keys(cosmeticRules.domainExceptions || {}).length &&
+    !userScriptlets.length && lines.length > 0)
+  ) {
     cosmeticRules = parseUserCosmeticRules(filtersText);
   }
     
@@ -1398,15 +1402,29 @@ async function rebuildAllowlistRules(allowlist) {
     .filter((r) => r.id >= DNR_ALLOWLIST_START)
     .map((r) => r.id);
 
-  const newRules = allowlist.map((domain, i) => ({
-    id: DNR_ALLOWLIST_START + i,
-    priority: 500, // Systematic Priority for User Allowlist
-    condition: {
-      urlFilter: `||${domain}^`,
-      resourceTypes: ['main_frame', 'sub_frame'],
-    },
-    action: { type: 'allowAllRequests' },
-  }));
+  let newRules;
+  if (wasmReady) {
+    try {
+      newRules = JSON.parse(build_allowlist_rules_json(
+        JSON.stringify(allowlist || []),
+        DNR_ALLOWLIST_START
+      ));
+    } catch (err) {
+      console.error('[Nullify] WASM allowlist rule build failed:', err);
+    }
+  }
+
+  if (!newRules) {
+    newRules = allowlist.map((domain, i) => ({
+      id: DNR_ALLOWLIST_START + i,
+      priority: 500, // Systematic Priority for User Allowlist
+      condition: {
+        urlFilter: `||${domain}^`,
+        resourceTypes: ['main_frame', 'sub_frame'],
+      },
+      action: { type: 'allowAllRequests' },
+    }));
+  }
 
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: allowlistRuleIds,

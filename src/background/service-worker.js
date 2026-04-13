@@ -1683,18 +1683,11 @@ async function handleMessage(message, sender) {
           scriptletsToRun.push({ name: 'set-constant', args: ['yt.config_.ADS_DATA', 'undefined'] });
           scriptletsToRun.push({ name: 'set-constant', args: ['ytInitialPlayerResponse.adPlacements', 'undefined'] });
           scriptletsToRun.push({ name: 'set-constant', args: ['playerResponse.adPlacements', 'undefined'] });
-          
-          // 2. Intercept and neutralize Fetch/XHR ad data
-          scriptletsToRun.push({ 
-            name: 'trusted-replace-fetch-response', 
-            args: ['/youtubei/v1/player', '"adPlacements"', '"no_ads"'] 
-          });
-          scriptletsToRun.push({ 
-            name: 'trusted-replace-xhr-response', 
-            args: ['/youtubei/v1/player', '"adPlacements"', '"no_ads"'] 
-          });
-          
-          // 3. Prune ad-related keys from JSON
+
+          // 2. Keep JSON pruning as a lightweight backstop. The dedicated
+          // youtube-shield content script already owns fetch/XHR interception,
+          // and duplicating transport-level response rewriting here makes the
+          // small inline player noticeably slower on youtube.com.
           scriptletsToRun.push({ 
             name: 'json-prune', 
             args: ['playerResponse.adPlacements playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots adClientParams'] 

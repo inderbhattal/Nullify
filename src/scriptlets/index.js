@@ -173,25 +173,22 @@ function activateShields() {
     run('set-constant', ['ytInitialPlayerResponse.adPlacements', 'undefined']);
     run('set-constant', ['playerResponse.adPlacements', 'undefined']);
     
-    // 2. High-speed network interception (broadened)
-    run('trusted-replace-fetch-response', ['/youtubei/v1/player', '"adPlacements"', '"no_ads"']);
-    run('trusted-replace-xhr-response', ['/youtubei/v1/player', '"adPlacements"', '"no_ads"']);
-    run('trusted-replace-fetch-response', ['/youtubei/v1/get_watch', '"adPlacements"', '"no_ads"']);
-    
-    // 2.5. 'Poison' any ad-heartbeat or ad-related metadata requests
+    // 2. Block ad-only endpoints. The dedicated youtube-shield content script
+    // owns fetch/XHR interception for player responses; duplicating transport-
+    // level response rewriting here slows down the small inline player.
     run('prevent-fetch', ['/youtubei/v1/ad_break']);
     run('prevent-xhr', ['/youtubei/v1/ad_break']);
     run('prevent-fetch', ['/youtubei/v1/att/get_attestation']); // also prevents ad-attestation checks
     run('prevent-xhr', ['/youtubei/v1/att/get_attestation']);
     
-    // 2.6. Brute-force JSON pruning for ad-related keys
+    // 3. Brute-force JSON pruning for ad-related keys
     run('json-prune', ['playerResponse.adPlacements playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots adClientParams']);
 
     
-    // 3. Fail-safe skipper
+    // 4. Fail-safe skipper
     run('youtube-ad-skipper', []);
 
-    // 4. Handle SPA Navigations (YouTube doesn't reload page)
+    // 5. Handle SPA Navigations (YouTube doesn't reload page)
     window.addEventListener('yt-navigate-start', () => {
       run('set-constant', ['ytInitialPlayerResponse.adPlacements', 'undefined']);
     });

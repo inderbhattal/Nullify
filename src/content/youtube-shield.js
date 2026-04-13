@@ -7,7 +7,6 @@
 
 import init, {
   process_youtube_player,
-  process_youtube_player_bytes,
   sanitize_youtube_experiments,
   should_block_youtube_url,
 } from '../shared/wasm/nullify_core.js';
@@ -23,8 +22,6 @@ import init, {
     }
   };
   const isPlayerResponseUrl = (url) => url.includes('/v1/player');
-  const textEncoder = new TextEncoder();
-  const textDecoder = new TextDecoder();
 
   // ---- Ad key constants ----
   const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams', 'adClientParams'];
@@ -58,6 +55,33 @@ import init, {
     if (obj.playerResponse) pruneAdKeys(obj.playerResponse);
   }
 
+  function hasAdPayload(obj) {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
+    for (let i = 0; i < AD_KEYS.length; i++) {
+      if (obj[AD_KEYS[i]] !== undefined) return true;
+    }
+    return false;
+  }
+
+  function shouldPruneParsedResult(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
+    if (hasAdPayload(result)) return true;
+
+    const nested = result.playerResponse;
+    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) return false;
+
+    if (hasAdPayload(nested)) return true;
+
+    // Narrow the page-global JSON.parse hook to known YouTube player-ish shapes.
+    return !!(
+      nested.playabilityStatus ||
+      nested.streamingData ||
+      nested.videoDetails ||
+      nested.microformat ||
+      nested.responseContext
+    );
+  }
+
   // 1a. JSON.parse hook — THE critical interception layer.
   //
   // This runs synchronously at document_start before ANY YouTube code executes,
@@ -72,51 +96,23 @@ import init, {
   const _origJSONParse = JSON.parse;
   JSON.parse = function(text, ...rest) {
     const result = _origJSONParse.call(this, text, ...rest);
-    if (result !== null && typeof result === 'object' &&
-        (result.adPlacements !== undefined || result.playerAds !== undefined ||
-         result.adSlots !== undefined ||
-         (result.playerResponse &&
-          result.playerResponse.adPlacements !== undefined))) {
+    if (shouldPruneParsedResult(result)) {
       pruneAdKeys(result);
     }
     return result;
   };
 
-  // 1b. Response hooks — cover fetch consumers using json(), text(), or arrayBuffer().
+  // 1b. Response.json hook — keep the scope narrow and let JSON.parse handle
+  // text-backed consumers. The broader text()/arrayBuffer() hooks were touching
+  // too much page traffic for little gain.
   if (window.Response?.prototype) {
     const _origResponseJson = Response.prototype.json;
     Response.prototype.json = async function(...args) {
       const result = await _origResponseJson.apply(this, args);
-      if (isPlayerResponseUrl(this.url) &&
-          result !== null && typeof result === 'object' &&
-          (result.adPlacements !== undefined || result.playerAds !== undefined ||
-           result.adSlots !== undefined)) {
+      if (isPlayerResponseUrl(this.url) && shouldPruneParsedResult(result)) {
         pruneAdKeys(result);
       }
       return result;
-    };
-
-    const _origResponseText = Response.prototype.text;
-    Response.prototype.text = async function(...args) {
-      const text = await _origResponseText.apply(this, args);
-      return isPlayerResponseUrl(this.url) ? scrub(text) : text;
-    };
-
-    const _origResponseArrayBuffer = Response.prototype.arrayBuffer;
-    Response.prototype.arrayBuffer = async function(...args) {
-      const buffer = await _origResponseArrayBuffer.apply(this, args);
-      if (!isPlayerResponseUrl(this.url)) return buffer;
-      const bytes = new Uint8Array(buffer);
-      if (wasmReady) {
-        const cleaned = process_youtube_player_bytes(bytes);
-        if (cleaned.length !== 0) return cleaned.buffer;
-        return buffer;
-      }
-      const decoded = textDecoder.decode(bytes);
-      const scrubbed = scrub(decoded);
-      return scrubbed === decoded
-        ? buffer
-        : textEncoder.encode(scrubbed).buffer;
     };
   }
 

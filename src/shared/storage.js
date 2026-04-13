@@ -9,6 +9,7 @@ export const StorageKeys = {
   SETTINGS: 'settings',
   ALLOWLIST: 'allowlist',
   USER_FILTERS: 'userFilters',
+  USER_FILTERS_APPLIED: 'userFiltersApplied',
   USER_COSMETIC_RULES: 'userCosmeticRules',
   TAB_STATS: 'tabStats',
   ENABLED_RULESETS: 'enabledRulesets',

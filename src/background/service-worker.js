@@ -25,6 +25,7 @@ import init, {
   AllowlistMatcher,
   UrlSanitizer,
   build_css_from_selectors,
+  build_page_bundle_from_json,
   generate_gaussian_noise,
   plan_selector_rules_json,
   reduce_cosmetic_rules_json,
@@ -269,6 +270,19 @@ function reduceCosmeticRules(cosmetic) {
 }
 
 function buildPageBundle(rawRules) {
+  if (wasmReady) {
+    try {
+      return build_page_bundle_from_json(
+        JSON.stringify(rawRules.generic || []),
+        JSON.stringify(rawRules.domainSpecific || []),
+        JSON.stringify(rawRules.exceptions || []),
+        150
+      );
+    } catch (err) {
+      console.error('[Nullify] WASM page bundle build failed:', err);
+    }
+  }
+
   const exceptions = [...new Set((rawRules.exceptions || []).filter((selector) => typeof selector === 'string' && selector.trim()))];
   const exceptionSet = new Set(exceptions);
   const activeSelectors = [
@@ -339,9 +353,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
     await ingestRules(); // Build initial rule index
     await refreshMemoryCache(); // Fill RAM cache for speed
-    await applyPrivacySettings();
-    await applyRulesets();
-    await scheduleFilterUpdateAlarm();
+    await ensureBackgroundSetup();
 
     // Update badge for all existing tabs
     const tabs = await chrome.tabs.query({});
@@ -356,6 +368,34 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 // ---- Startup Orchestration (Speed Optimized) ----
 let _criticalReady = false;
 let _criticalPromise = null;
+let _backgroundSetupPromise = null;
+
+function ensureBackgroundSetup() {
+  if (_backgroundSetupPromise) return _backgroundSetupPromise;
+
+  _backgroundSetupPromise = (async () => {
+    const data = await getStorageBulk([
+      StorageKeys.USER_FILTERS,
+      StorageKeys.USER_FILTERS_APPLIED,
+    ]);
+    const userFilters = data[StorageKeys.USER_FILTERS] || '';
+    const appliedUserFilters = data[StorageKeys.USER_FILTERS_APPLIED] || '';
+
+    await Promise.all([
+      userFilters === appliedUserFilters
+        ? Promise.resolve({ network: 0, cosmetic: 0 })
+        : applyUserFilters(userFilters),
+      applyPrivacySettings(),
+      applyRulesets(),
+      scheduleFilterUpdateAlarm(),
+    ]);
+  })().catch((err) => {
+    _backgroundSetupPromise = null;
+    throw err;
+  });
+
+  return _backgroundSetupPromise;
+}
 
 function startInitialization() {
   if (_criticalPromise) return _criticalPromise;
@@ -386,15 +426,7 @@ function startInitialization() {
     _criticalReady = true;
 
     // Stage 2: Background tasks (non-blocking for messages)
-    (async () => {
-      const userFilters = await getStorage(StorageKeys.USER_FILTERS);
-      await Promise.all([
-        applyUserFilters(userFilters || ''),
-        applyPrivacySettings(),
-        applyRulesets(),
-        scheduleFilterUpdateAlarm(),
-      ]);
-    })().catch(err => console.error('[Nullify] Background startup failed:', err));
+    ensureBackgroundSetup().catch(err => console.error('[Nullify] Background startup failed:', err));
 
   })().catch(err => console.error('[Nullify] Critical startup failed:', err));
 
@@ -584,6 +616,7 @@ async function initializeDefaults() {
   await setStorage(StorageKeys.ALLOWLIST, []);
   await rebuildAllowlistRules([]);
   await setStorage(StorageKeys.USER_FILTERS, '');
+  await setStorage(StorageKeys.USER_FILTERS_APPLIED, '');
   await setStorage(StorageKeys.TAB_STATS, {});
   await setStorage(StorageKeys.FILTER_LISTS_META, {});
 
@@ -1285,6 +1318,7 @@ async function applyUserFilters(filtersText) {
   }
     
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
+  await setStorage(StorageKeys.USER_FILTERS_APPLIED, filtersText || '');
   await setStorage('userScriptletRules', userScriptlets);
 
   // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately

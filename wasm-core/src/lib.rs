@@ -1,4 +1,5 @@
 use wasm_bindgen::prelude::*;
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -499,6 +500,21 @@ struct ReducedCosmeticRules {
     domain_specific: HashMap<String, Vec<String>>,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct PageBundleRules {
+    generic: Vec<String>,
+    #[serde(rename = "domainSpecific")]
+    domain_specific: Vec<PlannedSelectorRule>,
+    exceptions: Vec<String>,
+}
+
+struct BuiltPageBundle {
+    rules: PageBundleRules,
+    css_text: String,
+    exception_css: String,
+    cosmetic_rules_binary: Vec<u8>,
+}
+
 struct FirstOp {
     base: String,
     op: String,
@@ -642,6 +658,113 @@ fn is_valid_selector(selector: &str) -> bool {
     !trimmed.is_empty() && !trimmed.contains('{') && !trimmed.contains('}') && !trimmed.contains(';')
 }
 
+fn build_css_from_selector_list(selectors: &[String], chunk_size: usize) -> String {
+    let cap = if chunk_size == 0 { 100 } else { chunk_size };
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+
+    for selector in selectors {
+        let selector = selector.trim();
+        if !is_valid_selector(selector) {
+            continue;
+        }
+        if seen.insert(selector.to_string()) {
+            unique.push(selector.to_string());
+        }
+    }
+
+    let mut out = Vec::with_capacity(unique.len() / cap + 1);
+    for chunk in unique.chunks(cap) {
+        out.push(format!(
+            "{} {{ display: none !important; visibility: hidden !important; }}",
+            chunk.join(",")
+        ));
+    }
+    out.join("\n")
+}
+
+fn serialize_rules_to_binary_lists(generic: &[String], domain_specific: &[String], exceptions: &[String]) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let write_list = |buf: &mut Vec<u8>, list: &[String]| {
+        buf.extend_from_slice(&(list.len() as u32).to_le_bytes());
+        for s in list {
+            buf.extend_from_slice(s.as_bytes());
+            buf.push(0);
+        }
+    };
+
+    write_list(&mut buffer, generic);
+    write_list(&mut buffer, domain_specific);
+    write_list(&mut buffer, exceptions);
+    buffer
+}
+
+fn build_page_bundle_internal(
+    generic_in: Vec<String>,
+    domain_specific_in: Vec<String>,
+    exceptions_in: Vec<String>,
+    css_chunk_size: usize,
+) -> BuiltPageBundle {
+    let mut exceptions = Vec::new();
+    let mut exception_seen = HashSet::new();
+    for selector in exceptions_in {
+        let selector = selector.trim();
+        if !is_valid_selector(selector) {
+            continue;
+        }
+        if exception_seen.insert(selector.to_string()) {
+            exceptions.push(selector.to_string());
+        }
+    }
+
+    let exception_set: HashSet<&str> = exceptions.iter().map(String::as_str).collect();
+    let mut css_selectors = Vec::new();
+    let mut procedural_rules = Vec::new();
+
+    for selector in generic_in.into_iter().chain(domain_specific_in.into_iter()) {
+        let selector = selector.trim();
+        if !is_valid_selector(selector) || exception_set.contains(selector) {
+            continue;
+        }
+
+        if contains_proc_op(selector) {
+            procedural_rules.push(PlannedSelectorRule {
+                selector: selector.to_string(),
+                plan: parse_procedural_plan(selector),
+            });
+        } else {
+            css_selectors.push(selector.to_string());
+        }
+    }
+
+    let css_text = build_css_from_selector_list(&css_selectors, css_chunk_size);
+    let exception_css = if exceptions.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "{} {{ display: revert !important; visibility: revert !important; }}",
+            exceptions.join(",")
+        )
+    };
+
+    let binary_domain_specific: Vec<String> = procedural_rules.iter()
+        .filter_map(|rule| serde_json::to_string(rule).ok())
+        .collect();
+
+    let cosmetic_rules_binary = serialize_rules_to_binary_lists(&Vec::new(), &binary_domain_specific, &exceptions);
+
+    BuiltPageBundle {
+        rules: PageBundleRules {
+            generic: Vec::new(),
+            domain_specific: procedural_rules,
+            exceptions,
+        },
+        css_text,
+        exception_css,
+        cosmetic_rules_binary,
+    }
+}
+
 /// Classify a newline-separated list of CSS selectors into CSS-safe vs procedural
 /// in a single O(total_chars) AhoCorasick pass — much faster than calling
 /// isProceduralSelector() per selector in JS.
@@ -691,6 +814,46 @@ pub fn plan_selector_rules_json(selectors_json: &str) -> String {
     }
 
     serde_json::to_string(&bundle).unwrap_or_else(|_| "{\"cssSelectors\":[],\"proceduralRules\":[]}".to_string())
+}
+
+/// Build the per-page cosmetic bundle in one Rust pass:
+/// - dedupe/validate exceptions
+/// - split CSS-safe vs procedural selectors
+/// - pre-plan procedural selectors
+/// - build CSS text
+/// - serialize the binary procedural payload for content scripts
+#[wasm_bindgen]
+pub fn build_page_bundle_from_json(
+    generic_json: &str,
+    domain_specific_json: &str,
+    exceptions_json: &str,
+    css_chunk_size: usize,
+) -> JsValue {
+    let generic_in: Vec<String> = serde_json::from_str(generic_json).unwrap_or_default();
+    let domain_specific_in: Vec<String> = serde_json::from_str(domain_specific_json).unwrap_or_default();
+    let exceptions_in: Vec<String> = serde_json::from_str(exceptions_json).unwrap_or_default();
+    let bundle = build_page_bundle_internal(generic_in, domain_specific_in, exceptions_in, css_chunk_size);
+
+    let bundle_obj = Object::new();
+    let rules_obj = Object::new();
+
+    let generic_js = Array::new();
+    let domain_specific_js = serde_wasm_bindgen::to_value(&bundle.rules.domain_specific)
+        .unwrap_or_else(|_| Array::new().into());
+    let exceptions_js = serde_wasm_bindgen::to_value(&bundle.rules.exceptions)
+        .unwrap_or_else(|_| Array::new().into());
+    let binary_js = Uint8Array::from(bundle.cosmetic_rules_binary.as_slice());
+
+    let _ = Reflect::set(&rules_obj, &JsValue::from_str("generic"), &generic_js.into());
+    let _ = Reflect::set(&rules_obj, &JsValue::from_str("domainSpecific"), &domain_specific_js);
+    let _ = Reflect::set(&rules_obj, &JsValue::from_str("exceptions"), &exceptions_js);
+
+    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("rules"), &rules_obj.into());
+    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("cssText"), &JsValue::from_str(&bundle.css_text));
+    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("exceptionCss"), &JsValue::from_str(&bundle.exception_css));
+    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("cosmeticRulesBinary"), &binary_js.into());
+
+    bundle_obj.into()
 }
 
 // ---------------------------------------------------------------------------
@@ -862,16 +1025,10 @@ pub fn sanitize_and_compact_selectors(csv: &str, chunk_size: usize) -> String {
 
 #[wasm_bindgen]
 pub fn serialize_rules_to_binary_from_json(generic_json: &str, domain_specific_json: &str, exceptions_json: &str) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let write_list = |buf: &mut Vec<u8>, json: &str| {
-        let list: Vec<String> = serde_json::from_str(json).unwrap_or_default();
-        buf.extend_from_slice(&(list.len() as u32).to_le_bytes());
-        for s in list { buf.extend_from_slice(s.as_bytes()); buf.push(0); }
-    };
-    write_list(&mut buffer, generic_json);
-    write_list(&mut buffer, domain_specific_json);
-    write_list(&mut buffer, exceptions_json);
-    buffer
+    let generic: Vec<String> = serde_json::from_str(generic_json).unwrap_or_default();
+    let domain_specific: Vec<String> = serde_json::from_str(domain_specific_json).unwrap_or_default();
+    let exceptions: Vec<String> = serde_json::from_str(exceptions_json).unwrap_or_default();
+    serialize_rules_to_binary_lists(&generic, &domain_specific, &exceptions)
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,6 +1429,24 @@ mod tests {
         assert_eq!(parsed["generic"].as_array().unwrap().len(), 2);
         assert_eq!(parsed["domainSpecific"]["example.com"].as_array().unwrap()[0], ".sidebar-ad");
         assert_eq!(parsed["domainSpecific"]["example.com"].as_array().unwrap()[1], "__exception__.allow-me");
+    }
+
+    #[test]
+    fn build_page_bundle_internal_splits_css_and_procedural_once() {
+        let bundle = build_page_bundle_internal(
+            vec![".hero-ad".into(), ".allow-me".into()],
+            vec!["div:has-text(Sponsored):upward(article)".into()],
+            vec![".allow-me".into(), ".allow-me".into()],
+            150,
+        );
+
+        assert!(bundle.css_text.contains(".hero-ad"));
+        assert!(!bundle.css_text.contains(".allow-me"));
+        assert_eq!(bundle.rules.domain_specific.len(), 1);
+        assert_eq!(bundle.rules.domain_specific[0].selector, "div:has-text(Sponsored):upward(article)");
+        assert_eq!(bundle.rules.exceptions, vec![".allow-me".to_string()]);
+        assert!(bundle.exception_css.contains(".allow-me"));
+        assert!(bundle.cosmetic_rules_binary.len() > 12);
     }
 
     #[test]

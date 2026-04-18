@@ -1847,24 +1847,10 @@ async function handleMessage(message, sender) {
       if (!isAllowed && sender.tab?.id) {
         const scriptletsToRun = [...scriptletRules];
 
-        // Targeted YouTube Anti-Adblock (uBO-grade)
-        if (hostname.includes('youtube.com')) {
-          // 1. Force ad flags to undefined
-          scriptletsToRun.push({ name: 'set-constant', args: ['yt.config_.ADS_DATA', 'undefined'] });
-          scriptletsToRun.push({ name: 'set-constant', args: ['ytInitialPlayerResponse.adPlacements', 'undefined'] });
-          scriptletsToRun.push({ name: 'set-constant', args: ['playerResponse.adPlacements', 'undefined'] });
-
-          // 2. Keep JSON pruning as a lightweight backstop. The dedicated
-          // youtube-shield content script already owns fetch/XHR interception,
-          // and duplicating transport-level response rewriting here makes the
-          // small inline player noticeably slower on youtube.com.
-          scriptletsToRun.push({ 
-            name: 'json-prune', 
-            args: ['playerResponse.adPlacements playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots adClientParams'] 
-          });
-          }
-
-          if (settings.fingerprintProtection !== false) {
+        // The dedicated youtube-shield content script owns YouTube ad blocking.
+        // Duplicating the same protections here adds latency without improving
+        // coverage, so keep the generic scriptlet path only.
+        if (!hostname.includes('youtube.com') && settings.fingerprintProtection !== false) {
           scriptletsToRun.push({ name: 'fingerprint-noise', args: [] });
           scriptletsToRun.push({ name: 'battery-spoof', args: [] });
         }

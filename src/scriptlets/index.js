@@ -163,47 +163,11 @@ function run(name, args = []) {
 }
 
 // ---------------------------------------------------------------------------
-// Auto-Shield — Early activation for critical sites
-// ---------------------------------------------------------------------------
-function activateShields() {
-  const isYT = document.documentElement.hasAttribute('data-nullify-yt');
-  if (isYT) {
-    // 1. Instant variable protection
-    run('set-constant', ['yt.config_.ADS_DATA', 'undefined']);
-    run('set-constant', ['ytInitialPlayerResponse.adPlacements', 'undefined']);
-    run('set-constant', ['playerResponse.adPlacements', 'undefined']);
-    
-    // 2. Block ad-only endpoints. The dedicated youtube-shield content script
-    // owns fetch/XHR interception for player responses; duplicating transport-
-    // level response rewriting here slows down the small inline player.
-    run('prevent-fetch', ['/youtubei/v1/ad_break']);
-    run('prevent-xhr', ['/youtubei/v1/ad_break']);
-    run('prevent-fetch', ['/youtubei/v1/att/get_attestation']); // also prevents ad-attestation checks
-    run('prevent-xhr', ['/youtubei/v1/att/get_attestation']);
-    
-    // 3. Brute-force JSON pruning for ad-related keys
-    run('json-prune', ['playerResponse.adPlacements playerResponse.playerAds playerResponse.adSlots adPlacements playerAds adSlots adClientParams']);
-
-    
-    // 4. Fail-safe skipper
-    run('youtube-ad-skipper', []);
-
-    // 5. Handle SPA Navigations (YouTube doesn't reload page)
-    window.addEventListener('yt-navigate-start', () => {
-      run('set-constant', ['ytInitialPlayerResponse.adPlacements', 'undefined']);
-    });
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Public API — attached to window so MAIN-world injection can call it
 // ---------------------------------------------------------------------------
 // Use a less predictable property name to make extension detection harder.
 const REGISTRY_NAME = '__nu' + Math.random().toString(36).slice(2, 8);
 window[REGISTRY_NAME] = { run };
-
-// Activate shields immediately upon bundle execution
-activateShields();
 
 // Export the name so it can be used by the injector
 export { run, REGISTRY_NAME };

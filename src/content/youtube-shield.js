@@ -1,19 +1,19 @@
 /**
- * youtube-shield.js — Zero-Allocation Architecture
- * Optimized for sub-frame latency: MutationObserver replaces setInterval,
- * WASM automata built once via OnceLock, combined player processor avoids
- * double JS→WASM round-trip.
+ * youtube-shield.js — YouTube fast path
+ * Optimized for sub-frame latency: eager WASM bootstrap, single-owner
+ * transport/parsing interception, and short backoff polling for player attach.
  */
 
 import init, {
   process_youtube_player,
   sanitize_youtube_experiments,
-  should_block_youtube_url,
 } from '../shared/wasm/nullify_core.js';
 
 (function() {
   let wasmReady = false;
   let wasmInitStarted = false;
+  let wasmInitError = null;
+  let wasmSource = null;
   const getRuntimeWasmUrl = () => {
     try {
       return globalThis.chrome?.runtime?.getURL?.('dist/nullify_core_bg.wasm') || null;
@@ -22,6 +22,7 @@ import init, {
     }
   };
   const isPlayerResponseUrl = (url) => url.includes('/v1/player');
+  const PLAYER_POLL_DELAYS = [50, 100, 200, 400, 800, 1600, 3000];
 
   // ---- Ad key constants ----
   const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams', 'adClientParams'];
@@ -39,6 +40,33 @@ import init, {
     ['"web_player_api_v2_ads_metadata":true', '"web_player_api_v2_ads_metadata":false'],
     ['"web_enable_ad_break_heartbeat":true', '"web_enable_ad_break_heartbeat":false'],
   ];
+  const WASM_STATE_KEY = '__nullifyYoutubeWasm';
+  const updateWasmState = (status) => {
+    globalThis[WASM_STATE_KEY] = {
+      status,
+      ready: status === 'ready',
+      error: wasmInitError,
+      source: wasmSource,
+    };
+    try {
+      const root = document.documentElement;
+      if (!root) return;
+      root.setAttribute('data-nullify-yt-wasm', status);
+      if (wasmSource) {
+        root.setAttribute('data-nullify-yt-wasm-source', wasmSource);
+      } else {
+        root.removeAttribute('data-nullify-yt-wasm-source');
+      }
+    } catch {
+      // Ignore page-level debug state failures.
+    }
+  };
+  const shouldBlockRequestUrl = (url) =>
+    url.includes('/ad_break') ||
+    url.includes('/get_attestation') ||
+    url.includes('/ad_slot_logging');
+
+  updateWasmState('waiting');
 
   // 1. Primary prevention — set ad keys to false in any parsed object.
   //
@@ -117,28 +145,52 @@ import init, {
   }
 
   // 2. WASM Initialization
-  const bootstrapWasm = (url) => {
+  const bootstrapWasm = (url, source = null) => {
     if (wasmReady || wasmInitStarted || !url) return;
     wasmInitStarted = true;
+    wasmInitError = null;
+    wasmSource = source;
+    updateWasmState('loading');
     const initPromise = init({ module_or_path: url });
     initPromise.then(() => {
       wasmReady = true;
-      console.log('%c[Nullify] WASM Active', 'color: #00ff00; font-weight: bold;');
+      wasmInitError = null;
+      updateWasmState('ready');
+      console.info(`[Nullify] YouTube WASM ready (${wasmSource || 'unknown'})`);
+      try {
+        if (window.ytcfg?.config_) poison(window.ytcfg.config_);
+      } catch {
+        // Ignore late config poisoning failures.
+      }
     }).catch((err) => {
       wasmInitStarted = false;
+      wasmInitError = err?.message || String(err);
+      updateWasmState('error');
       console.error('[Nullify] WASM init failed:', err);
     });
   };
-  bootstrapWasm(getRuntimeWasmUrl());
-  const attrObs = new MutationObserver(() => {
-    const url = document.documentElement.getAttribute('data-nullify-wasm');
-    if (url) { bootstrapWasm(url); attrObs.disconnect(); }
-  });
-  attrObs.observe(document.documentElement, { attributes: true });
-  const initialUrl = document.documentElement.getAttribute('data-nullify-wasm');
-  if (initialUrl) {
-    bootstrapWasm(initialUrl);
-    attrObs.disconnect();
+  const resolveWasmModule = () => {
+    const runtimeUrl = getRuntimeWasmUrl();
+    if (runtimeUrl) return { url: runtimeUrl, source: 'runtime' };
+    const attrUrl = document.documentElement?.getAttribute('data-nullify-wasm') || null;
+    if (attrUrl) return { url: attrUrl, source: 'dom' };
+    return { url: null, source: null };
+  };
+  const startWasmBootstrap = () => {
+    const { url, source } = resolveWasmModule();
+    if (!url) return false;
+    bootstrapWasm(url, source);
+    return true;
+  };
+  if (!startWasmBootstrap()) {
+    const root = document.documentElement;
+    if (root) {
+      const attrObs = new MutationObserver(() => {
+        if (!startWasmBootstrap()) return;
+        attrObs.disconnect();
+      });
+      attrObs.observe(root, { attributes: true, attributeFilter: ['data-nullify-wasm'] });
+    }
   }
 
   // 3. Response Scrubber
@@ -208,10 +260,9 @@ import init, {
     const url = typeof input === 'string' ? input : input?.url || '';
 
     // Pre-flight block: return empty response without hitting network.
-    // WASM automaton check when ready; exact string fallback otherwise.
-    const blocked = wasmReady
-      ? should_block_youtube_url(url)
-      : (url.includes('/ad_break') || url.includes('/get_attestation') || url.includes('/ad_slot_logging'));
+    // These are exact fixed endpoints, so crossing the JS->WASM boundary here
+    // adds overhead without buying more coverage.
+    const blocked = shouldBlockRequestUrl(url);
     if (blocked) {
       return new Response('{}', {
         status: 200,
@@ -248,9 +299,7 @@ import init, {
     // Pre-flight block — abort ad-only XHR requests before they reach the network.
     send(...args) {
       const url = this._nUrl;
-      const block = wasmReady
-        ? should_block_youtube_url(url)
-        : (url.includes('/ad_break') || url.includes('/get_attestation') || url.includes('/ad_slot_logging'));
+      const block = shouldBlockRequestUrl(url);
       if (block) {
         this._nBlocked = true;
         this._nCached = '{}';
@@ -352,19 +401,23 @@ import init, {
     web_player_api_v2_ads_metadata: false,
     web_enable_ad_break_heartbeat: false,
   };
+  const sanitizedExperimentFlagSets = new WeakSet();
   const poison = (cfg) => {
-    if (!cfg || !cfg.EXPERIMENT_FLAGS) return;
+    const flags = cfg?.EXPERIMENT_FLAGS;
+    if (!flags || typeof flags !== 'object') return;
     // Synchronous baseline — always runs, no WASM dependency.
-    Object.assign(cfg.EXPERIMENT_FLAGS, POISON_FLAGS);
+    Object.assign(flags, POISON_FLAGS);
     // WASM extends coverage to any additional flags we may have missed.
-    if (wasmReady) {
-      try {
-        const sanitized = JSON.parse(sanitize_youtube_experiments(JSON.stringify(cfg)));
-        if (sanitized?.EXPERIMENT_FLAGS) {
-          Object.assign(cfg.EXPERIMENT_FLAGS, sanitized.EXPERIMENT_FLAGS);
-        }
-      } catch (e) {}
-    }
+    if (!wasmReady || sanitizedExperimentFlagSets.has(flags)) return;
+    try {
+      const sanitized = JSON.parse(
+        sanitize_youtube_experiments(JSON.stringify({ EXPERIMENT_FLAGS: flags }))
+      );
+      if (sanitized?.EXPERIMENT_FLAGS) {
+        Object.assign(flags, sanitized.EXPERIMENT_FLAGS);
+      }
+      sanitizedExperimentFlagSets.add(flags);
+    } catch (e) {}
   };
 
   if (window.ytcfg?.set) {
@@ -374,11 +427,13 @@ import init, {
       return origSet.apply(this, [cfg, ...args]);
     };
     if (window.ytcfg.config_) poison(window.ytcfg.config_);
+  } else if (window.ytcfg?.config_) {
+    poison(window.ytcfg.config_);
   }
 
-  // 8. Zero-Latency Ad Skipper — MutationObserver fires the instant YouTube
-  //    adds/removes 'ad-showing' or 'ad-interrupting' on #movie_player.
-  //    This replaces setInterval(fn, 200) with immediate-reaction semantics.
+  // 8. Zero-Latency Ad Skipper — MutationObserver reacts immediately when
+  //    YouTube toggles ad classes on #movie_player. A short backoff poll is
+  //    only used to discover or rediscover the player element.
   //
   //    Skip priority:
   //      1. Click the skip button (YouTube's own UI — cleanest, no side effects)
@@ -432,10 +487,20 @@ import init, {
 
   let _adObs = null;
   let _observedPlayer = null;
+  let _playerPollTimer = null;
+  let _playerPollIndex = 0;
+
+  const stopPlayerPoll = () => {
+    if (_playerPollTimer) {
+      clearTimeout(_playerPollTimer);
+      _playerPollTimer = null;
+    }
+  };
 
   const attachToPlayer = (player) => {
     if (player === _observedPlayer) return;
     if (_adObs) _adObs.disconnect();
+    stopPlayerPoll();
     _observedPlayer = player;
 
     _adObs = new MutationObserver(() => {
@@ -455,27 +520,31 @@ import init, {
     }
   };
 
-  // Find #movie_player using a lightweight interval instead of a subtree
-  // MutationObserver. A full-subtree observer on YouTube's SPA generates
-  // thousands of callbacks per navigation; a 50ms poll is far cheaper and
-  // fast enough — the player always appears within ~500ms of page load.
-  // The interval also handles YouTube SPA navigations (yt-navigate-finish).
+  // Find #movie_player using a short backoff poll instead of a fixed interval.
+  // A full-subtree observer on YouTube's SPA generates thousands of callbacks
+  // per navigation, and a fixed 50ms loop keeps running longer than needed.
   const pollForPlayer = () => {
     const player = document.querySelector('#movie_player');
-    if (player) attachToPlayer(player);
+    if (!player) return false;
+    attachToPlayer(player);
+    return true;
   };
 
-  // Poll quickly at startup
-  const initPoll = setInterval(() => {
-    pollForPlayer();
-    if (_observedPlayer) clearInterval(initPoll);
-  }, 50);
-  // Safety: stop fast poll after 10 s regardless
-  setTimeout(() => clearInterval(initPoll), 10000);
+  const schedulePlayerPoll = (reset = false) => {
+    if (reset) {
+      stopPlayerPoll();
+      _playerPollIndex = 0;
+    }
+    if (pollForPlayer()) return;
+    if (_playerPollTimer || _playerPollIndex >= PLAYER_POLL_DELAYS.length) return;
+    const delay = PLAYER_POLL_DELAYS[_playerPollIndex++];
+    _playerPollTimer = setTimeout(() => {
+      _playerPollTimer = null;
+      schedulePlayerPoll(false);
+    }, delay);
+  };
 
-  // Re-attach on YouTube SPA navigation (yt-navigate-finish fires when a new
-  // video page is loaded in the same tab — the player element may be reused
-  // but its class list resets, so we need a fresh MutationObserver).
-  window.addEventListener('yt-navigate-finish', pollForPlayer);
-  window.addEventListener('yt-page-data-updated', pollForPlayer);
+  schedulePlayerPoll(true);
+  window.addEventListener('yt-navigate-finish', () => schedulePlayerPoll(true));
+  window.addEventListener('yt-page-data-updated', () => schedulePlayerPoll(true));
 })();

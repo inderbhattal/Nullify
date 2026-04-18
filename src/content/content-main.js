@@ -60,14 +60,14 @@ function decodeBinaryRules(buffer) {
 }
 
 async function main() {
-  // 0. Handle YouTube-specific initialization (always active)
-  if (hostname.includes('youtube.com')) {
+  // 0. Provide the WASM URL fallback to the MAIN-world YouTube shield.
+  const isYouTube = hostname.includes('youtube.com');
+  if (isYouTube) {
     try {
       const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
-      document.documentElement.setAttribute('data-nullify-yt', '1');
       document.documentElement.setAttribute('data-nullify-wasm', wasmUrl);
     } catch {
-      // Background worker may not be ready yet
+      // Ignore if runtime URL resolution is unavailable here
     }
   }
 
@@ -89,8 +89,14 @@ async function main() {
     : cosmeticRules;
 
   // Only inject scriptlets bundle if we actually have scriptlets to run or fingerprinting is on.
-  // This saves substantial memory and parsing time on "clean" pages.
-  if (hasScriptlets || settings?.fingerprintProtection !== false) {
+  // YouTube owns its own fast-path blocker in youtube-shield.js, so avoid
+  // paying to parse the general scriptlet bundle there unless we have real
+  // page-specific scriptlets to run.
+  const shouldInjectScriptlets = isYouTube
+    ? hasScriptlets
+    : (hasScriptlets || settings?.fingerprintProtection !== false);
+
+  if (shouldInjectScriptlets) {
     injectScriptletsBundleIntoMainWorld();
   }
 

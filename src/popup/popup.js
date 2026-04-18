@@ -55,22 +55,22 @@ async function loadSettings() {
 
 async function loadTabStats() {
   try {
-    const stats = await chrome.runtime.sendMessage({
-      type: 'GET_TAB_STATS',
-      payload: { tabId: currentTab.id },
-    });
+    const [stats, dailyTotal] = await Promise.all([
+      chrome.runtime.sendMessage({
+        type: 'GET_TAB_STATS',
+        payload: { tabId: currentTab.id },
+      }),
+      chrome.runtime.sendMessage({ type: 'GET_DAILY_BLOCKED_TOTAL' }),
+    ]);
+
     $('blockedCount').textContent = stats?.blocked ?? 0;
     $('trackerCount').textContent = stats?.trackers ?? 0;
+    $('totalBlocked').textContent = dailyTotal?.total ?? 0;
   } catch {
     $('blockedCount').textContent = '—';
     $('trackerCount').textContent = '—';
+    $('totalBlocked').textContent = '—';
   }
-
-  // Total today from storage
-  try {
-    const data = await chrome.storage.local.get('totalBlockedToday');
-    $('totalBlocked').textContent = data.totalBlockedToday ?? 0;
-  } catch {}
 }
 
 async function loadSiteStatus() {

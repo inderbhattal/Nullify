@@ -14,6 +14,8 @@ export const StorageKeys = {
   USER_FILTERS_APPLIED: 'userFiltersApplied',
   USER_COSMETIC_RULES: 'userCosmeticRules',
   TAB_STATS: 'tabStats',
+  TOTAL_BLOCKED_TODAY: 'totalBlockedToday',
+  TOTAL_BLOCKED_DATE: 'totalBlockedDate',
   ENABLED_RULESETS: 'enabledRulesets',
   FILTER_LISTS_META: 'filterListsMeta',
   LAST_UPDATE_CHECK: 'lastUpdateCheck',

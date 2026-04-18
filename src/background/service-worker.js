@@ -69,6 +69,13 @@ let cachedAllowlist = new Set();
 let cachedGenericCss = null;
 let domainRulesCache = new Map(); // hostname -> packaged page bundle (LRU, max 100 entries)
 const DOMAIN_RULES_CACHE_MAX = 100;
+const YOUTUBE_SHIELD_SCRIPT_ID = 'nullify-youtube-shield';
+const YOUTUBE_SHIELD_TARGETS = [
+  { hostname: 'youtube.com', pattern: '*://youtube.com/*' },
+  { hostname: 'www.youtube.com', pattern: '*://www.youtube.com/*' },
+  { hostname: 'm.youtube.com', pattern: '*://m.youtube.com/*' },
+  { hostname: 'music.youtube.com', pattern: '*://music.youtube.com/*' },
+];
 
 function setCachedDomainRules(hostname, bundle) {
   // Evict oldest entry when at capacity (Map preserves insertion order)
@@ -353,14 +360,12 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     }
 
     await ingestRules(); // Build initial rule index
-    await refreshMemoryCache(); // Fill RAM cache for speed
+    await Promise.all([
+      refreshMemoryCache(), // Fill RAM cache for speed
+      restorePersistedStats(),
+    ]);
     await ensureBackgroundSetup();
-
-    // Update badge for all existing tabs
-    const tabs = await chrome.tabs.query({});
-    for (const tab of tabs) {
-      updateBadge(tab.id);
-    }
+    await refreshAllBadges();
   } catch (err) {
     console.error('[Nullify] onInstalled handler failed:', err);
   }
@@ -423,8 +428,10 @@ function startInitialization() {
     await Promise.all([
       loadBloomFilter(),
       refreshMemoryCache(),
+      restorePersistedStats(),
     ]);
     _criticalReady = true;
+    refreshAllBadges().catch(err => console.error('[Nullify] Badge refresh failed:', err));
 
     // Stage 2: Background tasks (non-blocking for messages)
     ensureBackgroundSetup().catch(err => console.error('[Nullify] Background startup failed:', err));
@@ -454,6 +461,32 @@ function rebuildAllowlistMatcher() {
   if (allowlistMatcher) { allowlistMatcher.free(); allowlistMatcher = null; }
   if (cachedAllowlist.size > 0) {
     allowlistMatcher = new AllowlistMatcher(Array.from(cachedAllowlist).join(','));
+  }
+}
+
+function getYouTubeShieldExcludeMatches() {
+  return YOUTUBE_SHIELD_TARGETS
+    .filter(({ hostname }) => isHostnameAllowedCached(hostname))
+    .map(({ pattern }) => pattern);
+}
+
+async function syncYouTubeShieldRegistration() {
+  try {
+    const registration = {
+      id: YOUTUBE_SHIELD_SCRIPT_ID,
+      matches: YOUTUBE_SHIELD_TARGETS.map(({ pattern }) => pattern),
+      excludeMatches: getYouTubeShieldExcludeMatches(),
+      js: ['dist/youtube-shield.js'],
+      runAt: 'document_start',
+      world: 'MAIN',
+      allFrames: true,
+      persistAcrossSessions: true,
+    };
+
+    await chrome.scripting.unregisterContentScripts({ ids: [YOUTUBE_SHIELD_SCRIPT_ID] }).catch(() => {});
+    await chrome.scripting.registerContentScripts([registration]);
+  } catch (err) {
+    console.error('[Nullify] Failed to sync YouTube shield registration:', err);
   }
 }
 
@@ -492,6 +525,7 @@ async function refreshMemoryCache() {
 
   domainRulesCache.clear();
   genericCssLoaded = !!cachedGenericCss;
+  await syncYouTubeShieldRegistration();
 }
 
 async function loadBloomFilter() {
@@ -614,6 +648,7 @@ async function initializeDefaults() {
     blockWebRTC: true,
     upgradeInsecureRequests: true,
     blockHyperlinkAuditing: true,
+    showBadge: true,
     blockThirdPartyCookies: false,
     fingerprintProtection: true,
     stripTrackingHeaders: true,
@@ -629,6 +664,8 @@ async function initializeDefaults() {
   await setStorage(StorageKeys.USER_FILTERS, '');
   await setStorage(StorageKeys.USER_FILTERS_APPLIED, '');
   await setStorage(StorageKeys.TAB_STATS, {});
+  await setStorage(StorageKeys.TOTAL_BLOCKED_TODAY, 0);
+  await setStorage(StorageKeys.TOTAL_BLOCKED_DATE, getCurrentDayStamp());
   await setStorage(StorageKeys.FILTER_LISTS_META, {});
 
   // Enabled/disabled rulesets
@@ -654,15 +691,23 @@ async function applyPrivacySettings() {
   const settings = await getStorage(StorageKeys.SETTINGS) || {};
 
   // Block WebRTC IP leaks
-  if (chrome.privacy && settings.blockWebRTC !== false) {
-    chrome.privacy.network.webRTCIPHandlingPolicy.set({
-      value: 'disable_non_proxied_udp',
-    });
+  if (chrome.privacy?.network?.webRTCIPHandlingPolicy) {
+    if (settings.blockWebRTC !== false) {
+      await chrome.privacy.network.webRTCIPHandlingPolicy.set({
+        value: 'disable_non_proxied_udp',
+      });
+    } else {
+      await chrome.privacy.network.webRTCIPHandlingPolicy.clear({});
+    }
   }
 
   // Block hyperlink auditing (ping attribute)
-  if (chrome.privacy && settings.blockHyperlinkAuditing !== false) {
-    chrome.privacy.websites.hyperlinkAuditingEnabled.set({ value: false });
+  if (chrome.privacy?.websites?.hyperlinkAuditingEnabled) {
+    if (settings.blockHyperlinkAuditing !== false) {
+      await chrome.privacy.websites.hyperlinkAuditingEnabled.set({ value: false });
+    } else {
+      await chrome.privacy.websites.hyperlinkAuditingEnabled.clear({});
+    }
   }
 
   // Block third-party cookies (thirdPartyCookiesAllowed removed in Chrome 112)
@@ -674,6 +719,9 @@ async function applyPrivacySettings() {
 
   // Update header stripping rules
   await applyHeaderRules(settings.stripTrackingHeaders !== false);
+
+  // Upgrade insecure requests where possible.
+  await applyUpgradeSchemeRules(settings.upgradeInsecureRequests !== false);
 
   // Update stealth rules (CSP stripping)
   await applyStealthRules(settings.enhancedStealth === true);
@@ -690,6 +738,7 @@ async function applyPrivacySettings() {
 
 const DNR_HEADER_RULES_START = 800_000;
 const DNR_STEALTH_RULES_START = 810_000;
+const DNR_HTTPS_RULES_START = 815_000;
 
 /** Apply DNR rules to strip tracking headers (Referer, Set-Cookie). */
 async function applyHeaderRules(enabled) {
@@ -775,6 +824,31 @@ async function applyStealthRules(enabled) {
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: [ruleId],
     addRules: rules,
+  });
+}
+
+/** Upgrade HTTP requests to HTTPS. */
+async function applyUpgradeSchemeRules(enabled) {
+  const ruleId = DNR_HTTPS_RULES_START;
+
+  if (!enabled) {
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    return;
+  }
+
+  const rules = [{
+    id: ruleId,
+    priority: 1,
+    action: { type: 'upgradeScheme' },
+    condition: {
+      urlFilter: '|http://',
+      excludedRequestDomains: ['localhost', '127.0.0.1', '0.0.0.0']
+    }
+  }];
+
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [ruleId],
+    addRules: rules
   });
 }
 
@@ -1087,31 +1161,88 @@ async function checkFilterListUpdates() {
 // Tab stats tracking — count blocked requests per tab
 // ---------------------------------------------------------------------------
 const tabStats = new Map(); // tabId → { blocked: number, url: string }
+let totalBlockedToday = 0;
+let totalBlockedDate = getCurrentDayStamp();
+
+function getCurrentDayStamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function normalizeTabStatsEntry(entry, fallbackUrl = '') {
+  return {
+    blocked: Math.max(0, Number(entry?.blocked) || 0),
+    trackers: Math.max(0, Number(entry?.trackers) || 0),
+    url: typeof entry?.url === 'string' ? entry.url : fallbackUrl,
+  };
+}
+
+function ensureTabStatsEntry(tabId, url = '') {
+  if (tabId == null || tabId < 0) return null;
+
+  const stats = normalizeTabStatsEntry(tabStats.get(tabId), url);
+  if (url) stats.url = url;
+  tabStats.set(tabId, stats);
+  return stats;
+}
+
+function rollDailyBlockedTotalIfNeeded() {
+  const today = getCurrentDayStamp();
+  if (totalBlockedDate === today) return false;
+
+  totalBlockedDate = today;
+  totalBlockedToday = 0;
+  return true;
+}
+
+function incrementDailyBlockedTotal(count = 1) {
+  const increment = Math.max(0, Number(count) || 0);
+  if (increment === 0) return;
+
+  rollDailyBlockedTotalIfNeeded();
+  totalBlockedToday += increment;
+}
 
 function resetTabStats(tabId, url = '') {
-  if (!tabId || tabId < 0) return;
+  if (tabId == null || tabId < 0) return;
 
   tabStats.set(tabId, { blocked: 0, trackers: 0, url });
   updateBadge(tabId);
   schedulePersistTabStats();
 }
 
-// Load existing tab stats when the service worker wakes up
-(async () => {
-  const stored = await getStorage(StorageKeys.TAB_STATS);
-  if (stored) {
-    for (const [key, val] of Object.entries(stored)) {
-      const numKey = Number(key);
-      if (!tabStats.has(numKey)) {
-        tabStats.set(numKey, val);
-      } else {
-        const current = tabStats.get(numKey);
-        current.blocked = (current.blocked || 0) + (val.blocked || 0);
-        current.trackers = (current.trackers || 0) + (val.trackers || 0);
-      }
+async function restorePersistedStats() {
+  const data = await getStorageBulk([
+    StorageKeys.TAB_STATS,
+    StorageKeys.TOTAL_BLOCKED_TODAY,
+    StorageKeys.TOTAL_BLOCKED_DATE,
+  ]);
+
+  tabStats.clear();
+  const storedStats = data[StorageKeys.TAB_STATS];
+  if (storedStats && typeof storedStats === 'object') {
+    for (const [key, val] of Object.entries(storedStats)) {
+      const tabId = Number(key);
+      if (!Number.isInteger(tabId) || tabId < 0) continue;
+      tabStats.set(tabId, normalizeTabStatsEntry(val));
     }
   }
-})();
+
+  const today = getCurrentDayStamp();
+  totalBlockedDate = today;
+  totalBlockedToday = data[StorageKeys.TOTAL_BLOCKED_DATE] === today
+    ? Math.max(0, Number(data[StorageKeys.TOTAL_BLOCKED_TODAY]) || 0)
+    : 0;
+
+  if (
+    data[StorageKeys.TOTAL_BLOCKED_DATE] !== totalBlockedDate ||
+    data[StorageKeys.TOTAL_BLOCKED_TODAY] !== totalBlockedToday
+  ) {
+    await persistTabStats();
+  }
+}
 
 let _persistTimeout = null;
 function schedulePersistTabStats() {
@@ -1138,54 +1269,45 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
 
   // 1. Determine action from ID ranges (new robust system)
   let actionLabel = 'block';
-  let isAllow = false;
 
   const id = rule.ruleId;
-  const ruleset = rule.rulesetId;
+  const ruleset = rule.rulesetId || '';
 
   // Check static rulesets (exceptions assigned 1,000,000+ range by compiler)
   if (id >= 1000000) {
-    isAllow = true;
     actionLabel = 'allow';
   } 
   // Check known allow-only static rulesets
   else if (['ubo-unbreak', 'anti-adblock', 'system-unbreak', '_allowlist'].some(r => ruleset.includes(r))) {
-    isAllow = true;
     actionLabel = 'allow';
   }
   // Handle Dynamic Rules categorization
   else if (ruleset === '_dynamic') {
     if (id >= 990000) {
-      isAllow = true;
       actionLabel = 'allow';
+    } else if (id === DNR_HTTPS_RULES_START) {
+      actionLabel = 'upgrade';
     } else if (id >= 800000 && id < 900000) {
       actionLabel = 'modify';
     }
   }
 
-  // Track stats
-  if (ruleset !== '_dynamic' && ruleset !== '_session') {
-    if (!tabStats.has(request.tabId)) {
-      tabStats.set(request.tabId, { blocked: 0, trackers: 0, url: request.url });
+  if (request.tabId >= 0 && actionLabel === 'block') {
+    const stats = ensureTabStatsEntry(request.tabId, request.url);
+    stats.blocked++;
+    incrementDailyBlockedTotal();
+
+    // Classify as tracker if from privacy/malware lists OR matches tracker keywords
+    const isTracker = (ruleset === 'easyprivacy' || ruleset === 'malware') ||
+      (trackerMatcher?.matches(request.url));
+    if (isTracker) {
+      stats.trackers++;
     }
 
-    const stats = tabStats.get(request.tabId);
-
-    // Only count as 'blocked' if it's an actual block rule
-    if (actionLabel === 'block') {
-      stats.blocked++;
-
-      // Classify as tracker if from privacy/malware lists OR matches tracker keywords
-      const isTracker = (rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware') ||
-                        (trackerMatcher?.matches(request.url));
-      if (isTracker) {
-        stats.trackers++;
-      }
-
-      updateBadge(request.tabId);
-      schedulePersistTabStats();
-    }
+    updateBadge(request.tabId);
+    schedulePersistTabStats();
   }
+
   // Broadcast to Logger
   let entity = '';
   try {
@@ -1196,7 +1318,11 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   broadcastLoggerEvent({
     type: 'network',
     action: actionLabel,
-    isTracker: actionLabel === 'block' && (rule.rulesetId === 'easyprivacy' || rule.rulesetId === 'malware'),
+    isTracker: actionLabel === 'block' && (
+      ruleset === 'easyprivacy' ||
+      ruleset === 'malware' ||
+      !!trackerMatcher?.matches(request.url)
+    ),
     url: request.url,
     method: request.method,
     resourceType: request.type,
@@ -1215,8 +1341,21 @@ function broadcastLoggerEvent(event) {
   }).catch(() => { }); // Ignore if no one is listening
 }
 
+async function refreshAllBadges() {
+  const tabs = await chrome.tabs.query({});
+  for (const tab of tabs) {
+    if (tab.id != null) updateBadge(tab.id);
+  }
+}
+
 function updateBadge(tabId) {
-  if (!tabId || tabId < 0) return; // ignore non-tab requests (tabId = -1)
+  if (tabId == null || tabId < 0) return; // ignore non-tab requests (tabId = -1)
+
+  if (cachedSettings?.showBadge === false) {
+    chrome.action.setBadgeText({ text: '', tabId }).catch(() => { });
+    return;
+  }
+
   const stats = tabStats.get(tabId);
   const count = stats?.blocked || 0;
   const text = count > 999 ? '999+' : count > 0 ? String(count) : '';
@@ -1230,7 +1369,11 @@ async function persistTabStats() {
   for (const [tabId, stats] of tabStats) {
     obj[tabId] = stats;
   }
-  await setStorage(StorageKeys.TAB_STATS, obj).catch(() => { });
+  await Promise.all([
+    setStorage(StorageKeys.TAB_STATS, obj),
+    setStorage(StorageKeys.TOTAL_BLOCKED_TODAY, totalBlockedToday),
+    setStorage(StorageKeys.TOTAL_BLOCKED_DATE, totalBlockedDate),
+  ]).catch(() => { });
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,6 +1816,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const needsCache = message.type === 'GET_COSMETIC_RULES' ||
     message.type === 'GET_SCRIPTLET_RULES' ||
     message.type === 'IS_SITE_ALLOWED' ||
+    message.type === 'GET_ALLOWLIST' ||
+    message.type === 'GET_TAB_STATS' ||
+    message.type === 'GET_DAILY_BLOCKED_TOTAL' ||
     message.type === 'GET_INIT_DATA';
 
   const run = needsCache && !_criticalReady
@@ -1750,7 +1896,13 @@ async function handleMessage(message, sender) {
     }
     case 'GET_TAB_STATS': {
       const tabId = payload?.tabId ?? sender.tab?.id;
-      return tabStats.get(tabId) || { blocked: 0 };
+      return normalizeTabStatsEntry(tabStats.get(tabId));
+    }
+    case 'GET_DAILY_BLOCKED_TOTAL': {
+      if (rollDailyBlockedTotalIfNeeded()) {
+        await persistTabStats();
+      }
+      return { total: totalBlockedToday };
     }
     case 'GET_SETTINGS':
       return (await getStorage(StorageKeys.SETTINGS)) || {};
@@ -1758,6 +1910,7 @@ async function handleMessage(message, sender) {
       await setStorage(StorageKeys.SETTINGS, payload);
       cachedSettings = payload;
       await applyPrivacySettings();
+      await refreshAllBadges();
       return { ok: true };
     }
     case 'GET_ALLOWLIST':
@@ -1769,6 +1922,7 @@ async function handleMessage(message, sender) {
       cachedAllowlist.add(domain);
       domainRulesCache.delete(domain);
       rebuildAllowlistMatcher();
+      await syncYouTubeShieldRegistration();
       return { ok: true };
     }
     case 'DISALLOW_SITE': {
@@ -1778,6 +1932,7 @@ async function handleMessage(message, sender) {
       cachedAllowlist.delete(domain);
       domainRulesCache.delete(domain);
       rebuildAllowlistMatcher();
+      await syncYouTubeShieldRegistration();
       return { ok: true };
     }
     case 'IS_SITE_ALLOWED': {
@@ -1859,10 +2014,12 @@ async function handleMessage(message, sender) {
     }
     case 'CONTENT_BLOCKED': {
       const tabId = sender.tab?.id;
-      if (tabId) {
-        const entry = tabStats.get(tabId) || { blocked: 0 };
-        entry.blocked += payload.count || 1;
-        tabStats.set(tabId, entry);
+      if (tabId != null && tabId >= 0) {
+        const count = Number(payload.count);
+        const increment = Number.isFinite(count) && count > 0 ? count : 1;
+        const entry = ensureTabStatsEntry(tabId, sender.tab?.url || '');
+        entry.blocked += increment;
+        incrementDailyBlockedTotal(increment);
         updateBadge(tabId);
         schedulePersistTabStats();
       }

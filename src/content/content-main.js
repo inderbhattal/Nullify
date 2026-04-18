@@ -12,8 +12,9 @@
 
 import { CosmeticEngine } from './cosmetic-engine.js';
 import { activatePicker, deactivatePicker } from './element-picker.js';
+import { normalizeHostname } from '../shared/hostname.js';
 
-const hostname = location.hostname.replace(/^www\./, '');
+const hostname = normalizeHostname(location.hostname);
 
 /**
  * Fast binary decoder for ruleset data.

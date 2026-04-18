@@ -17,6 +17,7 @@ import {getAllowlist, getStorage, getStorageBulk, setStorage, StorageKeys} from 
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
+import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import init, {
   BloomFilter as WasmBloom,
   KeywordMatcher,
@@ -464,8 +465,18 @@ async function refreshMemoryCache() {
   ]);
 
   cachedSettings = data[StorageKeys.SETTINGS];
-  cachedAllowlist = new Set(data[StorageKeys.ALLOWLIST] || []);
+  const rawAllowlist = data[StorageKeys.ALLOWLIST] || [];
+  const normalizedAllowlist = normalizeAllowlist(rawAllowlist);
+  cachedAllowlist = new Set(normalizedAllowlist);
   rebuildAllowlistMatcher(); // Rebuild with fresh allowlist data
+
+  if (
+    rawAllowlist.length !== normalizedAllowlist.length ||
+    rawAllowlist.some((domain, index) => domain !== normalizedAllowlist[index])
+  ) {
+    await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
+    await rebuildAllowlistRules(normalizedAllowlist);
+  }
 
   const genericSelectors = data[StorageKeys.GENERIC_CSS];
   if (Array.isArray(genericSelectors) && genericSelectors.length > 0) {
@@ -1172,7 +1183,7 @@ chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
   // Broadcast to Logger
   let entity = '';
   try {
-    const hostname = new URL(request.url).hostname.replace(/^www\./, '');
+    const hostname = normalizeHostname(new URL(request.url).hostname);
     entity = wasmReady ? resolve_entity(hostname) : '';
   } catch {}
 
@@ -1379,9 +1390,12 @@ function parseSimpleNetworkRule(line, id) {
 
 /** Add a site to the per-site allowlist (disable blocking for domain). */
 async function allowSite(domain) {
-  const allowlist = await getAllowlist();
-  if (!allowlist.includes(domain)) {
-    allowlist.push(domain);
+  const normalizedDomain = normalizeHostname(domain);
+  if (!normalizedDomain) return;
+
+  const allowlist = normalizeAllowlist(await getAllowlist());
+  if (!allowlist.includes(normalizedDomain)) {
+    allowlist.push(normalizedDomain);
     await setStorage(StorageKeys.ALLOWLIST, allowlist);
   }
   await rebuildAllowlistRules(allowlist);
@@ -1389,14 +1403,18 @@ async function allowSite(domain) {
 
 /** Remove a site from the allowlist. */
 async function disallowSite(domain) {
-  let allowlist = await getAllowlist();
-  allowlist = allowlist.filter((d) => d !== domain);
+  const normalizedDomain = normalizeHostname(domain);
+  if (!normalizedDomain) return;
+
+  let allowlist = normalizeAllowlist(await getAllowlist());
+  allowlist = allowlist.filter((d) => d !== normalizedDomain);
   await setStorage(StorageKeys.ALLOWLIST, allowlist);
   await rebuildAllowlistRules(allowlist);
 }
 
 /** Rebuild DNR allow-all-requests rules from allowlist. */
 async function rebuildAllowlistRules(allowlist) {
+  const normalizedAllowlist = normalizeAllowlist(allowlist);
   const existing = await chrome.declarativeNetRequest.getDynamicRules();
   const allowlistRuleIds = existing
     .filter((r) => r.id >= DNR_ALLOWLIST_START)
@@ -1406,7 +1424,7 @@ async function rebuildAllowlistRules(allowlist) {
   if (wasmReady) {
     try {
       newRules = JSON.parse(build_allowlist_rules_json(
-        JSON.stringify(allowlist || []),
+        JSON.stringify(normalizedAllowlist),
         DNR_ALLOWLIST_START
       ));
     } catch (err) {
@@ -1415,7 +1433,7 @@ async function rebuildAllowlistRules(allowlist) {
   }
 
   if (!newRules) {
-    newRules = allowlist.map((domain, i) => ({
+    newRules = normalizedAllowlist.map((domain, i) => ({
       id: DNR_ALLOWLIST_START + i,
       priority: 500, // Systematic Priority for User Allowlist
       condition: {
@@ -1738,20 +1756,26 @@ async function handleMessage(message, sender) {
     }
     case 'GET_ALLOWLIST':
       return Array.from(cachedAllowlist);
-    case 'ALLOW_SITE':
-      await allowSite(payload.domain);
-      cachedAllowlist.add(payload.domain);
-      domainRulesCache.delete(payload.domain);
+    case 'ALLOW_SITE': {
+      const domain = normalizeHostname(payload.domain);
+      if (!domain) return { ok: false };
+      await allowSite(domain);
+      cachedAllowlist.add(domain);
+      domainRulesCache.delete(domain);
       rebuildAllowlistMatcher();
       return { ok: true };
-    case 'DISALLOW_SITE':
-      await disallowSite(payload.domain);
-      cachedAllowlist.delete(payload.domain);
-      domainRulesCache.delete(payload.domain);
+    }
+    case 'DISALLOW_SITE': {
+      const domain = normalizeHostname(payload.domain);
+      if (!domain) return { ok: false };
+      await disallowSite(domain);
+      cachedAllowlist.delete(domain);
+      domainRulesCache.delete(domain);
       rebuildAllowlistMatcher();
       return { ok: true };
+    }
     case 'IS_SITE_ALLOWED': {
-      return { allowed: isHostnameAllowedCached(payload.domain) };
+      return { allowed: isHostnameAllowedCached(normalizeHostname(payload.domain)) };
     }
     case 'GET_USER_FILTERS':
       return { filters: (await getStorage(StorageKeys.USER_FILTERS)) || '' };
@@ -1972,6 +1996,8 @@ async function getScriptletRulesForPage(hostname) {
 }
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
 function isHostnameAllowedCached(hostname) {
+  hostname = normalizeHostname(hostname);
+  if (!hostname) return false;
   if (!cachedAllowlist || cachedAllowlist.size === 0) return false;
 
   // AllowlistMatcher is built once and checks in O(1) — no Array/string alloc per call.
@@ -1994,7 +2020,7 @@ function isHostnameAllowedCached(hostname) {
 async function performEarlyInjection(tabId, urlStr) {
   if (!urlStr?.startsWith('http')) return;
   const url = new URL(urlStr);
-  const hostname = url.hostname.replace(/^www\./, '');
+  const hostname = normalizeHostname(url.hostname);
 
   if (isHostnameAllowedCached(hostname)) return;
 
@@ -2040,7 +2066,7 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (!details.url.startsWith('http')) return;
 
   const url = new URL(details.url);
-  const hostname = url.hostname.replace(/^www\./, '');
+  const hostname = normalizeHostname(url.hostname);
 
   if (!domainRulesCache.has(hostname)) {
     const bundle = await getCosmeticBundleForPage(hostname);

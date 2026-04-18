@@ -4,6 +4,8 @@
 
 import './options.css';
 
+import { normalizeHostname } from '../shared/hostname.js';
+
 const $ = (id) => document.getElementById(id);
 
 const FILTER_LISTS = [
@@ -237,10 +239,7 @@ async function initAllowlist() {
   await renderAllowlist();
 
   $('btnAddAllowlist').addEventListener('click', async () => {
-    const domain = $('allowlistInput').value.trim()
-      .replace(/^https?:\/\//, '')
-      .replace(/\/.*/, '')
-      .toLowerCase();
+    const domain = normalizeHostname($('allowlistInput').value);
 
     if (!domain) return;
 

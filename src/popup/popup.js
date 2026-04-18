@@ -3,6 +3,7 @@
  */
 
 import './popup.css';
+import { normalizeHostname } from '../shared/hostname.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -26,7 +27,7 @@ async function init() {
 
   try {
     const url = new URL(tab.url);
-    currentHostname = url.hostname.replace(/^www\./, '');
+    currentHostname = normalizeHostname(url.hostname);
   } catch {
     currentHostname = '';
   }

@@ -1,3 +1,5 @@
+import { normalizeAllowlist, normalizeHostname } from './hostname.js';
+
 /**
  * storage.js — shared storage abstraction
  *
@@ -54,16 +56,22 @@ export async function setStorage(key, value) {
 
 /** Get the current allowlist. */
 export async function getAllowlist() {
-  return (await getStorage(StorageKeys.ALLOWLIST)) || [];
+  return normalizeAllowlist(await getStorage(StorageKeys.ALLOWLIST));
 }
 
 /** Check if a hostname (or any parent domain) is in the allowlist. */
 export async function isHostnameAllowed(hostname) {
+  let domain = normalizeHostname(hostname);
+  if (!domain) return false;
+
   const allowlist = await getAllowlist();
-  const parts = hostname.split('.');
-  for (let i = 0; i < parts.length - 1; i++) {
-    const domain = parts.slice(i).join('.');
+
+  while (domain) {
     if (allowlist.includes(domain)) return true;
+    const dotIdx = domain.indexOf('.');
+    if (dotIdx === -1) break;
+    domain = domain.slice(dotIdx + 1);
   }
+
   return false;
 }

@@ -6,8 +6,7 @@
  * Responsibilities:
  *  1. Determine if this page is in the allowlist (skip if so)
  *  2. Ask background for cosmetic rules and apply them via CosmeticEngine
- *  3. Ask background to inject scriptlets for this page (MAIN world injection)
- *  4. Inject the scriptlets-world.js bundle into the page MAIN world
+ *  3. Let the background own MAIN-world scriptlet injection
  */
 
 import { CosmeticEngine } from './cosmetic-engine.js';
@@ -79,7 +78,11 @@ async function main() {
     // SW not ready — proceed with defaults
   }
 
-  const { isAllowed, settings, cosmeticRules, cosmeticRulesBinary, hasScriptlets } = initRes || {};
+  const {
+    isAllowed,
+    cosmeticRules,
+    cosmeticRulesBinary,
+  } = initRes || {};
 
   if (isAllowed === true) return;
 
@@ -87,18 +90,6 @@ async function main() {
   const finalRules = cosmeticRulesBinary 
     ? decodeBinaryRules(cosmeticRulesBinary)
     : cosmeticRules;
-
-  // Only inject scriptlets bundle if we actually have scriptlets to run or fingerprinting is on.
-  // YouTube owns its own fast-path blocker in youtube-shield.js, so avoid
-  // paying to parse the general scriptlet bundle there unless we have real
-  // page-specific scriptlets to run.
-  const shouldInjectScriptlets = isYouTube
-    ? hasScriptlets
-    : (hasScriptlets || settings?.fingerprintProtection !== false);
-
-  if (shouldInjectScriptlets) {
-    injectScriptletsBundleIntoMainWorld();
-  }
 
   // Apply cosmetic rules
   const hasProcedural = finalRules?.generic?.some(r => typeof r === 'object' || (typeof r === 'string' && r.includes(':'))) || 
@@ -125,19 +116,5 @@ chrome.runtime.onMessage.addListener((message) => {
     deactivatePicker();
   }
 });
-
-/**
- * Inject the scriptlets MAIN-world bundle via a <script> tag.
- */
-function injectScriptletsBundleIntoMainWorld() {
-  try {
-    const script = document.createElement('script');
-    script.src = chrome.runtime.getURL('dist/scriptlets-world.js');
-    (document.head || document.documentElement).appendChild(script);
-    script.addEventListener('load', () => script.remove());
-  } catch {
-    // Blocked by CSP or other restrictions — skip
-  }
-}
 
 main().catch(() => {});

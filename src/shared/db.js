@@ -6,9 +6,10 @@
  */
 
 const DB_NAME = 'NullifyRules';
-const DB_VERSION = 2; // Incremented version
+const DB_VERSION = 3;
 const STORE_COSMETIC = 'cosmetic_rules';
 const STORE_SCRIPTLET = 'scriptlet_rules';
+const STORE_FILTER_SOURCES = 'filter_sources';
 
 export class RulesDB {
   constructor() {
@@ -23,7 +24,6 @@ export class RulesDB {
 
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
-        const transaction = event.target.transaction;
 
         if (!db.objectStoreNames.contains(STORE_COSMETIC)) {
           db.createObjectStore(STORE_COSMETIC, { keyPath: 'hostname' });
@@ -32,6 +32,9 @@ export class RulesDB {
           const store = db.createObjectStore(STORE_SCRIPTLET, { keyPath: 'id', autoIncrement: true });
           // Index by domain for faster lookup
           store.createIndex('domain', 'domains', { multiEntry: true, unique: false });
+        }
+        if (!db.objectStoreNames.contains(STORE_FILTER_SOURCES)) {
+          db.createObjectStore(STORE_FILTER_SOURCES, { keyPath: 'listId' });
         }
       };
 
@@ -130,7 +133,7 @@ export class RulesDB {
   }
 
   /** Clear all indexed rules. */
-  async clear() {
+  async clearActiveRules() {
     const db = await this.open();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction([STORE_COSMETIC, STORE_SCRIPTLET], 'readwrite');
@@ -139,6 +142,62 @@ export class RulesDB {
 
       transaction.oncomplete = () => resolve();
       transaction.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Backward-compatible alias for clearing the active rule index only. */
+  async clear() {
+    return this.clearActiveRules();
+  }
+
+  /** Replace multiple per-list source bundles. */
+  async putBulkFilterSources(sourceMap) {
+    const db = await this.open();
+    const entries = Array.isArray(sourceMap)
+      ? sourceMap
+      : Object.entries(sourceMap || {}).map(([listId, data]) => ({ listId, ...data }));
+
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_FILTER_SOURCES], 'readwrite');
+      const store = transaction.objectStore(STORE_FILTER_SOURCES);
+
+      for (const entry of entries) {
+        if (!entry?.listId) continue;
+        store.put({
+          listId: entry.listId,
+          cosmetic: entry.cosmetic || { generic: [], domainSpecific: {}, exceptions: {} },
+          scriptlets: entry.scriptlets || [],
+        });
+      }
+
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Returns all stored per-list source bundles. */
+  async getAllFilterSources() {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_FILTER_SOURCES], 'readonly');
+      const store = transaction.objectStore(STORE_FILTER_SOURCES);
+      const request = store.getAll();
+
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Returns true when at least one per-list source bundle is stored. */
+  async hasFilterSources() {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_FILTER_SOURCES], 'readonly');
+      const store = transaction.objectStore(STORE_FILTER_SOURCES);
+      const request = store.count();
+
+      request.onsuccess = () => resolve((request.result || 0) > 0);
+      request.onerror = (event) => reject(event.target.error);
     });
   }
 }

@@ -18,6 +18,7 @@ import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
+import { CORE_FILTER_SOURCE } from '../shared/core-filter-source.js';
 import init, {
   BloomFilter as WasmBloom,
   KeywordMatcher,
@@ -28,7 +29,6 @@ import init, {
   build_allowlist_rules_json,
   compile_user_filters_to_json,
   generate_gaussian_noise,
-  merge_filter_sources_to_json,
   plan_selector_rules_json,
   reduce_cosmetic_rules_json,
   serialize_rules_to_binary_from_json,
@@ -48,6 +48,12 @@ const REMOTE_FILTER_LISTS = [
   { id: 'annoyances',  url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances.txt' },
   { id: 'malware',     url: 'https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt' },
   { id: 'anti-adblock',url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt' },
+  { id: 'ubo-cookie-annoyances', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances-cookies.txt' },
+];
+const REMOTE_FILTER_LIST_IDS = REMOTE_FILTER_LISTS.map((list) => list.id);
+const ALL_KNOWN_LIST_IDS = [
+  'system-unbreak',
+  ...REMOTE_FILTER_LIST_IDS,
 ];
 
 const db = new RulesDB();
@@ -68,6 +74,7 @@ let cachedSettings = null;
 let cachedAllowlist = new Set();
 let cachedGenericCss = null;
 let domainRulesCache = new Map(); // hostname -> packaged page bundle (LRU, max 100 entries)
+const _inFlightRules = new Map();
 const DOMAIN_RULES_CACHE_MAX = 100;
 const YOUTUBE_SHIELD_SCRIPT_ID = 'nullify-youtube-shield';
 const YOUTUBE_SHIELD_TARGETS = [
@@ -93,6 +100,121 @@ const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const FILTER_UPDATE_INTERVAL_MINUTES = 24 * 60; // 24 hours
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
+
+function getDefaultEnabledRulesets() {
+  return {
+    easylist: true,
+    easyprivacy: true,
+    annoyances: true,
+    malware: true,
+    'ubo-filters': true,
+    'ubo-unbreak': true,
+    'system-unbreak': true,
+    'anti-adblock': true,
+    'ubo-cookie-annoyances': true,
+  };
+}
+
+function normalizeEnabledRulesetsMap(raw = {}) {
+  const defaults = getDefaultEnabledRulesets();
+  const normalized = { ...defaults };
+  for (const listId of Object.keys(defaults)) {
+    if (raw[listId] === false) normalized[listId] = false;
+    else if (raw[listId] === true) normalized[listId] = true;
+  }
+  normalized['system-unbreak'] = true;
+  return normalized;
+}
+
+function cloneFilterSource(source) {
+  return {
+    cosmetic: {
+      generic: [...(source?.cosmetic?.generic || [])],
+      domainSpecific: Object.fromEntries(
+        Object.entries(source?.cosmetic?.domainSpecific || {}).map(([domain, selectors]) => [
+          domain,
+          [...(selectors || [])],
+        ])
+      ),
+      exceptions: Object.fromEntries(
+        Object.entries(source?.cosmetic?.exceptions || {}).map(([domain, selectors]) => [
+          domain,
+          [...(selectors || [])],
+        ])
+      ),
+    },
+    scriptlets: (source?.scriptlets || []).map((rule) => ({
+      ...rule,
+      domains: [...(rule.domains || [])],
+      args: [...(rule.args || [])],
+    })),
+  };
+}
+
+function appendSelectorsByDomain(target, source = {}) {
+  for (const [domain, selectors] of Object.entries(source)) {
+    if (!target[domain]) target[domain] = [];
+    target[domain].push(...(selectors || []));
+  }
+}
+
+function dedupeScriptlets(rules) {
+  const seen = new Set();
+  return (rules || []).filter((rule) => {
+    const key = `${rule.name}|${(rule.domains || []).join(',')}|${(rule.args || []).join('\u0001')}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function buildSourceBundleFromParsed(parsed) {
+  const cosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
+
+  for (const rule of parsed?.cosmeticRules || []) {
+    if (!rule?.selector) continue;
+    if (rule.domains.length === 0) {
+      if (!rule.exception) cosmetic.generic.push(rule.selector);
+      continue;
+    }
+
+    for (const domain of rule.domains) {
+      const target = rule.exception ? cosmetic.exceptions : cosmetic.domainSpecific;
+      if (!target[domain]) target[domain] = [];
+      target[domain].push(rule.selector);
+    }
+  }
+
+  cosmetic.generic = [...new Set(cosmetic.generic)];
+  for (const [domain, selectors] of Object.entries(cosmetic.domainSpecific)) {
+    cosmetic.domainSpecific[domain] = [...new Set(selectors)];
+  }
+  for (const [domain, selectors] of Object.entries(cosmetic.exceptions)) {
+    cosmetic.exceptions[domain] = [...new Set(selectors)];
+  }
+
+  return {
+    cosmetic,
+    scriptlets: dedupeScriptlets(parsed?.scriptletRules || []),
+  };
+}
+
+function mergeFilterSources(listSources) {
+  const mergedCosmetic = cloneFilterSource(CORE_FILTER_SOURCE).cosmetic;
+  const mergedScriptlets = [...CORE_FILTER_SOURCE.scriptlets];
+
+  for (const source of listSources) {
+    mergedCosmetic.generic.push(...(source?.cosmetic?.generic || []));
+    appendSelectorsByDomain(mergedCosmetic.domainSpecific, source?.cosmetic?.domainSpecific);
+    appendSelectorsByDomain(mergedCosmetic.exceptions, source?.cosmetic?.exceptions);
+    mergedScriptlets.push(...(source?.scriptlets || []));
+  }
+
+  return {
+    cosmetic: reduceCosmeticRules(mergedCosmetic),
+    scriptlets: dedupeScriptlets(mergedScriptlets),
+  };
+}
 
 // All known procedural operators that require JS evaluation
 const PROC_OPS = [
@@ -339,6 +461,116 @@ function buildPageBundle(rawRules) {
   };
 }
 
+async function loadPackagedFilterSources() {
+  try {
+    const url = chrome.runtime.getURL('rules/filter-sources.json');
+    return await (await fetch(url)).json();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAndStoreRemoteFilterSources() {
+  const sourceBundles = {};
+  let fetchedAny = false;
+
+  for (const list of REMOTE_FILTER_LISTS) {
+    try {
+      console.log(`[AdBlock] Fetching ${list.id} source bundle...`);
+      const text = await fetchAndExpand(list.url);
+      sourceBundles[list.id] = buildSourceBundleFromParsed(parseFilterList(text));
+      fetchedAny = true;
+    } catch (err) {
+      console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
+    }
+  }
+
+  if (!fetchedAny) return false;
+  await db.putBulkFilterSources(sourceBundles);
+  return true;
+}
+
+async function rebuildActiveRuleIndexFromStoredSources() {
+  const enabledMap = normalizeEnabledRulesetsMap(
+    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
+  );
+  const storedSources = await db.getAllFilterSources();
+  const sourceMap = new Map(storedSources.map((entry) => [entry.listId, entry]));
+  const activeSources = REMOTE_FILTER_LIST_IDS
+    .filter((listId) => enabledMap[listId] !== false)
+    .map((listId) => sourceMap.get(listId))
+    .filter(Boolean);
+
+  const merged = mergeFilterSources(activeSources);
+
+  await db.clearActiveRules();
+
+  const totalDomains = Object.keys(merged.cosmetic.domainSpecific).length +
+    merged.scriptlets.reduce((count, rule) => count + (rule.domains?.length || 0), 0) + 1;
+  const newBloom = wasmReady ? new WasmBloom(totalDomains * 10, 4) : BloomFilter.forCapacity(totalDomains);
+
+  await db.putBulkCosmeticRules(merged.cosmetic.domainSpecific);
+  for (const hostname of Object.keys(merged.cosmetic.domainSpecific)) {
+    newBloom.add(hostname);
+  }
+
+  await db.putBulkScriptletRules(merged.scriptlets);
+  for (const rule of merged.scriptlets) {
+    for (const domain of rule.domains || []) {
+      newBloom.add(domain);
+    }
+  }
+  newBloom.add('');
+
+  bloom = newBloom;
+  await setStorage(
+    StorageKeys.BLOOM_FILTER,
+    wasmReady ? bloom.serialize_to_json() : bloom.serialize()
+  );
+
+  await setStorage(StorageKeys.GENERIC_CSS, merged.cosmetic.generic);
+  cachedGenericCss = merged.cosmetic.generic.length > 0
+    ? (wasmReady
+        ? sanitize_and_compact_selectors(merged.cosmetic.generic.join('\n'), 100)
+        : merged.cosmetic.generic.join(',') + ' { display: none !important; visibility: hidden !important; }')
+    : null;
+
+  domainRulesCache.clear();
+  _inFlightRules.clear();
+  return true;
+}
+
+async function ensureFilterSourcesReady() {
+  if (await db.hasFilterSources()) return true;
+
+  const packaged = await loadPackagedFilterSources();
+  if (packaged && Object.keys(packaged).length > 0) {
+    await db.putBulkFilterSources(packaged);
+    return true;
+  }
+
+  return await fetchAndStoreRemoteFilterSources();
+}
+
+async function ensureRuleDataReady() {
+  const existingBloom = await getStorage(StorageKeys.BLOOM_FILTER);
+  const hadSources = await db.hasFilterSources();
+  const sourcesReady = hadSources || await ensureFilterSourcesReady();
+
+  if (sourcesReady) {
+    if (!existingBloom || !hadSources) {
+      await rebuildActiveRuleIndexFromStoredSources();
+    }
+    return true;
+  }
+
+  if (!existingBloom) {
+    await ingestLegacyRules();
+  }
+
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // Install / startup
 // ---------------------------------------------------------------------------
@@ -359,7 +591,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
       await initializeDefaults();
     }
 
-    await ingestRules(); // Build initial rule index
+    await ensureRuleDataReady();
     await Promise.all([
       refreshMemoryCache(), // Fill RAM cache for speed
       restorePersistedStats(),
@@ -424,7 +656,10 @@ function startInitialization() {
       console.error('[Nullify] WASM initialization failed:', err);
     }
 
-    // Stage 1: Critical data for responding to content scripts
+    // Stage 1: Ensure the active rule index exists and is list-aware.
+    await ensureRuleDataReady();
+
+    // Stage 2: Critical data for responding to content scripts
     await Promise.all([
       loadBloomFilter(),
       refreshMemoryCache(),
@@ -433,7 +668,7 @@ function startInitialization() {
     _criticalReady = true;
     refreshAllBadges().catch(err => console.error('[Nullify] Badge refresh failed:', err));
 
-    // Stage 2: Background tasks (non-blocking for messages)
+    // Stage 3: Background tasks (non-blocking for messages)
     ensureBackgroundSetup().catch(err => console.error('[Nullify] Background startup failed:', err));
 
   })().catch(err => console.error('[Nullify] Critical startup failed:', err));
@@ -533,12 +768,14 @@ async function loadBloomFilter() {
   if (data) {
     try {
       if (typeof data === 'string') {
-        // Base64 format check removed - logic now handles JSON strings via WASM
         if (wasmReady) {
           bloom = WasmBloom.deserialize_from_json(data);
         } else {
-          // Re-ingest if WASM not ready but we have a string
-          await ingestRules();
+          if (await db.hasFilterSources()) {
+            await rebuildActiveRuleIndexFromStoredSources();
+          } else {
+            await ingestLegacyRules();
+          }
         }
         return;
       }
@@ -562,7 +799,7 @@ async function loadBloomFilter() {
  * Fetch latest rules and index them into IndexedDB.
  * This keeps the Service Worker's memory usage low by not holding rules in RAM.
  */
-async function ingestRules() {
+async function ingestLegacyRules() {
   try {
     // 1. Ingest Cosmetic Rules
     const cosUrl = chrome.runtime.getURL('rules/cosmetic-rules.json');
@@ -650,7 +887,7 @@ async function initializeDefaults() {
     blockHyperlinkAuditing: true,
     showBadge: true,
     blockThirdPartyCookies: false,
-    fingerprintProtection: true,
+    fingerprintProtection: false,
     stripTrackingHeaders: true,
     enhancedStealth: false,
     stealthPersona: 'default',
@@ -669,17 +906,7 @@ async function initializeDefaults() {
   await setStorage(StorageKeys.FILTER_LISTS_META, {});
 
   // Enabled/disabled rulesets
-  await setStorage(StorageKeys.ENABLED_RULESETS, {
-    easylist: true,
-    easyprivacy: true,
-    annoyances: true,
-    malware: true,
-    'ubo-filters': true,
-    'ubo-unbreak': true,
-    'system-unbreak': true,
-    'anti-adblock': true,
-    'ubo-cookie-annoyances': true,
-  });
+  await setStorage(StorageKeys.ENABLED_RULESETS, getDefaultEnabledRulesets());
 
   console.log('[AdBlock] Defaults initialized');
 }
@@ -792,38 +1019,11 @@ async function applyHeaderRules(enabled) {
   });
 }
 
-/** Apply DNR rules to strip CSP headers for advanced scriptlet injection. */
+/** Clear the legacy CSP-stripping rule. Enhanced stealth now runs in MAIN world. */
 async function applyStealthRules(enabled) {
   const ruleId = DNR_STEALTH_RULES_START;
-
-  if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [ruleId],
-    });
-    return;
-  }
-
-  const rules = [
-    {
-      id: ruleId,
-      priority: 1,
-      action: {
-        type: 'modifyHeaders',
-        responseHeaders: [
-          { header: 'content-security-policy', operation: 'remove' },
-          { header: 'x-content-security-policy', operation: 'remove' },
-          { header: 'content-security-policy-report-only', operation: 'remove' }
-        ]
-      },
-      condition: {
-        resourceTypes: ['main_frame', 'sub_frame']
-      }
-    }
-  ];
-
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: [ruleId],
-    addRules: rules,
   });
 }
 
@@ -1013,145 +1213,16 @@ async function checkFilterListUpdates() {
   _filterUpdateInProgress = true;
 
   try {
-    console.log('[AdBlock] Fetching remote filter lists...');
-
-    const bundledCosmetic = { generic: [], domainSpecific: {} };
-    let bundledScriptlets = [];
-    const remoteTexts = [];
-
-    // 1. Load bundled cosmetic rules first (highest priority)
-    try {
-      const bundledUrl = chrome.runtime.getURL('rules/cosmetic-rules.json');
-      const bundled = await (await fetch(bundledUrl)).json();
-      bundledCosmetic.generic.push(...(bundled.generic || []));
-      for (const [domain, selectors] of Object.entries(bundled.domainSpecific || {})) {
-        bundledCosmetic.domainSpecific[domain] = [...selectors];
-      }
-    } catch (err) {
-      console.warn('[AdBlock] Could not load bundled cosmetic rules:', err.message);
+    console.log('[AdBlock] Refreshing per-list cosmetic/scriptlet sources...');
+    const updated = await fetchAndStoreRemoteFilterSources();
+    if (!updated) {
+      console.warn('[AdBlock] No filter sources were refreshed');
+      return;
     }
 
-    // 2. Load bundled scriptlet rules
-    try {
-      const scriptUrl = chrome.runtime.getURL('rules/scriptlet-rules.json');
-      bundledScriptlets = await (await fetch(scriptUrl)).json();
-    } catch { /* non-fatal */ }
-
-    // 3. Fetch and merge remote filter lists
-    for (const list of REMOTE_FILTER_LISTS) {
-      try {
-        console.log(`[AdBlock] Fetching ${list.id}...`);
-        const text = await fetchAndExpand(list.url);
-        remoteTexts.push(text);
-      } catch (err) {
-        console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
-      }
-    }
-
-    let mergedCosmetic;
-    let dedupedScriptlets;
-
-    if (wasmReady) {
-      try {
-        const reduced = JSON.parse(merge_filter_sources_to_json(
-          JSON.stringify(bundledCosmetic.generic || []),
-          JSON.stringify(bundledCosmetic.domainSpecific || {}),
-          JSON.stringify(bundledScriptlets || []),
-          JSON.stringify(remoteTexts)
-        ));
-        mergedCosmetic = {
-          generic: reduced.generic || [],
-          domainSpecific: reduced.domainSpecific || {},
-        };
-        dedupedScriptlets = reduced.scriptletRules || [];
-      } catch (err) {
-        console.error('[Nullify] WASM filter-source merge failed:', err);
-      }
-    }
-
-    if (!mergedCosmetic || !dedupedScriptlets) {
-      // Start with bundled rules so curated fixes (e.g. CNN :remove()) take priority.
-      // Remote rules are merged in after, then deduplicated — bundled entries win
-      // because Set preserves first-seen order.
-      mergedCosmetic = {
-        generic: [...(bundledCosmetic.generic || [])],
-        domainSpecific: { ...(bundledCosmetic.domainSpecific || {}) },
-        exceptions: {},
-      };
-      const mergedScriptlets = [...(bundledScriptlets || [])];
-
-      for (const text of remoteTexts) {
-        const { cosmeticRules, scriptletRules } = parseFilterList(text);
-
-        for (const r of cosmeticRules) {
-          if (r.domains.length === 0) {
-            if (r.exception) continue; // generic exceptions not supported
-            mergedCosmetic.generic.push(r.selector);
-          } else {
-            for (const d of r.domains) {
-              if (r.exception) {
-                if (!mergedCosmetic.exceptions[d]) mergedCosmetic.exceptions[d] = [];
-                mergedCosmetic.exceptions[d].push(r.selector);
-              } else {
-                if (!mergedCosmetic.domainSpecific[d]) mergedCosmetic.domainSpecific[d] = [];
-                mergedCosmetic.domainSpecific[d].push(r.selector);
-              }
-            }
-          }
-        }
-
-        for (const r of scriptletRules) mergedScriptlets.push(r);
-      }
-
-      const scriptletSeen = new Set();
-      dedupedScriptlets = mergedScriptlets.filter(r => {
-        const key = r.name + '|' + (r.domains || []).sort().join(',') + '|' + (r.args || []).join(',');
-        if (scriptletSeen.has(key)) return false;
-        scriptletSeen.add(key);
-        return true;
-      });
-
-      const reducedCosmetic = reduceCosmeticRules(mergedCosmetic);
-      mergedCosmetic.generic = reducedCosmetic.generic;
-      mergedCosmetic.domainSpecific = reducedCosmetic.domainSpecific;
-    }
-
-    // 7. Re-index into IndexedDB + rebuild Bloom Filter
-    await db.clear();
-    const totalDomains = Object.keys(mergedCosmetic.domainSpecific).length +
-      dedupedScriptlets.reduce((n, r) => n + (r.domains?.length || 0), 0) + 1;
-    
-    const newBloom = wasmReady ? new WasmBloom(totalDomains * 10, 4) : BloomFilter.forCapacity(totalDomains);
-
-    await db.putBulkCosmeticRules(mergedCosmetic.domainSpecific);
-    for (const hostname of Object.keys(mergedCosmetic.domainSpecific)) newBloom.add(hostname);
-
-    await db.putBulkScriptletRules(dedupedScriptlets);
-    for (const r of dedupedScriptlets) {
-      if (r.domains) for (const d of r.domains) newBloom.add(d);
-    }
-
-    // Mark that we have generic rules
-    newBloom.add('');
-
-    bloom = newBloom;
-    await setStorage(
-      StorageKeys.BLOOM_FILTER,
-      wasmReady ? bloom.serialize_to_json() : bloom.serialize()
-    );
-
-    // 8. Always update generic CSS — store selector array, compile string in RAM
-    await setStorage(StorageKeys.GENERIC_CSS, mergedCosmetic.generic);
-    cachedGenericCss = mergedCosmetic.generic.length > 0
-      ? (wasmReady 
-          ? sanitize_and_compact_selectors(mergedCosmetic.generic.join('\n'), 100) 
-          : mergedCosmetic.generic.join(',') + ' { display: none !important; visibility: hidden !important; }')
-      : null;
-
-    domainRulesCache.clear();
-
+    await rebuildActiveRuleIndexFromStoredSources();
     await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
-    console.log(`[AdBlock] Filter update complete — ${mergedCosmetic.generic.length} generic, ${Object.keys(mergedCosmetic.domainSpecific).length} domains, ${dedupedScriptlets.length} scriptlets`);
+    console.log('[AdBlock] Filter source update complete');
   } finally {
     _filterUpdateInProgress = false;
   }
@@ -1667,7 +1738,9 @@ function orderRulesetIdsByPriority(rulesetIds) {
 
 /** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
 async function applyRulesets() {
-  const enabledMap = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  const enabledMap = normalizeEnabledRulesetsMap(
+    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
+  );
 
   const allKnownListIds = [
     'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist',
@@ -1738,27 +1811,44 @@ async function applyRulesets() {
   } catch (err) {
     console.warn('[AdBlock] Failed to read enabled static rulesets:', err);
   }
+
+  return getEffectiveEnabledRulesetsMap();
 }
 
 /** Enable or disable a static ruleset (or group) by ID. */
 async function setRulesetEnabled(rulesetId, enabled) {
-  const idsToChange = getRulesetIdsForList(rulesetId);
-
-  if (enabled) {
-    await chrome.declarativeNetRequest.updateEnabledRulesets({
-      enableRulesetIds: idsToChange,
-      disableRulesetIds: [],
-    });
-  } else {
-    await chrome.declarativeNetRequest.updateEnabledRulesets({
-      enableRulesetIds: [],
-      disableRulesetIds: idsToChange,
-    });
-  }
-
-  const meta = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  const meta = normalizeEnabledRulesetsMap(
+    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
+  );
   meta[rulesetId] = enabled;
   await setStorage(StorageKeys.ENABLED_RULESETS, meta);
+
+  const enabledMap = await applyRulesets();
+  if (await ensureFilterSourcesReady()) {
+    await rebuildActiveRuleIndexFromStoredSources();
+  }
+  return enabledMap;
+}
+
+async function getEffectiveEnabledRulesetsMap() {
+  const activeRulesets = new Set(await chrome.declarativeNetRequest.getEnabledRulesets().catch(() => []));
+  const effective = normalizeEnabledRulesetsMap({});
+
+  for (const listId of ALL_KNOWN_LIST_IDS) {
+    if (listId === 'system-unbreak') {
+      effective[listId] = true;
+      continue;
+    }
+
+    const rulesetIds = getRulesetIdsForList(listId);
+    const enabledCount = rulesetIds.filter((id) => activeRulesets.has(id)).length;
+
+    if (enabledCount === 0) effective[listId] = false;
+    else if (enabledCount === rulesetIds.length) effective[listId] = true;
+    else effective[listId] = 'partial';
+  }
+
+  return effective;
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,6 +1863,9 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
   if (!scriptletRules || scriptletRules.length === 0) return;
 
   try {
+    const registryReady = await ensureScriptletRegistry(tabId, frameId);
+    if (!registryReady) return;
+
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
@@ -1783,6 +1876,40 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
     if (!err.message?.includes('No frame with id')) {
       console.warn('[AdBlock] Scriptlet injection failed:', err.message);
     }
+  }
+}
+
+function hasScriptletRegistry() {
+  for (const key of Object.keys(window)) {
+    if (key.startsWith('__nu') && typeof window[key]?.run === 'function') {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function ensureScriptletRegistry(tabId, frameId) {
+  try {
+    const [{ result: ready = false } = {}] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: hasScriptletRegistry,
+    });
+
+    if (ready) return true;
+
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      files: ['dist/scriptlets-world.js'],
+    });
+
+    return true;
+  } catch (err) {
+    if (!err.message?.includes('No frame with id')) {
+      console.warn('[AdBlock] Failed to bootstrap scriptlet registry:', err.message);
+    }
+    return false;
   }
 }
 
@@ -1842,24 +1969,31 @@ async function handleMessage(message, sender) {
         getScriptletRulesForPage(hostname),
       ]);
 
-      const hasScriptlets = scriptletRules.length > 0;
+      const isTopFrame = (sender.frameId || 0) === 0;
 
       if (!isAllowed && sender.tab?.id) {
         const scriptletsToRun = [...scriptletRules];
 
-        // The dedicated youtube-shield content script owns YouTube ad blocking.
-        // Duplicating the same protections here adds latency without improving
-        // coverage, so keep the generic scriptlet path only.
-        if (!hostname.includes('youtube.com') && settings.fingerprintProtection !== false) {
+        if (!hostname.includes('youtube.com') && isTopFrame && settings.fingerprintProtection === true) {
           scriptletsToRun.push({ name: 'fingerprint-noise', args: [] });
           scriptletsToRun.push({ name: 'battery-spoof', args: [] });
+        }
+        if (isTopFrame && settings.enhancedStealth === true) {
+          scriptletsToRun.push({ name: 'bot-stealth', args: [settings.stealthPersona || 'default'] });
+        }
+        if (isTopFrame && settings.stealthPersona && settings.stealthPersona !== 'default') {
+          scriptletsToRun.push({ name: 'persona-spoof', args: [settings.stealthPersona] });
         }
         if (scriptletsToRun.length > 0) {
           await injectScriptlets(sender.tab.id, sender.frameId || 0, scriptletsToRun);
         }
       }
 
-      let responseData = { isAllowed, settings, cosmeticRules: cosmeticBundle.rules, hasScriptlets };
+      let responseData = {
+        isAllowed,
+        settings,
+        cosmeticRules: cosmeticBundle.rules,
+      };
 
       if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
         try {
@@ -1949,11 +2083,11 @@ async function handleMessage(message, sender) {
       return { ok: true };
     }
     case 'SET_RULESET_ENABLED': {
-      await setRulesetEnabled(payload.rulesetId, payload.enabled);
-      return { ok: true };
+      const enabledMap = await setRulesetEnabled(payload.rulesetId, payload.enabled);
+      return { ok: true, enabledMap };
     }
     case 'GET_ENABLED_RULESETS':
-      return (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+      return await getEffectiveEnabledRulesetsMap();
 
     case 'GET_NOISE': {
       const { mean = 0, stdDev = 1 } = payload || {};
@@ -2030,9 +2164,6 @@ async function handleMessage(message, sender) {
 // ---------------------------------------------------------------------------
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
-
-// In-flight rule requests to deduplicate redundant DB hits
-const _inFlightRules = new Map();
 
 async function getCosmeticRulesForPage(hostname) {
   const bundle = await getCosmeticBundleForPage(hostname);

@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import https from 'https';
 import { fileURLToPath } from 'url';
+import { CORE_FILTER_SOURCE } from '../src/shared/core-filter-source.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
@@ -1002,8 +1003,9 @@ function smartTruncate(networkRules, limit) {
 async function main() {
   fs.mkdirSync(RULES_DIR, { recursive: true });
 
-  const allCosmeticRules = generateSampleCosmeticRules();
-  const allScriptletRules = generateSampleScriptletRules();
+  const allCosmeticRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.cosmetic));
+  const allScriptletRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.scriptlets));
+  const filterSources = {};
 
   // Define how many parts each list is split into (matching manifest.json)
   const LIST_CONFIG = {
@@ -1049,6 +1051,45 @@ async function main() {
       }
       console.log('');
 
+      const sourceCosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
+      for (const r of parsed.cosmeticRules) {
+        if (r.domains.length === 0) {
+          if (r.exception) continue;
+          sourceCosmetic.generic.push(r.selector);
+        } else {
+          for (const d of r.domains) {
+            if (r.exception) {
+              if (!sourceCosmetic.exceptions[d]) sourceCosmetic.exceptions[d] = [];
+              sourceCosmetic.exceptions[d].push(r.selector);
+            } else {
+              if (!sourceCosmetic.domainSpecific[d]) sourceCosmetic.domainSpecific[d] = [];
+              sourceCosmetic.domainSpecific[d].push(r.selector);
+            }
+          }
+        }
+      }
+      sourceCosmetic.generic = [...new Set(sourceCosmetic.generic)];
+      for (const [domain, selectors] of Object.entries(sourceCosmetic.domainSpecific)) {
+        sourceCosmetic.domainSpecific[domain] = [...new Set(selectors)];
+      }
+      for (const [domain, selectors] of Object.entries(sourceCosmetic.exceptions)) {
+        sourceCosmetic.exceptions[domain] = [...new Set(selectors)];
+      }
+
+      const sourceScriptlets = [];
+      const scriptletSeen = new Set();
+      for (const rule of parsed.scriptletRules) {
+        const key = `${rule.name}|${(rule.domains || []).join(',')}|${(rule.args || []).join('\u0001')}`;
+        if (scriptletSeen.has(key)) continue;
+        scriptletSeen.add(key);
+        sourceScriptlets.push(rule);
+      }
+
+      filterSources[list.id] = {
+        cosmetic: sourceCosmetic,
+        scriptlets: sourceScriptlets,
+      };
+
       // Merge cosmetic/scriptlet rules
       for (const r of parsed.cosmeticRules) {
         if (r.domains.length === 0) {
@@ -1083,6 +1124,10 @@ async function main() {
   const scriptletsPath = path.join(RULES_DIR, 'scriptlet-rules.json');
   fs.writeFileSync(scriptletsPath, JSON.stringify(allScriptletRules, null, 2));
   console.log(`✅ scriptlet-rules.json — ${allScriptletRules.length} rules`);
+
+  const filterSourcesPath = path.join(RULES_DIR, 'filter-sources.json');
+  fs.writeFileSync(filterSourcesPath, JSON.stringify(filterSources, null, 2));
+  console.log(`✅ filter-sources.json — ${Object.keys(filterSources).length} list sources`);
 
   console.log('\n🎉 Build complete!');
   process.exit(0);

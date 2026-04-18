@@ -16,6 +16,7 @@ const FILTER_LISTS = [
   { id: 'malware',      name: 'Malware Blocklist', desc: 'Blocks malware and phishing URLs' },
   { id: 'ubo-filters',  name: 'uBO Filters',       desc: 'uBlock Origin default filter list' },
   { id: 'ubo-unbreak',  name: 'uBO Unbreak',       desc: 'Fixes over-blocking by other lists' },
+  { id: 'anti-adblock', name: 'Anti-Adblock',      desc: 'Anti-adblock and badware fixes from uBO' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -47,6 +48,9 @@ function initNav() {
 // Filter Lists
 // ---------------------------------------------------------------------------
 async function initFilterLists() {
+  const getStatusText = (state) => state === false ? 'Disabled' : state === 'partial' ? 'Partial' : 'Active';
+  const isEffectivelyEnabled = (state) => state !== false;
+
   let enabled = {};
   let lastUpdate = 0;
   try {
@@ -75,7 +79,8 @@ async function initFilterLists() {
   grid.innerHTML = '';
 
   for (const list of FILTER_LISTS) {
-    const isEnabled = enabled[list.id] !== false;
+    const initialState = enabled[list.id];
+    const isEnabled = isEffectivelyEnabled(initialState);
 
     const card = document.createElement('div');
     card.className = 'list-card' + (isEnabled ? '' : ' disabled');
@@ -89,20 +94,30 @@ async function initFilterLists() {
         <div class="list-desc">${list.desc}</div>
       </div>
       <div class="list-meta" id="meta-${list.id}">
-        ${isEnabled ? 'Active' : 'Disabled'}
+        ${getStatusText(initialState)}
       </div>
     `;
 
     const checkbox = card.querySelector('input[type="checkbox"]');
+    checkbox.indeterminate = initialState === 'partial';
     checkbox.addEventListener('change', async () => {
       const nowEnabled = checkbox.checked;
-      card.className = 'list-card' + (nowEnabled ? '' : ' disabled');
-      $(`meta-${list.id}`).textContent = nowEnabled ? 'Active' : 'Disabled';
+      const applyState = (enabledMap) => {
+        const actualState = enabledMap?.[list.id];
+        const actualEnabled = isEffectivelyEnabled(actualState);
+        checkbox.checked = actualEnabled;
+        checkbox.indeterminate = actualState === 'partial';
+        card.className = 'list-card' + (actualEnabled ? '' : ' disabled');
+        $(`meta-${list.id}`).textContent = getStatusText(actualState);
+      };
 
-      await chrome.runtime.sendMessage({
+      applyState({ [list.id]: nowEnabled });
+
+      const res = await chrome.runtime.sendMessage({
         type: 'SET_RULESET_ENABLED',
         payload: { rulesetId: list.id, enabled: nowEnabled },
       });
+      applyState(res?.enabledMap || {});
     });
 
     grid.appendChild(card);
@@ -307,7 +322,7 @@ async function initSettings() {
   $('settingHTTPS').checked = settings.upgradeInsecureRequests !== false;
   $('settingBadge').checked = settings.showBadge !== false;
   $('settingCookies').checked = settings.blockThirdPartyCookies === true;
-  $('settingFingerprint').checked = settings.fingerprintProtection !== false;
+  $('settingFingerprint').checked = settings.fingerprintProtection === true;
   $('settingHeaders').checked = settings.stripTrackingHeaders !== false;
   $('settingStealth').checked = settings.enhancedStealth === true;
   $('settingPersona').value = settings.stealthPersona || 'default';

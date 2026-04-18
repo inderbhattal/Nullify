@@ -15,6 +15,7 @@ const FILTER_LIST_NAMES = {
   malware: 'Malware',
   'ubo-filters': 'uBO Filters',
   'ubo-unbreak': 'uBO Unbreak',
+  'anti-adblock': 'Anti-Adblock',
 };
 
 let currentTab = null;
@@ -115,9 +116,13 @@ async function loadFilterLists() {
     chips.innerHTML = '';
 
     for (const [id, name] of Object.entries(FILTER_LIST_NAMES)) {
+      const state = enabled[id];
       const chip = document.createElement('span');
-      chip.className = 'chip' + (enabled[id] === false ? ' disabled' : '');
-      chip.textContent = name;
+      chip.className = 'chip' + (state === false ? ' disabled' : state === 'partial' ? ' partial' : '');
+      chip.textContent = state === 'partial' ? `${name}*` : name;
+      if (state === 'partial') {
+        chip.title = `${name} partially enabled due to Chrome static rule limits`;
+      }
       chips.appendChild(chip);
     }
   } catch {}

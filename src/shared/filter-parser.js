@@ -134,7 +134,37 @@ export async function fetchAndExpand(url, depth = 0) {
   const text = await res.text();
 
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
-  const lines = text.split('\n');
+  const lines = [];
+  const stack = [true];
+
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('!#if')) {
+      const condition = trimmed.slice(4).trim();
+      const isTrue = condition.includes('env_chromium') ||
+        condition.includes('cap_dnr') ||
+        !condition.includes('env_');
+      stack.push(isTrue && stack[stack.length - 1]);
+      continue;
+    }
+
+    if (trimmed.startsWith('!#else')) {
+      const prev = stack.pop();
+      const parent = stack[stack.length - 1];
+      stack.push(!prev && parent);
+      continue;
+    }
+
+    if (trimmed.startsWith('!#endif')) {
+      stack.pop();
+      if (stack.length === 0) stack.push(true);
+      continue;
+    }
+
+    if (!stack[stack.length - 1]) continue;
+    lines.push(line);
+  }
 
   const expandedLines = await Promise.all(lines.map(async (line) => {
     const m = line.trim().match(/^!#include\s+(.+)$/);

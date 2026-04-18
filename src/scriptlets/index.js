@@ -45,6 +45,7 @@ import { hideWindowError } from './hide-window-error.js';
 import { fingerprintNoise } from './fingerprint-noise.js';
 import { batterySpoof } from './battery-spoof.js';
 import { botStealth } from './bot-stealth.js';
+import { personaSpoof } from './persona-spoof.js';
 
 // ---------------------------------------------------------------------------
 // Registry — maps scriptlet name (and aliases) to implementation
@@ -136,6 +137,7 @@ const REGISTRY = new Map([
   ['bs', batterySpoof],
   ['bot-stealth', botStealth],
   ['stealth', botStealth],
+  ['persona-spoof', personaSpoof],
 ]);
 
 // ---------------------------------------------------------------------------

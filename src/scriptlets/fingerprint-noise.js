@@ -1,44 +1,44 @@
 /**
  * fingerprint-noise.js
  *
- * Adds statistically sound Gaussian noise (from WASM Core) to Canvas and Audio API outputs.
- * This changes the browser's fingerprint using Differential Privacy principles, 
- * making it mathematically harder for tracking scripts to detect the noise.
+ * Adds small deterministic per-document noise to Canvas and Audio API outputs.
+ * This is intentionally local and lazy: no service-worker chatter, no timers.
  */
 export function fingerprintNoise() {
-  // ---------------------------------------------------------------------------
-  // Noise Buffer (to avoid messaging overhead)
-  // ---------------------------------------------------------------------------
-  let noiseBuffer = [];
-  const BUFFER_SIZE = 512;
+  if (globalThis.__nullifyFingerprintNoiseApplied) return;
+  globalThis.__nullifyFingerprintNoiseApplied = true;
 
-  async function refillNoiseBuffer() {
-    try {
-      // Use chrome.runtime.sendMessage to fetch Gaussian noise from the WASM core in SW
-      const response = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ 
-          type: 'GET_NOISE', 
-          payload: { mean: 0, stdDev: 0.8 } 
-        }, resolve);
-      });
-      if (response && response.noise !== undefined) {
-        noiseBuffer.push(response.noise);
-        // Trim buffer if it gets too large
-        if (noiseBuffer.length > BUFFER_SIZE) noiseBuffer.shift();
-      }
-    } catch { /* background might be sleeping */ }
-  }
+  const seedBuffer = new Uint32Array(1);
+  crypto.getRandomValues(seedBuffer);
+  const seed = seedBuffer[0] || 1;
 
-  // Initial fill
-  for (let i = 0; i < 10; i++) refillNoiseBuffer();
-  // Periodic refill
-  setInterval(refillNoiseBuffer, 5000);
+  const clampByte = (value) => Math.max(0, Math.min(255, value));
+  const clampAudio = (value) => Math.max(-1, Math.min(1, value));
 
-  function getNoise() {
-    if (noiseBuffer.length > 0) {
-      return noiseBuffer.pop();
+  const bitNoise = (salt) => {
+    let x = (seed ^ salt) >>> 0;
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    return (x & 1) === 0 ? -1 : 1;
+  };
+
+  const perturbPixels = (data, salt) => {
+    for (let i = 0; i < data.length; i += 4096) {
+      data[i] = clampByte(data[i] + bitNoise(salt + i));
     }
-    return (Math.random() - 0.5) * 2; // Fast fallback
+  };
+
+  const perturbAudio = (data, salt) => {
+    for (let i = 0; i < data.length; i += 4096) {
+      data[i] = clampAudio(data[i] + (bitNoise(salt + i) * 1e-7));
+    }
+  };
+
+  const getCanvasSalt = (canvas) => {
+    const width = Number(canvas?.width) || 0;
+    const height = Number(canvas?.height) || 0;
+    return ((width << 16) ^ height) >>> 0;
   }
 
   // ---------------------------------------------------------------------------
@@ -56,14 +56,7 @@ export function fingerprintNoise() {
   const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
   CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
     const imageData = origGetImageData.apply(this, arguments);
-    const data = imageData.data;
-    
-    // Add statistically sound noise periodically
-    for (let i = 0; i < data.length; i += 4096) {
-      const n = getNoise();
-      data[i] = data[i] + (n > 0 ? 1 : -1);
-    }
-    
+    perturbPixels(imageData.data, ((x << 24) ^ (y << 16) ^ (w << 8) ^ h) >>> 0);
     return imageData;
   };
 
@@ -77,11 +70,7 @@ export function fingerprintNoise() {
       if (octx) {
         octx.drawImage(this, 0, 0);
         const imageData = octx.getImageData(0, 0, offscreen.width, offscreen.height);
-        const data = imageData.data;
-        for (let i = 0; i < data.length; i += 4096) {
-          const n = getNoise();
-          data[i] = data[i] + (n > 0 ? 1 : -1);
-        }
+        perturbPixels(imageData.data, getCanvasSalt(this));
         octx.putImageData(imageData, 0, 0);
         return offscreen.toDataURL.apply(offscreen, arguments);
       }
@@ -96,9 +85,7 @@ export function fingerprintNoise() {
     const origGetChannelData = AudioBuffer.prototype.getChannelData;
     AudioBuffer.prototype.getChannelData = function () {
       const data = origGetChannelData.apply(this, arguments);
-      for (let i = 0; i < data.length; i += 4096) {
-        data[i] = data[i] + (getNoise() * 0.0000001);
-      }
+      perturbAudio(data, data.length >>> 0);
       return data;
     };
   }

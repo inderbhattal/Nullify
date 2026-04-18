@@ -1088,6 +1088,14 @@ async function checkFilterListUpdates() {
 // ---------------------------------------------------------------------------
 const tabStats = new Map(); // tabId → { blocked: number, url: string }
 
+function resetTabStats(tabId, url = '') {
+  if (!tabId || tabId < 0) return;
+
+  tabStats.set(tabId, { blocked: 0, trackers: 0, url });
+  updateBadge(tabId);
+  schedulePersistTabStats();
+}
+
 // Load existing tab stats when the service worker wakes up
 (async () => {
   const stored = await getStorage(StorageKeys.TAB_STATS);
@@ -1119,11 +1127,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   persistTabStats();
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === 'loading' && changeInfo.url) {
-    tabStats.set(tabId, { blocked: 0, trackers: 0, url: changeInfo.url });
-    updateBadge(tabId);
-    schedulePersistTabStats();
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status === 'loading' && !tabStats.has(tabId)) {
+    resetTabStats(tabId, changeInfo.url || tab?.url || '');
   }
 });
 
@@ -2064,6 +2070,8 @@ async function performEarlyInjection(tabId, urlStr) {
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (details.frameId !== 0) return;
   if (!details.url.startsWith('http')) return;
+
+  resetTabStats(details.tabId, details.url);
 
   const url = new URL(details.url);
   const hostname = normalizeHostname(url.hostname);

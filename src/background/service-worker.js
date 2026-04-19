@@ -19,23 +19,24 @@ import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import { CORE_FILTER_SOURCE } from '../shared/core-filter-source.js';
+import { initWasmFromUrl } from '../shared/wasm-loader.js';
 import init, {
   BloomFilter as WasmBloom,
   KeywordMatcher,
   AllowlistMatcher,
   UrlSanitizer,
+  compile_active_filter_index,
+  build_allowlist_rules,
   build_css_from_selectors,
-  build_page_bundle_from_json,
-  build_allowlist_rules_json,
-  compile_user_filters_to_json,
+  build_page_bundle,
+  compile_user_filters,
   generate_gaussian_noise,
+  parse_filter_source,
   plan_selector_rules_json,
-  reduce_cosmetic_rules_json,
   serialize_rules_to_binary_from_json,
   sanitize_url_with_csv,
   resolve_entity,
   is_semantic_ad,
-  sanitize_and_compact_selectors,
   anonymize_stats_json
 } from '../shared/wasm/nullify_core.js';
 
@@ -73,9 +74,11 @@ const trackerKeywordsCsv = [
 let cachedSettings = null;
 let cachedAllowlist = new Set();
 let cachedGenericCss = null;
+let cachedGenericProceduralRules = [];
 let domainRulesCache = new Map(); // hostname -> packaged page bundle (LRU, max 100 entries)
 const _inFlightRules = new Map();
 const DOMAIN_RULES_CACHE_MAX = 100;
+const PAGE_BUNDLE_DB_MAX = 250;
 const YOUTUBE_SHIELD_SCRIPT_ID = 'nullify-youtube-shield';
 const YOUTUBE_SHIELD_TARGETS = [
   { hostname: 'youtube.com', pattern: '*://youtube.com/*' },
@@ -83,6 +86,7 @@ const YOUTUBE_SHIELD_TARGETS = [
   { hostname: 'm.youtube.com', pattern: '*://m.youtube.com/*' },
   { hostname: 'music.youtube.com', pattern: '*://music.youtube.com/*' },
 ];
+let youtubeShieldSyncPromise = null;
 
 function setCachedDomainRules(hostname, bundle) {
   // Evict oldest entry when at capacity (Map preserves insertion order)
@@ -91,7 +95,6 @@ function setCachedDomainRules(hostname, bundle) {
   }
   domainRulesCache.set(hostname, bundle);
 }
-let genericCssLoaded = false;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -100,6 +103,9 @@ const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const FILTER_UPDATE_INTERVAL_MINUTES = 24 * 60; // 24 hours
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
+const RULE_DATA_SCHEMA_VERSION = 2;
+
+let bundledRuleDataVersionPromise = null;
 
 function getDefaultEnabledRulesets() {
   return {
@@ -210,10 +216,63 @@ function mergeFilterSources(listSources) {
     mergedScriptlets.push(...(source?.scriptlets || []));
   }
 
+  const generic = [...new Set((mergedCosmetic.generic || []).filter(Boolean))];
+  const genericSet = new Set(generic);
+  const domainSpecific = {};
+
+  for (const [domain, selectors] of Object.entries(mergedCosmetic.domainSpecific || {})) {
+    const deduped = [...new Set((selectors || []).filter((selector) => selector && !genericSet.has(selector)))];
+    if (deduped.length > 0) {
+      domainSpecific[domain] = deduped;
+    }
+  }
+
+  for (const [domain, selectors] of Object.entries(mergedCosmetic.exceptions || {})) {
+    if (!domainSpecific[domain]) domainSpecific[domain] = [];
+    const seen = new Set(domainSpecific[domain]);
+    for (const selector of selectors || []) {
+      const prefixed = '__exception__' + selector;
+      if (!seen.has(prefixed)) {
+        seen.add(prefixed);
+        domainSpecific[domain].push(prefixed);
+      }
+    }
+  }
+
+  Object.keys(domainSpecific).forEach((domain) => {
+    if (domainSpecific[domain].length === 0) delete domainSpecific[domain];
+  });
+
   return {
-    cosmetic: reduceCosmeticRules(mergedCosmetic),
+    cosmetic: { generic, domainSpecific },
     scriptlets: dedupeScriptlets(mergedScriptlets),
   };
+}
+
+function hashString(input) {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `rv${RULE_DATA_SCHEMA_VERSION}-${(hash >>> 0).toString(16)}`;
+}
+
+async function computeBundledRuleDataVersion() {
+  if (!bundledRuleDataVersionPromise) {
+    bundledRuleDataVersionPromise = (async () => {
+      const packaged = await loadPackagedFilterSources();
+      return hashString(JSON.stringify({
+        schema: RULE_DATA_SCHEMA_VERSION,
+        core: CORE_FILTER_SOURCE,
+        packaged: packaged || {},
+      }));
+    })().catch((err) => {
+      bundledRuleDataVersionPromise = null;
+      throw err;
+    });
+  }
+  return bundledRuleDataVersionPromise;
 }
 
 // All known procedural operators that require JS evaluation
@@ -356,56 +415,126 @@ function classifyAndPlanSelectors(selectors) {
   return { cssSelectors, proceduralRules };
 }
 
-function reduceCosmeticRules(cosmetic) {
-  if (wasmReady) {
-    try {
-      return JSON.parse(reduce_cosmetic_rules_json(
-        JSON.stringify(cosmetic.generic || []),
-        JSON.stringify(cosmetic.domainSpecific || {}),
-        JSON.stringify(cosmetic.exceptions || {})
-      ));
-    } catch (err) {
-      console.error('[Nullify] WASM cosmetic reduction failed:', err);
+function hasBalancedSelectorDelimiters(selector) {
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let quote = null;
+  let escaped = false;
+
+  for (const ch of selector) {
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+
+    if (ch === '"' || ch === '\'') {
+      quote = ch;
+    } else if (ch === '[') {
+      bracketDepth++;
+    } else if (ch === ']') {
+      bracketDepth--;
+      if (bracketDepth < 0) return false;
+    } else if (ch === '(') {
+      parenDepth++;
+    } else if (ch === ')') {
+      parenDepth--;
+      if (parenDepth < 0) return false;
     }
   }
 
-  const generic = [...new Set((cosmetic.generic || []).filter(Boolean))];
-  const genericSet = new Set(generic);
-  const domainSpecific = {};
+  return !quote && bracketDepth === 0 && parenDepth === 0;
+}
 
-  for (const [domain, selectors] of Object.entries(cosmetic.domainSpecific || {})) {
-    const deduped = [...new Set((selectors || []).filter((selector) => selector && !genericSet.has(selector)))];
-    if (deduped.length > 0) {
-      domainSpecific[domain] = deduped;
+function hasInvalidUniversalUsage(selector) {
+  const chars = [...selector];
+  let bracketDepth = 0;
+  let quote = null;
+  let escaped = false;
+
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
     }
-  }
+    if (ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === '\'') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '[') {
+      bracketDepth++;
+      continue;
+    }
+    if (ch === ']') {
+      bracketDepth--;
+      continue;
+    }
+    if (ch !== '*' || bracketDepth > 0) continue;
 
-  for (const [domain, selectors] of Object.entries(cosmetic.exceptions || {})) {
-    if (!domainSpecific[domain]) domainSpecific[domain] = [];
-    const seen = new Set(domainSpecific[domain]);
-    for (const selector of selectors || []) {
-      const prefixed = '__exception__' + selector;
-      if (!seen.has(prefixed)) {
-        seen.add(prefixed);
-        domainSpecific[domain].push(prefixed);
+    let prev = null;
+    for (let j = i - 1; j >= 0; j--) {
+      if (!/\s/.test(chars[j])) {
+        prev = chars[j];
+        break;
       }
     }
+
+    if (prev && /[A-Za-z0-9_\-)\]]/.test(prev)) {
+      return true;
+    }
   }
 
-  Object.keys(domainSpecific).forEach((domain) => {
-    if (domainSpecific[domain].length === 0) delete domainSpecific[domain];
-  });
+  return false;
+}
 
-  return { generic, domainSpecific };
+function isSafeCssSelector(selector) {
+  if (typeof selector !== 'string') return false;
+  const trimmed = selector.trim();
+  return !!trimmed &&
+    !trimmed.includes('{') &&
+    !trimmed.includes('}') &&
+    !trimmed.includes(';') &&
+    !isProceduralSelector(trimmed) &&
+    hasBalancedSelectorDelimiters(trimmed) &&
+    !hasInvalidUniversalUsage(trimmed);
+}
+
+function buildCssFromSelectorList(selectors, declarations) {
+  const uniqueSelectors = [...new Set(
+    (selectors || [])
+      .filter((selector) => isSafeCssSelector(selector))
+      .map((selector) => selector.trim())
+  )];
+
+  return uniqueSelectors
+    .map((selector) => `${selector} { ${declarations} }`)
+    .join('\n');
 }
 
 function buildPageBundle(rawRules) {
   if (wasmReady) {
     try {
-      return build_page_bundle_from_json(
-        JSON.stringify(rawRules.generic || []),
-        JSON.stringify(rawRules.domainSpecific || []),
-        JSON.stringify(rawRules.exceptions || []),
+      return build_page_bundle(
+        rawRules.generic || [],
+        rawRules.domainSpecific || [],
+        rawRules.exceptions || [],
         150
       );
     } catch (err) {
@@ -413,14 +542,18 @@ function buildPageBundle(rawRules) {
     }
   }
 
-  const exceptions = [...new Set((rawRules.exceptions || []).filter((selector) => typeof selector === 'string' && selector.trim()))];
+  const exceptions = [...new Set(
+    (rawRules.exceptions || [])
+      .filter((selector) => isSafeCssSelector(selector))
+      .map((selector) => selector.trim())
+  )];
   const exceptionSet = new Set(exceptions);
   const activeSelectors = [
     ...(rawRules.generic || []),
     ...(rawRules.domainSpecific || []),
   ].filter((selector) => typeof selector === 'string' && selector.trim() && !exceptionSet.has(selector));
 
-  const planned = classifyAndPlanSelectors(activeSelectors);
+  const planned = classifyAndPlanSelectors(activeSelectors.filter((selector) => isProceduralSelector(selector) || isSafeCssSelector(selector)));
   const proceduralRules = planned.proceduralRules || [];
   const cssSelectors = planned.cssSelectors || [];
 
@@ -433,11 +566,11 @@ function buildPageBundle(rawRules) {
   const cssText = cssSelectors.length > 0
     ? (wasmReady
         ? build_css_from_selectors(cssSelectors.join('\n'), '', 150)
-        : cssSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }')
+        : buildCssFromSelectorList(cssSelectors, 'display: none !important; visibility: hidden !important;'))
     : '';
 
   const exceptionCss = exceptions.length > 0
-    ? exceptions.join(',') + ' { display: revert !important; visibility: revert !important; }'
+    ? buildCssFromSelectorList(exceptions, 'display: revert !important; visibility: revert !important;')
     : '';
 
   let cosmeticRulesBinary = null;
@@ -461,6 +594,27 @@ function buildPageBundle(rawRules) {
   };
 }
 
+function normalizeStoredBundle(bundle) {
+  if (!bundle || typeof bundle !== 'object') return null;
+
+  if (bundle.cosmeticRulesBinary instanceof Uint8Array || bundle.cosmeticRulesBinary == null) {
+    return bundle;
+  }
+  if (bundle.cosmeticRulesBinary instanceof ArrayBuffer) {
+    return {
+      ...bundle,
+      cosmeticRulesBinary: new Uint8Array(bundle.cosmeticRulesBinary),
+    };
+  }
+  if (Array.isArray(bundle.cosmeticRulesBinary)) {
+    return {
+      ...bundle,
+      cosmeticRulesBinary: new Uint8Array(bundle.cosmeticRulesBinary),
+    };
+  }
+  return bundle;
+}
+
 async function loadPackagedFilterSources() {
   try {
     const url = chrome.runtime.getURL('rules/filter-sources.json');
@@ -478,7 +632,9 @@ async function fetchAndStoreRemoteFilterSources() {
     try {
       console.log(`[AdBlock] Fetching ${list.id} source bundle...`);
       const text = await fetchAndExpand(list.url);
-      sourceBundles[list.id] = buildSourceBundleFromParsed(parseFilterList(text));
+      sourceBundles[list.id] = wasmReady
+        ? parse_filter_source(text)
+        : buildSourceBundleFromParsed(parseFilterList(text));
       fetchedAny = true;
     } catch (err) {
       console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
@@ -501,26 +657,35 @@ async function rebuildActiveRuleIndexFromStoredSources() {
     .map((listId) => sourceMap.get(listId))
     .filter(Boolean);
 
-  const merged = mergeFilterSources(activeSources);
+  let compiled = null;
+  if (wasmReady) {
+    try {
+      compiled = compile_active_filter_index(CORE_FILTER_SOURCE, activeSources, 100);
+    } catch (err) {
+      console.error('[Nullify] WASM active index compilation failed:', err);
+    }
+  }
+
+  const merged = compiled || mergeFilterSources(activeSources);
 
   await db.clearActiveRules();
 
-  const totalDomains = Object.keys(merged.cosmetic.domainSpecific).length +
-    merged.scriptlets.reduce((count, rule) => count + (rule.domains?.length || 0), 0) + 1;
+  const bloomHosts = Array.isArray(compiled?.bloomHosts)
+    ? compiled.bloomHosts
+    : [
+        ...Object.keys(merged.cosmetic.domainSpecific || {}),
+        ...merged.scriptlets.flatMap((rule) => rule.domains || []),
+        '',
+      ];
+  const totalDomains = Math.max(bloomHosts.length, 1);
   const newBloom = wasmReady ? new WasmBloom(totalDomains * 10, 4) : BloomFilter.forCapacity(totalDomains);
 
-  await db.putBulkCosmeticRules(merged.cosmetic.domainSpecific);
-  for (const hostname of Object.keys(merged.cosmetic.domainSpecific)) {
-    newBloom.add(hostname);
-  }
+  await db.putBulkCosmeticRules(merged.cosmetic.domainSpecific || {});
 
   await db.putBulkScriptletRules(merged.scriptlets);
-  for (const rule of merged.scriptlets) {
-    for (const domain of rule.domains || []) {
-      newBloom.add(domain);
-    }
+  for (const hostname of bloomHosts) {
+    newBloom.add(hostname || '');
   }
-  newBloom.add('');
 
   bloom = newBloom;
   await setStorage(
@@ -528,15 +693,21 @@ async function rebuildActiveRuleIndexFromStoredSources() {
     wasmReady ? bloom.serialize_to_json() : bloom.serialize()
   );
 
-  await setStorage(StorageKeys.GENERIC_CSS, merged.cosmetic.generic);
-  cachedGenericCss = merged.cosmetic.generic.length > 0
-    ? (wasmReady
-        ? sanitize_and_compact_selectors(merged.cosmetic.generic.join('\n'), 100)
-        : merged.cosmetic.generic.join(',') + ' { display: none !important; visibility: hidden !important; }')
-    : null;
+  const genericBundle = buildPageBundle({
+    generic: merged.cosmetic.generic || [],
+    domainSpecific: [],
+    exceptions: [],
+  });
+  cachedGenericCss = genericBundle.cssText || null;
+  cachedGenericProceduralRules = genericBundle.rules?.domainSpecific || [];
+  await Promise.all([
+    setStorage(StorageKeys.GENERIC_CSS, cachedGenericCss || ''),
+    setStorage(StorageKeys.GENERIC_PROCEDURAL_RULES, cachedGenericProceduralRules),
+  ]);
 
   domainRulesCache.clear();
   _inFlightRules.clear();
+  await db.clearPageBundles();
   return true;
 }
 
@@ -554,18 +725,40 @@ async function ensureFilterSourcesReady() {
 
 async function ensureRuleDataReady() {
   const existingBloom = await getStorage(StorageKeys.BLOOM_FILTER);
+  const storedRuleDataVersion = await getStorage(StorageKeys.RULE_DATA_VERSION);
+  const bundledRuleDataVersion = await computeBundledRuleDataVersion().catch(() => null);
   const hadSources = await db.hasFilterSources();
-  const sourcesReady = hadSources || await ensureFilterSourcesReady();
+  let sourcesReady = hadSources;
+
+  const ruleDataChanged = !!bundledRuleDataVersion && storedRuleDataVersion !== bundledRuleDataVersion;
+
+  if (ruleDataChanged) {
+    const packaged = await loadPackagedFilterSources();
+    if (packaged && Object.keys(packaged).length > 0) {
+      await db.putBulkFilterSources(packaged);
+      sourcesReady = true;
+    }
+  }
+
+  if (!sourcesReady) {
+    sourcesReady = await ensureFilterSourcesReady();
+  }
 
   if (sourcesReady) {
-    if (!existingBloom || !hadSources) {
+    if (!existingBloom || !hadSources || ruleDataChanged) {
       await rebuildActiveRuleIndexFromStoredSources();
+      if (bundledRuleDataVersion) {
+        await setStorage(StorageKeys.RULE_DATA_VERSION, bundledRuleDataVersion);
+      }
     }
     return true;
   }
 
-  if (!existingBloom) {
+  if (!existingBloom || ruleDataChanged) {
     await ingestLegacyRules();
+    if (bundledRuleDataVersion) {
+      await setStorage(StorageKeys.RULE_DATA_VERSION, bundledRuleDataVersion);
+    }
   }
 
   return false;
@@ -642,7 +835,7 @@ function startInitialization() {
     // Stage 0: Initialize WASM
     try {
       const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
-      await init({ module_or_path: wasmUrl });
+      await initWasmFromUrl(init, wasmUrl);
       wasmReady = true;
 
       // Initialize tracker detector using string-based interface
@@ -705,8 +898,16 @@ function getYouTubeShieldExcludeMatches() {
     .map(({ pattern }) => pattern);
 }
 
+function arraysEqual(a = [], b = []) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
 async function syncYouTubeShieldRegistration() {
-  try {
+  const run = async () => {
     const registration = {
       id: YOUTUBE_SHIELD_SCRIPT_ID,
       matches: YOUTUBE_SHIELD_TARGETS.map(({ pattern }) => pattern),
@@ -718,18 +919,62 @@ async function syncYouTubeShieldRegistration() {
       persistAcrossSessions: true,
     };
 
-    await chrome.scripting.unregisterContentScripts({ ids: [YOUTUBE_SHIELD_SCRIPT_ID] }).catch(() => {});
+    const existingScripts = await chrome.scripting.getRegisteredContentScripts({
+      ids: [YOUTUBE_SHIELD_SCRIPT_ID],
+    }).catch(() => []);
+    const existing = existingScripts?.[0] || null;
+
+    if (
+      existing &&
+      arraysEqual(existing.matches || [], registration.matches) &&
+      arraysEqual(existing.excludeMatches || [], registration.excludeMatches) &&
+      existing.runAt === registration.runAt &&
+      existing.world === registration.world &&
+      existing.allFrames === registration.allFrames
+    ) {
+      return;
+    }
+
+    if (existing && typeof chrome.scripting.updateContentScripts === 'function') {
+      await chrome.scripting.updateContentScripts([{
+        id: YOUTUBE_SHIELD_SCRIPT_ID,
+        matches: registration.matches,
+        excludeMatches: registration.excludeMatches,
+        runAt: registration.runAt,
+        world: registration.world,
+        allFrames: registration.allFrames,
+      }]);
+      return;
+    }
+
+    if (existing) {
+      await chrome.scripting.unregisterContentScripts({ ids: [YOUTUBE_SHIELD_SCRIPT_ID] }).catch(() => {});
+    }
+
     await chrome.scripting.registerContentScripts([registration]);
-  } catch (err) {
-    console.error('[Nullify] Failed to sync YouTube shield registration:', err);
-  }
+  };
+
+  const pending = (youtubeShieldSyncPromise || Promise.resolve())
+    .then(run)
+    .catch((err) => {
+      console.error('[Nullify] Failed to sync YouTube shield registration:', err);
+    });
+
+  youtubeShieldSyncPromise = pending.finally(() => {
+    if (youtubeShieldSyncPromise === pending) {
+      youtubeShieldSyncPromise = null;
+    }
+  });
+
+  return youtubeShieldSyncPromise;
 }
 
 async function refreshMemoryCache() {
   const data = await getStorageBulk([
     StorageKeys.SETTINGS,
     StorageKeys.ALLOWLIST,
-    StorageKeys.GENERIC_CSS
+    StorageKeys.GENERIC_CSS,
+    StorageKeys.GENERIC_PROCEDURAL_RULES,
   ]);
 
   cachedSettings = data[StorageKeys.SETTINGS];
@@ -746,20 +991,17 @@ async function refreshMemoryCache() {
     await rebuildAllowlistRules(normalizedAllowlist);
   }
 
-  const genericSelectors = data[StorageKeys.GENERIC_CSS];
-  if (Array.isArray(genericSelectors) && genericSelectors.length > 0) {
-    // Use WASM builder when ready for chunked, deduped CSS
-    cachedGenericCss = wasmReady
-      ? build_css_from_selectors(genericSelectors.join('\n'), '', 100)
-      : genericSelectors.join(',') + ' { display: none !important; visibility: hidden !important; }';
-  } else if (typeof genericSelectors === 'string' && genericSelectors.length > 0) {
-    cachedGenericCss = genericSelectors;
+  const genericCss = data[StorageKeys.GENERIC_CSS];
+  if (typeof genericCss === 'string' && genericCss.length > 0) {
+    cachedGenericCss = genericCss;
   } else {
     cachedGenericCss = null;
   }
+  cachedGenericProceduralRules = Array.isArray(data[StorageKeys.GENERIC_PROCEDURAL_RULES])
+    ? data[StorageKeys.GENERIC_PROCEDURAL_RULES]
+    : [];
 
   domainRulesCache.clear();
-  genericCssLoaded = !!cachedGenericCss;
   await syncYouTubeShieldRegistration();
 }
 
@@ -847,12 +1089,17 @@ async function ingestLegacyRules() {
       await setStorage(StorageKeys.BLOOM_FILTER, bloom.serialize());
     }
 
-    if (cosData.generic && cosData.generic.length > 0) {
-      await setStorage(StorageKeys.GENERIC_CSS, cosData.generic);
-      cachedGenericCss = wasmReady 
-        ? sanitize_and_compact_selectors(cosData.generic.join('\n'), 100)
-        : cosData.generic.join(',') + ' { display: none !important; visibility: hidden !important; }';
-    }
+    const genericBundle = buildPageBundle({
+      generic: cosData.generic || [],
+      domainSpecific: [],
+      exceptions: [],
+    });
+    cachedGenericCss = genericBundle.cssText || null;
+    cachedGenericProceduralRules = genericBundle.rules?.domainSpecific || [];
+    await Promise.all([
+      setStorage(StorageKeys.GENERIC_CSS, cachedGenericCss || ''),
+      setStorage(StorageKeys.GENERIC_PROCEDURAL_RULES, cachedGenericProceduralRules),
+    ]);
 
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
     console.log('[AdBlock] Rule indexing and Bloom Filter build complete');
@@ -1507,7 +1754,7 @@ async function applyUserFilters(filtersText) {
 
   if (wasmReady) {
     try {
-      const compiled = JSON.parse(compile_user_filters_to_json(filtersText || '', DNR_USER_RULES_START));
+      const compiled = compile_user_filters(filtersText || '', DNR_USER_RULES_START);
       newRules = compiled.dnrRules || [];
       cosmeticRules = compiled.cosmeticRules || cosmeticRules;
       userScriptlets = compiled.scriptletRules || [];
@@ -1559,6 +1806,7 @@ async function applyUserFilters(filtersText) {
   // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately
   domainRulesCache.clear();
   _inFlightRules.clear();
+  await db.clearPageBundles();
 
   const totalDomainSpecificRules = Object.values(cosmeticRules.domainSpecific || {})
     .reduce((sum, rules) => sum + (rules?.length || 0), 0);
@@ -1643,10 +1891,7 @@ async function rebuildAllowlistRules(allowlist) {
   let newRules;
   if (wasmReady) {
     try {
-      newRules = JSON.parse(build_allowlist_rules_json(
-        JSON.stringify(normalizedAllowlist),
-        DNR_ALLOWLIST_START
-      ));
+      newRules = build_allowlist_rules(normalizedAllowlist, DNR_ALLOWLIST_START);
     } catch (err) {
       console.error('[Nullify] WASM allowlist rule build failed:', err);
     }
@@ -1993,6 +2238,9 @@ async function handleMessage(message, sender) {
         isAllowed,
         settings,
         cosmeticRules: cosmeticBundle.rules,
+        cssText: cosmeticBundle.cssText || '',
+        exceptionCss: cosmeticBundle.exceptionCss || '',
+        genericProceduralRules: cachedGenericProceduralRules,
       };
 
       if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
@@ -2181,6 +2429,12 @@ async function getCosmeticBundleForPage(hostname) {
   const cached = domainRulesCache.get(hostname);
   if (cached) return cached;
 
+  const persistedBundle = normalizeStoredBundle(await db.getPageBundle(hostname));
+  if (persistedBundle) {
+    setCachedDomainRules(hostname, persistedBundle);
+    return persistedBundle;
+  }
+
   // Deduplicate: If we are already fetching rules for this domain, return the same promise.
   if (_inFlightRules.has(hostname)) return _inFlightRules.get(hostname);
 
@@ -2240,8 +2494,11 @@ async function getCosmeticBundleForPage(hostname) {
 
   _inFlightRules.set(hostname, promise);
   try {
-    const bundle = await promise;
+    const bundle = normalizeStoredBundle(await promise);
     setCachedDomainRules(hostname, bundle); // Populate cache so GET_INIT_DATA skips IndexedDB
+    await db.putPageBundle(hostname, bundle)
+      .then(() => db.prunePageBundles(PAGE_BUNDLE_DB_MAX))
+      .catch(() => {});
     return bundle;
   } finally {
     _inFlightRules.delete(hostname);
@@ -2297,7 +2554,7 @@ function isHostnameAllowedCached(hostname) {
  * Reusable core injection logic.
  * Ensures CSS is injected as early as possible.
  */
-async function performEarlyInjection(tabId, urlStr) {
+async function performEarlyInjection(tabId, frameId, urlStr) {
   if (!urlStr?.startsWith('http')) return;
   const url = new URL(urlStr);
   const hostname = normalizeHostname(url.hostname);
@@ -2307,7 +2564,7 @@ async function performEarlyInjection(tabId, urlStr) {
   // 1. Inject Generic CSS
   if (cachedGenericCss) {
     chrome.scripting.insertCSS({
-      target: { tabId, allFrames: true },
+      target: { tabId, frameIds: [frameId] },
       css: cachedGenericCss,
       origin: 'USER',
     }).catch(() => { });
@@ -2322,7 +2579,7 @@ async function performEarlyInjection(tabId, urlStr) {
 
   if (bundle.cssText) {
     chrome.scripting.insertCSS({
-      target: { tabId, allFrames: true },
+      target: { tabId, frameIds: [frameId] },
       css: bundle.cssText,
       origin: 'USER',
     }).catch(() => { });
@@ -2331,7 +2588,7 @@ async function performEarlyInjection(tabId, urlStr) {
   // 3. Inject Exceptions
   if (bundle.exceptionCss) {
     chrome.scripting.insertCSS({
-      target: { tabId, allFrames: true },
+      target: { tabId, frameIds: [frameId] },
       css: bundle.exceptionCss,
       origin: 'USER',
     }).catch(() => { });
@@ -2342,10 +2599,11 @@ async function performEarlyInjection(tabId, urlStr) {
  * Stage 1: onBeforeNavigate (Warm up the cache)
  */
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
-  if (details.frameId !== 0) return;
   if (!details.url.startsWith('http')) return;
 
-  resetTabStats(details.tabId, details.url);
+  if (details.frameId === 0) {
+    resetTabStats(details.tabId, details.url);
+  }
 
   const url = new URL(details.url);
   const hostname = normalizeHostname(url.hostname);
@@ -2360,6 +2618,5 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
  * Stage 2: onCommitted (Reliability fallback)
  */
 chrome.webNavigation.onCommitted.addListener(async (details) => {
-  if (details.frameId !== 0) return;
-  performEarlyInjection(details.tabId, details.url);
+  performEarlyInjection(details.tabId, details.frameId || 0, details.url);
 });

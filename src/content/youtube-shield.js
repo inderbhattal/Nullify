@@ -8,6 +8,7 @@ import init, {
   process_youtube_player,
   sanitize_youtube_experiments,
 } from '../shared/wasm/nullify_core.js';
+import { initWasmFromUrl } from '../shared/wasm-loader.js';
 
 (function() {
   let wasmReady = false;
@@ -151,7 +152,7 @@ import init, {
     wasmInitError = null;
     wasmSource = source;
     updateWasmState('loading');
-    const initPromise = init({ module_or_path: url });
+    const initPromise = initWasmFromUrl(init, url);
     initPromise.then(() => {
       wasmReady = true;
       wasmInitError = null;

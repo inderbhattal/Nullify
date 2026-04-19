@@ -1,0 +1,110 @@
+const sharedGlobals = {
+  AbortController: 'readonly',
+  ArrayBuffer: 'readonly',
+  Blob: 'readonly',
+  Buffer: 'readonly',
+  CanvasRenderingContext2D: 'readonly',
+  CSS: 'readonly',
+  CustomEvent: 'readonly',
+  DataView: 'readonly',
+  Document: 'readonly',
+  Event: 'readonly',
+  EventTarget: 'readonly',
+  FormData: 'readonly',
+  Headers: 'readonly',
+  HTMLCanvasElement: 'readonly',
+  MutationObserver: 'readonly',
+  Node: 'readonly',
+  ProgressEvent: 'readonly',
+  Request: 'readonly',
+  Response: 'readonly',
+  TextDecoder: 'readonly',
+  TextEncoder: 'readonly',
+  URL: 'readonly',
+  URLSearchParams: 'readonly',
+  Uint8Array: 'readonly',
+  XPathResult: 'readonly',
+  atob: 'readonly',
+  btoa: 'readonly',
+  clearInterval: 'readonly',
+  clearTimeout: 'readonly',
+  console: 'readonly',
+  crypto: 'readonly',
+  fetch: 'readonly',
+  globalThis: 'readonly',
+  performance: 'readonly',
+  queueMicrotask: 'readonly',
+  requestAnimationFrame: 'readonly',
+  setInterval: 'readonly',
+  setTimeout: 'readonly',
+  structuredClone: 'readonly',
+};
+
+const browserGlobals = {
+  ...sharedGlobals,
+  CSSStyleSheet: 'readonly',
+  DocumentFragment: 'readonly',
+  Element: 'readonly',
+  HTMLDocument: 'readonly',
+  HTMLElement: 'readonly',
+  KeyboardEvent: 'readonly',
+  MouseEvent: 'readonly',
+  Navigator: 'readonly',
+  ShadowRoot: 'readonly',
+  Window: 'readonly',
+  chrome: 'readonly',
+  document: 'readonly',
+  getComputedStyle: 'readonly',
+  indexedDB: 'readonly',
+  localStorage: 'readonly',
+  location: 'readonly',
+  navigator: 'readonly',
+  sessionStorage: 'readonly',
+  window: 'readonly',
+  AudioBuffer: 'readonly',
+};
+
+const nodeGlobals = {
+  ...sharedGlobals,
+  __dirname: 'readonly',
+  process: 'readonly',
+};
+
+const commonRules = {
+  'no-undef': 'error',
+  'no-unused-vars': ['warn', {
+    argsIgnorePattern: '^_',
+    varsIgnorePattern: '^_',
+    caughtErrorsIgnorePattern: '^_',
+  }],
+};
+
+export default [
+  {
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'rules/**',
+      'src/shared/wasm/**',
+      'wasm-core/target/**',
+    ],
+  },
+  {
+    files: ['src/**/*.js'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: browserGlobals,
+    },
+    rules: commonRules,
+  },
+  {
+    files: ['scripts/**/*.mjs', 'webpack.config.js'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: nodeGlobals,
+    },
+    rules: commonRules,
+  },
+];

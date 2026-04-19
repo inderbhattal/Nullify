@@ -23,6 +23,8 @@ export const StorageKeys = {
   COSMETIC_GENERIC_RULES: 'cosmeticGenericRules',
   BLOOM_FILTER: 'bloomFilter',
   GENERIC_CSS: 'genericCss',
+  GENERIC_PROCEDURAL_RULES: 'genericProceduralRules',
+  RULE_DATA_VERSION: 'ruleDataVersion',
   BLOCK_THIRD_PARTY_COOKIES: 'blockThirdPartyCookies',
   FINGERPRINT_PROTECTION: 'fingerprintProtection',
   STRIP_TRACKING_HEADERS: 'stripTrackingHeaders',

@@ -6,10 +6,11 @@
  */
 
 const DB_NAME = 'NullifyRules';
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 const STORE_COSMETIC = 'cosmetic_rules';
 const STORE_SCRIPTLET = 'scriptlet_rules';
 const STORE_FILTER_SOURCES = 'filter_sources';
+const STORE_PAGE_BUNDLES = 'page_bundles';
 
 export class RulesDB {
   constructor() {
@@ -35,6 +36,9 @@ export class RulesDB {
         }
         if (!db.objectStoreNames.contains(STORE_FILTER_SOURCES)) {
           db.createObjectStore(STORE_FILTER_SOURCES, { keyPath: 'listId' });
+        }
+        if (!db.objectStoreNames.contains(STORE_PAGE_BUNDLES)) {
+          db.createObjectStore(STORE_PAGE_BUNDLES, { keyPath: 'hostname' });
         }
       };
 
@@ -136,9 +140,10 @@ export class RulesDB {
   async clearActiveRules() {
     const db = await this.open();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction([STORE_COSMETIC, STORE_SCRIPTLET], 'readwrite');
+      const transaction = db.transaction([STORE_COSMETIC, STORE_SCRIPTLET, STORE_PAGE_BUNDLES], 'readwrite');
       transaction.objectStore(STORE_COSMETIC).clear();
       transaction.objectStore(STORE_SCRIPTLET).clear();
+      transaction.objectStore(STORE_PAGE_BUNDLES).clear();
 
       transaction.oncomplete = () => resolve();
       transaction.onerror = (event) => reject(event.target.error);
@@ -198,6 +203,86 @@ export class RulesDB {
 
       request.onsuccess = () => resolve((request.result || 0) > 0);
       request.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Persist a compiled page bundle for a hostname. */
+  async putPageBundle(hostname, bundle) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
+      const store = transaction.objectStore(STORE_PAGE_BUNDLES);
+      store.put({ hostname, bundle, updatedAt: Date.now() });
+
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Get a compiled page bundle for a hostname. */
+  async getPageBundle(hostname) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
+      const store = transaction.objectStore(STORE_PAGE_BUNDLES);
+      const request = store.get(hostname);
+      let bundle = null;
+
+      request.onsuccess = () => {
+        const record = request.result;
+        bundle = record?.bundle || null;
+        if (record) {
+          store.put({ ...record, updatedAt: Date.now() });
+        }
+      };
+      transaction.oncomplete = () => resolve(bundle);
+      transaction.onerror = (event) => reject(event.target.error);
+      request.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Clear persisted page bundles without touching the active rule index. */
+  async clearPageBundles() {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
+      transaction.objectStore(STORE_PAGE_BUNDLES).clear();
+
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = (event) => reject(event.target.error);
+    });
+  }
+
+  /** Remove the least-recently-used page bundles above the provided cap. */
+  async prunePageBundles(maxEntries) {
+    if (!Number.isInteger(maxEntries) || maxEntries <= 0) return 0;
+
+    const db = await this.open();
+    const records = await new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readonly');
+      const store = transaction.objectStore(STORE_PAGE_BUNDLES);
+      const request = store.getAll();
+
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = (event) => reject(event.target.error);
+    });
+
+    if (records.length <= maxEntries) return 0;
+
+    const staleRecords = [...records]
+      .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
+      .slice(0, records.length - maxEntries);
+
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
+      const store = transaction.objectStore(STORE_PAGE_BUNDLES);
+
+      for (const record of staleRecords) {
+        if (record?.hostname) store.delete(record.hostname);
+      }
+
+      transaction.oncomplete = () => resolve(staleRecords.length);
+      transaction.onerror = (event) => reject(event.target.error);
     });
   }
 }

@@ -14,6 +14,25 @@ import { activatePicker, deactivatePicker } from './element-picker.js';
 import { normalizeHostname } from '../shared/hostname.js';
 
 const hostname = normalizeHostname(location.hostname);
+const FRAME_STYLE_ID = '__nullify_frame_css__';
+const FRAME_EXCEPTION_STYLE_ID = '__nullify_exception_css__';
+
+function injectStyle(id, cssText, append = false) {
+  if (!cssText) return;
+
+  const existing = document.getElementById(id);
+  if (existing) existing.remove();
+
+  const style = document.createElement('style');
+  style.id = id;
+  style.textContent = cssText;
+
+  const parent = document.head || document.documentElement;
+  if (!parent) return;
+
+  if (append) parent.appendChild(style);
+  else parent.prepend(style);
+}
 
 /**
  * Fast binary decoder for ruleset data.
@@ -82,14 +101,28 @@ async function main() {
     isAllowed,
     cosmeticRules,
     cosmeticRulesBinary,
+    cssText,
+    exceptionCss,
+    genericProceduralRules,
   } = initRes || {};
 
   if (isAllowed === true) return;
 
+  injectStyle(FRAME_STYLE_ID, cssText);
+  injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
+
   // Use binary rules if available, otherwise fallback to JSON
-  const finalRules = cosmeticRulesBinary 
+  const pageRules = cosmeticRulesBinary 
     ? decodeBinaryRules(cosmeticRulesBinary)
     : cosmeticRules;
+  const finalRules = {
+    generic: pageRules?.generic || [],
+    domainSpecific: [
+      ...(Array.isArray(genericProceduralRules) ? genericProceduralRules : []),
+      ...(pageRules?.domainSpecific || []),
+    ],
+    exceptions: pageRules?.exceptions || [],
+  };
 
   // Apply cosmetic rules
   const hasProcedural = finalRules?.generic?.some(r => typeof r === 'object' || (typeof r === 'string' && r.includes(':'))) || 

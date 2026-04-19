@@ -7,14 +7,14 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "setup": "npm install && npm run build:sample-rules && npm run build:ext",
-    "setup:prod": "npm install && npm run build:rules && npm run build:ext",
+    "setup": "npm install && npm run build:wasm && npm run build:sample-rules && npm run build:ext",
+    "setup:prod": "npm install && npm run build:wasm && npm run build:rules && npm run build:ext",
     "build": "npm run build:rules && npm run build:wasm && npm run build:ext",
     "build:rules": "node scripts/build-rules.mjs",
     "build:wasm": "cd wasm-core && wasm-pack build --target web --out-dir ../src/shared/wasm",
     "build:ext": "webpack --mode production",
     "build:sample-rules": "node scripts/build-rules.mjs --sample",
-    "dev": "npm run build:sample-rules && webpack --mode development --watch",
+    "dev": "npm run build:wasm && npm run build:sample-rules && webpack --mode development --watch",
     "lint": "eslint src/ scripts/ --ext .js,.mjs",
     "clean": "rm -rf dist/ && find rules/ -name '*.json' ! -name 'system-unbreak.json' -delete",
     "clean:all": "npm run clean && rm -rf node_modules/",

@@ -20,6 +20,20 @@ import { CORE_FILTER_SOURCE } from '../src/shared/core-filter-source.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
+const SAMPLE_MODE = process.argv.includes('--sample');
+
+const LIST_CONFIG = {
+  'easylist': { parts: 4, totalLimit: 100000 },
+  'easyprivacy': { parts: 3, totalLimit: 75000 },
+  'ubo-filters': { parts: 2, totalLimit: 40000 },
+  'annoyances': { parts: 1, totalLimit: 30000 },
+  'malware': { parts: 1, totalLimit: 30000 },
+  'ubo-unbreak': { parts: 1, totalLimit: 30000 },
+  'anti-adblock': { parts: 1, totalLimit: 30000 },
+  'ubo-cookie-annoyances': { parts: 1, totalLimit: 30000 },
+};
+
+const MAX_PER_FILE = 25000;
 
 // ---------------------------------------------------------------------------
 // Filter list sources
@@ -747,6 +761,173 @@ function buildDNRRules(networkRules) {
   return dnrRules;
 }
 
+function buildSourceBundleFallback(parsed) {
+  const sourceCosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
+  const cosmeticRules = [...(parsed.cosmeticRules || []), ...(parsed.cosmeticExceptions || [])];
+  for (const r of cosmeticRules) {
+    if (r.domains.length === 0) {
+      if (r.exception) continue;
+      sourceCosmetic.generic.push(r.selector);
+    } else {
+      for (const d of r.domains) {
+        if (r.exception) {
+          if (!sourceCosmetic.exceptions[d]) sourceCosmetic.exceptions[d] = [];
+          sourceCosmetic.exceptions[d].push(r.selector);
+        } else {
+          if (!sourceCosmetic.domainSpecific[d]) sourceCosmetic.domainSpecific[d] = [];
+          sourceCosmetic.domainSpecific[d].push(r.selector);
+        }
+      }
+    }
+  }
+  sourceCosmetic.generic = [...new Set(sourceCosmetic.generic)];
+  for (const [domain, selectors] of Object.entries(sourceCosmetic.domainSpecific)) {
+    sourceCosmetic.domainSpecific[domain] = [...new Set(selectors)];
+  }
+  for (const [domain, selectors] of Object.entries(sourceCosmetic.exceptions)) {
+    sourceCosmetic.exceptions[domain] = [...new Set(selectors)];
+  }
+
+  const sourceScriptlets = [];
+  const scriptletSeen = new Set();
+  for (const rule of parsed.scriptletRules) {
+    const key = `${rule.name}|${(rule.domains || []).join(',')}|${(rule.args || []).join('\u0001')}`;
+    if (scriptletSeen.has(key)) continue;
+    scriptletSeen.add(key);
+    sourceScriptlets.push(rule);
+  }
+
+  return {
+    cosmetic: sourceCosmetic,
+    scriptlets: sourceScriptlets,
+  };
+}
+
+function createEmptySourceBundle() {
+  return {
+    cosmetic: { generic: [], domainSpecific: {}, exceptions: {} },
+    scriptlets: [],
+  };
+}
+
+function collectExpectedRulesetFiles() {
+  const files = [];
+  for (const list of FILTER_LISTS) {
+    const config = LIST_CONFIG[list.id] || { parts: 1 };
+    for (let i = 0; i < config.parts; i++) {
+      const suffix = i === 0 ? '' : `_${i + 1}`;
+      files.push(`${list.id}${suffix}.json`);
+    }
+  }
+  return files;
+}
+
+function cleanGeneratedRuleFiles() {
+  if (!fs.existsSync(RULES_DIR)) return;
+
+  const generatedFiles = new Set([
+    ...collectExpectedRulesetFiles(),
+    'cosmetic-rules.json',
+    'scriptlet-rules.json',
+    'filter-sources.json',
+  ]);
+
+  for (const entry of fs.readdirSync(RULES_DIR, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    if (entry.name === 'system-unbreak.json') continue;
+    if (!generatedFiles.has(entry.name)) continue;
+    fs.rmSync(path.join(RULES_DIR, entry.name), { force: true });
+  }
+}
+
+function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }) {
+  for (const [filename, rules] of Object.entries(rulesetOutputs)) {
+    const outPath = path.join(RULES_DIR, filename);
+    fs.writeFileSync(outPath, JSON.stringify(rules, null, 2));
+    console.log(`✅ ${filename} — ${rules.length} DNR rules written`);
+  }
+
+  const cosmeticsPath = path.join(RULES_DIR, 'cosmetic-rules.json');
+  fs.writeFileSync(cosmeticsPath, JSON.stringify(cosmeticRules, null, 2));
+  console.log(`\n✅ cosmetic-rules.json — ${cosmeticRules.generic.length} generic + ${Object.keys(cosmeticRules.domainSpecific).length} domain-specific`);
+
+  const scriptletsPath = path.join(RULES_DIR, 'scriptlet-rules.json');
+  fs.writeFileSync(scriptletsPath, JSON.stringify(scriptletRules, null, 2));
+  console.log(`✅ scriptlet-rules.json — ${scriptletRules.length} rules`);
+
+  const filterSourcesPath = path.join(RULES_DIR, 'filter-sources.json');
+  fs.writeFileSync(filterSourcesPath, JSON.stringify(filterSources, null, 2));
+  console.log(`✅ filter-sources.json — ${Object.keys(filterSources).length} list sources`);
+}
+
+function buildSampleRulesetOutputs() {
+  const outputs = {};
+  for (const filename of collectExpectedRulesetFiles()) {
+    outputs[filename] = [];
+  }
+
+  outputs['easylist.json'] = [
+    {
+      id: 1,
+      priority: 1,
+      action: { type: 'block' },
+      condition: {
+        urlFilter: '||ads.example^',
+        resourceTypes: ['script', 'image', 'sub_frame', 'xmlhttprequest'],
+      },
+    },
+  ];
+  outputs['easyprivacy.json'] = [
+    {
+      id: 1,
+      priority: 1,
+      action: { type: 'block' },
+      condition: {
+        urlFilter: '||tracker.example^',
+        resourceTypes: ['script', 'xmlhttprequest', 'image'],
+      },
+    },
+  ];
+  outputs['annoyances.json'] = [
+    {
+      id: 1,
+      priority: 1,
+      action: { type: 'block' },
+      condition: {
+        urlFilter: '||consent.example^',
+        resourceTypes: ['sub_frame', 'script'],
+      },
+    },
+  ];
+
+  return outputs;
+}
+
+function buildSampleFilterSources() {
+  const sampleBundle = {
+    cosmetic: generateSampleCosmeticRules(),
+    scriptlets: generateSampleScriptletRules(),
+  };
+
+  return Object.fromEntries(FILTER_LISTS.map(({ id }, index) => [
+    id,
+    index === 0 ? sampleBundle : createEmptySourceBundle(),
+  ]));
+}
+
+function writeSampleOutputs() {
+  console.log('🧪 Generating sample rule artifacts (offline mode)...\n');
+
+  writeBuildOutputs({
+    rulesetOutputs: buildSampleRulesetOutputs(),
+    cosmeticRules: generateSampleCosmeticRules(),
+    scriptletRules: generateSampleScriptletRules(),
+    filterSources: buildSampleFilterSources(),
+  });
+
+  console.log('\n🎉 Sample build complete!');
+}
+
 // ---------------------------------------------------------------------------
 // Sample rules generator (for development without internet access)
 // ---------------------------------------------------------------------------
@@ -1002,24 +1183,33 @@ function smartTruncate(networkRules, limit) {
 // ---------------------------------------------------------------------------
 async function main() {
   fs.mkdirSync(RULES_DIR, { recursive: true });
+  cleanGeneratedRuleFiles();
+
+  if (SAMPLE_MODE) {
+    writeSampleOutputs();
+    process.exit(0);
+  }
+
+  let rustSourceParserReady = false;
+  let parseFilterSourceWithRust = null;
+  try {
+    const wasmJsPath = path.resolve(__dirname, '../src/shared/wasm/nullify_core.js');
+    const wasmPath = path.resolve(__dirname, '../src/shared/wasm/nullify_core_bg.wasm');
+    if (fs.existsSync(wasmJsPath) && fs.existsSync(wasmPath)) {
+      const wasmModule = await import('../src/shared/wasm/nullify_core.js');
+      await wasmModule.default({ module_or_path: fs.readFileSync(wasmPath) });
+      parseFilterSourceWithRust = wasmModule.parse_filter_source;
+      rustSourceParserReady = true;
+    }
+  } catch (err) {
+    console.warn(`⚠️  Rust source parser unavailable, falling back to JS extraction: ${err.message}`);
+  }
 
   const allCosmeticRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.cosmetic));
   const allScriptletRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.scriptlets));
   const filterSources = {};
-
-  // Define how many parts each list is split into (matching manifest.json)
-  const LIST_CONFIG = {
-    'easylist': { parts: 4, totalLimit: 100000 },
-    'easyprivacy': { parts: 3, totalLimit: 75000 },
-    'ubo-filters': { parts: 2, totalLimit: 40000 },
-    'annoyances': { parts: 1, totalLimit: 30000 },
-    'malware': { parts: 1, totalLimit: 30000 },
-    'ubo-unbreak': { parts: 1, totalLimit: 30000 },
-    'anti-adblock': { parts: 1, totalLimit: 30000 },
-    'ubo-cookie-annoyances': { parts: 1, totalLimit: 30000 },
-  };
-
-  const MAX_PER_FILE = 25000;
+  const rulesetOutputs = {};
+  const failures = [];
 
   console.log('📡 Downloading filter lists...\n');
 
@@ -1032,6 +1222,9 @@ async function main() {
       console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skipped} skipped`);
       const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
       let networkRules = parsed.networkRules;
+      const sourceBundle = rustSourceParserReady
+        ? parseFilterSourceWithRust(text)
+        : buildSourceBundleFallback(parsed);
       
       if (networkRules.length > config.totalLimit) {
         console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
@@ -1041,93 +1234,51 @@ async function main() {
 
       const dnrRules = buildDNRRules(networkRules);
       
-      // Split and write rules
+      // Split and stage rules for a single final write.
       for (let i = 0; i < config.parts; i++) {
         const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
         const suffix = i === 0 ? '' : `_${i + 1}`;
-        const outPath = path.join(RULES_DIR, `${list.id}${suffix}.json`);
-        fs.writeFileSync(outPath, JSON.stringify(chunk, null, 2));
-        console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules written`);
+        rulesetOutputs[`${list.id}${suffix}.json`] = chunk;
+        console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules staged`);
       }
       console.log('');
 
-      const sourceCosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
-      for (const r of parsed.cosmeticRules) {
-        if (r.domains.length === 0) {
-          if (r.exception) continue;
-          sourceCosmetic.generic.push(r.selector);
-        } else {
-          for (const d of r.domains) {
-            if (r.exception) {
-              if (!sourceCosmetic.exceptions[d]) sourceCosmetic.exceptions[d] = [];
-              sourceCosmetic.exceptions[d].push(r.selector);
-            } else {
-              if (!sourceCosmetic.domainSpecific[d]) sourceCosmetic.domainSpecific[d] = [];
-              sourceCosmetic.domainSpecific[d].push(r.selector);
-            }
-          }
-        }
-      }
-      sourceCosmetic.generic = [...new Set(sourceCosmetic.generic)];
-      for (const [domain, selectors] of Object.entries(sourceCosmetic.domainSpecific)) {
-        sourceCosmetic.domainSpecific[domain] = [...new Set(selectors)];
-      }
-      for (const [domain, selectors] of Object.entries(sourceCosmetic.exceptions)) {
-        sourceCosmetic.exceptions[domain] = [...new Set(selectors)];
-      }
-
-      const sourceScriptlets = [];
-      const scriptletSeen = new Set();
-      for (const rule of parsed.scriptletRules) {
-        const key = `${rule.name}|${(rule.domains || []).join(',')}|${(rule.args || []).join('\u0001')}`;
-        if (scriptletSeen.has(key)) continue;
-        scriptletSeen.add(key);
-        sourceScriptlets.push(rule);
-      }
-
-      filterSources[list.id] = {
-        cosmetic: sourceCosmetic,
-        scriptlets: sourceScriptlets,
-      };
+      filterSources[list.id] = sourceBundle;
 
       // Merge cosmetic/scriptlet rules
-      for (const r of parsed.cosmeticRules) {
-        if (r.domains.length === 0) {
-          allCosmeticRules.generic.push(r.selector);
-        } else {
-          for (const d of r.domains) {
-            if (!allCosmeticRules.domainSpecific[d]) allCosmeticRules.domainSpecific[d] = [];
-            allCosmeticRules.domainSpecific[d].push(r.selector);
-          }
-        }
+      for (const selector of sourceBundle.cosmetic?.generic || []) {
+        allCosmeticRules.generic.push(selector);
       }
-      for (const r of parsed.scriptletRules) {
-        allScriptletRules.push(r);
+      for (const [domain, selectors] of Object.entries(sourceBundle.cosmetic?.domainSpecific || {})) {
+        if (!allCosmeticRules.domainSpecific[domain]) allCosmeticRules.domainSpecific[domain] = [];
+        allCosmeticRules.domainSpecific[domain].push(...selectors);
+      }
+      for (const rule of sourceBundle.scriptlets || []) {
+        allScriptletRules.push(rule);
       }
     } catch (err) {
+      failures.push(list.id);
       console.error(`❌ Failed to process ${list.id}: ${err.message}`);
     }
   }
 
-  // Write cosmetic rules (used by content-script cosmetic engine)
-  const cosmeticsPath = path.join(RULES_DIR, 'cosmetic-rules.json');
+  if (failures.length > 0) {
+    throw new Error(`Failed to process filter lists: ${failures.join(', ')}`);
+  }
+
   // Deduplicate generic selectors
   allCosmeticRules.generic = [...new Set(allCosmeticRules.generic)];
   // Deduplicate domain-specific
   for (const d of Object.keys(allCosmeticRules.domainSpecific)) {
     allCosmeticRules.domainSpecific[d] = [...new Set(allCosmeticRules.domainSpecific[d])];
   }
-  fs.writeFileSync(cosmeticsPath, JSON.stringify(allCosmeticRules, null, 2));
-  console.log(`\n✅ cosmetic-rules.json — ${allCosmeticRules.generic.length} generic + ${Object.keys(allCosmeticRules.domainSpecific).length} domain-specific`);
 
-  // Write scriptlet rules
-  const scriptletsPath = path.join(RULES_DIR, 'scriptlet-rules.json');
-  fs.writeFileSync(scriptletsPath, JSON.stringify(allScriptletRules, null, 2));
-  console.log(`✅ scriptlet-rules.json — ${allScriptletRules.length} rules`);
-
-  const filterSourcesPath = path.join(RULES_DIR, 'filter-sources.json');
-  fs.writeFileSync(filterSourcesPath, JSON.stringify(filterSources, null, 2));
-  console.log(`✅ filter-sources.json — ${Object.keys(filterSources).length} list sources`);
+  writeBuildOutputs({
+    rulesetOutputs,
+    cosmeticRules: allCosmeticRules,
+    scriptletRules: allScriptletRules,
+    filterSources,
+  });
 
   console.log('\n🎉 Build complete!');
   process.exit(0);

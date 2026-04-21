@@ -636,17 +636,23 @@ pub struct DnrAction { #[serde(rename = "type")] action_type: String, #[serde(sk
 pub struct DnrRedirect { #[serde(skip_serializing_if = "Option::is_none")] url: Option<String> }
 
 #[derive(Serialize, Deserialize, Default)]
-pub struct DnrCondition { 
-    #[serde(rename = "urlFilter", skip_serializing_if = "Option::is_none")] 
+pub struct DnrCondition {
+    #[serde(rename = "urlFilter", skip_serializing_if = "Option::is_none")]
     pub url_filter: Option<String>,
-    #[serde(rename = "regexFilter", skip_serializing_if = "Option::is_none")] 
+    #[serde(rename = "regexFilter", skip_serializing_if = "Option::is_none")]
     pub regex_filter: Option<String>,
-    #[serde(rename = "resourceTypes", skip_serializing_if = "Option::is_none")] 
+    #[serde(rename = "resourceTypes", skip_serializing_if = "Option::is_none")]
     pub resource_types: Option<Vec<String>>,
-    #[serde(rename = "excludedResourceTypes", skip_serializing_if = "Option::is_none")] 
+    #[serde(rename = "excludedResourceTypes", skip_serializing_if = "Option::is_none")]
     pub excluded_resource_types: Option<Vec<String>>,
-    #[serde(rename = "domainType", skip_serializing_if = "Option::is_none")] 
-    pub domain_type: Option<String>
+    #[serde(rename = "domainType", skip_serializing_if = "Option::is_none")]
+    pub domain_type: Option<String>,
+    #[serde(rename = "initiatorDomains", skip_serializing_if = "Option::is_none")]
+    pub initiator_domains: Option<Vec<String>>,
+    #[serde(rename = "excludedInitiatorDomains", skip_serializing_if = "Option::is_none")]
+    pub excluded_initiator_domains: Option<Vec<String>>,
+    #[serde(rename = "excludedRequestDomains", skip_serializing_if = "Option::is_none")]
+    pub excluded_request_domains: Option<Vec<String>>,
 }
 
 // Counts filter rules dropped by the critical-path guard in
@@ -654,6 +660,9 @@ pub struct DnrCondition {
 // which made filter-list breakage untraceable. JS reads this via
 // `critical_path_drop_count()` so the diagnostic surfaces in the UI.
 static CRITICAL_PATH_DROPS: AtomicU32 = AtomicU32::new(0);
+// Counts rules dropped because they use a uBO option we can't translate
+// to Chrome DNR (e.g. $csp, $rewrite). Also surfaced via getter.
+static UNSUPPORTED_OPT_DROPS: AtomicU32 = AtomicU32::new(0);
 
 #[wasm_bindgen]
 pub fn critical_path_drop_count() -> u32 {
@@ -663,6 +672,16 @@ pub fn critical_path_drop_count() -> u32 {
 #[wasm_bindgen]
 pub fn reset_critical_path_drop_count() {
     CRITICAL_PATH_DROPS.store(0, Ordering::Relaxed);
+}
+
+#[wasm_bindgen]
+pub fn unsupported_opt_drop_count() -> u32 {
+    UNSUPPORTED_OPT_DROPS.load(Ordering::Relaxed)
+}
+
+#[wasm_bindgen]
+pub fn reset_unsupported_opt_drop_count() {
+    UNSUPPORTED_OPT_DROPS.store(0, Ordering::Relaxed);
 }
 
 fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
@@ -719,8 +738,61 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
             let negated = opt_trimmed.starts_with('~');
             let opt_name = if negated { &opt_trimmed[1..] } else { opt_trimmed };
 
+            // Options that take an argument (key=value).
+            if let Some(eq_idx) = opt_name.find('=') {
+                let (key, value) = (&opt_name[..eq_idx], &opt_name[eq_idx + 1..]);
+                match key {
+                    "domain" => {
+                        // uBO: $domain=a.com|~b.com — pipe-delimited, '~' prefix excludes.
+                        let mut included: Vec<String> = Vec::new();
+                        let mut excluded: Vec<String> = Vec::new();
+                        for entry in value.split('|') {
+                            let e = entry.trim();
+                            if e.is_empty() { continue; }
+                            if let Some(stripped) = e.strip_prefix('~') {
+                                excluded.push(stripped.to_lowercase());
+                            } else {
+                                included.push(e.to_lowercase());
+                            }
+                        }
+                        if !included.is_empty() { condition.initiator_domains = Some(included); }
+                        if !excluded.is_empty() { condition.excluded_initiator_domains = Some(excluded); }
+                    }
+                    "denyallow" => {
+                        // Requests to these domains are allowed despite matching.
+                        let doms: Vec<String> = value
+                            .split('|')
+                            .map(|s| s.trim().to_lowercase())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if !doms.is_empty() { condition.excluded_request_domains = Some(doms); }
+                    }
+                    // Known but unmappable-to-DNR options. Count them so the
+                    // coverage gap is auditable instead of invisible.
+                    "csp" | "rewrite" | "removeparam" | "redirect" | "redirect-rule" => {
+                        UNSUPPORTED_OPT_DROPS.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => { /* unknown arg option — ignore */ }
+                }
+                continue;
+            }
+
             match opt_name {
                 "important" => is_important = true,
+                "badfilter" => {
+                    // uBO: $badfilter invalidates a matching non-badfilter rule
+                    // elsewhere. We don't model cross-rule invalidation, so
+                    // the safest action is to drop this rule entirely rather
+                    // than emit it as a live block.
+                    return None;
+                },
+                "popup" => {
+                    let mut types = condition.resource_types.unwrap_or_default();
+                    if !types.iter().any(|t| t == "main_frame") {
+                        types.push("main_frame".to_string());
+                    }
+                    condition.resource_types = Some(types);
+                },
                 "script" | "image" | "stylesheet" | "xmlhttprequest" | "subdocument" | "document" | "media" | "font" | "websocket" | "ping" | "other" => {
                     let dnr_type = match opt_name {
                         "subdocument" => "sub_frame",
@@ -744,7 +816,7 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                 "first-party" | "1p" => {
                     condition.domain_type = Some(if negated { "thirdParty" } else { "firstParty" }.to_string());
                 },
-                _ => {} 
+                _ => {}
             }
         }
     }
@@ -1233,6 +1305,25 @@ fn build_css_from_selector_list(selectors: &[String], chunk_size: usize) -> Stri
     out.join("\n")
 }
 
+// Chunk the exception CSS the same way we chunk block CSS. One monolithic
+// selector-list rule has two failure modes: (1) any unbalanced token
+// invalidates the entire declaration (browsers fail-open, so excepted
+// elements stay hidden), and (2) tens of thousands of selectors stress
+// the parser. Chunking contains the blast radius and matches the safety
+// profile of `build_css_from_selector_list`.
+fn build_exception_css(exceptions: &[String], chunk_size: usize) -> String {
+    if exceptions.is_empty() { return String::new(); }
+    let cap = if chunk_size == 0 { 100 } else { chunk_size };
+    let mut out = Vec::with_capacity(exceptions.len() / cap + 1);
+    for chunk in exceptions.chunks(cap) {
+        out.push(format!(
+            "{} {{ display: revert !important; visibility: revert !important; }}",
+            chunk.join(",")
+        ));
+    }
+    out.join("\n")
+}
+
 fn serialize_rules_to_binary_lists(generic: &[String], domain_specific: &[String], exceptions: &[String]) -> Vec<u8> {
     let mut buffer = Vec::new();
     let write_list = |buf: &mut Vec<u8>, list: &[String]| {
@@ -1288,14 +1379,7 @@ fn build_page_bundle_internal(
     }
 
     let css_text = build_css_from_selector_list(&css_selectors, css_chunk_size);
-    let exception_css = if exceptions.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "{} {{ display: revert !important; visibility: revert !important; }}",
-            exceptions.join(",")
-        )
-    };
+    let exception_css = build_exception_css(&exceptions, css_chunk_size);
 
     let binary_domain_specific: Vec<String> = procedural_rules.iter()
         .filter_map(|rule| serde_json::to_string(rule).ok())

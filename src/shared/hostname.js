@@ -1,6 +1,7 @@
 /**
  * Hostname normalization helpers used by the allowlist and site-scoped lookups.
  */
+import { isPublicSuffix } from './psl.js';
 
 /**
  * Convert a user-entered hostname or URL-ish string into a canonical hostname.
@@ -38,7 +39,12 @@ export function normalizeHostname(input, { stripWww = true } = {}) {
   value = value.replace(/^\.+|\.+$/g, '');
 
   if (stripWww && value.startsWith('www.') && value.includes('.', 4)) {
-    value = value.slice(4);
+    const stripped = value.slice(4);
+    // Don't collapse www.<public-suffix> — e.g. `www.co.uk` must not become
+    // the bare suffix `co.uk`, which would allowlist every site on that TLD.
+    if (!isPublicSuffix(stripped)) {
+      value = stripped;
+    }
   }
 
   return value;

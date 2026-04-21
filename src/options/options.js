@@ -190,12 +190,18 @@ async function initMyFilters() {
     const header = `! Title: My Filters\n! Exported: ${new Date().toISOString()}\n!\n`;
     const blob = new Blob([header + filters], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `my-filters-${new Date().toISOString().slice(0, 10)}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
-    showFilterStatus('✓ Filters exported', 'success');
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `my-filters-${new Date().toISOString().slice(0, 10)}.txt`;
+      a.click();
+      showFilterStatus('✓ Filters exported', 'success');
+    } finally {
+      // Defer revoke past the current task so a cancelled or stalled
+      // download still releases the URL reference without racing the
+      // browser's download-initiation handler.
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
   });
 
   // Import filters from file
@@ -420,11 +426,14 @@ class LiveLogger {
 
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `nullify-log-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `nullify-log-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
   }
 
   listen() {
@@ -497,7 +506,7 @@ class LiveLogger {
     if (e.type === 'network') {
       infoHtml = `<span class="log-url" title="Click to copy: ${this.esc(e.url)}" data-copy="${this.esc(e.url)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.url)}</span>
                   ${trackerBadge} ${entityBadge}
-                  <span class="log-extra">${e.method} • ${e.resourceType} • ${e.rulesetId}#${e.ruleId}</span>`;
+                  <span class="log-extra">${this.esc(e.method)} • ${this.esc(e.resourceType)} • ${this.esc(e.rulesetId)}#${this.esc(e.ruleId)}</span>`;
     } else {
       infoHtml = `<span class="log-selector" title="Click to copy: ${this.esc(e.selector)}" data-copy="${this.esc(e.selector)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.selector)}</span>
                   <span class="log-extra" title="${this.esc(e.hostname)}">${this.esc(e.hostname)}</span>`;
@@ -536,7 +545,9 @@ class LiveLogger {
   }
 
   esc(s) {
-    if (!s) return '';
+    // Treat null/undefined as empty but let falsy numbers like 0 render —
+    // DNR ruleId is numeric and 0 is a valid id.
+    if (s === null || s === undefined || s === '') return '';
     return String(s)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')

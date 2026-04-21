@@ -579,9 +579,29 @@ export class CosmeticEngine {
         }
 
         case 'semantic': {
+          // Skip semantic classification on article bodies — the WASM
+          // matcher trips on legitimate text like "sponsored content"
+          // appearing in editorial copy. Restrict to ad-shaped
+          // containers (small widgets, iframes, aside elements).
+          const tag = el.tagName;
+          const isArticleContext =
+            !!el.closest('article, main, [role="article"], [role="main"]');
           const text = el.textContent || '';
+          const tooLarge = text.length > 400;
+          if (
+            isArticleContext ||
+            tooLarge ||
+            tag === 'ARTICLE' ||
+            tag === 'MAIN' ||
+            tag === 'P' ||
+            tag === 'H1' ||
+            tag === 'H2' ||
+            tag === 'H3'
+          ) {
+            return null;
+          }
           if (!text || text.length < 3) return null;
-          
+
           // Use cache to avoid redundant messages
           const cacheKey = `semantic|${text.slice(0, 100)}`;
           const cached = this._matchCache.get(cacheKey);

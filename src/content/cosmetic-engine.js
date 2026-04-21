@@ -191,6 +191,11 @@ export class CosmeticEngine {
     this._hideQueue = new Set();    // elements pending hide
     this._removeQueue = new Set();  // elements pending physical removal
     this._matchCache = new Map();   // selector -> WeakMap(el -> bool)
+    // Subtree roots mutated since the last procedural run. A match-cache
+    // entry for element `e` is trusted iff none of the last-run's dirty
+    // roots equal `e` or contain it. Bumps per scheduled run.
+    this._dirtyRoots = [];          // accumulating during observation
+    this._lastDirtyRoots = [];      // snapshot used by the in-progress run
     this._reportTimer = null;
     this._proceduralDebounce = null;
     this._rafId = null;
@@ -394,13 +399,29 @@ export class CosmeticEngine {
       this._matchCache.set(key, opCache);
     }
 
-    if (opCache.has(el)) {
+    // Only trust the cached value when `el` is not inside a subtree that
+    // was mutated this tick. `_lastDirtyRoots` is the snapshot captured
+    // when this procedural run was scheduled.
+    const dirty = this._isInDirtySubtree(el);
+    if (!dirty && opCache.has(el)) {
       return opCache.get(el);
     }
 
     const result = evaluator();
     opCache.set(el, result);
     return result;
+  }
+
+  _isInDirtySubtree(el) {
+    const roots = this._lastDirtyRoots;
+    if (!roots || roots.length === 0) return false;
+    for (const root of roots) {
+      if (root === el) return true;
+      // `contains` handles disconnected-subtree case; Element.contains is
+      // safe even when `root` was removed between mutation and lookup.
+      if (root.contains && root.contains(el)) return true;
+    }
+    return false;
   }
 
   /** Check if an element matches a procedural selector plan (used by :has, :not, etc). */
@@ -662,7 +683,13 @@ export class CosmeticEngine {
       for (const mutation of mutations) {
         if (mutation.addedNodes.length > 0) {
           needsProcedural = true;
-          break;
+          // Record the mutation target — any descendant of this node is
+          // considered cache-dirty until the next procedural run consumes
+          // the batch.
+          if (mutation.target) this._dirtyRoots.push(mutation.target);
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType === 1 /* ELEMENT */) this._dirtyRoots.push(node);
+          }
         }
       }
 
@@ -682,7 +709,12 @@ export class CosmeticEngine {
     if (this._proceduralDebounce) return;
     this._proceduralDebounce = setTimeout(() => {
       this._proceduralDebounce = null;
-      this._matchCache.clear(); // Clear cache for the new run
+      // Swap the dirty-roots buffer for this run instead of wiping the
+      // whole match cache. _getCachedMatch consults _lastDirtyRoots to
+      // invalidate only entries whose element lives inside a mutated
+      // subtree — cache hits for unaffected elements survive.
+      this._lastDirtyRoots = this._dirtyRoots;
+      this._dirtyRoots = [];
       this._applyAllProcedural();
     }, 100);
   }

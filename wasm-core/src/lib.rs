@@ -3,10 +3,65 @@ use js_sys::{Array, Object, Reflect, Uint8Array};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use aho_corasick::AhoCorasick;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Normal};
+
+// Install a panic hook so Rust panics surface as readable JS errors instead
+// of opaque `RuntimeError: unreachable`, which poisons the whole module and
+// leaves no diagnostic trail. Runs automatically on module instantiation.
+#[wasm_bindgen(start)]
+pub fn start() {
+    console_error_panic_hook::set_once();
+}
+
+// ---------------------------------------------------------------------------
+// Public Suffix guard — mirrors `src/shared/psl.js`. We stop ascending
+// hostname ancestor chains at any suffix in this set to prevent `co.uk`
+// (etc.) from matching entire TLDs in allowlist / bloom lookups.
+// ---------------------------------------------------------------------------
+fn public_suffixes() -> &'static HashSet<&'static str> {
+    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    SET.get_or_init(|| {
+        [
+            "com", "org", "net", "edu", "gov", "mil", "int", "io", "co", "ai",
+            "app", "dev", "info", "biz", "me", "tv", "xyz", "online", "site",
+            "store", "shop", "tech", "cloud", "blog", "news", "art",
+            "uk", "us", "de", "fr", "it", "es", "nl", "be", "ch", "at", "se",
+            "no", "dk", "fi", "pl", "cz", "pt", "gr", "ie", "au", "nz", "ca",
+            "mx", "br", "ar", "cl", "pe", "ru", "ua", "by", "tr", "il", "sa",
+            "ae", "eg", "za", "ng", "ke", "ma", "jp", "kr", "cn", "hk", "tw",
+            "sg", "my", "id", "th", "vn", "ph", "in", "pk", "bd", "lk",
+            "co.uk", "org.uk", "gov.uk", "ac.uk", "net.uk", "sch.uk", "nhs.uk",
+            "com.au", "net.au", "org.au", "edu.au", "gov.au",
+            "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
+            "co.kr", "or.kr", "ne.kr", "go.kr", "ac.kr",
+            "com.br", "net.br", "org.br", "gov.br", "edu.br",
+            "com.mx", "org.mx", "gob.mx",
+            "com.ar", "org.ar", "gob.ar", "gov.ar",
+            "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
+            "com.sg", "edu.sg", "gov.sg",
+            "com.hk", "org.hk", "gov.hk",
+            "com.tw", "org.tw", "gov.tw", "edu.tw",
+            "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
+            "co.in", "net.in", "org.in", "gov.in", "ac.in",
+            "co.il", "org.il", "gov.il", "ac.il",
+            "co.za", "org.za", "gov.za", "ac.za",
+            "com.tr", "org.tr", "gov.tr", "edu.tr",
+            "com.ua", "org.ua", "gov.ua", "edu.ua",
+            "com.ru", "org.ru", "gov.ru",
+            "github.io", "gitlab.io", "netlify.app", "vercel.app", "herokuapp.com",
+            "pages.dev", "workers.dev", "web.app", "firebaseapp.com",
+            "s3.amazonaws.com", "cloudfront.net",
+        ].into_iter().collect()
+    })
+}
+
+fn is_public_suffix(host: &str) -> bool {
+    host.is_empty() || public_suffixes().contains(host)
+}
 
 // ---------------------------------------------------------------------------
 // Bloom Filter
@@ -69,18 +124,20 @@ impl BloomFilter {
     }
 
     pub fn deserialize_from_json(json: &str) -> Self {
-        let s: SerializedBloom = serde_json::from_str(json).unwrap();
-        Self {
-            size: s.size,
-            hashes: s.hashes,
-            bitset: s.data,
+        // Fall back to an empty filter on malformed input rather than
+        // panicking through WASM — a corrupt stored bloom filter should
+        // degrade gracefully, not crash the whole rule pipeline.
+        match serde_json::from_str::<SerializedBloom>(json) {
+            Ok(s) => Self { size: s.size, hashes: s.hashes, bitset: s.data },
+            Err(_) => Self::new(1, 1),
         }
     }
 
     pub fn check_hostname(&self, hostname: &str) -> bool {
-        if self.has("") { return true; } 
+        if self.has("") { return true; }
         let mut d = hostname;
         loop {
+            if is_public_suffix(d) { break; }
             if self.has(d) { return true; }
             match d.find('.') {
                 Some(idx) => d = &d[idx + 1..],
@@ -101,22 +158,6 @@ struct SerializedBloom {
 // ---------------------------------------------------------------------------
 // Filter Parser & DNR Compiler
 // ---------------------------------------------------------------------------
-
-#[wasm_bindgen]
-pub fn compile_filters_to_dnr_json(text: &str, mut start_id: u32) -> String {
-    let mut rules = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if should_skip_filter_line(line) { continue; }
-        if line.contains("##") || line.contains("#@#") || line.contains("#?#") { continue; }
-
-        if let Some(dnr_rule) = parse_network_rule_to_dnr(line, start_id) {
-            rules.push(dnr_rule);
-            start_id += 1;
-        }
-    }
-    serde_json::to_string(&rules).unwrap_or_else(|_| "[]".to_string())
-}
 
 #[derive(Serialize, Deserialize, Default)]
 struct BucketedCosmeticRules {
@@ -608,6 +649,22 @@ pub struct DnrCondition {
     pub domain_type: Option<String>
 }
 
+// Counts filter rules dropped by the critical-path guard in
+// `parse_network_rule_to_dnr`. Previously these were discarded silently,
+// which made filter-list breakage untraceable. JS reads this via
+// `critical_path_drop_count()` so the diagnostic surfaces in the UI.
+static CRITICAL_PATH_DROPS: AtomicU32 = AtomicU32::new(0);
+
+#[wasm_bindgen]
+pub fn critical_path_drop_count() -> u32 {
+    CRITICAL_PATH_DROPS.load(Ordering::Relaxed)
+}
+
+#[wasm_bindgen]
+pub fn reset_critical_path_drop_count() {
+    CRITICAL_PATH_DROPS.store(0, Ordering::Relaxed);
+}
+
 fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
     let is_exception = line.starts_with("@@");
     let pattern_part = if is_exception { &line[2..] } else { line };
@@ -639,7 +696,11 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
             if let Some(opts) = options_str {
                 if opts.contains("important") { is_important = true; }
             }
-            if !is_important { return None; } // Skip blocking this critical path
+            if !is_important {
+                // Tick diagnostic counter so silent drops are auditable.
+                CRITICAL_PATH_DROPS.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
         }
     }
 
@@ -713,7 +774,11 @@ impl KeywordMatcher {
     #[wasm_bindgen(constructor)]
     pub fn new(patterns_csv: &str) -> Self {
         let patterns: Vec<&str> = patterns_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-        let ac = AhoCorasick::new(&patterns).unwrap();
+        // Matches `UrlSanitizer::new` — fall back to an empty automaton on
+        // AhoCorasick construction failure rather than panicking across the
+        // JS boundary.
+        let ac = AhoCorasick::new(&patterns)
+            .unwrap_or_else(|_| AhoCorasick::new::<[&str; 0], &str>([]).unwrap());
         Self { ac }
     }
     pub fn matches(&self, text: &str) -> bool { self.ac.is_match(text) }
@@ -742,11 +807,15 @@ impl AllowlistMatcher {
         Self { domains }
     }
 
-    /// Returns true if `hostname` or any of its parent domains is in the allowlist.
+    /// Returns true if `hostname` or any of its parent domains (up to but
+    /// excluding the first public suffix) is in the allowlist. Without the
+    /// public-suffix guard a rule at e.g. `co.uk` would match every site on
+    /// that TLD.
     pub fn check(&self, hostname: &str) -> bool {
         let lower = hostname.to_lowercase();
         let mut h: &str = &lower;
         loop {
+            if is_public_suffix(h) { return false; }
             if self.domains.contains(h) { return true; }
             match h.find('.') {
                 Some(idx) => h = &h[idx + 1..],
@@ -1358,9 +1427,19 @@ pub fn build_css_from_selectors(selectors: &str, exceptions: &str, chunk_size: u
 
 #[wasm_bindgen]
 pub fn generate_gaussian_noise(mean: f64, std_dev: f64, seed: f64) -> f64 {
-    let dist = Normal::new(mean, std_dev).unwrap();
-    let mut rng = SmallRng::seed_from_u64(seed as u64);
-    dist.sample(&mut rng)
+    // `Normal::new` rejects non-finite or negative std_dev. Guard first —
+    // callers that pass 0 (noise disabled) or a bad seed should just get
+    // the mean back rather than a WASM panic.
+    if !std_dev.is_finite() || std_dev <= 0.0 || !mean.is_finite() {
+        return mean;
+    }
+    match Normal::new(mean, std_dev) {
+        Ok(dist) => {
+            let mut rng = SmallRng::seed_from_u64(seed as u64);
+            dist.sample(&mut rng)
+        }
+        Err(_) => mean,
+    }
 }
 
 fn reduce_cosmetic_rules_internal(
@@ -1547,34 +1626,25 @@ pub fn serialize_rules_to_binary_from_json(generic_json: &str, domain_specific_j
 }
 
 // ---------------------------------------------------------------------------
-// URL Sanitizer
-// ---------------------------------------------------------------------------
-
-#[wasm_bindgen]
-pub fn sanitize_url_with_csv(url: &str, patterns_csv: &str) -> String {
-    if !url.contains('?') { return url.into(); }
-    let patterns: Vec<&str> = patterns_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-    let ac = AhoCorasick::new(&patterns).unwrap();
-    let parts: Vec<&str> = url.splitn(2, '?').collect();
-    let mut pairs: Vec<&str> = parts[1].split('&').collect();
-    pairs.retain(|pair| !ac.is_match(pair.split('=').next().unwrap_or("")));
-    if pairs.is_empty() { parts[0].into() } else { format!("{}?{}", parts[0], pairs.join("&")) }
-}
-
-// ---------------------------------------------------------------------------
 // Differential Privacy Reporter
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
 pub fn anonymize_stats_json(json: &str, noise_scale: f64, seed: f64) -> String {
     let mut data: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
-    let dist = Normal::new(0.0, noise_scale).unwrap();
+    // Skip noise injection entirely when `noise_scale` is nonpositive or
+    // non-finite rather than panicking inside `Normal::new`.
+    let dist = if noise_scale.is_finite() && noise_scale > 0.0 {
+        Normal::new(0.0, noise_scale).ok()
+    } else {
+        None
+    };
     let mut rng = SmallRng::seed_from_u64(seed as u64);
 
     if let Some(obj) = data.as_object_mut() {
         for (_key, value) in obj.iter_mut() {
             if let Some(count) = value.as_f64() {
-                let noise = dist.sample(&mut rng);
+                let noise = dist.as_ref().map(|d| d.sample(&mut rng)).unwrap_or(0.0);
                 let anonymized = (count + noise).max(0.0).round();
                 *value = serde_json::json!(anonymized);
             }

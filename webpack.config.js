@@ -1,7 +1,7 @@
 import path from 'path';
 import { fileURLToPath } from 'url';
-import CopyWebpackPlugin from 'copy-webpack-plugin';
 import MiniCssExtractPlugin from 'mini-css-extract-plugin';
+import CopyWebpackPlugin from 'copy-webpack-plugin';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -35,14 +35,19 @@ export default {
 
   plugins: [
     new MiniCssExtractPlugin({ filename: '[name].css' }),
-
+    // Narrow Copy — wasm-pack emits to `src/shared/wasm/`, but the manifest
+    // + service worker reference `dist/nullify_core_bg.wasm`. Without this
+    // copy the extension 404s the WASM fetch at startup. (We deliberately
+    // do NOT copy manifest.json / assets/ / rules/ here — those already
+    // live at the paths the manifest references and must not be rewritten
+    // by the webpack pipeline.)
     new CopyWebpackPlugin({
       patterns: [
-        { from: 'manifest.json', to: '../manifest.json' },
-        { from: 'assets', to: '../assets' },
-        { from: 'rules', to: '../rules', noErrorOnMissing: true },
-        { from: 'src/popup/popup.html', to: '../src/popup/popup.html' },
-        { from: 'src/options/options.html', to: '../src/options/options.html' },
+        {
+          from: path.resolve(__dirname, 'src/shared/wasm/nullify_core_bg.wasm'),
+          to: path.resolve(__dirname, 'dist/nullify_core_bg.wasm'),
+          noErrorOnMissing: false,
+        },
       ],
     }),
   ],

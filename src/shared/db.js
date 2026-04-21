@@ -5,12 +5,16 @@
  * to avoid loading them all into memory at once.
  */
 
+import { ancestorDomains } from './psl.js';
+
 const DB_NAME = 'NullifyRules';
 const DB_VERSION = 4;
 const STORE_COSMETIC = 'cosmetic_rules';
 const STORE_SCRIPTLET = 'scriptlet_rules';
 const STORE_FILTER_SOURCES = 'filter_sources';
 const STORE_PAGE_BUNDLES = 'page_bundles';
+
+const ALL_STORES = [STORE_COSMETIC, STORE_SCRIPTLET, STORE_FILTER_SOURCES, STORE_PAGE_BUNDLES];
 
 export class RulesDB {
   constructor() {
@@ -25,6 +29,17 @@ export class RulesDB {
 
       request.onupgradeneeded = (event) => {
         const db = event.target.result;
+        const oldVersion = event.oldVersion || 0;
+
+        // Schemas for v1-v3 diverged enough (scriptlet key shape, cosmetic
+        // bucket layout) that reusing their rows risks stale data. Rebuild
+        // the stores on any upgrade path — the next rule-compile pass will
+        // repopulate them from the filter sources.
+        if (oldVersion > 0 && oldVersion < DB_VERSION) {
+          for (const name of ALL_STORES) {
+            if (db.objectStoreNames.contains(name)) db.deleteObjectStore(name);
+          }
+        }
 
         if (!db.objectStoreNames.contains(STORE_COSMETIC)) {
           db.createObjectStore(STORE_COSMETIC, { keyPath: 'hostname' });
@@ -44,11 +59,24 @@ export class RulesDB {
 
       request.onsuccess = (event) => {
         this.db = event.target.result;
+        // If another tab triggers a version upgrade later, Chrome will try
+        // to invalidate our open connection. Close it so the upgrade can
+        // proceed rather than stalling indefinitely.
+        this.db.onversionchange = () => {
+          try { this.db.close(); } catch { /* ignore */ }
+          this.db = null;
+        };
         resolve(this.db);
       };
 
       request.onerror = (event) => {
         reject(event.target.error);
+      };
+
+      // Another tab already has the DB open at the old version and is
+      // blocking the upgrade. Reject rather than hang forever.
+      request.onblocked = () => {
+        reject(new Error('IndexedDB upgrade blocked by another tab'));
       };
     });
   }
@@ -77,8 +105,10 @@ export class RulesDB {
       const store = transaction.objectStore(STORE_SCRIPTLET);
       const index = store.index('domain');
       
-      const parts = hostname.split('.');
-      const domainsToCheck = ['', ...parts.map((_, i) => parts.slice(i).join('.'))];
+      // Stop ascending at the first public suffix so `co.uk`-indexed rules
+      // cannot match every site on that TLD. Empty string key is the
+      // "generic" bucket (rules with no domain).
+      const domainsToCheck = ['', ...ancestorDomains(hostname)];
       
       const allRules = [];
       let completed = 0;

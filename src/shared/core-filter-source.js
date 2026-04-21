@@ -61,7 +61,9 @@ export const CORE_FILTER_SOURCE = {
         '[data-testid="placementTracking"]',
       ],
       'cnn.com': [
-        '.ad-slot-header:remove()',
+        // `.ad-slot-header:remove()` was invalid as a raw selector —
+        // `:remove()` is a uBO procedural operator, not CSS. Removed; the
+        // `.ad-slot-header` rule below still hides the element.
         'div.ad-slot-header',
         '.ad-slot',
         '.ad-slot-header',
@@ -91,7 +93,10 @@ export const CORE_FILTER_SOURCE = {
         '.product-offer-card-container_related-products',
       ],
       'greenhouse.io': [
-        'section:has(h2:has-text(Featured Jobs))',
+        // `section:has(h2:has-text(Featured Jobs))` was invalid:
+        // `:has-text(...)` is a uBO procedural operator whose argument
+        // also needs quoting. Raw CSS fallbacks below cover the
+        // straightforward cases.
         '.featured-jobs',
         '.job-post:has(.featured)',
         '.featured',

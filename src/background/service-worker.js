@@ -13,7 +13,7 @@
  *  - Apply WebRTC/privacy settings
  */
 
-import {getAllowlist, getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
+import {getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
@@ -34,7 +34,6 @@ import init, {
   parse_filter_source,
   plan_selector_rules_json,
   serialize_rules_to_binary_from_json,
-  sanitize_url_with_csv,
   resolve_entity,
   is_semantic_ad,
   anonymize_stats_json
@@ -454,13 +453,12 @@ function hasBalancedSelectorDelimiters(selector) {
 }
 
 function hasInvalidUniversalUsage(selector) {
-  const chars = [...selector];
   let bracketDepth = 0;
   let quote = null;
   let escaped = false;
 
-  for (let i = 0; i < chars.length; i++) {
-    const ch = chars[i];
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector.charAt(i);
 
     if (escaped) {
       escaped = false;
@@ -490,8 +488,9 @@ function hasInvalidUniversalUsage(selector) {
 
     let prev = null;
     for (let j = i - 1; j >= 0; j--) {
-      if (!/\s/.test(chars[j])) {
-        prev = chars[j];
+      const pc = selector.charAt(j);
+      if (!/\s/.test(pc)) {
+        prev = pc;
         break;
       }
     }
@@ -767,17 +766,28 @@ async function ensureRuleDataReady() {
 // ---------------------------------------------------------------------------
 // Install / startup
 // ---------------------------------------------------------------------------
+// Re-registers the context menu idempotently. Chrome throws
+// "Cannot create item with duplicate id" if `create` runs twice with the
+// same id — onInstalled AND onStartup both fire during update, so we must
+// wipe first.
+function registerContextMenus() {
+  chrome.contextMenus.removeAll(() => {
+    // Swallow lastError from removeAll (no-op if nothing to remove).
+    void chrome.runtime.lastError;
+    chrome.contextMenus.create({
+      id: 'nullify-block-element',
+      title: 'Block element...',
+      contexts: ['all'],
+    }, () => {
+      void chrome.runtime.lastError;
+    });
+  });
+}
+
 chrome.runtime.onInstalled.addListener(async (details) => {
   console.log('[AdBlock] onInstalled:', details.reason);
 
-  // Register context menu on install/update
-  chrome.contextMenus.create({
-    id: 'nullify-block-element',
-    title: 'Block element...',
-    contexts: ['all'],
-  }, () => {
-    if (chrome.runtime.lastError) { /* ignore */ }
-  });
+  registerContextMenus();
 
   try {
     if (details.reason === 'install') {
@@ -805,6 +815,13 @@ function ensureBackgroundSetup() {
   if (_backgroundSetupPromise) return _backgroundSetupPromise;
 
   _backgroundSetupPromise = (async () => {
+    // Defaults must be persisted BEFORE applyRulesets reads ENABLED_RULESETS.
+    // initializeDefaults is idempotent (returns early if SETTINGS exists).
+    await initializeDefaults();
+    // Load the compiled per-ruleset rule counts before applyRulesets so
+    // budget-fallback decisions use fresh numbers, not the stale literals.
+    await loadRulesetCountsFromBuild();
+
     const data = await getStorageBulk([
       StorageKeys.USER_FILTERS,
       StorageKeys.USER_FILTERS_APPLIED,
@@ -873,13 +890,7 @@ function startInitialization() {
 startInitialization();
 
 chrome.runtime.onStartup.addListener(() => {
-  chrome.contextMenus.create({
-    id: 'nullify-block-element',
-    title: 'Block element...',
-    contexts: ['all'],
-  }, () => {
-    if (chrome.runtime.lastError) { /* ignore */ }
-  });
+  registerContextMenus();
   startInitialization();
 });
 
@@ -981,8 +992,10 @@ async function refreshMemoryCache() {
   const rawAllowlist = data[StorageKeys.ALLOWLIST] || [];
   const normalizedAllowlist = normalizeAllowlist(rawAllowlist);
   cachedAllowlist = new Set(normalizedAllowlist);
-  rebuildAllowlistMatcher(); // Rebuild with fresh allowlist data
 
+  // Sync DNR state BEFORE rebuilding the in-memory matcher.
+  // If we rebuilt the matcher first, content scripts could observe one
+  // allowlist state while DNR still enforced the previous one.
   if (
     rawAllowlist.length !== normalizedAllowlist.length ||
     rawAllowlist.some((domain, index) => domain !== normalizedAllowlist[index])
@@ -990,6 +1003,8 @@ async function refreshMemoryCache() {
     await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
     await rebuildAllowlistRules(normalizedAllowlist);
   }
+
+  rebuildAllowlistMatcher(); // Rebuild with fresh allowlist data — last, so matcher and DNR agree.
 
   const genericCss = data[StorageKeys.GENERIC_CSS];
   if (typeof genericCss === 'string' && genericCss.length > 0) {
@@ -1186,8 +1201,11 @@ async function applyPrivacySettings() {
 
   // Block third-party cookies (thirdPartyCookiesAllowed removed in Chrome 112)
   if (chrome.privacy?.websites?.thirdPartyCookiesAllowed) {
-    chrome.privacy.websites.thirdPartyCookiesAllowed.set({
-      value: !settings.blockThirdPartyCookies,
+    await new Promise((resolve) => {
+      chrome.privacy.websites.thirdPartyCookiesAllowed.set(
+        { value: !settings.blockThirdPartyCookies },
+        () => resolve()
+      );
     });
   }
 
@@ -1845,6 +1863,9 @@ function parseSimpleNetworkRule(line, id) {
     if (types.length > 0) resourceTypes = types;
   }
 
+  urlFilter = urlFilter.trim();
+  if (!urlFilter) return null;
+
   const condition = { urlFilter };
   if (resourceTypes) condition.resourceTypes = resourceTypes;
 
@@ -1861,12 +1882,15 @@ async function allowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
   if (!normalizedDomain) return;
 
-  const allowlist = normalizeAllowlist(await getAllowlist());
-  if (!allowlist.includes(normalizedDomain)) {
-    allowlist.push(normalizedDomain);
-    await setStorage(StorageKeys.ALLOWLIST, allowlist);
+  // Source of truth is the in-memory cache + matcher. Persist + DNR sync to
+  // keep DNR in lock-step, then refresh the memoized matcher last.
+  if (!cachedAllowlist.has(normalizedDomain)) {
+    cachedAllowlist.add(normalizedDomain);
   }
+  const allowlist = Array.from(cachedAllowlist);
+  await setStorage(StorageKeys.ALLOWLIST, allowlist);
   await rebuildAllowlistRules(allowlist);
+  rebuildAllowlistMatcher();
 }
 
 /** Remove a site from the allowlist. */
@@ -1874,10 +1898,11 @@ async function disallowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
   if (!normalizedDomain) return;
 
-  let allowlist = normalizeAllowlist(await getAllowlist());
-  allowlist = allowlist.filter((d) => d !== normalizedDomain);
+  if (!cachedAllowlist.delete(normalizedDomain)) return;
+  const allowlist = Array.from(cachedAllowlist);
   await setStorage(StorageKeys.ALLOWLIST, allowlist);
   await rebuildAllowlistRules(allowlist);
+  rebuildAllowlistMatcher();
 }
 
 /** Rebuild DNR allow-all-requests rules from allowlist. */
@@ -1924,9 +1949,11 @@ const RULESET_GROUPS = {
   'ubo-filters': ['ubo-filters', 'ubo-filters_2'],
 };
 
-// Estimated static DNR rule counts for packaged rulesets. These let us make
-// budget-aware enable decisions before Chrome rejects an oversized shard.
-const RULESET_RULE_COUNTS = {
+// Static DNR rule counts for packaged rulesets. Populated at startup from
+// `rules/ruleset-counts.json`, which `scripts/build-rules.mjs` emits. The
+// literal defaults below are a frozen-in-time fallback if the build
+// artifact is missing; they will drift, but keep budget checks working.
+let RULESET_RULE_COUNTS = {
   'system-unbreak': 18,
   'ubo-unbreak': 1479,
   'anti-adblock': 4172,
@@ -1944,22 +1971,38 @@ const RULESET_RULE_COUNTS = {
   'easylist_4': 0,
 };
 
-// Prefer high-signal smaller lists before secondary large shards so Chrome's
-// static-rule cap does not crowd out anti-adblock, malware, and unbreak lists.
+async function loadRulesetCountsFromBuild() {
+  try {
+    const url = chrome.runtime.getURL('rules/ruleset-counts.json');
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const counts = await res.json();
+    if (counts && typeof counts === 'object') {
+      RULESET_RULE_COUNTS = counts;
+    }
+  } catch (err) {
+    console.warn('[Nullify] ruleset-counts.json load failed, using defaults:', err?.message || err);
+  }
+}
+
+// Stability/safety lists first, then core ad/tracker blockers (main shards
+// before secondary shards), then niche lists. This order ensures that under
+// tight static-rule budgets the user still gets the main EasyList and
+// EasyPrivacy coverage before niche annoyances/cookie lists.
 const RULESET_ENABLE_PRIORITY = [
   'system-unbreak',
   'ubo-unbreak',
-  'anti-adblock',
   'malware',
-  'ubo-filters',
-  'ubo-cookie-annoyances',
-  'annoyances',
   'easylist',
-  'easylist_2',
-  'easylist_3',
   'easyprivacy',
-  'easyprivacy_3',
+  'ubo-filters',
+  'easylist_2',
   'easyprivacy_2',
+  'easylist_3',
+  'easyprivacy_3',
+  'anti-adblock',
+  'annoyances',
+  'ubo-cookie-annoyances',
   'easylist_4',
   'ubo-filters_2',
 ];
@@ -1981,6 +2024,70 @@ function orderRulesetIdsByPriority(rulesetIds) {
   });
 }
 
+/**
+ * Return the set of ruleset IDs that this extension actually declares in its
+ * manifest. Used to filter out stale/unknown IDs before calling
+ * chrome.declarativeNetRequest.updateEnabledRulesets, which rejects the whole
+ * batch if any ID is unknown.
+ */
+function getManifestRulesetIds() {
+  const rulesetIds = new Set();
+  try {
+    const manifest = chrome.runtime.getManifest();
+    const resources = manifest?.declarative_net_request?.rule_resources || [];
+    for (const resource of resources) {
+      if (resource?.id) rulesetIds.add(resource.id);
+    }
+  } catch (err) {
+    console.warn('[AdBlock] Failed to read manifest ruleset IDs:', err);
+  }
+  return rulesetIds;
+}
+
+/**
+ * Run the sequential priority fallback: disable everything, then enable
+ * rulesets one at a time in priority order, stopping at Chrome's static rule
+ * limit. Returns the list of IDs that could not be enabled.
+ */
+async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds) {
+  // Reset our static rulesets so budget checks start from a clean slate.
+  try {
+    await chrome.declarativeNetRequest.updateEnabledRulesets({
+      disableRulesetIds: [...new Set(enableRulesetIds.concat(disableRulesetIds))],
+    });
+  } catch (resetErr) {
+    console.warn('[AdBlock] Reset before sequential fallback failed:', resetErr);
+  }
+
+  const prioritizedRulesetIds = orderRulesetIdsByPriority(enableRulesetIds);
+  const skippedRulesetIds = [];
+  let availableStaticRuleCount = await chrome.declarativeNetRequest
+    .getAvailableStaticRuleCount()
+    .catch(() => Number.MAX_SAFE_INTEGER);
+
+  for (const id of prioritizedRulesetIds) {
+    const estimatedRuleCount = RULESET_RULE_COUNTS[id] ?? 0;
+    if (estimatedRuleCount > 0 && estimatedRuleCount > availableStaticRuleCount) {
+      skippedRulesetIds.push(id);
+      continue;
+    }
+
+    try {
+      await chrome.declarativeNetRequest.updateEnabledRulesets({ enableRulesetIds: [id] });
+      availableStaticRuleCount = await chrome.declarativeNetRequest
+        .getAvailableStaticRuleCount()
+        .catch(() => availableStaticRuleCount);
+    } catch (seqErr) {
+      // Log every failure — previously only rule-limit errors were
+      // recorded, which silently hid missing/malformed ruleset errors.
+      console.warn(`[AdBlock] Enable ruleset "${id}" failed:`, seqErr?.message || seqErr);
+      skippedRulesetIds.push(id);
+    }
+  }
+
+  return skippedRulesetIds;
+}
+
 /** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
 async function applyRulesets() {
   const enabledMap = normalizeEnabledRulesetsMap(
@@ -1991,17 +2098,33 @@ async function applyRulesets() {
     'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist',
     'easyprivacy', 'malware', 'annoyances', 'anti-adblock', 'ubo-cookie-annoyances'
   ];
-  
+
+  const manifestRulesetIds = getManifestRulesetIds();
   const enableRulesetIds = [];
   const disableRulesetIds = [];
+  const unknownRulesetIds = [];
 
   for (const listId of allKnownListIds) {
     const rulesets = getRulesetIdsForList(listId);
-    if (enabledMap[listId] === true || listId === 'system-unbreak') {
-      enableRulesetIds.push(...rulesets);
-    } else {
-      disableRulesetIds.push(...rulesets);
+    for (const rulesetId of rulesets) {
+      // Filter out IDs that the manifest no longer declares. Passing an
+      // unknown ID to updateEnabledRulesets rejects the entire batch, which
+      // historically caused every ruleset to stay disabled on fresh install.
+      if (manifestRulesetIds.size > 0 && !manifestRulesetIds.has(rulesetId)) {
+        unknownRulesetIds.push(rulesetId);
+        continue;
+      }
+
+      if (enabledMap[listId] === true || listId === 'system-unbreak') {
+        enableRulesetIds.push(rulesetId);
+      } else {
+        disableRulesetIds.push(rulesetId);
+      }
     }
+  }
+
+  if (unknownRulesetIds.length > 0) {
+    console.warn('[AdBlock] Skipping ruleset IDs not declared in manifest:', unknownRulesetIds.join(', '));
   }
 
   try {
@@ -2011,42 +2134,20 @@ async function applyRulesets() {
       disableRulesetIds,
     });
   } catch (err) {
-    if (err.message?.includes('exceeds the rule count limit')) {
+    // 2. Fall back to the sequential per-ruleset path for ANY error —
+    // previously only rule-limit errors triggered the fallback, so a single
+    // unknown/malformed ruleset would cause every other list to stay off.
+    const isRuleLimitError = err?.message?.includes('exceeds the rule count limit');
+    if (isRuleLimitError) {
       console.warn('[AdBlock] Batch enable failed due to rule limit. Falling back to sequential priority loading.');
-
-      // 2. Reset our static rulesets so budget checks start from a clean slate.
-      await chrome.declarativeNetRequest.updateEnabledRulesets({
-        disableRulesetIds: [...new Set(enableRulesetIds.concat(disableRulesetIds))],
-      });
-
-      const prioritizedRulesetIds = orderRulesetIdsByPriority(enableRulesetIds);
-      const skippedRulesetIds = [];
-      let availableStaticRuleCount = await chrome.declarativeNetRequest.getAvailableStaticRuleCount();
-
-      for (const id of prioritizedRulesetIds) {
-        const estimatedRuleCount = RULESET_RULE_COUNTS[id] ?? 0;
-        if (estimatedRuleCount > 0 && estimatedRuleCount > availableStaticRuleCount) {
-          skippedRulesetIds.push(id);
-          continue;
-        }
-
-        try {
-          await chrome.declarativeNetRequest.updateEnabledRulesets({ enableRulesetIds: [id] });
-          availableStaticRuleCount = await chrome.declarativeNetRequest.getAvailableStaticRuleCount();
-        } catch (seqErr) {
-          if (seqErr.message?.includes('exceeds the rule count limit')) {
-            console.warn(`[AdBlock] Limit reached at ruleset: ${id}`);
-            skippedRulesetIds.push(id);
-            continue;
-          }
-        }
-      }
-
-      if (skippedRulesetIds.length > 0) {
-        console.warn('[AdBlock] Skipped rulesets due to Chrome static rule limit:', skippedRulesetIds.join(', '));
-      }
     } else {
-      console.error('[AdBlock] Failed to apply rulesets:', err);
+      console.warn('[AdBlock] Batch enable failed; falling back to sequential loading:', err?.message || err);
+    }
+
+    const skippedRulesetIds = await applyRulesetsSequentially(enableRulesetIds, disableRulesetIds);
+
+    if (skippedRulesetIds.length > 0) {
+      console.warn('[AdBlock] Skipped rulesets during sequential fallback:', skippedRulesetIds.join(', '));
     }
   }
 
@@ -2060,6 +2161,39 @@ async function applyRulesets() {
   return getEffectiveEnabledRulesetsMap();
 }
 
+// Debounced cosmetic index rebuild — toggling several rulesets in quick
+// succession (e.g. from the options UI) would otherwise trigger one full
+// rebuild per toggle. Trailing-edge so the final state is always applied.
+const REBUILD_DEBOUNCE_MS = 150;
+let _rebuildIndexTimer = null;
+let _rebuildIndexPromise = null;
+let _rebuildIndexResolve = null;
+
+function scheduleActiveIndexRebuild() {
+  if (!_rebuildIndexPromise) {
+    _rebuildIndexPromise = new Promise((resolve) => {
+      _rebuildIndexResolve = resolve;
+    });
+  }
+  if (_rebuildIndexTimer) clearTimeout(_rebuildIndexTimer);
+  _rebuildIndexTimer = setTimeout(async () => {
+    _rebuildIndexTimer = null;
+    const resolve = _rebuildIndexResolve;
+    _rebuildIndexPromise = null;
+    _rebuildIndexResolve = null;
+    try {
+      if (await ensureFilterSourcesReady()) {
+        await rebuildActiveRuleIndexFromStoredSources();
+      }
+    } catch (err) {
+      console.error('[Nullify] Cosmetic index rebuild failed:', err);
+    } finally {
+      resolve?.();
+    }
+  }, REBUILD_DEBOUNCE_MS);
+  return _rebuildIndexPromise;
+}
+
 /** Enable or disable a static ruleset (or group) by ID. */
 async function setRulesetEnabled(rulesetId, enabled) {
   const meta = normalizeEnabledRulesetsMap(
@@ -2069,9 +2203,7 @@ async function setRulesetEnabled(rulesetId, enabled) {
   await setStorage(StorageKeys.ENABLED_RULESETS, meta);
 
   const enabledMap = await applyRulesets();
-  if (await ensureFilterSourcesReady()) {
-    await rebuildActiveRuleIndexFromStoredSources();
-  }
+  scheduleActiveIndexRebuild();
   return enabledMap;
 }
 
@@ -2100,6 +2232,28 @@ async function getEffectiveEnabledRulesetsMap() {
 // Scriptlet injection
 // ---------------------------------------------------------------------------
 
+// Per-SW-session capability key the scriptlet bundle registers itself under.
+// We don't expose this key to the page via any fixed name, and the registry
+// property is installed non-enumerable + non-configurable so page scripts
+// can't enumerate or shadow it. A page could still reach the bundle by
+// guessing the key, but the 128-bit nonce makes that infeasible.
+const SCRIPTLET_REGISTRY_KEY = (() => {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return '__n_' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+})();
+
+// Produce a 64-bit integer seed from the CSPRNG for WASM noise generators.
+// `Date.now() * Math.random()` is predictable, low-entropy, and callable in
+// a timing attack — `crypto.getRandomValues` is both faster and unbiased.
+function cryptoSeed64() {
+  const buf = new Uint32Array(2);
+  crypto.getRandomValues(buf);
+  // JS numbers are float64 (53-bit mantissa); combining two u32s saturates
+  // below 2^53 which fits the `seed as u64` cast on the Rust side.
+  return buf[0] * 0x1_0000 + buf[1];
+}
+
 /**
  * Inject scriptlets into a tab/frame via chrome.scripting.executeScript
  * in the MAIN world — this allows intercepting window-level properties.
@@ -2115,7 +2269,7 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
       func: executeScriptlets,
-      args: [scriptletRules],
+      args: [SCRIPTLET_REGISTRY_KEY, scriptletRules],
     });
   } catch (err) {
     if (!err.message?.includes('No frame with id')) {
@@ -2124,13 +2278,13 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
   }
 }
 
-function hasScriptletRegistry() {
-  for (const key of Object.keys(window)) {
-    if (key.startsWith('__nu') && typeof window[key]?.run === 'function') {
-      return true;
-    }
-  }
-  return false;
+function hasScriptletRegistry(key) {
+  const reg = window[key];
+  return reg && typeof reg.run === 'function';
+}
+
+function seedBootKey(key) {
+  globalThis.__nullifyBootKey = key;
 }
 
 async function ensureScriptletRegistry(tabId, frameId) {
@@ -2139,9 +2293,17 @@ async function ensureScriptletRegistry(tabId, frameId) {
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
       func: hasScriptletRegistry,
+      args: [SCRIPTLET_REGISTRY_KEY],
     });
 
     if (ready) return true;
+
+    await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: seedBootKey,
+      args: [SCRIPTLET_REGISTRY_KEY],
+    });
 
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
@@ -2159,18 +2321,13 @@ async function ensureScriptletRegistry(tabId, frameId) {
 }
 
 /**
- * This function runs in the MAIN world of the page.
+ * This function runs in the MAIN world of the page. The registry is looked
+ * up under a specific per-session key the page does not know and cannot
+ * enumerate (property is non-enumerable). Unknown registries are ignored.
  */
-function executeScriptlets(specs) {
-  let registry = null;
-  for (const key of Object.keys(window)) {
-    if (key.startsWith('__nu') && typeof window[key]?.run === 'function') {
-      registry = window[key];
-      break;
-    }
-  }
-
-  if (!registry) return;
+function executeScriptlets(key, specs) {
+  const registry = window[key];
+  if (!registry || typeof registry.run !== 'function') return;
 
   for (const spec of specs) {
     try {
@@ -2182,7 +2339,23 @@ function executeScriptlets(specs) {
 // ---------------------------------------------------------------------------
 // Message bus
 // ---------------------------------------------------------------------------
+// Messages only ever come from this extension's own pages + content scripts.
+// Reject anything else up front rather than dispatching it into the handler
+// (defense in depth against accidental `externally_connectable` regressions
+// or malformed traffic from compromised renderers).
+const MAX_USER_FILTERS_BYTES = 2 * 1024 * 1024;   // 2 MB text cap
+const MAX_USER_FILTERS_DNR_RULES = 10_000;        // dynamic DNR budget guard
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (!sender || sender.id !== chrome.runtime.id) {
+    sendResponse({ error: 'foreign sender rejected' });
+    return false;
+  }
+  if (!message || typeof message.type !== 'string') {
+    sendResponse({ error: 'malformed message' });
+    return false;
+  }
+
   // For content-script critical-path messages, ensure caches are ready first.
   // Non-critical messages (stats, settings UI) don't need to wait.
   const needsCache = message.type === 'GET_COSMETIC_RULES' ||
@@ -2248,12 +2421,12 @@ async function handleMessage(message, sender) {
           responseData.cosmeticRulesBinary = cosmeticBundle.cosmeticRulesBinary;
           delete responseData.cosmeticRules;
           
-          // Also provide a sanitized URL for privacy reporting/cleanup
-          if (sender.tab?.url) {
-            // urlSanitizer has the AC pre-built — no reconstruction per call.
-            responseData.sanitizedUrl = urlSanitizer
-              ? urlSanitizer.sanitize(sender.tab.url)
-              : sanitize_url_with_csv(sender.tab.url, trackerKeywordsCsv);
+          // Also provide a sanitized URL for privacy reporting/cleanup.
+          // `urlSanitizer` is initialized alongside WASM readiness, so if
+          // it is missing we skip sanitization rather than reconstructing
+          // the AC per call (the standalone fn has been removed).
+          if (sender.tab?.url && urlSanitizer) {
+            responseData.sanitizedUrl = urlSanitizer.sanitize(sender.tab.url);
           }
         } catch (err) {
           console.error('[Nullify] Rule serialization/sanitization failed:', err);
@@ -2281,15 +2454,25 @@ async function handleMessage(message, sender) {
       await refreshAllBadges();
       return { ok: true };
     }
+    case 'UPDATE_SETTINGS': {
+      // Partial merge — safe when multiple UI surfaces (popup + options)
+      // may be editing settings concurrently. SET_SETTINGS is read-modify-
+      // write from the caller's perspective and can drop sibling changes.
+      const current = (await getStorage(StorageKeys.SETTINGS)) || {};
+      const merged = { ...current, ...(payload || {}) };
+      await setStorage(StorageKeys.SETTINGS, merged);
+      cachedSettings = merged;
+      await applyPrivacySettings();
+      await refreshAllBadges();
+      return { ok: true, settings: merged };
+    }
     case 'GET_ALLOWLIST':
       return Array.from(cachedAllowlist);
     case 'ALLOW_SITE': {
       const domain = normalizeHostname(payload.domain);
       if (!domain) return { ok: false };
       await allowSite(domain);
-      cachedAllowlist.add(domain);
       domainRulesCache.delete(domain);
-      rebuildAllowlistMatcher();
       await syncYouTubeShieldRegistration();
       return { ok: true };
     }
@@ -2297,9 +2480,7 @@ async function handleMessage(message, sender) {
       const domain = normalizeHostname(payload.domain);
       if (!domain) return { ok: false };
       await disallowSite(domain);
-      cachedAllowlist.delete(domain);
       domainRulesCache.delete(domain);
-      rebuildAllowlistMatcher();
       await syncYouTubeShieldRegistration();
       return { ok: true };
     }
@@ -2309,8 +2490,19 @@ async function handleMessage(message, sender) {
     case 'GET_USER_FILTERS':
       return { filters: (await getStorage(StorageKeys.USER_FILTERS)) || '' };
     case 'SET_USER_FILTERS': {
-      await setStorage(StorageKeys.USER_FILTERS, payload.filters);
-      return await applyUserFilters(payload.filters);
+      const raw = typeof payload?.filters === 'string' ? payload.filters : '';
+      // Cap raw text at 2 MB so a pasted/imported blob cannot exhaust the
+      // service worker's heap or block the filter compiler indefinitely.
+      if (raw.length > MAX_USER_FILTERS_BYTES) {
+        return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
+      }
+      await setStorage(StorageKeys.USER_FILTERS, raw);
+      const counts = await applyUserFilters(raw);
+      // Extra guard on compiled DNR output — dynamic rule budget is finite.
+      if (counts && Number.isFinite(counts.network) && counts.network > MAX_USER_FILTERS_DNR_RULES) {
+        return { ...counts, warning: `Network rule count ${counts.network} exceeds budget ${MAX_USER_FILTERS_DNR_RULES}` };
+      }
+      return counts;
     }
     case 'GET_COSMETIC_RULES': {
       const bundle = await getCosmeticBundleForPage(payload.hostname);
@@ -2340,9 +2532,7 @@ async function handleMessage(message, sender) {
     case 'GET_NOISE': {
       const { mean = 0, stdDev = 1 } = payload || {};
       if (wasmReady) {
-        // Provide entropy from JS side to avoid getrandom environment issues
-        const seed = Date.now() * Math.random();
-        return { noise: generate_gaussian_noise(mean, stdDev, seed) };
+        return { noise: generate_gaussian_noise(mean, stdDev, cryptoSeed64()) };
       }
       return { noise: (Math.random() - 0.5) * 2 * stdDev + mean }; // JS fallback
     }
@@ -2350,12 +2540,10 @@ async function handleMessage(message, sender) {
     case 'GET_ANONYMIZED_STATS': {
       const stats = await getStorage(StorageKeys.TAB_STATS) || {};
       if (!wasmReady) return { stats };
-      
+
       const json = JSON.stringify(stats);
       const noiseScale = payload?.noiseScale || 2.0;
-      const seed = Date.now() * Math.random();
-      
-      const anonymizedJson = anonymize_stats_json(json, noiseScale, seed);
+      const anonymizedJson = anonymize_stats_json(json, noiseScale, cryptoSeed64());
       return { stats: JSON.parse(anonymizedJson) };
     }
 

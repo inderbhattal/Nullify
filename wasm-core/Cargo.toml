@@ -17,13 +17,22 @@ serde-wasm-bindgen = "0.4"
 rustc-hash = "1.1"
 # Advanced matching
 aho-corasick = "1.0"
-# Statistical noise (using seeded RNG to avoid getrandom JS issues)
-rand = { version = "0.8", features = ["small_rng"] }
+# Statistical noise. We always seed explicitly from JS, so `getrandom`
+# isn't *called*. But `rand_core` (pulled in transitively by `rand_distr`)
+# has a compile-time gate requiring a platform backend for
+# wasm32-unknown-unknown, so the `js` feature must be enabled to build.
+# LTO should dead-code-eliminate the unused entropy path.
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 rand_distr = "0.4"
 getrandom = { version = "0.2", features = ["js"] }
+# Surface Rust panics as meaningful JS errors instead of opaque
+# `RuntimeError: unreachable` that poisons the module.
+console_error_panic_hook = "0.1"
 
 [package.metadata.wasm-pack.profile.release]
-wasm-opt = false
+# Let wasm-opt run so `opt-level = "z"` + `lto` actually produce a small
+# binary. Disabling it left large amounts of dead code in the output.
+wasm-opt = true
 
 [profile.release]
 # Optimize for small size

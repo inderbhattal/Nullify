@@ -1,4 +1,5 @@
 import { normalizeAllowlist, normalizeHostname } from './hostname.js';
+import { ancestorDomains } from './psl.js';
 
 /**
  * storage.js — shared storage abstraction
@@ -63,19 +64,20 @@ export async function getAllowlist() {
   return normalizeAllowlist(await getStorage(StorageKeys.ALLOWLIST));
 }
 
-/** Check if a hostname (or any parent domain) is in the allowlist. */
+/**
+ * Check if a hostname (or any non-public-suffix parent domain) is in the
+ * allowlist. We deliberately stop ascending at the first public suffix
+ * (e.g. `co.uk`) to prevent a rule at that level from blanketing a TLD.
+ */
 export async function isHostnameAllowed(hostname) {
-  let domain = normalizeHostname(hostname);
+  const domain = normalizeHostname(hostname);
   if (!domain) return false;
 
   const allowlist = await getAllowlist();
+  const set = new Set(allowlist);
 
-  while (domain) {
-    if (allowlist.includes(domain)) return true;
-    const dotIdx = domain.indexOf('.');
-    if (dotIdx === -1) break;
-    domain = domain.slice(dotIdx + 1);
+  for (const candidate of ancestorDomains(domain)) {
+    if (set.has(candidate)) return true;
   }
-
   return false;
 }

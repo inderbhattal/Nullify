@@ -54,36 +54,39 @@ export function trustedReplaceXhrResponse(urlPattern, findStr, replaceStr = '') 
   const matchUrl = toMatcher(urlPattern);
   const findRe = toRegex(findStr);
   const OrigXHR = window.XMLHttpRequest;
+  const interceptedMap = new WeakMap();
 
-  window.XMLHttpRequest = function () {
-    const xhr = new OrigXHR();
-    const origOpen = xhr.open;
-    let intercepted = false;
+  const origOpen = OrigXHR.prototype.open;
+  OrigXHR.prototype.open = function (method, url, ...args) {
+    if (matchUrl(url)) interceptedMap.set(this, true);
+    else interceptedMap.delete(this);
+    return origOpen.call(this, method, url, ...args);
+  };
 
-    xhr.open = function (method, url, ...args) {
-      if (matchUrl(url)) intercepted = true;
-      return origOpen.call(this, method, url, ...args);
-    };
+  // Proxy preserves identity (`x instanceof XMLHttpRequest`, prototype chain).
+  window.XMLHttpRequest = new Proxy(OrigXHR, {
+    construct(target, args) {
+      const xhr = Reflect.construct(target, args);
+      const textDesc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText');
+      const respDesc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'response');
 
-    const patch = (prop) => {
-      const desc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, prop);
-      Object.defineProperty(xhr, prop, {
+      const wrap = (desc) => ({
+        configurable: true,
         get() {
           const val = desc.get.call(this);
-          if (intercepted && typeof val === 'string') {
+          if (interceptedMap.get(this) && typeof val === 'string') {
             return val.replace(findRe, replaceStr);
           }
           return val;
         },
-        configurable: true
       });
-    };
 
-    patch('responseText');
-    patch('response');
+      if (textDesc?.get) Object.defineProperty(xhr, 'responseText', wrap(textDesc));
+      if (respDesc?.get) Object.defineProperty(xhr, 'response', wrap(respDesc));
 
-    return xhr;
-  };
+      return xhr;
+    },
+  });
 }
 
 function toRegex(s) {

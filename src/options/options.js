@@ -203,9 +203,16 @@ async function initMyFilters() {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.txt,.text,text/plain';
+    const MAX_IMPORT_BYTES = 5 * 1024 * 1024; // 5 MB
     input.addEventListener('change', async () => {
       const file = input.files?.[0];
       if (!file) return;
+      // Reject oversized files before calling `.text()` so a huge upload
+      // cannot pin the UI thread on decoding.
+      if (file.size > MAX_IMPORT_BYTES) {
+        showFilterStatus(`✗ File too large (>${MAX_IMPORT_BYTES / (1024 * 1024)} MB)`, 'error');
+        return;
+      }
       try {
         const text = await file.text();
         // Strip header comments added by export (! Title:, ! Exported:, blank ! lines)
@@ -421,8 +428,12 @@ class LiveLogger {
   }
 
   listen() {
-    chrome.runtime.onMessage.addListener((message) => {
-      if (message.type === 'LOGGER_EVENT') {
+    chrome.runtime.onMessage.addListener((message, sender) => {
+      // Only accept logger broadcasts from the background service worker
+      // (same extension id, no tab). Pages or external senders must not be
+      // able to inject fake rows into the log view.
+      if (!sender || sender.id !== chrome.runtime.id || sender.tab) return;
+      if (message?.type === 'LOGGER_EVENT') {
         this.addEvent(message.payload);
       }
     });
@@ -526,7 +537,12 @@ class LiveLogger {
 
   esc(s) {
     if (!s) return '';
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 }
 

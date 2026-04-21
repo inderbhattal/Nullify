@@ -165,11 +165,31 @@ function run(name, args = []) {
 }
 
 // ---------------------------------------------------------------------------
-// Public API — attached to window so MAIN-world injection can call it
+// Public API — capability token handed to the bundle by the service worker.
 // ---------------------------------------------------------------------------
-// Use a less predictable property name to make extension detection harder.
-const REGISTRY_NAME = '__nu' + Math.random().toString(36).slice(2, 8);
-window[REGISTRY_NAME] = { run };
+// The SW injects a one-shot global `__nullifyBootKey` before loading this
+// bundle. We register the dispatcher under that key (non-enumerable +
+// non-configurable so page scripts can't enumerate or replace it), then
+// delete the temporary boot key.
+//
+// No fixed sentinel. No randomized `__nu*` prefix exposed via Object.keys.
+// If the boot key is missing (e.g. direct <script> load) we refuse to
+// register — the SW is the only legitimate caller.
+const bootKey = globalThis.__nullifyBootKey;
+if (typeof bootKey === 'string' && bootKey.length > 0) {
+  try {
+    Object.defineProperty(window, bootKey, {
+      value: Object.freeze({ run }),
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  } catch {
+    // Attacker pre-claimed the key with a non-configurable descriptor — refuse.
+  }
+  try {
+    delete globalThis.__nullifyBootKey;
+  } catch { /* ignore */ }
+}
 
-// Export the name so it can be used by the injector
-export { run, REGISTRY_NAME };
+export { run };

@@ -214,26 +214,25 @@ function parseScriptletArgs(str) {
   return args;
 }
 
+// Sentinel return values so callers distinguish "ignore silently" from
+// "skipped for a documented reason".
+const SKIP_SILENT = { skip: true, reason: null };
+function skip(reason) { return { skip: true, reason }; }
+
 /**
  * Parse a single filter line into a structured rule object.
- * Returns null if the line is a comment, blank, or unsupported.
+ * Returns a rule, SKIP_SILENT (comment/blank), or `{ skip, reason }`.
  */
 function parseLine(line) {
   line = line.trim();
 
-  // Skip comments and empty lines
-  if (!line || line.startsWith('!') || line.startsWith('[')) return null;
-  // Skip Adblock Plus-specific directives
-  if (line.startsWith('@@#')) return null;
+  if (!line || line.startsWith('!') || line.startsWith('[')) return SKIP_SILENT;
+  if (line.startsWith('@@#')) return SKIP_SILENT;
 
-  // ---- Scriptlet injections (MUST come before generic ## check) ----
-  // example.com##+js(scriptlet-name, arg1, arg2)
-  // Also handles AdGuard format: example.com#%#//scriptlet('name', 'arg')
   const scriptletMatch = line.match(/^([^#]*)##\+js\((.+)\)$/) ||
                          line.match(/^([^#]*)#\+js\((.+)\)$/);
   if (scriptletMatch) {
     const [, domains, scriptletStr] = scriptletMatch;
-    // Parse args carefully — scriptlet args can contain commas inside quotes
     const args = parseScriptletArgs(scriptletStr);
     const [name, ...rest] = args;
     return {
@@ -244,8 +243,6 @@ function parseLine(line) {
     };
   }
 
-  // ---- ABP extended CSS selectors (#?#) — treat as cosmetic rules ----
-  // These use ABP's :-abp-contains(), :-abp-has() pseudo-selectors
   const abpExtMatch = line.match(/^([^#]*)#\?#(.+)$/);
   if (abpExtMatch) {
     const [, domains, selector] = abpExtMatch;
@@ -257,9 +254,6 @@ function parseLine(line) {
     };
   }
 
-  // ---- Cosmetic filters ----
-  // Domain-specific: example.com##.ad-class
-  // Generic: ##.ad-class
   const cosmeticMatch = line.match(/^([^#]*)##(.+)$/);
   if (cosmeticMatch) {
     const [, domains, selector] = cosmeticMatch;
@@ -271,7 +265,6 @@ function parseLine(line) {
     };
   }
 
-  // Cosmetic exception: example.com#@#.ad-class
   const cosmeticExceptionMatch = line.match(/^([^#]*)#@#(.+)$/);
   if (cosmeticExceptionMatch) {
     const [, domains, selector] = cosmeticExceptionMatch;
@@ -283,12 +276,9 @@ function parseLine(line) {
     };
   }
 
-  // ---- Network filters ----
-  // Exception rules start with @@
   const isException = line.startsWith('@@');
   const rawRule = isException ? line.slice(2) : line;
 
-  // Parse options block ($option1,option2,...)
   let pattern = rawRule;
   let optionsStr = '';
   const dollarPos = rawRule.lastIndexOf('$');
@@ -297,15 +287,14 @@ function parseLine(line) {
     optionsStr = rawRule.slice(dollarPos + 1);
   }
 
-  // Skip rules we can't handle at all
-  if (optionsStr.includes('$csp=') && !isException) {
-    // CSP rules: convert to modifyHeaders if possible (simplified)
-    return null; // Too complex for now
+  if (/(^|,)csp=/.test(optionsStr) && !isException) {
+    return skip('csp-modifier: Chrome MV3 DNR cannot inject CSP response headers via a block rule; needs modifyHeaders which we do not translate yet');
   }
 
-  // Parse options
   const options = parseOptions(optionsStr);
-  if (options === null) return null; // Unsupported option combo
+  if (options === null) {
+    return skip('unsupported-option-combo');
+  }
 
   return {
     type: 'network',
@@ -361,7 +350,11 @@ function parseOptions(optionsStr) {
     } else if (optName === 'important') {
       options.important = true;
     } else if (optName.startsWith('redirect=') || optName.startsWith('redirect-rule=')) {
-      options.redirect = optName.split('=')[1];
+      // uBO resource names are usually simple, but the value side can contain
+      // '=' for base64-encoded fallbacks — slice past the FIRST '=' rather
+      // than splitting, which would truncate anything after a second '='.
+      const eqIdx = optName.indexOf('=');
+      options.redirect = eqIdx >= 0 ? optName.slice(eqIdx + 1) : '';
     } else if (optName.startsWith('removeparam=')) {
       options.removeparam = optName.slice(12);
     } else if (optName === 'popup') {
@@ -370,12 +363,16 @@ function parseOptions(optionsStr) {
       // Manifest V3 can't block inline scripts.
       // We don't skip the rule, we just ignore this specific option
       // so other options in the same rule (like $script) still apply.
-    } else if (optName === 'genericblock' || optName === 'generichide') {
-      // Treat as a general exception for the pattern
-      options.important = true; 
-    } else if (optName === 'elemhide' || optName === 'specifichide') {
-      // Treat as a general exception
-      options.important = true;
+    } else if (
+      optName === 'genericblock' ||
+      optName === 'generichide' ||
+      optName === 'elemhide' ||
+      optName === 'specifichide'
+    ) {
+      // Cosmetic-scope exception hints — we no longer flip `important`
+      // here. Setting the priority-bumped important flag used to mask real
+      // cosmetic exception rules at DNR priority 5.
+      options.cosmeticScopeException = true;
     }
     // Ignore unknown options silently (many are optional/metadata)
   }
@@ -475,88 +472,85 @@ const CRITICAL_SAFE_PATHS = [
   'aexp-static.com',
 ];
 
+// Drop reporter: populated by buildDNRRules, read by parseFilterList caller
+// so every networkFilterToDNR/convertPatternToUrlFilter rejection is
+// recorded with the original line and a human-readable reason.
+let _currentDropSink = null;
+function reportDrop(reason, pattern) {
+  if (_currentDropSink) _currentDropSink.push({ reason, pattern });
+}
+
 /**
  * Convert a parsed network filter into a DNR rule object.
- * Returns null if conversion is not possible.
+ * Returns null if conversion is not possible (reason is reported via reportDrop).
  */
 function networkFilterToDNR(parsed) {
   if (parsed.type !== 'network') return null;
 
   const { pattern, options, exception } = parsed;
 
-  // Safe Path Guard: If this pattern matches a critical path, 
-  // and it's a block rule, skip it or convert to allow if it's an exception.
   const lowerPattern = pattern.toLowerCase();
   for (const safePath of CRITICAL_SAFE_PATHS) {
     if (lowerPattern.includes(safePath)) {
-      if (exception) return null; // already handled by allow rule
+      if (exception) { reportDrop(`critical-safe-path-exception: ${safePath} (already covered by allow rule)`, pattern); return null; }
       if (!options.important) {
-        // console.log(`   🛡️  Neutralizing critical path block: ${pattern}`);
-        return null; // Skip this block rule
+        reportDrop(`critical-safe-path-block: ${safePath} (blocking would break extension/browser core flow)`, pattern);
+        return null;
       }
     }
   }
 
-  // Build URL condition
   let urlFilter = null;
   let regexFilter = null;
 
-  // Blacklist: Reject known broken/overly-broad upstream patterns
   const patternBlacklist = [
     '://www.*.com/*.css|',
     'www.*.com/*.css',
   ];
   if (patternBlacklist.includes(pattern)) {
-    // console.log(`   🚫 Rejecting blacklisted broad pattern: ${pattern}`);
+    reportDrop('upstream-blacklist: known broken/overly-broad pattern', pattern);
     return null;
   }
 
   if (pattern.startsWith('/') && pattern.endsWith('/')) {
-    // Regex filter — Chrome DNR compiles with RE2 under a 2KB program memory limit.
-    //
-    // Rejection criteria:
-    // 1. RE2-unsupported syntax: lookaheads, lookbehinds, backrefs, etc.
-    // 2. Non-ASCII characters.
-    // 3. Source longer than 150 chars.
-    // 4. Product of all {n,m} upper-bounds > 500 (catches nested quantifiers).
-    // 5. Estimated NFA instruction count > 1000.
-    //    RE2 expands character classes into per-char alternatives:
-    //    [0-9A-Za-z]{16} = 62 chars × 16 reps = 992 NFA instructions.
-    //    \d, \w, \s shorthands expand similarly (10, 63, 6 chars).
-    // 6. Must compile as valid JS regex (final syntax check).
-
     regexFilter = pattern.slice(1, -1);
 
-    // Check 1: RE2-unsupported syntax
-    if (/\(\?[=!]|\(\?<[=!]|\\[1-9]|\(\?>|[*+?]\+|\(\?\(|\\k</.test(regexFilter)) return null;
+    if (/\(\?[=!]|\(\?<[=!]|\\[1-9]|\(\?>|[*+?]\+|\(\?\(|\\k</.test(regexFilter)) {
+      reportDrop('regex: uses RE2-unsupported syntax (lookaround/backref/possessive/named-backref)', pattern);
+      return null;
+    }
+    if (/[^\x00-\x7F]/.test(regexFilter)) {
+      reportDrop('regex: contains non-ASCII — DNR requires ASCII-only', pattern);
+      return null;
+    }
+    if (regexFilter.length > 150) {
+      reportDrop(`regex: source length ${regexFilter.length} > 150 (Chrome RE2 2KB program budget)`, pattern);
+      return null;
+    }
 
-    // Check 2: non-ASCII
-    if (/[^\x00-\x7F]/.test(regexFilter)) return null;
-
-    // Check 3: source length
-    if (regexFilter.length > 150) return null;
-
-    // Check 4: product of all quantifier upper-bounds
     let quantProduct = 1;
     const quantRe4 = /\{(\d+)(?:,(\d+))?\}/g;
     let qm4;
     while ((qm4 = quantRe4.exec(regexFilter)) !== null) {
       quantProduct *= parseInt(qm4[2] ?? qm4[1], 10);
-      if (quantProduct > 500) return null;
+      if (quantProduct > 500) {
+        reportDrop(`regex: quantifier product ${quantProduct} > 500 (nested-quantifier blowup)`, pattern);
+        return null;
+      }
     }
 
-    // Check 5: estimated NFA instruction cost
-    // RE2 expands [a-z] into 26 alternatives, \d into 10, \w into 63, etc.
-    // A quantifier {n,m} on an expression of cost C produces ~C*m instructions.
-    // Chrome's 2KB limit ≈ 500-700 raw nodes (each has ~3 bytes RE2 overhead).
-    if (estimateRegexNfaCost(regexFilter) > 500) return null;
+    if (estimateRegexNfaCost(regexFilter) > 500) {
+      reportDrop('regex: estimated NFA cost > 500 instructions (exceeds Chrome 2KB RE2 budget)', pattern);
+      return null;
+    }
 
-    // Check 6: valid JS regex syntax
-    try { new RegExp(regexFilter); } catch { return null; }
+    try { new RegExp(regexFilter); } catch (e) {
+      reportDrop(`regex: invalid JS regex syntax (${e.message})`, pattern);
+      return null;
+    }
   } else {
-    // Convert ABP-style URL pattern to DNR urlFilter
     urlFilter = convertPatternToUrlFilter(pattern);
-    if (!urlFilter) return null;
+    if (!urlFilter) return null; // convertPatternToUrlFilter calls reportDrop itself
   }
 
   // Build condition
@@ -631,45 +625,36 @@ const KNOWN_TLDS = new Set([
   'it','es','nl','be','at','ch','se','no','fi','dk','pl','cz','sk','hu','ro',
   'bg','hr','si','rs','ru','ua','by','md','ge','am','az','kz','cn','jp','kr',
   'tw','hk','sg','my','id','ph','th','vn','au','nz','ca','br','in','mx','za',
-  'eg','ng','ke','tz','gh','cm','ma','dz','tn','ly','sd','et','eu','ar','cl',
-  'pe','ve','ec','co','gt','hn','sv','cr','pa','cu','do','tt','bb','jm','bz',
+  'eg','ng','ke','tz','gh','cm','ma','dz','tn','sd','et','eu','ar','cl',
+  'pe','ve','ec','gt','hn','sv','cr','pa','cu','do','tt','bb','jm','bz',
 ]);
 
 /** Convert ABP-style URL pattern to DNR urlFilter */
 function convertPatternToUrlFilter(pattern) {
-  if (!pattern || pattern === '*') return null; // Too broad
-  
-  // 1. Decode URL-encoded characters (e.g. %2F -> /)
+  const original = pattern;
+  if (!pattern || pattern === '*') { reportDrop('urlFilter: empty or matches-everything ("*")', original); return null; }
+
   if (pattern.includes('%')) {
     try {
       const decoded = decodeURIComponent(pattern);
       if (decoded && decoded.trim().length > 0) pattern = decoded;
-    } catch (e) {}
+    } catch (e) { /* keep original */ }
   }
 
-  if (pattern.length < 2) return null; // Allow shorter path rules (e.g. /a)
+  if (pattern.length < 2) { reportDrop('urlFilter: pattern too short (<2 chars)', original); return null; }
+  if (/[^\x00-\x7F]/.test(pattern)) { reportDrop('urlFilter: non-ASCII — Chrome DNR requires ASCII', original); return null; }
+  if (pattern.startsWith('||*')) { reportDrop('urlFilter: ||* is invalid — wildcard cannot immediately follow domain anchor', original); return null; }
+  if (pattern.indexOf('||', 1) !== -1) { reportDrop('urlFilter: || must only appear at pattern start', original); return null; }
+  if (pattern === '||' || pattern === '|' || pattern === '^') { reportDrop('urlFilter: degenerate anchor-only pattern', original); return null; }
 
-  // DNR urlFilter must be ASCII-only
-  if (/[^\x00-\x7F]/.test(pattern)) return null;
-
-  // || means domain anchor — wildcard immediately after || is invalid in DNR
-  if (pattern.startsWith('||*')) return null;
-
-  // || must only appear at the very start
-  if (pattern.indexOf('||', 1) !== -1) return null;
-
-  // Check for extreme broadness
-  if (pattern === '||' || pattern === '|' || pattern === '^') return null;
-
-  // Guard: ||TLD^ (e.g. ||com^, ||net^, ||io^) anchors on the TLD component and
-  // therefore matches EVERY domain with that TLD — far too broad.
-  // Extract the first hostname label after ||: everything up to the first . ^ / * ?
   if (pattern.startsWith('||')) {
     const labelMatch = /^\|\|([^.|/*?^]+)/.exec(pattern);
-    if (labelMatch && KNOWN_TLDS.has(labelMatch[1].toLowerCase())) return null;
+    if (labelMatch && KNOWN_TLDS.has(labelMatch[1].toLowerCase())) {
+      reportDrop(`urlFilter: ||${labelMatch[1]}^ anchors on TLD — would match every .${labelMatch[1]} domain`, original);
+      return null;
+    }
   }
 
-  // DNR urlFilter uses the same syntax as ABP for these tokens, so it maps directly
   return pattern;
 }
 
@@ -697,24 +682,23 @@ function getBlankRedirectUrl(resourceType) {
 
 /**
  * Parse a complete filter list text into categorized rule sets.
+ * Also collects full skip records: every non-blank/non-comment line
+ * that parseLine rejects is recorded with the reason.
  */
 function parseFilterList(text, listId = 'unknown') {
   const networkRules = [];
   const cosmeticRules = [];
   const cosmeticExceptions = [];
   const scriptletRules = [];
-  let skipped = 0;
-  const skippedExamples = [];
+  const skippedRecords = []; // [{ reason, line }]
 
   for (const line of text.split('\n')) {
     const parsed = parseLine(line);
-    if (!parsed) { 
-      const trimmed = line.trim();
-      if (trimmed && !trimmed.startsWith('!') && !trimmed.startsWith('[')) {
-        skipped++; 
-        if (skippedExamples.length < 50) skippedExamples.push(trimmed);
+    if (!parsed || parsed.skip) {
+      if (parsed && parsed.skip && parsed.reason) {
+        skippedRecords.push({ reason: parsed.reason, line: line.trim() });
       }
-      continue; 
+      continue;
     }
 
     if (parsed.type === 'network') {
@@ -727,38 +711,44 @@ function parseFilterList(text, listId = 'unknown') {
     }
   }
 
-  if (skipped > 0) {
-    console.log(`   ℹ️  Examples of skipped rules for ${listId}:`);
-    skippedExamples.slice(0, 5).forEach(s => console.log(`      - ${s.slice(0, 100)}${s.length > 100 ? '...' : ''}`));
-  }
-
-  return { networkRules, cosmeticRules, cosmeticExceptions, scriptletRules, skipped };
+  return { networkRules, cosmeticRules, cosmeticExceptions, scriptletRules, skippedRecords };
 }
 
 /**
  * Convert parsed network rules to DNR rules, deduplicate, and return.
+ * Populates `droppedRecords` with every rejection + dedup drop.
  */
 function buildDNRRules(networkRules) {
   const dnrRules = [];
   const seen = new Set();
+  const droppedRecords = [];
 
-  for (const parsed of networkRules) {
-    const rule = networkFilterToDNR(parsed);
-    if (!rule) continue;
+  const prevSink = _currentDropSink;
+  _currentDropSink = droppedRecords;
 
-    // Deduplicate by urlFilter+action+resourceTypes
-    const key = JSON.stringify({
-      uf: rule.condition.urlFilter || rule.condition.regexFilter,
-      rt: rule.condition.resourceTypes,
-      at: rule.action.type,
-    });
-    if (seen.has(key)) continue;
-    seen.add(key);
+  try {
+    for (const parsed of networkRules) {
+      const rule = networkFilterToDNR(parsed);
+      if (!rule) continue;
 
-    dnrRules.push(rule);
+      const key = JSON.stringify({
+        uf: rule.condition.urlFilter || rule.condition.regexFilter,
+        rt: rule.condition.resourceTypes,
+        at: rule.action.type,
+      });
+      if (seen.has(key)) {
+        droppedRecords.push({ reason: 'dedup: duplicate of another DNR rule (same urlFilter+resourceTypes+action)', pattern: parsed.pattern });
+        continue;
+      }
+      seen.add(key);
+
+      dnrRules.push(rule);
+    }
+  } finally {
+    _currentDropSink = prevSink;
   }
 
-  return dnrRules;
+  return { dnrRules, droppedRecords };
 }
 
 function buildSourceBundleFallback(parsed) {
@@ -822,6 +812,60 @@ function collectExpectedRulesetFiles() {
   return files;
 }
 
+const SKIP_LOG_DIR = path.join(RULES_DIR, 'skipped');
+
+function groupByReason(records, keyField) {
+  const groups = new Map();
+  for (const r of records) {
+    const bucket = groups.get(r.reason) || [];
+    bucket.push(r[keyField]);
+    groups.set(r.reason, bucket);
+  }
+  return groups;
+}
+
+/**
+ * Write a full, untruncated log of every skipped/dropped line for `listId`.
+ * Each entry lists the reason and the exact source line — nothing is cut
+ * so engineers can reproduce and triage individual filters.
+ */
+function writeSkipLog(listId, { parseSkips, dnrDrops, truncatedCount }) {
+  fs.mkdirSync(SKIP_LOG_DIR, { recursive: true });
+  const lines = [];
+  lines.push(`# Skip log for ${listId}`);
+  lines.push(`# generated ${new Date().toISOString()}`);
+  lines.push(`# parse-skips: ${parseSkips.length}  dnr-drops: ${dnrDrops.length}  smart-truncate-dropped: ${truncatedCount}`);
+  lines.push('');
+
+  lines.push(`## Parse-time skips (parseLine rejected)`);
+  const parseGroups = groupByReason(parseSkips, 'line');
+  for (const [reason, entries] of parseGroups) {
+    lines.push(`\n### ${reason}  (${entries.length})`);
+    for (const entry of entries) lines.push(entry);
+  }
+
+  lines.push(`\n## DNR conversion drops (networkFilterToDNR / convertPatternToUrlFilter / dedup)`);
+  const dnrGroups = groupByReason(dnrDrops, 'pattern');
+  for (const [reason, entries] of dnrGroups) {
+    lines.push(`\n### ${reason}  (${entries.length})`);
+    for (const entry of entries) lines.push(entry);
+  }
+
+  if (truncatedCount > 0) {
+    lines.push(`\n## Smart-truncate`);
+    lines.push(`${truncatedCount} rules dropped because list exceeded configured totalLimit (see LIST_CONFIG).`);
+    lines.push(`Individual lines not recorded: smartTruncate operates on already-parsed rules ranked by scoreNetworkRule.`);
+  }
+
+  const outPath = path.join(SKIP_LOG_DIR, `${listId}.log`);
+  fs.writeFileSync(outPath, lines.join('\n'));
+}
+
+function printSkipSummary(listId, parseSkips, dnrDrops, truncatedCount) {
+  if (parseSkips.length === 0 && dnrDrops.length === 0 && truncatedCount === 0) return;
+  console.log(`   📝 Skip summary for ${listId} (full log: rules/skipped/${listId}.log)`);
+}
+
 function cleanGeneratedRuleFiles() {
   if (!fs.existsSync(RULES_DIR)) return;
 
@@ -838,14 +882,57 @@ function cleanGeneratedRuleFiles() {
     if (!generatedFiles.has(entry.name)) continue;
     fs.rmSync(path.join(RULES_DIR, entry.name), { force: true });
   }
+
+  // Wipe stale per-list skip logs so a shrinking skip set doesn't leave
+  // phantom entries behind from a previous build.
+  if (fs.existsSync(SKIP_LOG_DIR)) {
+    for (const entry of fs.readdirSync(SKIP_LOG_DIR)) {
+      if (entry.endsWith('.log')) fs.rmSync(path.join(SKIP_LOG_DIR, entry), { force: true });
+    }
+  }
+}
+
+/**
+ * Assert every rule_resources[].path referenced by manifest.json exists on disk.
+ * Prevents shipping a build where the manifest references a shard that was
+ * never generated — Chrome silently ignores missing rulesets at load time,
+ * which is how the first-install bug slipped through in 3.4.0.
+ */
+function verifyManifestRuleResourcePaths() {
+  const manifestPath = path.resolve(__dirname, '../manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const resources = manifest?.declarative_net_request?.rule_resources || [];
+  const projectRoot = path.resolve(__dirname, '..');
+  const missing = [];
+  for (const entry of resources) {
+    const abs = path.resolve(projectRoot, entry.path);
+    if (!fs.existsSync(abs)) missing.push(entry.path);
+  }
+  if (missing.length > 0) {
+    throw new Error(
+      `Manifest references rule_resources that do not exist on disk:\n  - ${missing.join('\n  - ')}\n` +
+      `Regenerate with \`npm run build:rules\` or remove the entries from manifest.json.`
+    );
+  }
+  console.log(`✅ manifest rule_resources verified (${resources.length} paths)`);
 }
 
 function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }) {
+  // Per-ruleset rule counts — previously hardcoded in service-worker.js and
+  // drifted from reality after every filter-list refresh. Emit the actual
+  // compiled counts so the SW can load them at runtime instead of guessing.
+  const rulesetCounts = {};
   for (const [filename, rules] of Object.entries(rulesetOutputs)) {
     const outPath = path.join(RULES_DIR, filename);
     fs.writeFileSync(outPath, JSON.stringify(rules, null, 2));
     console.log(`✅ ${filename} — ${rules.length} DNR rules written`);
+    const rulesetId = filename.replace(/\.json$/, '');
+    rulesetCounts[rulesetId] = rules.length;
   }
+
+  const countsPath = path.join(RULES_DIR, 'ruleset-counts.json');
+  fs.writeFileSync(countsPath, JSON.stringify(rulesetCounts, null, 2));
+  console.log(`✅ ruleset-counts.json — ${Object.keys(rulesetCounts).length} entries`);
 
   const cosmeticsPath = path.join(RULES_DIR, 'cosmetic-rules.json');
   fs.writeFileSync(cosmeticsPath, JSON.stringify(cosmeticRules, null, 2));
@@ -1152,24 +1239,54 @@ function smartTruncate(networkRules, limit) {
   // Pass 2: score & sort descending
   networkRules.sort((a, b) => scoreNetworkRule(b) - scoreNetworkRule(a));
 
-  // Pass 3: subsumption — domain-only anchors subsume path-specific anchors
-  const dominantDomains = new Set();
+  // Pass 3: subsumption — domain-only anchors subsume path-specific anchors,
+  // but ONLY when the broader rule's resourceTypes is a superset of the
+  // narrower rule's. Otherwise ||ads.foo (no types) wrongly subsumes
+  // ||ads.foo$image, which actually covers a different request set.
+  // dominantDomains: domain -> Set<resourceType> | null (null = all types)
+  const dominantDomains = new Map();
   const selected = [];
+
+  const typeSetFor = (rule) => {
+    const types = rule.options?.resourceTypes;
+    return Array.isArray(types) && types.length > 0 ? new Set(types) : null;
+  };
+
+  const broaderCoversNarrower = (broaderTypes, narrowerTypes) => {
+    // Broader has no resourceTypes constraint → matches all types → always covers.
+    if (broaderTypes === null) return true;
+    // Narrower has no constraint but broader does → broader is NOT a superset.
+    if (narrowerTypes === null) return false;
+    for (const t of narrowerTypes) if (!broaderTypes.has(t)) return false;
+    return true;
+  };
 
   for (const r of networkRules) {
     if (selected.length >= limit) break;
 
     const isDomainOnly = /^\|\|([^/*?^]+)\^?$/.exec(r.pattern);
     if (isDomainOnly && !r.exception) {
-      dominantDomains.add(isDomainOnly[1]);
+      const existing = dominantDomains.get(isDomainOnly[1]);
+      const incoming = typeSetFor(r);
+      // Track the broadest (type-wise) rule per domain — null wins.
+      if (!existing || existing === null) {
+        dominantDomains.set(isDomainOnly[1], incoming === null ? null : incoming);
+      } else if (incoming === null) {
+        dominantDomains.set(isDomainOnly[1], null);
+      } else {
+        for (const t of incoming) existing.add(t);
+      }
       selected.push(r);
       continue;
     }
 
-    // Skip if a broader rule for this domain is already selected
     if (!r.exception && r.pattern.startsWith('||')) {
       const domainMatch = /^\|\|([^/*?^]+)/.exec(r.pattern);
-      if (domainMatch && dominantDomains.has(domainMatch[1])) continue;
+      if (domainMatch && dominantDomains.has(domainMatch[1])) {
+        const broaderTypes = dominantDomains.get(domainMatch[1]);
+        const narrowerTypes = typeSetFor(r);
+        if (broaderCoversNarrower(broaderTypes, narrowerTypes)) continue;
+      }
     }
 
     selected.push(r);
@@ -1187,6 +1304,7 @@ async function main() {
 
   if (SAMPLE_MODE) {
     writeSampleOutputs();
+    verifyManifestRuleResourcePaths();
     process.exit(0);
   }
 
@@ -1198,8 +1316,13 @@ async function main() {
     if (fs.existsSync(wasmJsPath) && fs.existsSync(wasmPath)) {
       const wasmModule = await import('../src/shared/wasm/nullify_core.js');
       await wasmModule.default({ module_or_path: fs.readFileSync(wasmPath) });
-      parseFilterSourceWithRust = wasmModule.parse_filter_source;
-      rustSourceParserReady = true;
+      const fn = wasmModule.parse_filter_source;
+      if (typeof fn === 'function') {
+        parseFilterSourceWithRust = fn;
+        rustSourceParserReady = true;
+      } else {
+        console.warn('⚠️  WASM loaded but parse_filter_source export missing — using JS fallback. Rebuild wasm with `npm run build:wasm` if Rust parser is expected.');
+      }
     }
   } catch (err) {
     console.warn(`⚠️  Rust source parser unavailable, falling back to JS extraction: ${err.message}`);
@@ -1219,21 +1342,37 @@ async function main() {
       const text = await fetchAndExpand(list.url);
       const parsed = parseFilterList(text, list.id);
 
-      console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skipped} skipped`);
+      console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skippedRecords.length} skipped`);
       const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
       let networkRules = parsed.networkRules;
-      const sourceBundle = rustSourceParserReady
-        ? parseFilterSourceWithRust(text)
-        : buildSourceBundleFallback(parsed);
-      
+      let sourceBundle = null;
+      if (rustSourceParserReady) {
+        try {
+          sourceBundle = parseFilterSourceWithRust(text);
+        } catch (err) {
+          console.warn(`   ⚠️  Rust parse_filter_source failed for ${list.id} (${err.message}); using JS fallback.`);
+        }
+      }
+      if (!sourceBundle) sourceBundle = buildSourceBundleFallback(parsed);
+
+      let truncatedCount = 0;
       if (networkRules.length > config.totalLimit) {
-        console.log(`   ⚠️  Rule count (${networkRules.length}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
+        const before = networkRules.length;
+        console.log(`   ⚠️  Rule count (${before}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
         networkRules = smartTruncate(networkRules, config.totalLimit);
-        console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept`);
+        truncatedCount = before - networkRules.length;
+        console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept (${truncatedCount} trimmed by smartTruncate)`);
       }
 
-      const dnrRules = buildDNRRules(networkRules);
-      
+      const { dnrRules, droppedRecords } = buildDNRRules(networkRules);
+
+      writeSkipLog(list.id, {
+        parseSkips: parsed.skippedRecords,
+        dnrDrops: droppedRecords,
+        truncatedCount,
+      });
+      printSkipSummary(list.id, parsed.skippedRecords, droppedRecords, truncatedCount);
+
       // Split and stage rules for a single final write.
       for (let i = 0; i < config.parts; i++) {
         const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
@@ -1279,6 +1418,8 @@ async function main() {
     scriptletRules: allScriptletRules,
     filterSources,
   });
+
+  verifyManifestRuleResourcePaths();
 
   console.log('\n🎉 Build complete!');
   process.exit(0);

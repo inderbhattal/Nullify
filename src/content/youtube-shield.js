@@ -49,18 +49,6 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       error: wasmInitError,
       source: wasmSource,
     };
-    try {
-      const root = document.documentElement;
-      if (!root) return;
-      root.setAttribute('data-nullify-yt-wasm', status);
-      if (wasmSource) {
-        root.setAttribute('data-nullify-yt-wasm-source', wasmSource);
-      } else {
-        root.removeAttribute('data-nullify-yt-wasm-source');
-      }
-    } catch {
-      // Ignore page-level debug state failures.
-    }
   };
   const shouldBlockRequestUrl = (url) =>
     url.includes('/ad_break') ||
@@ -170,29 +158,13 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       console.error('[Nullify] WASM init failed:', err);
     });
   };
-  const resolveWasmModule = () => {
-    const runtimeUrl = getRuntimeWasmUrl();
-    if (runtimeUrl) return { url: runtimeUrl, source: 'runtime' };
-    const attrUrl = document.documentElement?.getAttribute('data-nullify-wasm') || null;
-    if (attrUrl) return { url: attrUrl, source: 'dom' };
-    return { url: null, source: null };
-  };
   const startWasmBootstrap = () => {
-    const { url, source } = resolveWasmModule();
+    const url = getRuntimeWasmUrl();
     if (!url) return false;
-    bootstrapWasm(url, source);
+    bootstrapWasm(url, 'runtime');
     return true;
   };
-  if (!startWasmBootstrap()) {
-    const root = document.documentElement;
-    if (root) {
-      const attrObs = new MutationObserver(() => {
-        if (!startWasmBootstrap()) return;
-        attrObs.disconnect();
-      });
-      attrObs.observe(root, { attributes: true, attributeFilter: ['data-nullify-wasm'] });
-    }
-  }
+  startWasmBootstrap();
 
   // 3. Response Scrubber
   // String scrubbers are kept for XHR/JSON-backed fallback paths. For fetch, we

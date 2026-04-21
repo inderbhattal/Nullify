@@ -41,7 +41,7 @@
     "rule_resources": [
       {
         "id": "easylist",
-        "enabled": false,
+        "enabled": true,
         "path": "rules/easylist.json"
       },
       {
@@ -61,7 +61,7 @@
       },
       {
         "id": "easyprivacy",
-        "enabled": false,
+        "enabled": true,
         "path": "rules/easyprivacy.json"
       },
       {
@@ -81,12 +81,12 @@
       },
       {
         "id": "malware",
-        "enabled": false,
+        "enabled": true,
         "path": "rules/malware.json"
       },
       {
         "id": "ubo-filters",
-        "enabled": false,
+        "enabled": true,
         "path": "rules/ubo-filters.json"
       },
       {
@@ -106,7 +106,7 @@
       },
       {
         "id": "anti-adblock",
-        "enabled": false,
+        "enabled": true,
         "path": "rules/anti-adblock.json"
       },
       {

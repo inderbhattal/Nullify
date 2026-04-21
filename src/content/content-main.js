@@ -78,17 +78,6 @@ function decodeBinaryRules(buffer) {
 }
 
 async function main() {
-  // 0. Provide the WASM URL fallback to the MAIN-world YouTube shield.
-  const isYouTube = hostname.includes('youtube.com');
-  if (isYouTube) {
-    try {
-      const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
-      document.documentElement.setAttribute('data-nullify-wasm', wasmUrl);
-    } catch {
-      // Ignore if runtime URL resolution is unavailable here
-    }
-  }
-
   // Fire a single consolidated request to avoid messaging overhead and SW wake-up contention.
   let initRes;
   try {
@@ -125,8 +114,10 @@ async function main() {
   };
 
   // Apply cosmetic rules
-  const hasProcedural = finalRules?.generic?.some(r => typeof r === 'object' || (typeof r === 'string' && r.includes(':'))) || 
-                       finalRules?.domainSpecific?.some(r => typeof r === 'object' || (typeof r === 'string' && r.includes(':')));
+  const PROC_TOKEN_REGEX = /:(?:has-text|upward|matches-css|matches-css-before|matches-css-after|matches-attr|matches-path|has|xpath|min-text-length|watch-attr|remove|if|if-not|nth-ancestor|style)\(/;
+  const isProceduralRule = (r) => typeof r === 'object' || (typeof r === 'string' && PROC_TOKEN_REGEX.test(r));
+  const hasProcedural = finalRules?.generic?.some(isProceduralRule) ||
+                       finalRules?.domainSpecific?.some(isProceduralRule);
   const hasExceptions = finalRules?.exceptions?.length > 0;
   
   if (!hasProcedural && !hasExceptions) return;

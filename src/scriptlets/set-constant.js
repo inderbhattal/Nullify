@@ -39,12 +39,20 @@ export function setConstant(prop, value) {
     obj = obj[p];
   }
 
-  Object.defineProperty(obj, lastProp, {
-    configurable: false,
-    enumerable: true,
-    writable: false, // Prevents overwriting
-    value: resolvedValue
-  });
+  // Match uBO semantics: getter returns constant, setter is a no-op. Keep the
+  // property configurable so a later call (or page script redefining with
+  // defineProperty) can replace the trap without throwing. The getter pins
+  // the value regardless of what page code assigns.
+  try {
+    Object.defineProperty(obj, lastProp, {
+      configurable: true,
+      enumerable: true,
+      get() { return resolvedValue; },
+      set() { /* ignore writes */ },
+    });
+  } catch {
+    // Existing non-configurable descriptor — best effort, skip.
+  }
 }
 
 function resolveValue(val) {

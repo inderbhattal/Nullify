@@ -43,16 +43,12 @@ export function fingerprintNoise() {
 
   // ---------------------------------------------------------------------------
   // Canvas Fingerprinting Protection
+  //
+  // Intentionally do NOT force willReadFrequently — that flag pushes the
+  // backing store to CPU memory and destroys framerate on legitimate
+  // canvas-heavy sites (games, photo editors, maps). Perturbing the output
+  // of getImageData and toDataURL is enough to defeat fingerprinting.
   // ---------------------------------------------------------------------------
-  const origGetContext = HTMLCanvasElement.prototype.getContext;
-  HTMLCanvasElement.prototype.getContext = function (type, options) {
-    if (type === '2d') {
-      options = options || {};
-      options.willReadFrequently = true;
-    }
-    return origGetContext.call(this, type, options);
-  };
-
   const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
   CanvasRenderingContext2D.prototype.getImageData = function (x, y, w, h) {
     const imageData = origGetImageData.apply(this, arguments);
@@ -80,13 +76,27 @@ export function fingerprintNoise() {
 
   // ---------------------------------------------------------------------------
   // Audio Fingerprinting Protection
+  //
+  // Hook OfflineAudioContext.startRendering — that's the API fingerprinters
+  // use to capture audio output deterministically. Perturb a clone of the
+  // rendered buffer rather than the live channel data (mutating live
+  // channel data corrupts playback on every audio-capable site).
   // ---------------------------------------------------------------------------
-  if (window.AudioBuffer) {
-    const origGetChannelData = AudioBuffer.prototype.getChannelData;
-    AudioBuffer.prototype.getChannelData = function () {
-      const data = origGetChannelData.apply(this, arguments);
-      perturbAudio(data, data.length >>> 0);
-      return data;
+  if (window.OfflineAudioContext?.prototype?.startRendering) {
+    const origRender = OfflineAudioContext.prototype.startRendering;
+    OfflineAudioContext.prototype.startRendering = function () {
+      const promise = origRender.apply(this, arguments);
+      return promise.then((buffer) => {
+        try {
+          for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+            const live = buffer.getChannelData(ch);
+            const clone = new Float32Array(live);
+            perturbAudio(clone, (ch + 1) >>> 0);
+            live.set(clone); // Replace values in-place; rendered output buffer is not played back anywhere else.
+          }
+        } catch { /* ignore */ }
+        return buffer;
+      });
     };
   }
 }

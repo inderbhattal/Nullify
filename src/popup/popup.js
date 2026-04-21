@@ -133,13 +133,21 @@ function bindEvents() {
   $('btnAllowSite').addEventListener('click', async () => {
     if (!currentHostname) return;
 
-    if (isSiteAllowed) {
-      await chrome.runtime.sendMessage({ type: 'DISALLOW_SITE', payload: { domain: currentHostname } });
-    } else {
-      await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: currentHostname } });
+    const type = isSiteAllowed ? 'DISALLOW_SITE' : 'ALLOW_SITE';
+    try {
+      const res = await chrome.runtime.sendMessage({ type, payload: { domain: currentHostname } });
+      // Trust the SW's view, not an optimistic local flip. If the SW
+      // reports failure (e.g. invalid domain) the UI must not lie.
+      if (res && res.ok === false) return;
+      const confirmRes = await chrome.runtime.sendMessage({
+        type: 'IS_SITE_ALLOWED',
+        payload: { domain: currentHostname },
+      });
+      isSiteAllowed = !!confirmRes?.allowed;
+    } catch (err) {
+      console.error('[Nullify] allowlist toggle failed:', err);
+      return;
     }
-
-    isSiteAllowed = !isSiteAllowed;
     updateSiteStatusUI();
   });
 
@@ -171,11 +179,13 @@ function bindEvents() {
   $('selectPersona').addEventListener('change', async (e) => {
     const persona = e.target.value;
     try {
-      const settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' });
-      settings.stealthPersona = persona;
-      await chrome.runtime.sendMessage({ type: 'SET_SETTINGS', payload: settings });
-      
-      // Reload the tab to apply the new User-Agent immediately
+      // Send only the changed key so the SW can merge atomically. A full
+      // read-modify-write here clobbers concurrent option-page edits.
+      await chrome.runtime.sendMessage({
+        type: 'UPDATE_SETTINGS',
+        payload: { stealthPersona: persona },
+      });
+
       chrome.tabs.reload(currentTab.id);
       window.close();
     } catch (err) {

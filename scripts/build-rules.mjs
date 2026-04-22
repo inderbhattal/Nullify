@@ -480,6 +480,17 @@ function reportDrop(reason, pattern) {
   if (_currentDropSink) _currentDropSink.push({ reason, pattern });
 }
 
+function isUnsafeGlobalFragmentImageRedirect(pattern, options, exception) {
+  if (exception || !options.redirect) return false;
+  if (options.important) return false;
+  if (options.thirdParty !== null) return false;
+  if (options.resourceTypes.length !== 1 || options.resourceTypes[0] !== 'image') return false;
+  if (options.excludedResourceTypes.length > 0) return false;
+  if (options.initiatorDomains.length > 0 || options.excludedInitiatorDomains.length > 0) return false;
+  if (options.requestDomains.length > 0) return false;
+  return /^\*\.(?:png|gif|jpe?g|svg)#$/.test(pattern);
+}
+
 /**
  * Convert a parsed network filter into a DNR rule object.
  * Returns null if conversion is not possible (reason is reported via reportDrop).
@@ -509,6 +520,14 @@ function networkFilterToDNR(parsed) {
   ];
   if (patternBlacklist.includes(pattern)) {
     reportDrop('upstream-blacklist: known broken/overly-broad pattern', pattern);
+    return null;
+  }
+
+  // Chromium DNR matches against the full request URL, including fragments.
+  // Legacy global sprite-killer rules such as `*.svg#$image,redirect-rule=1x1.gif`
+  // are therefore too broad here and break modern app icon/sprite assets.
+  if (isUnsafeGlobalFragmentImageRedirect(pattern, options, exception)) {
+    reportDrop('unsafe-global-fragment-image-redirect: too broad under Chromium DNR fragment matching', pattern);
     return null;
   }
 
@@ -1425,7 +1444,13 @@ async function main() {
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error('Build failed:', err);
-  process.exit(1);
-});
+export { parseLine, networkFilterToDNR };
+
+const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+  main().catch((err) => {
+    console.error('Build failed:', err);
+    process.exit(1);
+  });
+}

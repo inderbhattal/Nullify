@@ -4,7 +4,7 @@
 
 import './options.css';
 
-import { normalizeHostname } from '../shared/hostname.js';
+import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -254,10 +254,24 @@ async function initMyFilters() {
 }
 
 function showFilterStatus(msg, type) {
-  const el = $('filterStatus');
+  showStatus('filterStatus', msg, type);
+}
+
+function showAllowlistStatus(msg, type) {
+  showStatus('allowlistStatus', msg, type);
+}
+
+function showStatus(id, msg, type) {
+  const el = $(id);
+  if (!el) return;
   el.textContent = msg;
-  el.style.color = type === 'error' ? 'var(--red)' : 'var(--accent2)';
-  setTimeout(() => { el.textContent = ''; }, 3000);
+  el.style.color = type === 'error'
+    ? 'var(--red)'
+    : type === 'warning'
+      ? 'var(--yellow)'
+      : 'var(--accent2)';
+  if (el._clearTimer) clearTimeout(el._clearTimer);
+  el._clearTimer = setTimeout(() => { el.textContent = ''; }, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -269,15 +283,91 @@ async function initAllowlist() {
   $('btnAddAllowlist').addEventListener('click', async () => {
     const domain = normalizeHostname($('allowlistInput').value);
 
-    if (!domain) return;
+    if (!domain) {
+      showAllowlistStatus('Enter a valid hostname or URL', 'error');
+      return;
+    }
 
-    await chrome.runtime.sendMessage({
+    const res = await chrome.runtime.sendMessage({
       type: 'ALLOW_SITE',
       payload: { domain },
     });
+    if (res?.ok === false) {
+      showAllowlistStatus('Enter a valid hostname or URL', 'error');
+      return;
+    }
 
     $('allowlistInput').value = '';
-    await renderAllowlist();
+    await renderAllowlist(res?.allowlist);
+  });
+
+  $('btnExportAllowlist').addEventListener('click', async () => {
+    const allowlist = await fetchAllowlist();
+    if (allowlist.length === 0) {
+      showAllowlistStatus('Nothing to export — allowlist is empty', 'error');
+      return;
+    }
+
+    const header = `# Title: Allowlist\n# Exported: ${new Date().toISOString()}\n#\n`;
+    const blob = new Blob([header + allowlist.join('\n') + '\n'], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `allowlist-${new Date().toISOString().slice(0, 10)}.txt`;
+      a.click();
+      showAllowlistStatus('✓ Allowlist exported', 'success');
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    }
+  });
+
+  $('btnImportAllowlist').addEventListener('click', () => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.txt,.text,text/plain';
+    const MAX_IMPORT_BYTES = 1024 * 1024; // 1 MB
+
+    input.addEventListener('change', async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      if (file.size > MAX_IMPORT_BYTES) {
+        showAllowlistStatus(`✗ File too large (>${MAX_IMPORT_BYTES / (1024 * 1024)} MB)`, 'error');
+        return;
+      }
+
+      try {
+        const text = await file.text();
+        const imported = parseAllowlistText(text);
+        if (imported.length === 0) {
+          showAllowlistStatus('⚠ Imported file contains no valid sites', 'warning');
+          return;
+        }
+
+        const current = await fetchAllowlist();
+        const merged = normalizeAllowlist(current.concat(imported));
+        const addedCount = merged.length - current.length;
+        if (addedCount === 0) {
+          showAllowlistStatus('No new sites to import', 'warning');
+          return;
+        }
+
+        const res = await chrome.runtime.sendMessage({
+          type: 'SET_ALLOWLIST',
+          payload: { domains: merged },
+        });
+        if (res?.ok === false) {
+          throw new Error(res.error || 'Allowlist import failed');
+        }
+
+        await renderAllowlist(res?.allowlist || merged);
+        showAllowlistStatus(`✓ Imported ${file.name} (${addedCount} sites added)`, 'success');
+      } catch (err) {
+        showAllowlistStatus('✗ Import failed: ' + err.message, 'error');
+      }
+    });
+
+    input.click();
   });
 
   $('allowlistInput').addEventListener('keydown', (e) => {
@@ -285,17 +375,41 @@ async function initAllowlist() {
   });
 }
 
-async function renderAllowlist() {
-  let allowlist = [];
+function parseAllowlistText(text) {
+  return normalizeAllowlist(
+    text.split('\n')
+      .map((line) => line.trim())
+      .filter((line) => {
+        if (!line) return false;
+        if (/^(?:!|#)\s*$/.test(line)) return false;
+        if (/^(?:!|#)\s*(Title|Exported):/i.test(line)) return false;
+        if (/^(?:!|#)/.test(line)) return false;
+        return true;
+      })
+  );
+}
+
+async function fetchAllowlist() {
   try {
-    allowlist = await chrome.runtime.sendMessage({ type: 'GET_ALLOWLIST' }) || [];
-  } catch {}
+    return normalizeAllowlist(await chrome.runtime.sendMessage({ type: 'GET_ALLOWLIST' }) || []);
+  } catch {
+    return [];
+  }
+}
+
+async function renderAllowlist(allowlistOverride) {
+  const allowlist = Array.isArray(allowlistOverride)
+    ? normalizeAllowlist(allowlistOverride)
+    : await fetchAllowlist();
 
   const ul = $('allowlistItems');
   ul.innerHTML = '';
 
   if (allowlist.length === 0) {
-    ul.innerHTML = '<li style="color: var(--text-muted); font-size: 13px; padding: 12px;">No sites in allowlist.</li>';
+    const li = document.createElement('li');
+    li.className = 'allowlist-empty';
+    li.textContent = 'No sites in allowlist.';
+    ul.appendChild(li);
     return;
   }
 
@@ -311,11 +425,11 @@ async function renderAllowlist() {
     const removeBtn = li.querySelector('.allowlist-remove');
     removeBtn.dataset.domain = domain;
     removeBtn.addEventListener('click', async () => {
-      await chrome.runtime.sendMessage({
+      const res = await chrome.runtime.sendMessage({
         type: 'DISALLOW_SITE',
         payload: { domain },
       });
-      await renderAllowlist();
+      await renderAllowlist(res?.allowlist);
     });
     ul.appendChild(li);
   }

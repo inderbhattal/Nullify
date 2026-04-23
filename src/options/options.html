@@ -108,6 +108,10 @@
       <section id="tab-allowlist" class="tab-content">
         <div class="section-header">
           <h2>Allowlist</h2>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-secondary" id="btnImportAllowlist" title="Import allowlist from file">Import</button>
+            <button class="btn btn-secondary" id="btnExportAllowlist" title="Export allowlist to file">Export</button>
+          </div>
         </div>
         <p class="section-desc">Sites on this list will have all blocking disabled.</p>
 
@@ -115,6 +119,8 @@
           <input type="text" id="allowlistInput" class="text-input" placeholder="example.com">
           <button class="btn btn-primary" id="btnAddAllowlist">Add site</button>
         </div>
+
+        <div class="allowlist-status" id="allowlistStatus"></div>
 
         <ul class="allowlist-items" id="allowlistItems">
           <!-- Populated by JS -->

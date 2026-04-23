@@ -1878,29 +1878,40 @@ function parseSimpleNetworkRule(line, id) {
 /** Add a site to the per-site allowlist (disable blocking for domain). */
 async function allowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
-  if (!normalizedDomain) return;
+  if (!normalizedDomain) return Array.from(cachedAllowlist);
 
-  // Source of truth is the in-memory cache + matcher. Persist + DNR sync to
-  // keep DNR in lock-step, then refresh the memoized matcher last.
-  if (!cachedAllowlist.has(normalizedDomain)) {
-    cachedAllowlist.add(normalizedDomain);
+  if (cachedAllowlist.has(normalizedDomain)) {
+    return Array.from(cachedAllowlist);
   }
-  const allowlist = Array.from(cachedAllowlist);
-  await setStorage(StorageKeys.ALLOWLIST, allowlist);
-  await rebuildAllowlistRules(allowlist);
+
+  return setAllowlistDomains(Array.from(cachedAllowlist).concat(normalizedDomain));
+}
+
+/** Replace the entire allowlist and synchronize all dependent runtime state. */
+async function setAllowlistDomains(domains) {
+  const normalizedAllowlist = normalizeAllowlist(domains);
+
+  cachedAllowlist = new Set(normalizedAllowlist);
+  await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
+  await rebuildAllowlistRules(normalizedAllowlist);
   rebuildAllowlistMatcher();
+
+  // The allowlist changes which page bundles and script registrations apply,
+  // so drop cached bundles and recompute the YouTube shield exclusions.
+  domainRulesCache.clear();
+  await syncYouTubeShieldRegistration();
+
+  return normalizedAllowlist;
 }
 
 /** Remove a site from the allowlist. */
 async function disallowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
-  if (!normalizedDomain) return;
+  if (!normalizedDomain || !cachedAllowlist.has(normalizedDomain)) {
+    return Array.from(cachedAllowlist);
+  }
 
-  if (!cachedAllowlist.delete(normalizedDomain)) return;
-  const allowlist = Array.from(cachedAllowlist);
-  await setStorage(StorageKeys.ALLOWLIST, allowlist);
-  await rebuildAllowlistRules(allowlist);
-  rebuildAllowlistMatcher();
+  return setAllowlistDomains(Array.from(cachedAllowlist).filter((entry) => entry !== normalizedDomain));
 }
 
 /** Rebuild DNR allow-all-requests rules from allowlist. */
@@ -2468,18 +2479,18 @@ async function handleMessage(message, sender) {
     case 'ALLOW_SITE': {
       const domain = normalizeHostname(payload.domain);
       if (!domain) return { ok: false };
-      await allowSite(domain);
-      domainRulesCache.delete(domain);
-      await syncYouTubeShieldRegistration();
-      return { ok: true };
+      const allowlist = await allowSite(domain);
+      return { ok: true, allowlist };
     }
     case 'DISALLOW_SITE': {
       const domain = normalizeHostname(payload.domain);
       if (!domain) return { ok: false };
-      await disallowSite(domain);
-      domainRulesCache.delete(domain);
-      await syncYouTubeShieldRegistration();
-      return { ok: true };
+      const allowlist = await disallowSite(domain);
+      return { ok: true, allowlist };
+    }
+    case 'SET_ALLOWLIST': {
+      const allowlist = await setAllowlistDomains(payload?.domains);
+      return { ok: true, allowlist };
     }
     case 'IS_SITE_ALLOWED': {
       return { allowed: isHostnameAllowedCached(normalizeHostname(payload.domain)) };

@@ -245,7 +245,8 @@ body {
 }
 .filter-editor:focus { border-color: var(--accent); }
 
-.filter-status {
+.filter-status,
+.allowlist-status {
   margin-top: 8px;
   font-size: 12px;
   color: var(--accent2);
@@ -291,6 +292,12 @@ body {
 }
 
 .allowlist-item-domain { color: var(--text); }
+
+.allowlist-empty {
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 12px;
+}
 
 .allowlist-remove {
   background: none;

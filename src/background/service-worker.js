@@ -785,8 +785,6 @@ function registerContextMenus() {
 }
 
 chrome.runtime.onInstalled.addListener(async (details) => {
-  console.log('[AdBlock] onInstalled:', details.reason);
-
   registerContextMenus();
 
   try {
@@ -1985,26 +1983,25 @@ async function loadRulesetCountsFromBuild() {
   }
 }
 
-// Stability/safety lists first, then core ad/tracker blockers (main shards
-// before secondary shards), then niche lists. This order ensures that under
-// tight static-rule budgets the user still gets the main EasyList and
-// EasyPrivacy coverage before niche annoyances/cookie lists.
+// Stability/safety lists first, then core blockers, then niche lists. Under
+// tight static-rule budgets we prioritize ad blocking before tracker blocking,
+// so every EasyList shard is attempted before any EasyPrivacy shard.
 const RULESET_ENABLE_PRIORITY = [
   'system-unbreak',
   'ubo-unbreak',
-  'malware',
   'easylist',
-  'easyprivacy',
-  'ubo-filters',
   'easylist_2',
-  'easyprivacy_2',
   'easylist_3',
-  'easyprivacy_3',
+  'easylist_4',
+  'malware',
+  'ubo-filters',
   'anti-adblock',
   'annoyances',
   'ubo-cookie-annoyances',
-  'easylist_4',
   'ubo-filters_2',
+  'easyprivacy',
+  'easyprivacy_2',
+  'easyprivacy_3',
 ];
 
 /**

@@ -1,3 +1,5 @@
+import { toMatcher } from './shared-utils.js';
+
 /**
  * m3u-prune.js
  *
@@ -51,18 +53,21 @@ export function m3uPrune(urlPattern, prunePattern) {
       return origOpen(method, url, ...rest);
     };
 
-    Object.defineProperty(xhr, 'responseText', {
-      get() {
-        const text = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText').get.call(this);
-        if (isTarget && text) {
-          const lines = text.split('\n');
-          const filtered = lines.filter(line => !matchPrune(line));
-          return filtered.join('\n');
-        }
-        return text;
-      },
-      configurable: true,
-    });
+    const textDesc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText');
+    if (textDesc?.get) {
+      Object.defineProperty(xhr, 'responseText', {
+        get() {
+          const text = textDesc.get.call(this);
+          if (isTarget && text) {
+            const lines = text.split('\n');
+            const filtered = lines.filter(line => !matchPrune(line));
+            return filtered.join('\n');
+          }
+          return text;
+        },
+        configurable: true,
+      });
+    }
 
     return xhr;
   }
@@ -70,11 +75,3 @@ export function m3uPrune(urlPattern, prunePattern) {
   window.XMLHttpRequest = PatchedXHR;
 }
 
-function toMatcher(pattern) {
-  if (typeof pattern === 'string' && pattern.startsWith('/')) {
-    const lastSlash = pattern.lastIndexOf('/');
-    const re = new RegExp(pattern.slice(1, lastSlash), pattern.slice(lastSlash + 1));
-    return (val) => re.test(val);
-  }
-  return (val) => val.includes(pattern);
-}

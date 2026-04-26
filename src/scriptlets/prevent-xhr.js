@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /**
  * prevent-xhr.js
  * Block or stub XMLHttpRequest calls matching a URL pattern.
@@ -43,15 +45,4 @@ export function preventXhr(pattern) {
 
   PatchedXHR.prototype = OrigXHR.prototype;
   window.XMLHttpRequest = PatchedXHR;
-}
-
-function patternToRegex(pattern) {
-  try {
-    if (pattern.startsWith('/') && pattern.endsWith('/')) {
-      return new RegExp(pattern.slice(1, -1));
-    }
-    return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  } catch {
-    return null;
-  }
 }

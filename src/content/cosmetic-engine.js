@@ -680,6 +680,18 @@ export class CosmeticEngine {
 
   /** Apply an XPath expression directly to the document. */
   _applyXPath(expr) {
+    // Reject unsafe axes that can traverse beyond the document or access
+    // ancestor frames (ancestor, following, preceding, and unanchored //).
+    const unsafeAxes = /\b(ancestor|ancestor-or-self|following|following-sibling|preceding|preceding-sibling)::/;
+    if (unsafeAxes.test(expr)) {
+      _reportError('Blocked unsafe XPath axis', new Error(expr));
+      return;
+    }
+    // Reject expressions starting with // (unanchored descendant search)
+    if (/^\/\//.test(expr.trim())) {
+      _reportError('Blocked unanchored XPath //', new Error(expr));
+      return;
+    }
     try {
       const result = document.evaluate(
         expr, document, null,

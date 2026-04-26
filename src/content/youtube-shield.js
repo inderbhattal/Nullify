@@ -11,10 +11,24 @@ import init, {
 import { initWasmFromUrl } from '../shared/wasm-loader.js';
 
 (function() {
+  const SHIELD_STATE_KEY = '__nullifyYoutubeShield';
+  const SHIELD_VERSION = 2;
+  const shieldState = globalThis[SHIELD_STATE_KEY] || {};
+  const installedVersions = Array.isArray(shieldState.versions) ? shieldState.versions : [];
+  if (installedVersions.includes(SHIELD_VERSION)) return;
+  globalThis[SHIELD_STATE_KEY] = {
+    loaded: true,
+    version: SHIELD_VERSION,
+    versions: installedVersions.concat(SHIELD_VERSION),
+    startedAt: shieldState.startedAt || Date.now(),
+    updatedAt: Date.now(),
+  };
+
   let wasmReady = false;
   let wasmInitStarted = false;
   let wasmInitError = null;
   let wasmSource = null;
+  const WASM_ATTR = 'data-nullify-wasm';
   const getRuntimeWasmCandidates = () => {
     try {
       const runtime = globalThis.chrome?.runtime;
@@ -38,8 +52,21 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       return [];
     }
   };
-  const isPlayerResponseUrl = (url) => url.includes('/v1/player');
+  const getDomWasmCandidates = () => {
+    try {
+      const url = document.documentElement?.getAttribute(WASM_ATTR);
+      return url ? [{ url, source: 'dom' }] : [];
+    } catch {
+      return [];
+    }
+  };
+  const isYoutubePlayerLikeUrl = (url = '') =>
+    url.includes('/v1/player') ||
+    url.includes('/v1/next') ||
+    url.includes('/get_watch') ||
+    url.includes('/get_video_info');
   const PLAYER_POLL_DELAYS = [50, 100, 200, 400, 800, 1600, 3000];
+  const PRUNE_NODE_LIMIT = 10000;
 
   // ---- Ad key constants ----
   const AD_KEYS = ['adPlacements', 'adSlots', 'playerAds', 'adBreakHeartbeatParams', 'adClientParams'];
@@ -77,21 +104,40 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   //
   // Setting to false is safer than deletion or renaming. It keeps the exact
   // keys YouTube's player logic expects, but disables the ads.
-  function pruneAdKeys(obj) {
+  function pruneAdKeys(obj, deep = false, state = null) {
     if (!obj || typeof obj !== 'object') return;
+    const pruneState = state || { seen: new WeakSet(), nodes: 0 };
+    if (pruneState.seen.has(obj) || pruneState.nodes >= PRUNE_NODE_LIMIT) return;
+    pruneState.seen.add(obj);
+    pruneState.nodes++;
+
     for (let i = 0; i < AD_KEYS.length; i++) {
       const key = AD_KEYS[i];
-      if (obj[key] !== undefined) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
         obj[key] = false;
       }
     }
-    if (obj.playerResponse) pruneAdKeys(obj.playerResponse);
+
+    if (deep) {
+      if (obj.playerResponse && typeof obj.playerResponse === 'object') {
+        pruneAdKeys(obj.playerResponse, true, pruneState);
+      }
+      const keys = Object.keys(obj);
+      for (let i = 0; i < keys.length; i++) {
+        if (keys[i] === 'playerResponse') continue;
+        const value = obj[keys[i]];
+        if (value && typeof value === 'object') pruneAdKeys(value, true, pruneState);
+      }
+      return;
+    }
+
+    if (obj.playerResponse) pruneAdKeys(obj.playerResponse, false, pruneState);
   }
 
   function hasAdPayload(obj) {
     if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return false;
     for (let i = 0; i < AD_KEYS.length; i++) {
-      if (obj[AD_KEYS[i]] !== undefined) return true;
+      if (Object.prototype.hasOwnProperty.call(obj, AD_KEYS[i])) return true;
     }
     return false;
   }
@@ -142,7 +188,9 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     const _origResponseJson = Response.prototype.json;
     Response.prototype.json = async function(...args) {
       const result = await _origResponseJson.apply(this, args);
-      if (isPlayerResponseUrl(this.url) && shouldPruneParsedResult(result)) {
+      if (isYoutubePlayerLikeUrl(this.url)) {
+        pruneAdKeys(result, true);
+      } else if (shouldPruneParsedResult(result)) {
         pruneAdKeys(result);
       }
       return result;
@@ -190,12 +238,21 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     });
   };
   const startWasmBootstrap = () => {
-    const candidates = getRuntimeWasmCandidates();
+    const candidates = getRuntimeWasmCandidates().concat(getDomWasmCandidates());
     if (candidates.length === 0) return false;
     bootstrapWasm(candidates);
     return true;
   };
-  startWasmBootstrap();
+  if (!startWasmBootstrap()) {
+    const root = document.documentElement;
+    if (root) {
+      const attrObs = new MutationObserver(() => {
+        if (!startWasmBootstrap()) return;
+        attrObs.disconnect();
+      });
+      attrObs.observe(root, { attributes: true, attributeFilter: [WASM_ATTR] });
+    }
+  }
 
   // 3. Response Scrubber
   // String scrubbers are kept for XHR/JSON-backed fallback paths. For fetch, we
@@ -318,10 +375,16 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       return super.send(...args);
     }
 
-    _isPlayer() {
+    _isPlayerText() {
       return this.readyState === 4 &&
              (this.responseType === '' || this.responseType === 'text') &&
-             isPlayerResponseUrl(this._nUrl);
+             isYoutubePlayerLikeUrl(this._nUrl);
+    }
+
+    _isPlayerJson() {
+      return this.readyState === 4 &&
+             this.responseType === 'json' &&
+             isYoutubePlayerLikeUrl(this._nUrl);
     }
 
     _scrubbed() {
@@ -339,7 +402,7 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
 
     get responseText() {
       if (this._nBlocked) return this._nCached;
-      return this._isPlayer() ? this._scrubbed() : super.responseText;
+      return this._isPlayerText() ? this._scrubbed() : super.responseText;
     }
 
     get response() {
@@ -348,7 +411,11 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
         return this._nCached;
       }
       const r = super.response;
-      return (this._isPlayer() && typeof r === 'string') ? this._scrubbed() : r;
+      if (this._isPlayerJson()) {
+        pruneAdKeys(r, true);
+        return r;
+      }
+      return (this._isPlayerText() && typeof r === 'string') ? this._scrubbed() : r;
     }
 
     get readyState() {
@@ -447,19 +514,64 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   //         — avoids "Experiencing interruptions?" which is caused by seeking
   //           to an unbuffered position.
 
+  let _playbackSnapshot = null;
+
+  const isVisibleElement = (element) => {
+    if (!element || !(element instanceof Element)) return false;
+    const style = window.getComputedStyle(element);
+    const opacity = Number.parseFloat(style.opacity);
+    if (
+      style.display === 'none' ||
+      style.visibility === 'hidden' ||
+      style.visibility === 'collapse' ||
+      (!Number.isNaN(opacity) && opacity <= 0)
+    ) {
+      return false;
+    }
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+
+  const queryVisible = (root, selector) => {
+    const elements = root.querySelectorAll(selector);
+    for (let i = 0; i < elements.length; i++) {
+      if (isVisibleElement(elements[i])) return elements[i];
+    }
+    return null;
+  };
+
+  const capturePlaybackSnapshot = (video) => {
+    if (_playbackSnapshot?.video === video) return;
+    _playbackSnapshot = {
+      video,
+      muted: video.muted,
+      playbackRate: video.playbackRate,
+    };
+  };
+
   const doSkip = (player) => {
     const video = player.querySelector('video');
     if (!video) return;
 
     // 1. Skip button (shown for skippable ads after 5 s)
-    const skipBtn = player.querySelector(
+    const skipBtn = queryVisible(player,
       '.ytp-skip-ad-button:not([style*="display:none"]), ' +
       '.ytp-ad-skip-button-container button, ' +
-      '.ytp-ad-skip-button'
+      '.ytp-ad-skip-button, ' +
+      '.ytp-ad-skip-button-modern, ' +
+      'button[class*="skip"][class*="ad"]'
     );
-    if (skipBtn && skipBtn.offsetParent !== null) {
+    if (skipBtn) {
       skipBtn.click();
       return;
+    }
+
+    const closeOverlay = queryVisible(player,
+      '.ytp-ad-overlay-close-button, ' +
+      '.ytp-ad-image-overlay-close-button'
+    );
+    if (closeOverlay) {
+      closeOverlay.click();
     }
 
     // 2. YouTube internal API
@@ -469,6 +581,7 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     }
 
     // 3. Speed-through (stays within whatever is buffered)
+    capturePlaybackSnapshot(video);
     if (!video.muted) video.muted = true;
     if (video.playbackRate < 16) video.playbackRate = 16;
 
@@ -482,17 +595,88 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     }
   };
 
+  const isAdShowing = (player) => {
+    if (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')) {
+      return true;
+    }
+    return !!queryVisible(player,
+      '.ad-showing, ' +
+      '.ytp-ad-player-overlay, ' +
+      '.ytp-ad-preview-container, ' +
+      '.ytp-ad-text, ' +
+      '.ytp-ad-module, ' +
+      '.video-ads .ytp-ad-image-overlay, ' +
+      '.ytp-ad-skip-button, ' +
+      '.ytp-ad-skip-button-modern'
+    );
+  };
+
   const restorePlayback = (player) => {
+    if (!_playbackSnapshot) return;
     const video = player.querySelector('video');
-    if (!video) return;
-    if (video.muted) video.muted = false;
-    if (video.playbackRate !== 1) video.playbackRate = 1;
+    if (!video) {
+      _playbackSnapshot = null;
+      return;
+    }
+    if (_playbackSnapshot.video === video) {
+      if (video.muted !== _playbackSnapshot.muted) video.muted = _playbackSnapshot.muted;
+      if (video.playbackRate !== _playbackSnapshot.playbackRate) {
+        video.playbackRate = _playbackSnapshot.playbackRate;
+      }
+    }
+    _playbackSnapshot = null;
   };
 
   let _adObs = null;
   let _observedPlayer = null;
   let _playerPollTimer = null;
   let _playerPollIndex = 0;
+  let _adLoopTimer = null;
+  let _adStateFrame = null;
+
+  const stopAdLoop = () => {
+    if (_adLoopTimer) {
+      clearTimeout(_adLoopTimer);
+      _adLoopTimer = null;
+    }
+    if (_adStateFrame !== null) {
+      window.cancelAnimationFrame(_adStateFrame);
+      _adStateFrame = null;
+    }
+  };
+
+  const runAdLoop = (player) => {
+    if (player !== _observedPlayer || !isAdShowing(player)) {
+      stopAdLoop();
+      restorePlayback(player);
+      return;
+    }
+
+    doSkip(player);
+    if (!_adLoopTimer) {
+      _adLoopTimer = setTimeout(() => {
+        _adLoopTimer = null;
+        runAdLoop(player);
+      }, 150);
+    }
+  };
+
+  const handlePlayerAdState = (player) => {
+    if (isAdShowing(player)) {
+      runAdLoop(player);
+    } else {
+      stopAdLoop();
+      restorePlayback(player);
+    }
+  };
+
+  const schedulePlayerAdState = (player) => {
+    if (_adStateFrame !== null) return;
+    _adStateFrame = window.requestAnimationFrame(() => {
+      _adStateFrame = null;
+      handlePlayerAdState(player);
+    });
+  };
 
   const stopPlayerPoll = () => {
     if (_playerPollTimer) {
@@ -504,24 +688,20 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   const attachToPlayer = (player) => {
     if (player === _observedPlayer) return;
     if (_adObs) _adObs.disconnect();
+    stopAdLoop();
     stopPlayerPoll();
     _observedPlayer = player;
 
-    _adObs = new MutationObserver(() => {
-      const isAd = player.classList.contains('ad-showing') ||
-                   player.classList.contains('ad-interrupting');
-      if (isAd) {
-        doSkip(player);
-      } else {
-        restorePlayback(player);
-      }
+    _adObs = new MutationObserver(() => schedulePlayerAdState(player));
+    _adObs.observe(player, {
+      attributes: true,
+      attributeFilter: ['class', 'style'],
+      childList: true,
+      subtree: true,
     });
-    _adObs.observe(player, { attributes: true, attributeFilter: ['class'] });
 
     // Fire immediately in case the page loaded mid-ad
-    if (player.classList.contains('ad-showing') || player.classList.contains('ad-interrupting')) {
-      doSkip(player);
-    }
+    handlePlayerAdState(player);
   };
 
   // Find #movie_player using a short backoff poll instead of a fixed interval.

@@ -11,12 +11,18 @@
  *   Special values: "true", "false", "null", "undefined", "noopFunc",
  *                   "trueFunc", "falseFunc", "emptyArray", "emptyObj", ""
  */
+function isProtoPollutionKey(key) {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
 export function setConstant(prop, value) {
   if (!prop) return;
 
+  const parts = prop.split('.');
+  if (parts.some(isProtoPollutionKey)) return;
+
   const resolvedValue = resolveValue(value);
 
-  const parts = prop.split('.');
   const lastProp = parts[parts.length - 1];
 
   let obj = window;

@@ -16,6 +16,21 @@ import { normalizeHostname } from '../shared/hostname.js';
 const hostname = normalizeHostname(location.hostname);
 const FRAME_STYLE_ID = '__nullify_frame_css__';
 const FRAME_EXCEPTION_STYLE_ID = '__nullify_exception_css__';
+const YOUTUBE_HOSTNAMES = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
+
+function exposeYouTubeWasmUrl() {
+  if (!YOUTUBE_HOSTNAMES.has(hostname)) return;
+  try {
+    const root = document.documentElement;
+    const getURL = chrome.runtime?.getURL?.bind(chrome.runtime);
+    if (!root || typeof getURL !== 'function') return;
+    root.setAttribute('data-nullify-wasm', getURL('dist/nullify_core_bg.wasm'));
+  } catch {
+    // MAIN-world youtube-shield falls back to its own chrome.runtime path.
+  }
+}
+
+exposeYouTubeWasmUrl();
 
 function injectStyle(id, cssText, append = false) {
   if (!cssText) return;
@@ -61,6 +76,7 @@ function decodeBinaryRules(buffer) {
     const list = [];
     
     for (let i = 0; i < count; i++) {
+      if (offset >= buffer.byteLength) break;
       let start = offset;
       while (offset < buffer.byteLength && buffer[offset] !== 0) {
         offset++;

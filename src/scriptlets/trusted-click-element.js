@@ -19,13 +19,22 @@ export function trustedClickElement(selector, delay = 0, interval = 0, max = 1) 
 
   let count = 0;
 
+  function isVisible(el) {
+    if (!el) return false;
+    if (el.offsetParent === null) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
   function attempt() {
-    const el = document.querySelector(selector);
-    if (el) {
-      el.click();
-      count++;
-    }
-    
+    try {
+      const el = document.querySelector(selector);
+      if (el && isVisible(el)) {
+        el.click();
+        count++;
+      }
+    } catch { /* ignore */ }
+
     if (count < m && i > 0) {
       setTimeout(attempt, i);
     }

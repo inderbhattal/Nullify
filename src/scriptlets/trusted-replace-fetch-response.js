@@ -1,3 +1,5 @@
+import { toMatcher, toRegex } from './shared-utils.js';
+
 /**
  * trusted-replace-fetch-response.js
  *
@@ -13,6 +15,19 @@
  *   2. Text to find in the response body
  *   3. Replacement text (empty string = remove)
  */
+const TEXT_LIKE_TYPES = new Set([
+  'text/', 'application/javascript', 'application/json', 'application/xml',
+  'application/rss+xml', 'application/atom+xml', 'application/xhtml+xml',
+]);
+
+function isTextLikeResponse(response) {
+  const ct = response.headers.get('content-type') || '';
+  for (const type of TEXT_LIKE_TYPES) {
+    if (ct.includes(type)) return true;
+  }
+  return false;
+}
+
 export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = '') {
   if (!urlPattern) return;
 
@@ -26,6 +41,11 @@ export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = ''
     try {
       const response = await origFetch.call(this, input, init);
       if (!response.ok) return response;
+      if (!isTextLikeResponse(response)) return response;
+
+      // Avoid buffering huge binary payloads into memory
+      const length = parseInt(response.headers.get('content-length') || '0', 10);
+      if (length > 5 * 1024 * 1024) return response;
 
       const text = await response.text();
       const findRe = toRegex(findStr);
@@ -89,25 +109,3 @@ export function trustedReplaceXhrResponse(urlPattern, findStr, replaceStr = '') 
   });
 }
 
-function toRegex(s) {
-  if (s instanceof RegExp) return s;
-  if (s.startsWith('/') && s.lastIndexOf('/') > 0) {
-    const lastSlash = s.lastIndexOf('/');
-    return new RegExp(s.slice(1, lastSlash), s.slice(lastSlash + 1));
-  }
-  return new RegExp(escapeRegex(s), 'g');
-}
-
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-
-function toMatcher(pattern) {
-  if (typeof pattern === 'string' && pattern.startsWith('/')) {
-    const lastSlash = pattern.lastIndexOf('/');
-    const re = new RegExp(pattern.slice(1, lastSlash), pattern.slice(lastSlash + 1));
-    return (url) => re.test(url);
-  }
-  return (url) => url.includes(pattern);
-}

@@ -56,6 +56,12 @@ export function personaSpoof(personaId = 'default') {
   if (!navigator.userAgentData) return;
 
   const original = navigator.userAgentData;
+  const architectureMap = {
+    'Win32': 'x86',
+    'MacIntel': 'x86',
+    'Linux x86_64': 'x86',
+  };
+
   const spoofed = {
     brands: BRANDS,
     mobile: false,
@@ -64,17 +70,15 @@ export function personaSpoof(personaId = 'default') {
       const base = typeof original.getHighEntropyValues === 'function'
         ? await original.getHighEntropyValues(hints)
         : {};
-      return {
-        ...base,
-        brands: BRANDS,
-        mobile: false,
-        platform: persona.uaPlatform,
-        platformVersion: persona.platformVersion,
-        architecture: 'x86',
-        bitness: '64',
-        model: '',
-        uaFullVersion: '122.0.0.0',
-      };
+      const result = { ...base };
+      const hintSet = new Set(hints);
+      if (hintSet.has('platformVersion')) result.platformVersion = persona.platformVersion;
+      if (hintSet.has('architecture')) result.architecture = architectureMap[persona.platform] || 'x86';
+      if (hintSet.has('bitness')) result.bitness = '64';
+      if (hintSet.has('model')) result.model = '';
+      if (hintSet.has('uaFullVersion')) result.uaFullVersion = '122.0.0.0';
+      if (hintSet.has('fullVersionList')) result.fullVersionList = BRANDS;
+      return result;
     },
     toJSON() {
       return {

@@ -166,6 +166,9 @@ const YOUTUBE_SHIELD_TARGETS = [
   { hostname: 'm.youtube.com', pattern: '*://m.youtube.com/*' },
   { hostname: 'music.youtube.com', pattern: '*://music.youtube.com/*' },
 ];
+const YOUTUBE_SHIELD_HOSTNAMES = new Set(
+  YOUTUBE_SHIELD_TARGETS.map(({ hostname }) => normalizeHostname(hostname))
+);
 let youtubeShieldSyncPromise = null;
 
 function setCachedDomainRules(hostname, bundle) {
@@ -1165,17 +1168,57 @@ function arraysEqual(a = [], b = []) {
   return true;
 }
 
-// AbortController for YouTube shield sync — cancels stale in-flight operations
-let youtubeShieldAbortController = null;
+async function injectYouTubeShieldIntoOpenTabs() {
+  const tabs = await chrome.tabs.query({
+    url: YOUTUBE_SHIELD_TARGETS.map(({ pattern }) => pattern),
+  }).catch(() => []);
+
+  await Promise.all((tabs || []).map(async (tab) => {
+    if (tab.id == null) return;
+
+    const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null);
+    if (!Array.isArray(frames)) {
+      if (!tab.url) return;
+      let hostname = '';
+      try {
+        hostname = normalizeHostname(new URL(tab.url).hostname);
+      } catch {
+        return;
+      }
+      if (!YOUTUBE_SHIELD_HOSTNAMES.has(hostname) || isHostnameAllowedCached(hostname)) return;
+
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: 'MAIN',
+        files: [runtimeAssetPath('youtube-shield.js')],
+      }).catch(() => {});
+      return;
+    }
+
+    const frameIds = frames
+      .filter((frame) => {
+        if (!frame?.url?.startsWith('http')) return false;
+        try {
+          const hostname = normalizeHostname(new URL(frame.url).hostname);
+          return YOUTUBE_SHIELD_HOSTNAMES.has(hostname) && !isHostnameAllowedCached(hostname);
+        } catch {
+          return false;
+        }
+      })
+      .map((frame) => frame.frameId)
+      .filter((frameId) => Number.isInteger(frameId));
+
+    if (frameIds.length === 0) return;
+
+    await Promise.all(frameIds.map((frameId) => chrome.scripting.executeScript({
+      target: { tabId: tab.id, frameIds: [frameId] },
+      world: 'MAIN',
+      files: [runtimeAssetPath('youtube-shield.js')],
+    }).catch(() => {})));
+  }));
+}
 
 async function syncYouTubeShieldRegistration() {
-  // Abort any in-flight sync operation — new call takes precedence
-  if (youtubeShieldAbortController) {
-    youtubeShieldAbortController.abort();
-  }
-  youtubeShieldAbortController = new AbortController();
-  const { signal } = youtubeShieldAbortController;
-
   const run = async () => {
     const registration = {
       id: YOUTUBE_SHIELD_SCRIPT_ID,
@@ -1191,55 +1234,67 @@ async function syncYouTubeShieldRegistration() {
     const existingScripts = await chrome.scripting.getRegisteredContentScripts({
       ids: [YOUTUBE_SHIELD_SCRIPT_ID],
     }).catch(() => []);
-    if (signal.aborted) return;
     const existing = existingScripts?.[0] || null;
 
-    if (
+    const sameRegistration =
       existing &&
       arraysEqual(existing.matches || [], registration.matches) &&
       arraysEqual(existing.excludeMatches || [], registration.excludeMatches) &&
       arraysEqual(existing.js || [], registration.js) &&
       existing.runAt === registration.runAt &&
       existing.world === registration.world &&
-      existing.allFrames === registration.allFrames
-    ) {
+      existing.allFrames === registration.allFrames &&
+      existing.persistAcrossSessions === registration.persistAcrossSessions;
+
+    if (sameRegistration) {
+      await injectYouTubeShieldIntoOpenTabs();
       return;
     }
 
-    if (existing && typeof chrome.scripting.updateContentScripts === 'function') {
+    const canUpdateExcludeMatchesOnly =
+      existing &&
+      typeof chrome.scripting.updateContentScripts === 'function' &&
+      arraysEqual(existing.matches || [], registration.matches) &&
+      arraysEqual(existing.js || [], registration.js) &&
+      existing.runAt === registration.runAt &&
+      existing.world === registration.world &&
+      existing.allFrames === registration.allFrames &&
+      existing.persistAcrossSessions === registration.persistAcrossSessions;
+
+    if (canUpdateExcludeMatchesOnly) {
       await chrome.scripting.updateContentScripts([{
         id: YOUTUBE_SHIELD_SCRIPT_ID,
-        matches: registration.matches,
         excludeMatches: registration.excludeMatches,
-        runAt: registration.runAt,
-        world: registration.world,
-        allFrames: registration.allFrames,
       }]);
-      if (signal.aborted) return;
+      await injectYouTubeShieldIntoOpenTabs();
       return;
     }
 
     if (existing) {
       await chrome.scripting.unregisterContentScripts({ ids: [YOUTUBE_SHIELD_SCRIPT_ID] }).catch(() => {});
-      if (signal.aborted) return;
     }
 
     await chrome.scripting.registerContentScripts([registration]);
+    await injectYouTubeShieldIntoOpenTabs();
   };
 
-  const pending = run().catch((err) => {
-    if (signal.aborted) return; // Silently ignore aborted operations
-    console.error('[Nullify] Failed to sync YouTube shield registration:', err);
-  });
+  const previous = youtubeShieldSyncPromise || Promise.resolve();
+  const pending = previous
+    .catch(() => {})
+    .then(run)
+    .catch((err) => {
+      console.error('[Nullify] Failed to sync YouTube shield registration:', err);
+    });
 
-  youtubeShieldSyncPromise = pending.finally(() => {
-    if (youtubeShieldSyncPromise === pending && !signal.aborted) {
-      youtubeShieldAbortController = null;
+  let tracked;
+  tracked = pending.finally(() => {
+    if (youtubeShieldSyncPromise === tracked) {
       youtubeShieldSyncPromise = null;
     }
   });
+  youtubeShieldSyncPromise = tracked;
 
-  return youtubeShieldSyncPromise;
+  return tracked;
 }
 
 async function refreshMemoryCache() {
@@ -1255,6 +1310,7 @@ async function refreshMemoryCache() {
   const rawAllowlist = data[StorageKeys.ALLOWLIST] || [];
   const normalizedAllowlist = normalizeAllowlist(rawAllowlist);
   cachedAllowlist = new Set(normalizedAllowlist);
+  let allowlistStateRebuilt = false;
 
   // Sync DNR state BEFORE rebuilding the in-memory matcher.
   // If we rebuilt the matcher first, content scripts could observe one
@@ -1264,6 +1320,7 @@ async function refreshMemoryCache() {
     rawAllowlist.some((domain, index) => domain !== normalizedAllowlist[index])
   ) {
     await rebuildAllowlistState(normalizedAllowlist);
+    allowlistStateRebuilt = true;
   } else {
     // Ensure matcher is built even if no change
     rebuildAllowlistMatcher();
@@ -1283,6 +1340,9 @@ async function refreshMemoryCache() {
     : [];
 
   domainRulesCache.clear();
+  if (!allowlistStateRebuilt) {
+    await syncYouTubeShieldRegistration();
+  }
 }
 
 async function loadBloomFilter() {
@@ -2110,7 +2170,7 @@ async function applyUserFilters(filtersText) {
     
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
   await setStorage(StorageKeys.USER_FILTERS_APPLIED, filtersText || '');
-  await setStorage('userScriptletRules', userScriptlets);
+  await setStorage(StorageKeys.USER_SCRIPTLET_RULES, userScriptlets);
 
   // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately
   domainRulesCache.clear();
@@ -2224,7 +2284,6 @@ async function rebuildAllowlistRules(allowlist) {
       priority: 500, // Systematic Priority for User Allowlist
       condition: {
         urlFilter: `||${domain}^`,
-        resourceTypes: ['main_frame', 'sub_frame'],
       },
       action: { type: 'allowAllRequests' },
     }));
@@ -2687,7 +2746,8 @@ async function handleMessage(message, sender) {
       if (!isAllowed && sender.tab?.id) {
         const scriptletsToRun = [...scriptletRules];
 
-        if (!hostname.includes('youtube.com') && isTopFrame && settings.fingerprintProtection === true) {
+        const youtubeHostnames = new Set(YOUTUBE_SHIELD_TARGETS.map(t => t.hostname));
+        if (!youtubeHostnames.has(hostname) && isTopFrame && settings.fingerprintProtection === true) {
           scriptletsToRun.push({ name: 'fingerprint-noise', args: [] });
           scriptletsToRun.push({ name: 'battery-spoof', args: [] });
         }
@@ -3004,7 +3064,7 @@ async function getCosmeticBundleForPage(hostname) {
 }
 
 async function getScriptletRulesForPage(hostname) {
-  const userScriptlets = (await getStorage('userScriptletRules')) || [];
+  const userScriptlets = (await getStorage(StorageKeys.USER_SCRIPTLET_RULES)) || [];
   const activeUserScriptlets = userScriptlets.filter(r => {
     if (r.domains.length === 0) return true;
     return r.domains.some(d => hostname === d || hostname.endsWith('.' + d));
@@ -3054,7 +3114,12 @@ function isHostnameAllowedCached(hostname) {
  */
 async function performEarlyInjection(tabId, frameId, urlStr) {
   if (!urlStr?.startsWith('http')) return;
-  const url = new URL(urlStr);
+  let url;
+  try {
+    url = new URL(urlStr);
+  } catch {
+    return;
+  }
   const hostname = normalizeHostname(url.hostname);
 
   if (isHostnameAllowedCached(hostname)) return;
@@ -3086,12 +3151,17 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (!details.url.startsWith('http')) return;
 
+  let url;
+  try {
+    url = new URL(details.url);
+  } catch {
+    return;
+  }
+  const hostname = normalizeHostname(url.hostname);
+
   if (details.frameId === 0) {
     resetTabStats(details.tabId, details.url);
   }
-
-  const url = new URL(details.url);
-  const hostname = normalizeHostname(url.hostname);
 
   if (!domainRulesCache.has(hostname)) {
     const bundle = await getCosmeticBundleForPage(hostname);

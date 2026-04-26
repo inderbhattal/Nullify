@@ -42,6 +42,10 @@ export function jsonPrune(paths, requiredPaths) {
   }
 }
 
+function isProtoPollutionKey(key) {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
 function parsePrunePaths(pathsStr) {
   return pathsStr.trim().split(/\s+/).filter(Boolean);
 }
@@ -54,6 +58,7 @@ function getByPath(obj, path) {
   const parts = path.split('.');
   let current = obj;
   for (const part of parts) {
+    if (isProtoPollutionKey(part)) return undefined;
     if (current == null || typeof current !== 'object') return undefined;
     current = current[part];
   }
@@ -64,9 +69,11 @@ function pruneObject(obj, paths) {
   for (const path of paths) {
     const parts = path.split('.');
     const lastKey = parts[parts.length - 1];
+    if (isProtoPollutionKey(lastKey)) continue;
 
     let target = obj;
     for (let i = 0; i < parts.length - 1; i++) {
+      if (isProtoPollutionKey(parts[i])) { target = null; break; }
       if (target == null || typeof target !== 'object') { target = null; break; }
       target = target[parts[i]];
     }

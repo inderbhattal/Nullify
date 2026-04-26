@@ -117,9 +117,11 @@ function parseLine(line) {
   const scopeException = parseCosmeticScopeException(line);
   if (scopeException) return scopeException;
 
-  // Find the separator index first (#)
-  const hashIdx = line.indexOf('#');
-  if (hashIdx === -1) return null; // Network rule — skip
+  // Only consider cosmetic/scriptlet separators — bare '#' can appear in
+  // network URL patterns (fragment identifiers) and must not misclassify.
+  const hasCosmeticSep = line.includes('##') || line.includes('#@#') ||
+    line.includes('#?#') || line.includes('#+js(') || line.includes('##+js(');
+  if (!hasCosmeticSep) return null; // Network rule — skip
 
   // Scriptlet: example.com##+js(name, args)
   if (line.includes('##+js(') || line.includes('#+js(')) {

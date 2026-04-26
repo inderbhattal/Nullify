@@ -35,6 +35,7 @@ export const StorageKeys = {
   CACHE_PROTECTION: 'cacheProtection',
   REFERRER_CONTROL: 'referrerControl',
   BLOOM_FILL_THRESHOLD: 'bloomFillThreshold',
+  USER_SCRIPTLET_RULES: 'userScriptletRules',
 };
 
 /** Get multiple values from storage in one call. */

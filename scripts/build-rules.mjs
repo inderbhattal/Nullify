@@ -15,12 +15,29 @@
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
+import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
 import { CORE_FILTER_SOURCE } from '../src/shared/core-filter-source.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
 const SAMPLE_MODE = process.argv.includes('--sample');
+// Skip SRI verification — use with caution, only for development
+const SKIP_SRI = process.argv.includes('--skip-sri');
+// DEBUG flag for development logging — set to true to enable verbose logs
+const DEBUG = process.env.DEBUG === 'true' || process.argv.includes('--verbose');
+const log = DEBUG ? console.log.bind(console) : () => {};
+
+// SRI hashes for remote filter lists — loaded from rules/filter-list-hashes.json
+let FILTER_LIST_HASHES = {};
+try {
+  const hashesPath = path.join(RULES_DIR, 'filter-list-hashes.json');
+  if (fs.existsSync(hashesPath)) {
+    FILTER_LIST_HASHES = JSON.parse(fs.readFileSync(hashesPath, 'utf8'));
+  }
+} catch (err) {
+  console.warn('[SRI] Could not load filter-list-hashes.json, SRI verification disabled:', err.message);
+}
 
 const LIST_CONFIG = {
   'easylist': { parts: 4, totalLimit: 100000 },
@@ -102,12 +119,58 @@ function fetchText(url) {
 }
 
 /**
+ * Verify fetched content against SRI hash if available.
+ * Returns { valid: boolean, error?: string }
+ */
+function verifySriHash(content, listId) {
+  if (SKIP_SRI) {
+    return { valid: true, skipped: true };
+  }
+
+  const hashInfo = FILTER_LIST_HASHES[listId];
+  if (!hashInfo || !hashInfo.sha384) {
+    return { valid: true }; // No hash available, skip verification
+  }
+
+  const expectedPrefix = 'sha384-';
+  if (!hashInfo.sha384.startsWith(expectedPrefix)) {
+    return { valid: false, error: `Invalid hash format (expected ${expectedPrefix}...)` };
+  }
+
+  const expectedHash = hashInfo.sha384.slice(expectedPrefix.length);
+  const actualHash = createHash('sha384').update(content).digest('base64');
+
+  if (actualHash !== expectedHash) {
+    return {
+      valid: false,
+      error: `SRI hash mismatch! Expected ${expectedHash.slice(0, 24)}..., got ${actualHash.slice(0, 24)}...`,
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
  * Fetch a filter list and recursively resolve !#include directives.
  * uBlock Origin's filter lists are split across many sub-files.
  */
-async function fetchAndExpand(url, depth = 0) {
+async function fetchAndExpand(url, depth = 0, listId = null) {
   if (depth > 5) return '';
   const text = await fetchText(url);
+
+  // Verify SRI hash for top-level fetch (not includes)
+  if (depth === 0 && listId) {
+    const verification = verifySriHash(text, listId);
+    if (!verification.valid) {
+      if (SKIP_SRI) {
+        console.warn(`[SRI] ${listId}: ${verification.error} — verification skipped via --skip-sri flag`);
+      } else {
+        throw new Error(`[SRI] ${listId}: ${verification.error} — build aborted. Use --skip-sri to override.`);
+      }
+    } else if (!verification.skipped && DEBUG) {
+      log(`[SRI] ${listId}: hash verified`);
+    }
+  }
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
   const lines = [];
 
@@ -147,7 +210,7 @@ async function fetchAndExpand(url, depth = 0) {
       const includePath = m[1].trim();
       const includeUrl = includePath.startsWith('http') ? includePath : baseUrl + includePath;
       try {
-        lines.push(await fetchAndExpand(includeUrl, depth + 1));
+        lines.push(await fetchAndExpand(includeUrl, depth + 1, null));
       } catch (e) {
         console.warn(`  ⚠️  Skipping include ${includeUrl.split('/').pop()}: ${e.message}`);
       }
@@ -381,6 +444,38 @@ function parseOptions(optionsStr) {
 }
 
 /**
+ * Detect nested quantifiers that cause exponential backtracking.
+ * Patterns like (a+)+, (a*)+, (a+)*, (a*)*, (a+){2,}, etc. are dangerous.
+ * Returns { safe: boolean, pattern?: string } — if not safe, pattern describes the issue.
+ */
+function detectNestedQuantifiers(pattern) {
+  // Look for quantifier followed by quantifier (possibly with intermediate chars)
+  // Quantifiers: * + ? {n} {n,} {n,m}
+  const quantChar = '[*+?]';
+  const quantGroup = '\\{\\d+(?:,\\d*)?\\}';
+
+  // Pattern 1: (...)X where X is a quantifier and inside has quantifiable content
+  // e.g., (a+)+, (ab*)*, ([0-9]+){2,}
+  const nestedQuantRe = new RegExp(
+    `(\\([^()]*(${quantChar}|${quantGroup})[^()]*\\)(${quantChar}|${quantGroup}))`,
+    'g'
+  );
+  if (nestedQuantRe.test(pattern)) {
+    return { safe: false, pattern: 'nested-quantifier' };
+  }
+
+  // Pattern 2: Adjacent quantifiers on same token: a*a+, a+a*, a{2,}a*, etc.
+  const adjacentQuantRe = new RegExp(
+    `(${quantChar}|${quantGroup})\\s*\\w*\\s*(${quantChar}|${quantGroup})`
+  );
+  if (adjacentQuantRe.test(pattern)) {
+    return { safe: false, pattern: 'adjacent-quantifiers' };
+  }
+
+  return { safe: true };
+}
+
+/**
  * Estimate RE2 NFA instruction cost for a regex pattern.
  * RE2 expands character classes into per-character alternatives and
  * unrolls bounded quantifiers, so [0-9A-Za-z]{16} = 62 × 16 = 992
@@ -391,6 +486,10 @@ function parseOptions(optionsStr) {
 function estimateRegexNfaCost(pattern) {
   let cost = 0;
   let i = 0;
+  let quantifierDepth = 0;
+  let consecutiveQuantifiers = 0;
+  let lastQuantifierEnd = -2;
+
   while (i < pattern.length) {
     if (pattern[i] === '[') {
       // Character class
@@ -411,6 +510,11 @@ function estimateRegexNfaCost(pattern) {
       if (negated) classSize = Math.max(256 - classSize, classSize);
       i = j + 1;
       const [mult, next] = getQuantMult(pattern, i);
+      if (mult > 1) {
+        if (i - lastQuantifierEnd < 2) consecutiveQuantifiers++;
+        lastQuantifierEnd = next;
+        quantifierDepth++;
+      }
       cost += classSize * mult;
       i = next;
     } else if (pattern[i] === '\\' && i + 1 < pattern.length) {
@@ -421,19 +525,42 @@ function estimateRegexNfaCost(pattern) {
                    : ch === 'b' || ch === 'B' ? 2 : 1;
       i += 2;
       const [mult, next] = getQuantMult(pattern, i);
+      if (mult > 1) {
+        if (i - lastQuantifierEnd < 2) consecutiveQuantifiers++;
+        lastQuantifierEnd = next;
+        quantifierDepth++;
+      }
       cost += shSize * mult;
       i = next;
     } else if (pattern[i] === '.') {
       // Unescaped dot matches ANY byte — RE2 cost = 256 alternatives
       i++;
       const [mult, next] = getQuantMult(pattern, i);
+      if (mult > 1) {
+        if (i - lastQuantifierEnd < 2) consecutiveQuantifiers++;
+        lastQuantifierEnd = next;
+        quantifierDepth++;
+      }
       cost += 256 * mult;
       i = next;
+    } else if (pattern[i] === '(') {
+      // Track group depth for nested quantifier detection
+      quantifierDepth++;
+      i++;
+    } else if (pattern[i] === ')') {
+      quantifierDepth = Math.max(0, quantifierDepth - 1);
+      i++;
     } else {
       cost++;
       i++;
     }
   }
+
+  // Penalty for consecutive quantifiers (exponential backtracking risk)
+  if (consecutiveQuantifiers >= 2) {
+    cost *= (1 + consecutiveQuantifiers);
+  }
+
   return cost;
 }
 
@@ -547,6 +674,13 @@ function networkFilterToDNR(parsed) {
       return null;
     }
 
+    // Check for nested/adjacent quantifiers (exponential backtracking risk)
+    const nestedQuantCheck = detectNestedQuantifiers(regexFilter);
+    if (!nestedQuantCheck.safe) {
+      reportDrop(`regex: ${nestedQuantCheck.pattern} — exponential backtracking risk`, pattern);
+      return null;
+    }
+
     let quantProduct = 1;
     const quantRe4 = /\{(\d+)(?:,(\d+))?\}/g;
     let qm4;
@@ -558,8 +692,9 @@ function networkFilterToDNR(parsed) {
       }
     }
 
-    if (estimateRegexNfaCost(regexFilter) > 500) {
-      reportDrop('regex: estimated NFA cost > 500 instructions (exceeds Chrome 2KB RE2 budget)', pattern);
+    const nfaCost = estimateRegexNfaCost(regexFilter);
+    if (nfaCost > 500) {
+      reportDrop(`regex: estimated NFA cost ${nfaCost} > 500 instructions (exceeds Chrome 2KB RE2 budget)`, pattern);
       return null;
     }
 
@@ -882,7 +1017,7 @@ function writeSkipLog(listId, { parseSkips, dnrDrops, truncatedCount }) {
 
 function printSkipSummary(listId, parseSkips, dnrDrops, truncatedCount) {
   if (parseSkips.length === 0 && dnrDrops.length === 0 && truncatedCount === 0) return;
-  console.log(`   📝 Skip summary for ${listId} (full log: rules/skipped/${listId}.log)`);
+  log(`   📝 Skip summary for ${listId} (full log: rules/skipped/${listId}.log)`);
 }
 
 function cleanGeneratedRuleFiles() {
@@ -933,7 +1068,7 @@ function verifyManifestRuleResourcePaths() {
       `Regenerate with \`npm run build:rules\` or remove the entries from manifest.json.`
     );
   }
-  console.log(`✅ manifest rule_resources verified (${resources.length} paths)`);
+  log(`✅ manifest rule_resources verified (${resources.length} paths)`);
 }
 
 function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }) {
@@ -944,26 +1079,26 @@ function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filt
   for (const [filename, rules] of Object.entries(rulesetOutputs)) {
     const outPath = path.join(RULES_DIR, filename);
     fs.writeFileSync(outPath, JSON.stringify(rules, null, 2));
-    console.log(`✅ ${filename} — ${rules.length} DNR rules written`);
+    log(`✅ ${filename} — ${rules.length} DNR rules written`);
     const rulesetId = filename.replace(/\.json$/, '');
     rulesetCounts[rulesetId] = rules.length;
   }
 
   const countsPath = path.join(RULES_DIR, 'ruleset-counts.json');
   fs.writeFileSync(countsPath, JSON.stringify(rulesetCounts, null, 2));
-  console.log(`✅ ruleset-counts.json — ${Object.keys(rulesetCounts).length} entries`);
+  log(`✅ ruleset-counts.json — ${Object.keys(rulesetCounts).length} entries`);
 
   const cosmeticsPath = path.join(RULES_DIR, 'cosmetic-rules.json');
   fs.writeFileSync(cosmeticsPath, JSON.stringify(cosmeticRules, null, 2));
-  console.log(`\n✅ cosmetic-rules.json — ${cosmeticRules.generic.length} generic + ${Object.keys(cosmeticRules.domainSpecific).length} domain-specific`);
+  log(`\n✅ cosmetic-rules.json — ${cosmeticRules.generic.length} generic + ${Object.keys(cosmeticRules.domainSpecific).length} domain-specific`);
 
   const scriptletsPath = path.join(RULES_DIR, 'scriptlet-rules.json');
   fs.writeFileSync(scriptletsPath, JSON.stringify(scriptletRules, null, 2));
-  console.log(`✅ scriptlet-rules.json — ${scriptletRules.length} rules`);
+  log(`✅ scriptlet-rules.json — ${scriptletRules.length} rules`);
 
   const filterSourcesPath = path.join(RULES_DIR, 'filter-sources.json');
   fs.writeFileSync(filterSourcesPath, JSON.stringify(filterSources, null, 2));
-  console.log(`✅ filter-sources.json — ${Object.keys(filterSources).length} list sources`);
+  log(`✅ filter-sources.json — ${Object.keys(filterSources).length} list sources`);
 }
 
 function buildSampleRulesetOutputs() {
@@ -1022,7 +1157,7 @@ function buildSampleFilterSources() {
 }
 
 function writeSampleOutputs() {
-  console.log('🧪 Generating sample rule artifacts (offline mode)...\n');
+  log('🧪 Generating sample rule artifacts (offline mode)...\n');
 
   writeBuildOutputs({
     rulesetOutputs: buildSampleRulesetOutputs(),
@@ -1031,7 +1166,7 @@ function writeSampleOutputs() {
     filterSources: buildSampleFilterSources(),
   });
 
-  console.log('\n🎉 Sample build complete!');
+  log('\n🎉 Sample build complete!');
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,7 +1386,7 @@ function smartTruncate(networkRules, limit) {
     abpSeen.add(key);
     return true;
   });
-  console.log(`   🔍 After early dedup: ${networkRules.length} rules`);
+  log(`   🔍 After early dedup: ${networkRules.length} rules`);
 
   if (networkRules.length <= limit) return networkRules;
 
@@ -1353,15 +1488,15 @@ async function main() {
   const rulesetOutputs = {};
   const failures = [];
 
-  console.log('📡 Downloading filter lists...\n');
+  log('📡 Downloading filter lists...\n');
 
   for (const list of FILTER_LISTS) {
     try {
-      console.log(`⬇️  Fetching ${list.description}...`);
-      const text = await fetchAndExpand(list.url);
+      log(`⬇️  Fetching ${list.description}...`);
+      const text = await fetchAndExpand(list.url, 0, list.id);
       const parsed = parseFilterList(text, list.id);
 
-      console.log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skippedRecords.length} skipped`);
+      log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skippedRecords.length} skipped`);
       const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
       let networkRules = parsed.networkRules;
       let sourceBundle = null;
@@ -1377,10 +1512,10 @@ async function main() {
       let truncatedCount = 0;
       if (networkRules.length > config.totalLimit) {
         const before = networkRules.length;
-        console.log(`   ⚠️  Rule count (${before}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
+        log(`   ⚠️  Rule count (${before}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
         networkRules = smartTruncate(networkRules, config.totalLimit);
         truncatedCount = before - networkRules.length;
-        console.log(`   ✂️  Smart selection: ${networkRules.length} rules kept (${truncatedCount} trimmed by smartTruncate)`);
+        log(`   ✂️  Smart selection: ${networkRules.length} rules kept (${truncatedCount} trimmed by smartTruncate)`);
       }
 
       const { dnrRules, droppedRecords } = buildDNRRules(networkRules);
@@ -1397,9 +1532,9 @@ async function main() {
         const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
         const suffix = i === 0 ? '' : `_${i + 1}`;
         rulesetOutputs[`${list.id}${suffix}.json`] = chunk;
-        console.log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules staged`);
+        log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules staged`);
       }
-      console.log('');
+      log('');
 
       filterSources[list.id] = sourceBundle;
 
@@ -1440,7 +1575,7 @@ async function main() {
 
   verifyManifestRuleResourcePaths();
 
-  console.log('\n🎉 Build complete!');
+  log('\n🎉 Build complete!');
   process.exit(0);
 }
 

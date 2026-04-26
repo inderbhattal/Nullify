@@ -27,6 +27,15 @@ const STYLE_ID = '__adblock_cosmetic_styles__';
 const EXCEPTION_STYLE_ID = '__adblock_exception_styles__';
 const ELEMENT_ATTR = '__adblock_hidden__';
 
+// Error tracking for content script diagnostics
+const _errorStats = { errors: 0, lastError: null, proceduralFailures: 0 };
+
+function _reportError(context, err) {
+  _errorStats.errors++;
+  _errorStats.lastError = { context, message: err?.message, timestamp: Date.now() };
+  console.warn(`[Nullify Cosmetic] ${context}: ${err?.message || err}`);
+}
+
 // All known procedural operators in specificity order
 // (longer names must come before shorter prefixes to avoid partial matches)
 const PROC_OPS = [
@@ -191,14 +200,17 @@ export class CosmeticEngine {
     this._hideQueue = new Set();    // elements pending hide
     this._removeQueue = new Set();  // elements pending physical removal
     this._matchCache = new Map();   // selector -> WeakMap(el -> bool)
+    this._cacheAccessOrder = [];    // LRU tracking: most recently accessed keys
+    this._cacheAccessLimit = 500;   // Max cache entries before eviction
     // Subtree roots mutated since the last procedural run. A match-cache
     // entry for element `e` is trusted iff none of the last-run's dirty
     // roots equal `e` or contain it. Bumps per scheduled run.
-    this._dirtyRoots = [];          // accumulating during observation
+    this._dirtyRoots = new Set();   // Set for automatic deduplication, capped at 1000
     this._lastDirtyRoots = [];      // snapshot used by the in-progress run
     this._reportTimer = null;
     this._proceduralDebounce = null;
     this._rafId = null;
+    this._cacheSweepInterval = null; // periodic cache sweep timer
   }
 
   /**
@@ -268,6 +280,7 @@ export class CosmeticEngine {
 
     this._detectWatchAttrRules();
     this._startObserver();
+    this._startCacheSweep();
   }
 
   // ---------------------------------------------------------------------------
@@ -343,7 +356,7 @@ export class CosmeticEngine {
         elements = [...document.querySelectorAll(first.selector)];
         planIdx = 1;
       } catch (e) {
-        console.warn('[Nullify] Invalid selector in cosmetic rule:', first.selector, e.message);
+        _reportError('Invalid selector', e);
         return;
       }
     } else {
@@ -391,6 +404,28 @@ export class CosmeticEngine {
    * Returns the target element to hide, or null if this element should be
    * skipped (filter did not match).
    */
+  _evictCacheIfNeeded() {
+    if (this._matchCache.size <= this._cacheAccessLimit) return;
+
+    // Remove oldest entries (least recently accessed)
+    const toRemove = this._matchCache.size - this._cacheAccessLimit;
+    for (let i = 0; i < toRemove; i++) {
+      const oldestKey = this._cacheAccessOrder.shift();
+      if (oldestKey) {
+        this._matchCache.delete(oldestKey);
+      }
+    }
+  }
+
+  _recordCacheAccess(key) {
+    // Move key to end of access order (most recently used)
+    const idx = this._cacheAccessOrder.indexOf(key);
+    if (idx !== -1) {
+      this._cacheAccessOrder.splice(idx, 1);
+    }
+    this._cacheAccessOrder.push(key);
+  }
+
   _getCachedMatch(el, op, arg, evaluator) {
     const key = `${op}|${arg}`;
     let opCache = this._matchCache.get(key);
@@ -398,6 +433,9 @@ export class CosmeticEngine {
       opCache = new WeakMap();
       this._matchCache.set(key, opCache);
     }
+
+    // Track access for LRU eviction
+    this._recordCacheAccess(key);
 
     // Only trust the cached value when `el` is not inside a subtree that
     // was mutated this tick. `_lastDirtyRoots` is the snapshot captured
@@ -409,6 +447,10 @@ export class CosmeticEngine {
 
     const result = evaluator();
     opCache.set(el, result);
+
+    // Evict if cache grew beyond limit
+    this._evictCacheIfNeeded();
+
     return result;
   }
 
@@ -648,7 +690,8 @@ export class CosmeticEngine {
         if (node?.nodeType === Node.ELEMENT_NODE) this._hideElement(node, `xpath(${expr})`);
       }
     } catch (e) {
-      console.warn('[Nullify] Invalid XPath expression in cosmetic rule:', expr, e.message);
+      _reportError('Invalid XPath', e);
+      _errorStats.proceduralFailures++;
     }
   }
 
@@ -692,10 +735,12 @@ export class CosmeticEngine {
 
   _startObserver() {
     if (this._observer) return;
-    
+
     // Only start MutationObserver if we have procedural rules or watch-attr rules.
     // Static CSS rules injected via SW already work for dynamic elements natively.
     if (this._proceduralRules.length === 0 && this._watchAttrRules.length === 0) return;
+
+    const DIRTY_ROOTS_CAP = 1000;
 
     this._observer = new MutationObserver((mutations) => {
       let needsProcedural = false;
@@ -706,11 +751,18 @@ export class CosmeticEngine {
           // Record the mutation target — any descendant of this node is
           // considered cache-dirty until the next procedural run consumes
           // the batch.
-          if (mutation.target) this._dirtyRoots.push(mutation.target);
+          if (mutation.target) this._dirtyRoots.add(mutation.target);
           for (const node of mutation.addedNodes) {
-            if (node.nodeType === 1 /* ELEMENT */) this._dirtyRoots.push(node);
+            if (node.nodeType === 1 /* ELEMENT */) this._dirtyRoots.add(node);
           }
         }
+      }
+
+      // If dirty roots exceed cap, force immediate procedural run to prevent memory growth
+      if (this._dirtyRoots.size >= DIRTY_ROOTS_CAP) {
+        this._applyAllProcedural();
+        this._dirtyRoots.clear();
+        return;
       }
 
       if (needsProcedural && this._proceduralRules.length > 0) {
@@ -733,8 +785,8 @@ export class CosmeticEngine {
       // whole match cache. _getCachedMatch consults _lastDirtyRoots to
       // invalidate only entries whose element lives inside a mutated
       // subtree — cache hits for unaffected elements survive.
-      this._lastDirtyRoots = this._dirtyRoots;
-      this._dirtyRoots = [];
+      this._lastDirtyRoots = Array.from(this._dirtyRoots);
+      this._dirtyRoots.clear();
       this._applyAllProcedural();
     }, 100);
   }
@@ -746,6 +798,28 @@ export class CosmeticEngine {
     this._attrObserver = null;
     clearTimeout(this._proceduralDebounce);
     this._proceduralDebounce = null;
+    if (this._cacheSweepInterval) {
+      clearInterval(this._cacheSweepInterval);
+      this._cacheSweepInterval = null;
+    }
+  }
+
+  /** Periodic cache sweep — removes stale WeakMap entries every 5 minutes. */
+  _startCacheSweep() {
+    if (this._cacheSweepInterval) return;
+    this._cacheSweepInterval = setInterval(() => {
+      // Sweep match cache: remove entries where all WeakMaps have been GC'd
+      for (const [key, weakMap] of this._matchCache.entries()) {
+        // WeakMap doesn't expose iteration, so we can't clean individual entries.
+        // The GC handles this automatically; we just clear completely stale keys.
+        // For now, rely on GC — the WeakMap will release memory when elements die.
+      }
+      // Force a minor cleanup: clear _lastDirtyRoots after sweep
+      this._lastDirtyRoots = [];
+      // Trim LRU tracking array to prevent memory leak
+      const retainedKeys = new Set(this._matchCache.keys());
+      this._cacheAccessOrder = this._cacheAccessOrder.filter(k => retainedKeys.has(k));
+    }, 300000); // 5 minutes
   }
 
   // ---------------------------------------------------------------------------

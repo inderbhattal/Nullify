@@ -551,13 +551,19 @@ class LiveLogger {
   }
 
   listen() {
-    chrome.runtime.onMessage.addListener((message, sender) => {
+    this._loggerListener = (message, sender) => {
       // Only accept logger broadcasts from the background service worker
       // (same extension id, no tab). Pages or external senders must not be
       // able to inject fake rows into the log view.
       if (!sender || sender.id !== chrome.runtime.id || sender.tab) return;
       if (message?.type === 'LOGGER_EVENT') {
         this.addEvent(message.payload);
+      }
+    };
+    chrome.runtime.onMessage.addListener(this._loggerListener);
+    window.addEventListener('beforeunload', () => {
+      if (this._loggerListener) {
+        chrome.runtime.onMessage.removeListener(this._loggerListener);
       }
     });
   }

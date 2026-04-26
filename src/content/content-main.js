@@ -61,6 +61,7 @@ function decodeBinaryRules(buffer) {
     const list = [];
     
     for (let i = 0; i < count; i++) {
+      if (offset >= buffer.byteLength) break;
       let start = offset;
       while (offset < buffer.byteLength && buffer[offset] !== 0) {
         offset++;

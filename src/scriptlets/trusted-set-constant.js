@@ -3,8 +3,16 @@
  * Like set-constant but allows setting complex values (objects, functions).
  * "Trusted" scriptlets can only be injected via trusted filter lists.
  */
+
+function isProtoPollutionKey(key) {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
 export function trustedSetConstant(prop, value, _stack) {
   if (!prop) return;
+
+  const parts = prop.split('.');
+  if (parts.some(isProtoPollutionKey)) return;
 
   // Parse value — supports JSON
   let resolvedValue;
@@ -14,7 +22,6 @@ export function trustedSetConstant(prop, value, _stack) {
     resolvedValue = value === 'undefined' ? undefined : value;
   }
 
-  const parts = prop.split('.');
   const lastProp = parts[parts.length - 1];
   let obj = window;
   for (let i = 0; i < parts.length - 1; i++) {
@@ -22,10 +29,14 @@ export function trustedSetConstant(prop, value, _stack) {
     if (!obj) return;
   }
 
-  Object.defineProperty(obj, lastProp, {
-    configurable: false,
-    enumerable: true,
-    get: () => resolvedValue,
-    set: () => {},
-  });
+  try {
+    Object.defineProperty(obj, lastProp, {
+      configurable: false,
+      enumerable: true,
+      get: () => resolvedValue,
+      set: () => {},
+    });
+  } catch {
+    // Existing non-configurable descriptor — best effort, skip.
+  }
 }

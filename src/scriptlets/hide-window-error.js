@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /**
  * hide-window-error.js
  *
@@ -10,19 +12,17 @@
 export function hideWindowError(pattern) {
   if (!pattern) return;
 
-  const matchError = typeof pattern === 'string' && pattern.startsWith('/')
-    ? new RegExp(pattern.slice(1, pattern.lastIndexOf('/')), pattern.slice(pattern.lastIndexOf('/') + 1))
-    : null;
+  const matchError = patternToRegex(pattern);
 
   const origError = window.onerror;
   window.onerror = function (msg, _url, _line, _col, _error) {
     const message = msg?.message || msg || '';
     const shouldHide = matchError ? matchError.test(message) : message.includes(pattern);
-    
+
     if (shouldHide) {
       return true; // Prevents the default error handling
     }
-    
+
     if (origError) {
       return origError.apply(this, arguments);
     }
@@ -33,9 +33,9 @@ export function hideWindowError(pattern) {
   console.error = function (...args) {
     const message = args.join(' ');
     const shouldHide = matchError ? matchError.test(message) : message.includes(pattern);
-    
+
     if (shouldHide) return;
-    
+
     return origConsoleError.apply(this, args);
   };
 }

@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /**
  * prevent-fetch.js
  * Block or stub fetch() calls matching a URL pattern.
@@ -22,15 +24,4 @@ export function preventFetch(pattern, responseType, responseBody) {
     }
     return origFetch(input, init);
   };
-}
-
-function patternToRegex(pattern) {
-  try {
-    if (pattern.startsWith('/') && pattern.endsWith('/')) {
-      return new RegExp(pattern.slice(1, -1));
-    }
-    return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-  } catch {
-    return null;
-  }
 }

@@ -3,13 +3,26 @@ export function noSetTimeout(pattern, delay) {
   const re = pattern ? patternToRegex(pattern) : null;
   const targetDelay = delay !== undefined ? Number(delay) : undefined;
   const origSetTimeout = window.setTimeout;
+  const origClearTimeout = window.clearTimeout;
+  const noopTokens = new Set();
+  let tokenCounter = 0;
 
   window.setTimeout = function (fn, ms, ...rest) {
     const src = typeof fn === 'function' ? fn.toString() : String(fn);
     if ((!re || re.test(src)) && (targetDelay === undefined || targetDelay === ms)) {
-      return 0;
+      const token = `__n_stif_${++tokenCounter}`;
+      noopTokens.add(token);
+      return token;
     }
     return origSetTimeout.call(this, fn, ms, ...rest);
+  };
+
+  window.clearTimeout = function (id) {
+    if (typeof id === 'string' && id.startsWith('__n_stif_')) {
+      noopTokens.delete(id);
+      return;
+    }
+    return origClearTimeout.call(this, id);
   };
 }
 

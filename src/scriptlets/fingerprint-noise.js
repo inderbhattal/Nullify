@@ -24,13 +24,13 @@ export function fingerprintNoise() {
   };
 
   const perturbPixels = (data, salt) => {
-    for (let i = 0; i < data.length; i += 4096) {
+    for (let i = 0; i < data.length; i += 256) {
       data[i] = clampByte(data[i] + bitNoise(salt + i));
     }
   };
 
   const perturbAudio = (data, salt) => {
-    for (let i = 0; i < data.length; i += 4096) {
+    for (let i = 0; i < data.length; i += 256) {
       data[i] = clampAudio(data[i] + (bitNoise(salt + i) * 1e-7));
     }
   };

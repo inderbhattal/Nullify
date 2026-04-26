@@ -158,6 +158,7 @@ function bindEvents() {
 
   // Reload button
   $('btnRefresh').addEventListener('click', () => {
+    if (!currentTab?.id) return;
     chrome.tabs.reload(currentTab.id);
     window.close();
   });
@@ -186,6 +187,7 @@ function bindEvents() {
         payload: { stealthPersona: persona },
       });
 
+      if (!currentTab?.id) return;
       chrome.tabs.reload(currentTab.id);
       window.close();
     } catch (err) {

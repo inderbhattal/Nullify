@@ -104,11 +104,16 @@ const FILTER_LISTS = [
 // ---------------------------------------------------------------------------
 // HTTP fetch utility
 // ---------------------------------------------------------------------------
-function fetchText(url) {
+function fetchText(url, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { 'User-Agent': 'adblock-mv3-builder/1.0' } }, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
-        return fetchText(res.headers.location).then(resolve).catch(reject);
+        if (maxRedirects <= 0) return reject(new Error(`Redirect limit exceeded for ${url}`));
+        const location = res.headers.location;
+        if (!location || !location.startsWith('http')) {
+          return reject(new Error(`Invalid redirect location for ${url}`));
+        }
+        return fetchText(location, maxRedirects - 1).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
         return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
@@ -332,8 +337,8 @@ function parseLine(line) {
   if (!line || line.startsWith('!') || line.startsWith('[')) return SKIP_SILENT;
   if (line.startsWith('@@#')) return SKIP_SILENT;
 
-  const scriptletMatch = line.match(/^([^#]*)##\+js\((.+)\)$/) ||
-                         line.match(/^([^#]*)#\+js\((.+)\)$/);
+  const scriptletMatch = line.match(/^([^#|/*?^]*)##\+js\((.+)\)$/) ||
+                         line.match(/^([^#|/*?^]*)#\+js\((.+)\)$/);
   if (scriptletMatch) {
     const [, domains, scriptletStr] = scriptletMatch;
     const args = parseScriptletArgs(scriptletStr);
@@ -346,7 +351,7 @@ function parseLine(line) {
     };
   }
 
-  const abpExtMatch = line.match(/^([^#]*)#\?#(.+)$/);
+  const abpExtMatch = line.match(/^([^#|/*?^]*)#\?#(.+)$/);
   if (abpExtMatch) {
     const [, domains, selector] = abpExtMatch;
     return {
@@ -357,7 +362,7 @@ function parseLine(line) {
     };
   }
 
-  const cosmeticMatch = line.match(/^([^#]*)##(.+)$/);
+  const cosmeticMatch = line.match(/^([^#|/*?^]*)##(.+)$/);
   if (cosmeticMatch) {
     const [, domains, selector] = cosmeticMatch;
     return {
@@ -368,7 +373,7 @@ function parseLine(line) {
     };
   }
 
-  const cosmeticExceptionMatch = line.match(/^([^#]*)#@#(.+)$/);
+  const cosmeticExceptionMatch = line.match(/^([^#|/*?^]*)#@#(.+)$/);
   if (cosmeticExceptionMatch) {
     const [, domains, selector] = cosmeticExceptionMatch;
     return {
@@ -953,6 +958,11 @@ function buildDNRRules(networkRules) {
       const key = JSON.stringify({
         uf: rule.condition.urlFilter || rule.condition.regexFilter,
         rt: rule.condition.resourceTypes,
+        et: rule.condition.excludedResourceTypes,
+        id: rule.condition.initiatorDomains,
+        eid: rule.condition.excludedInitiatorDomains,
+        rd: rule.condition.requestDomains,
+        dt: rule.condition.domainType,
         at: rule.action.type,
       });
       if (seen.has(key)) {
@@ -1504,6 +1514,13 @@ function smartTruncate(networkRules, limit) {
     return Array.isArray(types) && types.length > 0 ? new Set(types) : null;
   };
 
+  const domainSetFor = (rule) => {
+    const domains = rule.options?.initiatorDomains || [];
+    const reqDomains = rule.options?.requestDomains || [];
+    if (domains.length === 0 && reqDomains.length === 0) return null;
+    return new Set([...domains, ...reqDomains]);
+  };
+
   const broaderCoversNarrower = (broaderTypes, narrowerTypes) => {
     // Broader has no resourceTypes constraint → matches all types → always covers.
     if (broaderTypes === null) return true;
@@ -1513,20 +1530,40 @@ function smartTruncate(networkRules, limit) {
     return true;
   };
 
+  const broaderDomainsCoverNarrower = (broaderDomains, narrowerDomains) => {
+    // Broader has no domain restriction → covers everything.
+    if (broaderDomains === null) return true;
+    // Narrower has no restriction but broader does → broader does NOT cover.
+    if (narrowerDomains === null) return false;
+    for (const d of narrowerDomains) if (!broaderDomains.has(d)) return false;
+    return true;
+  };
+
   for (const r of networkRules) {
     if (selected.length >= limit) break;
 
     const isDomainOnly = /^\|\|([^/*?^]+)\^?$/.exec(r.pattern);
     if (isDomainOnly && !r.exception) {
       const existing = dominantDomains.get(isDomainOnly[1]);
-      const incoming = typeSetFor(r);
-      // Track the broadest (type-wise) rule per domain — null wins.
-      if (!existing || existing === null) {
-        dominantDomains.set(isDomainOnly[1], incoming === null ? null : incoming);
-      } else if (incoming === null) {
-        dominantDomains.set(isDomainOnly[1], null);
+      const incomingTypes = typeSetFor(r);
+      const incomingDomains = domainSetFor(r);
+      // Track the broadest rule per domain — null wins for each dimension.
+      if (!existing) {
+        dominantDomains.set(isDomainOnly[1], {
+          types: incomingTypes === null ? null : new Set(incomingTypes),
+          domains: incomingDomains === null ? null : new Set(incomingDomains),
+        });
       } else {
-        for (const t of incoming) existing.add(t);
+        if (incomingTypes === null) {
+          existing.types = null;
+        } else if (existing.types !== null) {
+          for (const t of incomingTypes) existing.types.add(t);
+        }
+        if (incomingDomains === null) {
+          existing.domains = null;
+        } else if (existing.domains !== null) {
+          for (const d of incomingDomains) existing.domains.add(d);
+        }
       }
       selected.push(r);
       continue;
@@ -1535,9 +1572,15 @@ function smartTruncate(networkRules, limit) {
     if (!r.exception && r.pattern.startsWith('||')) {
       const domainMatch = /^\|\|([^/*?^]+)/.exec(r.pattern);
       if (domainMatch && dominantDomains.has(domainMatch[1])) {
-        const broaderTypes = dominantDomains.get(domainMatch[1]);
+        const broaderEntry = dominantDomains.get(domainMatch[1]);
+        const broaderTypes = broaderEntry.types;
+        const broaderDomains = broaderEntry.domains;
         const narrowerTypes = typeSetFor(r);
-        if (broaderCoversNarrower(broaderTypes, narrowerTypes)) continue;
+        const narrowerDomains = domainSetFor(r);
+        if (broaderCoversNarrower(broaderTypes, narrowerTypes) &&
+            broaderDomainsCoverNarrower(broaderDomains, narrowerDomains)) {
+          continue;
+        }
       }
     }
 
@@ -1679,7 +1722,6 @@ async function main() {
   verifyManifestRuleResourcePaths();
 
   log('\n🎉 Build complete!');
-  process.exit(0);
 }
 
 export { parseLine, networkFilterToDNR, buildSourceBundleFallback };

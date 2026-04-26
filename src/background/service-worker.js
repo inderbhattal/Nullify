@@ -2110,7 +2110,7 @@ async function applyUserFilters(filtersText) {
     
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
   await setStorage(StorageKeys.USER_FILTERS_APPLIED, filtersText || '');
-  await setStorage('userScriptletRules', userScriptlets);
+  await setStorage(StorageKeys.USER_SCRIPTLET_RULES, userScriptlets);
 
   // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately
   domainRulesCache.clear();
@@ -2224,7 +2224,6 @@ async function rebuildAllowlistRules(allowlist) {
       priority: 500, // Systematic Priority for User Allowlist
       condition: {
         urlFilter: `||${domain}^`,
-        resourceTypes: ['main_frame', 'sub_frame'],
       },
       action: { type: 'allowAllRequests' },
     }));
@@ -2687,7 +2686,8 @@ async function handleMessage(message, sender) {
       if (!isAllowed && sender.tab?.id) {
         const scriptletsToRun = [...scriptletRules];
 
-        if (!hostname.includes('youtube.com') && isTopFrame && settings.fingerprintProtection === true) {
+        const youtubeHostnames = new Set(YOUTUBE_SHIELD_TARGETS.map(t => t.hostname));
+        if (!youtubeHostnames.has(hostname) && isTopFrame && settings.fingerprintProtection === true) {
           scriptletsToRun.push({ name: 'fingerprint-noise', args: [] });
           scriptletsToRun.push({ name: 'battery-spoof', args: [] });
         }
@@ -3004,7 +3004,7 @@ async function getCosmeticBundleForPage(hostname) {
 }
 
 async function getScriptletRulesForPage(hostname) {
-  const userScriptlets = (await getStorage('userScriptletRules')) || [];
+  const userScriptlets = (await getStorage(StorageKeys.USER_SCRIPTLET_RULES)) || [];
   const activeUserScriptlets = userScriptlets.filter(r => {
     if (r.domains.length === 0) return true;
     return r.domains.some(d => hostname === d || hostname.endsWith('.' + d));
@@ -3054,7 +3054,12 @@ function isHostnameAllowedCached(hostname) {
  */
 async function performEarlyInjection(tabId, frameId, urlStr) {
   if (!urlStr?.startsWith('http')) return;
-  const url = new URL(urlStr);
+  let url;
+  try {
+    url = new URL(urlStr);
+  } catch {
+    return;
+  }
   const hostname = normalizeHostname(url.hostname);
 
   if (isHostnameAllowedCached(hostname)) return;
@@ -3086,12 +3091,17 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
   if (!details.url.startsWith('http')) return;
 
+  let url;
+  try {
+    url = new URL(details.url);
+  } catch {
+    return;
+  }
+  const hostname = normalizeHostname(url.hostname);
+
   if (details.frameId === 0) {
     resetTabStats(details.tabId, details.url);
   }
-
-  const url = new URL(details.url);
-  const hostname = normalizeHostname(url.hostname);
 
   if (!domainRulesCache.has(hostname)) {
     const bundle = await getCosmeticBundleForPage(hostname);

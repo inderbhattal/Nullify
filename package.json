@@ -19,7 +19,8 @@
     "clean": "rm -rf dist/ && find rules/ -name '*.json' ! -name 'system-unbreak.json' -delete && rm -rf _metadata",
     "clean:all": "npm run clean && rm -rf node_modules/",
     "version:sync": "node scripts/version.mjs",
-    "version:bump": "f() { new_ver=$(npm version --no-git-tag-version \"$1\") && npm run version:sync -- \"${new_ver#v}\" && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to ${new_ver#v}\" && git tag \"$new_ver\"; }; f",
+    "version:bump": "f() { new_ver=$(npm version --no-git-tag-version \"$1\") && npm run version:sync -- \"${new_ver#v}\" && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to ${new_ver#v}\"; }; f",
+"version:tag": "f() { git tag -a \"$1\" -m \"Nullify $1\" && echo \"Tag $1 created on $(git rev-parse HEAD)\"; }; f",
     "push": "git push origin main --tags"
   },
   "devDependencies": {

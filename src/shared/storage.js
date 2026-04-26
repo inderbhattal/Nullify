@@ -33,6 +33,7 @@ export const StorageKeys = {
   STEALTH_PERSONA: 'stealthPersona',
   CACHE_PROTECTION: 'cacheProtection',
   REFERRER_CONTROL: 'referrerControl',
+  BLOOM_FILL_THRESHOLD: 'bloomFillThreshold',
 };
 
 /** Get multiple values from storage in one call. */

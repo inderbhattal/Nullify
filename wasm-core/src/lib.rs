@@ -22,41 +22,11 @@ pub fn start() {
 // hostname ancestor chains at any suffix in this set to prevent `co.uk`
 // (etc.) from matching entire TLDs in allowlist / bloom lookups.
 // ---------------------------------------------------------------------------
+// PSL is generated from src/shared/psl.js to ensure JS/Rust sync
+mod psl_generated;
+
 fn public_suffixes() -> &'static HashSet<&'static str> {
-    static SET: OnceLock<HashSet<&'static str>> = OnceLock::new();
-    SET.get_or_init(|| {
-        [
-            "com", "org", "net", "edu", "gov", "mil", "int", "io", "co", "ai",
-            "app", "dev", "info", "biz", "me", "tv", "xyz", "online", "site",
-            "store", "shop", "tech", "cloud", "blog", "news", "art",
-            "uk", "us", "de", "fr", "it", "es", "nl", "be", "ch", "at", "se",
-            "no", "dk", "fi", "pl", "cz", "pt", "gr", "ie", "au", "nz", "ca",
-            "mx", "br", "ar", "cl", "pe", "ru", "ua", "by", "tr", "il", "sa",
-            "ae", "eg", "za", "ng", "ke", "ma", "jp", "kr", "cn", "hk", "tw",
-            "sg", "my", "id", "th", "vn", "ph", "in", "pk", "bd", "lk",
-            "co.uk", "org.uk", "gov.uk", "ac.uk", "net.uk", "sch.uk", "nhs.uk",
-            "com.au", "net.au", "org.au", "edu.au", "gov.au",
-            "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp",
-            "co.kr", "or.kr", "ne.kr", "go.kr", "ac.kr",
-            "com.br", "net.br", "org.br", "gov.br", "edu.br",
-            "com.mx", "org.mx", "gob.mx",
-            "com.ar", "org.ar", "gob.ar", "gov.ar",
-            "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz",
-            "com.sg", "edu.sg", "gov.sg",
-            "com.hk", "org.hk", "gov.hk",
-            "com.tw", "org.tw", "gov.tw", "edu.tw",
-            "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn",
-            "co.in", "net.in", "org.in", "gov.in", "ac.in",
-            "co.il", "org.il", "gov.il", "ac.il",
-            "co.za", "org.za", "gov.za", "ac.za",
-            "com.tr", "org.tr", "gov.tr", "edu.tr",
-            "com.ua", "org.ua", "gov.ua", "edu.ua",
-            "com.ru", "org.ru", "gov.ru",
-            "github.io", "gitlab.io", "netlify.app", "vercel.app", "herokuapp.com",
-            "pages.dev", "workers.dev", "web.app", "firebaseapp.com",
-            "s3.amazonaws.com", "cloudfront.net",
-        ].into_iter().collect()
-    })
+    psl_generated::public_suffixes_generated()
 }
 
 fn is_public_suffix(host: &str) -> bool {
@@ -114,13 +84,14 @@ impl BloomFilter {
         h
     }
 
-    pub fn serialize_to_json(&self) -> String {
+    pub fn serialize_to_json(&self) -> Result<String, JsValue> {
         let s = SerializedBloom {
             size: self.size,
             hashes: self.hashes,
             data: self.bitset.clone(),
         };
-        serde_json::to_string(&s).unwrap_or_default()
+        serde_json::to_string(&s)
+            .map_err(|e| JsValue::from_str(&format!("Bloom serialize error: {}", e)))
     }
 
     pub fn deserialize_from_json(json: &str) -> Self {
@@ -145,6 +116,24 @@ impl BloomFilter {
             }
         }
         false
+    }
+
+    /// Returns the fill ratio of the bloom filter (set bits / total bits).
+    /// A ratio > 0.5 indicates saturation and the filter should be rebuilt larger.
+    #[wasm_bindgen]
+    pub fn fill_ratio(&self) -> f64 {
+        let set_bits = self.count_set_bits();
+        set_bits as f64 / self.size as f64
+    }
+
+    /// Returns the fill ratio threshold at which the bloom filter should be rebuilt.
+    #[wasm_bindgen]
+    pub fn fill_threshold() -> f64 {
+        0.5
+    }
+
+    fn count_set_bits(&self) -> usize {
+        self.bitset.iter().map(|w| w.count_ones() as usize).sum()
     }
 }
 
@@ -204,11 +193,12 @@ struct FilterSourceBundle {
     scriptlets: Vec<ParsedRule>,
 }
 
-fn from_js_value<T>(value: JsValue) -> T
+fn from_js_value<T>(value: JsValue) -> Result<T, JsValue>
 where
     T: for<'de> Deserialize<'de> + Default,
 {
-    serde_wasm_bindgen::from_value(value).unwrap_or_default()
+    serde_wasm_bindgen::from_value(value)
+        .map_err(|e| JsValue::from_str(&format!("Deserialization error: {}", e)))
 }
 
 fn to_js_value<T>(value: &T) -> JsValue
@@ -559,9 +549,9 @@ fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<
 }
 
 #[wasm_bindgen]
-pub fn build_allowlist_rules(allowlist: JsValue, start_id: u32) -> JsValue {
-    let allowlist: Vec<String> = from_js_value(allowlist);
-    to_js_value(&build_allowlist_rules_internal(allowlist, start_id))
+pub fn build_allowlist_rules(allowlist: JsValue, start_id: u32) -> Result<JsValue, JsValue> {
+    let allowlist: Vec<String> = from_js_value(allowlist)?;
+    Ok(to_js_value(&build_allowlist_rules_internal(allowlist, start_id)))
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1178,8 +1168,10 @@ fn is_valid_selector(selector: &str) -> bool {
 fn has_balanced_selector_delimiters(selector: &str) -> bool {
     let mut bracket_depth = 0i32;
     let mut paren_depth = 0i32;
+    let mut curly_depth = 0i32;
     let mut quoted: Option<char> = None;
     let mut escaped = false;
+    let mut in_attribute_value = false;
 
     for ch in selector.chars() {
         if escaped {
@@ -1195,23 +1187,58 @@ fn has_balanced_selector_delimiters(selector: &str) -> bool {
         if let Some(quote) = quoted {
             if ch == quote {
                 quoted = None;
+                in_attribute_value = false;
             }
             continue;
         }
 
         match ch {
-            '"' | '\'' => quoted = Some(ch),
-            '[' => bracket_depth += 1,
+            '"' | '\'' => {
+                // Track quotes inside attribute brackets [...] for attribute value parsing.
+                // Note: Procedural selector args like :has-text("foo") are parsed separately
+                // and don't go through this delimiter balance check — this function validates
+                // the CSS selector portion only, before any procedural operator arguments.
+                if bracket_depth > 0 && !in_attribute_value {
+                    quoted = Some(ch);
+                    in_attribute_value = true;
+                }
+            }
+            '[' => {
+                // Reject nested brackets without closing (bypass attempt)
+                if bracket_depth >= 3 {
+                    return false;
+                }
+                bracket_depth += 1;
+            }
             ']' => {
                 bracket_depth -= 1;
                 if bracket_depth < 0 {
                     return false;
                 }
+                in_attribute_value = false;
             }
-            '(' => paren_depth += 1,
+            '(' => {
+                // Reject excessive nesting (bypass via deep nesting)
+                if paren_depth >= 5 {
+                    return false;
+                }
+                paren_depth += 1;
+            }
             ')' => {
                 paren_depth -= 1;
                 if paren_depth < 0 {
+                    return false;
+                }
+            }
+            '{' => {
+                curly_depth += 1;
+                if curly_depth > 0 {
+                    return false; // CSS selectors should not contain {
+                }
+            }
+            '}' => {
+                curly_depth -= 1;
+                if curly_depth < 0 {
                     return false;
                 }
             }
@@ -1219,12 +1246,15 @@ fn has_balanced_selector_delimiters(selector: &str) -> bool {
         }
     }
 
-    quoted.is_none() && bracket_depth == 0 && paren_depth == 0
+    // All delimiters must be balanced and no unclosed quotes
+    quoted.is_none() && bracket_depth == 0 && paren_depth == 0 && curly_depth == 0
 }
 
 fn has_invalid_universal_usage(selector: &str) -> bool {
     let chars: Vec<char> = selector.chars().collect();
+    let len = chars.len();
     let mut bracket_depth = 0i32;
+    let mut paren_depth = 0i32;
     let mut quoted: Option<char> = None;
     let mut escaped = false;
 
@@ -1257,11 +1287,49 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
             }
             ']' => {
                 bracket_depth -= 1;
+                if bracket_depth < 0 { return true; }
                 continue;
             }
-            '*' if bracket_depth == 0 => {
+            '(' => {
+                paren_depth += 1;
+                continue;
+            }
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 { return true; }
+                continue;
+            }
+            '*' if bracket_depth == 0 && paren_depth == 0 => {
+                // Universal selector (*) is invalid when preceded by alphanumeric/identifier chars
+                // This catches bypasses like `div*` or `.class*`
                 let prev = chars[..idx].iter().rev().find(|c| !c.is_whitespace());
                 if prev.is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ')' || *c == ']') {
+                    return true;
+                }
+                // Universal selector at start is valid only if followed by valid combinator or element
+                // Reject `*` followed by invalid characters (bypass via malformed selector)
+                if idx + 1 < len {
+                    let next = chars[idx + 1..].iter().find(|c| !c.is_whitespace());
+                    if let Some(n) = next {
+                        // After * we allow: combinator (>, +, ~, space), pseudo (:), or end
+                        if !n.is_ascii_alphanumeric() && *n != '#' && *n != '.' && *n != '[' &&
+                           *n != ':' && *n != '>' && *n != '+' && *n != '~' && *n != ',' {
+                            return true;
+                        }
+                    }
+                }
+            }
+            // Pseudo-element safety: reject double-colon followed by unknown pseudo-element
+            ':' if idx + 1 < len && chars[idx + 1] == ':' => {
+                // Allow known pseudo-elements only
+                let pseudo_rest: String = chars[idx..].iter().collect();
+                let known_pseudo_elements = [
+                    "::before", "::after", "::first-line", "::first-letter",
+                    "::selection", "::backdrop", "::placeholder", "::marker",
+                    "::cue", "::slotted", "::part", "::file-selector-button",
+                ];
+                if !known_pseudo_elements.iter().any(|p| pseudo_rest.starts_with(p)) {
+                    // Unknown pseudo-element — could be bypass attempt
                     return true;
                 }
             }
@@ -1436,10 +1504,10 @@ pub fn build_page_bundle(
     domain_specific: JsValue,
     exceptions: JsValue,
     css_chunk_size: usize,
-) -> JsValue {
-    let generic_in: Vec<String> = from_js_value(generic);
-    let domain_specific_in: Vec<String> = from_js_value(domain_specific);
-    let exceptions_in: Vec<String> = from_js_value(exceptions);
+) -> Result<JsValue, JsValue> {
+    let generic_in: Vec<String> = from_js_value(generic)?;
+    let domain_specific_in: Vec<String> = from_js_value(domain_specific)?;
+    let exceptions_in: Vec<String> = from_js_value(exceptions)?;
     let bundle = build_page_bundle_internal(generic_in, domain_specific_in, exceptions_in, css_chunk_size);
 
     let bundle_obj = Object::new();
@@ -1461,7 +1529,7 @@ pub fn build_page_bundle(
     let _ = Reflect::set(&bundle_obj, &JsValue::from_str("exceptionCss"), &JsValue::from_str(&bundle.exception_css));
     let _ = Reflect::set(&bundle_obj, &JsValue::from_str("cosmeticRulesBinary"), &binary_js.into());
 
-    bundle_obj.into()
+    Ok(bundle_obj.into())
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,10 +1746,10 @@ fn compile_active_filter_index_internal(
 }
 
 #[wasm_bindgen]
-pub fn compile_active_filter_index(core_source: JsValue, list_sources: JsValue, css_chunk_size: usize) -> JsValue {
-    let core_source: FilterSourceBundle = from_js_value(core_source);
-    let list_sources: Vec<FilterSourceBundle> = from_js_value(list_sources);
-    to_js_value(&compile_active_filter_index_internal(core_source, list_sources, css_chunk_size))
+pub fn compile_active_filter_index(core_source: JsValue, list_sources: JsValue, css_chunk_size: usize) -> Result<JsValue, JsValue> {
+    let core_source: FilterSourceBundle = from_js_value(core_source)?;
+    let list_sources: Vec<FilterSourceBundle> = from_js_value(list_sources)?;
+    Ok(to_js_value(&compile_active_filter_index_internal(core_source, list_sources, css_chunk_size)))
 }
 
 // ---------------------------------------------------------------------------

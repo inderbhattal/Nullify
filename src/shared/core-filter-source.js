@@ -120,7 +120,7 @@ export const CORE_FILTER_SOURCE = {
     exceptions: {},
   },
   scriptlets: [
-    { domains: ['example.com'], name: 'abort-on-property-read', args: ['_sp_'] },
-    { domains: ['somesite.com'], name: 'set-constant', args: ['adblockEnabled', 'false'] },
+    { type: 'scriptlet', domains: ['example.com'], name: 'abort-on-property-read', args: ['_sp_'] },
+    { type: 'scriptlet', domains: ['somesite.com'], name: 'set-constant', args: ['adblockEnabled', 'false'] },
   ],
 };

@@ -13,6 +13,51 @@
  *  - Apply WebRTC/privacy settings
  */
 
+// DEBUG flag for development logging — set via chrome.storage.local for runtime control
+// Checked synchronously at load time; changes require service worker restart
+const DEBUG = false;
+const log = DEBUG ? console.log.bind(console) : () => {};
+const warn = console.warn.bind(console);
+
+// Structured error reporting — collects critical failures for diagnostics
+const errorReport = {
+  critical: [],
+  warnings: [],
+  lastError: null,
+};
+
+function reportError(context, error, options = { fatal: false }) {
+  const entry = {
+    context,
+    message: error?.message || String(error),
+    stack: error?.stack,
+    timestamp: Date.now(),
+    fatal: options.fatal,
+  };
+  errorReport.lastError = entry;
+  if (options.fatal) {
+    errorReport.critical.push(entry);
+    console.error(`[Nullify] CRITICAL: ${context} — ${entry.message}`);
+  } else {
+    errorReport.warnings.push(entry);
+    warn(`[Nullify] ${context} — ${entry.message}`);
+  }
+  // Keep only last 100 entries per category
+  if (errorReport.critical.length > 100) errorReport.critical.shift();
+  if (errorReport.warnings.length > 100) errorReport.warnings.shift();
+}
+
+// Configurable constants — defaults can be overridden via storage
+const CONFIG = {
+  BLOOM_FILL_THRESHOLD: 0.5,        // Rebuild bloom filter when fill ratio exceeds this
+  BLOOM_BITS_PER_ITEM: 10,          // Bits per item for ~1% false positive rate
+  DOMAIN_RULES_CACHE_MAX: 100,      // Max entries in LRU domain rules cache
+  PAGE_BUNDLE_DB_MAX: 250,          // Max page bundles in IndexedDB
+  PROCEDURAL_DEBOUNCE_MS: 100,      // Debounce delay for procedural cosmetic runs
+  CACHE_SWEEP_INTERVAL_MS: 300000,  // 5 minutes - procedural cache sweep interval
+  FILTER_UPDATE_INTERVAL_MINUTES: 1440,  // 24 hours
+};
+
 import {getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
@@ -36,7 +81,8 @@ import init, {
   serialize_rules_to_binary_from_json,
   resolve_entity,
   is_semantic_ad,
-  anonymize_stats_json
+  anonymize_stats_json,
+  BloomFilter as WasmBloomClass
 } from '../shared/wasm/nullify_core.js';
 
 // Remote filter list sources (cosmetic + scriptlet rules only; DNR rules are static)
@@ -59,10 +105,33 @@ const ALL_KNOWN_LIST_IDS = [
 const db = new RulesDB();
 let bloom = null;
 let wasmReady = false;
+let wasmReadyPromise = null;  // Promise that resolves when WASM is ready
 let trackerMatcher = null;
 // Stateful WASM objects — built once, never rebuilt unless data changes.
 let allowlistMatcher = null;  // AllowlistMatcher: O(1) allowlist checks
 let urlSanitizer = null;      // UrlSanitizer: AC built once for tracking-param stripping
+
+/**
+ * Wait for WASM to be ready, with optional timeout.
+ * Returns true if WASM is ready (or becomes ready within timeout), false otherwise.
+ */
+function waitForWasm(timeoutMs = 5000) {
+  if (wasmReady) return Promise.resolve(true);
+  if (!wasmReadyPromise) return Promise.resolve(false);
+
+  const timeout = new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    wasmReadyPromise?.then(() => {
+      clearTimeout(timer);
+      resolve(true);
+    }).catch(() => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+
+  return timeout;
+}
 const trackerKeywordsCsv = [
   'telemetry', 'analytics', 'tracking', 'pixel', 'beacon', 'metrics',
   'collect', 'segment', 'mixpanel', 'hotjar', 'amplitude', 'doubleclick',
@@ -100,9 +169,19 @@ function setCachedDomainRules(hostname, bundle) {
 // ---------------------------------------------------------------------------
 const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
-const FILTER_UPDATE_INTERVAL_MINUTES = 24 * 60; // 24 hours
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
 const RULE_DATA_SCHEMA_VERSION = 2;
+
+// Load config from storage with fallback to defaults
+async function loadConfig() {
+  const stored = await getStorageBulk([
+    StorageKeys.BLOOM_FILL_THRESHOLD,
+  ]).catch(() => ({}));
+
+  if (typeof stored[StorageKeys.BLOOM_FILL_THRESHOLD] === 'number') {
+    CONFIG.BLOOM_FILL_THRESHOLD = stored[StorageKeys.BLOOM_FILL_THRESHOLD];
+  }
+}
 
 let bundledRuleDataVersionPromise = null;
 
@@ -417,8 +496,10 @@ function classifyAndPlanSelectors(selectors) {
 function hasBalancedSelectorDelimiters(selector) {
   let bracketDepth = 0;
   let parenDepth = 0;
+  let curlyDepth = 0;
   let quote = null;
   let escaped = false;
+  let inAttributeValue = false;
 
   for (const ch of selector) {
     if (escaped) {
@@ -430,30 +511,49 @@ function hasBalancedSelectorDelimiters(selector) {
       continue;
     }
     if (quote) {
-      if (ch === quote) quote = null;
+      if (ch === quote) {
+        quote = null;
+        inAttributeValue = false;
+      }
       continue;
     }
 
     if (ch === '"' || ch === '\'') {
-      quote = ch;
+      // Only track quotes inside attribute brackets
+      if (bracketDepth > 0 && !inAttributeValue) {
+        quote = ch;
+        inAttributeValue = true;
+      }
     } else if (ch === '[') {
+      // Reject excessive nesting (bypass attempt)
+      if (bracketDepth >= 3) return false;
       bracketDepth++;
     } else if (ch === ']') {
       bracketDepth--;
       if (bracketDepth < 0) return false;
+      inAttributeValue = false;
     } else if (ch === '(') {
+      // Reject excessive nesting
+      if (parenDepth >= 5) return false;
       parenDepth++;
     } else if (ch === ')') {
       parenDepth--;
       if (parenDepth < 0) return false;
+    } else if (ch === '{') {
+      curlyDepth++;
+      if (curlyDepth > 0) return false;
+    } else if (ch === '}') {
+      curlyDepth--;
+      if (curlyDepth < 0) return false;
     }
   }
 
-  return !quote && bracketDepth === 0 && parenDepth === 0;
+  return !quote && bracketDepth === 0 && parenDepth === 0 && curlyDepth === 0;
 }
 
 function hasInvalidUniversalUsage(selector) {
   let bracketDepth = 0;
+  let parenDepth = 0;
   let quote = null;
   let escaped = false;
 
@@ -482,21 +582,58 @@ function hasInvalidUniversalUsage(selector) {
     }
     if (ch === ']') {
       bracketDepth--;
+      if (bracketDepth < 0) return true;
       continue;
     }
-    if (ch !== '*' || bracketDepth > 0) continue;
+    if (ch === '(') {
+      parenDepth++;
+      continue;
+    }
+    if (ch === ')') {
+      parenDepth--;
+      if (parenDepth < 0) return true;
+      continue;
+    }
 
-    let prev = null;
-    for (let j = i - 1; j >= 0; j--) {
-      const pc = selector.charAt(j);
-      if (!/\s/.test(pc)) {
-        prev = pc;
-        break;
+    if (ch === '*' && bracketDepth === 0 && parenDepth === 0) {
+      // Universal selector (*) is invalid when preceded by alphanumeric/identifier chars
+      let prev = null;
+      for (let j = i - 1; j >= 0; j--) {
+        const pc = selector.charAt(j);
+        if (!/\s/.test(pc)) {
+          prev = pc;
+          break;
+        }
+      }
+      if (prev && /[A-Za-z0-9_\-)\]]/.test(prev)) {
+        return true;
+      }
+
+      // Validate what follows * — reject malformed selectors
+      let next = null;
+      for (let j = i + 1; j < selector.length; j++) {
+        const nc = selector.charAt(j);
+        if (!/\s/.test(nc)) {
+          next = nc;
+          break;
+        }
+      }
+      if (next && !/[A-Za-z0-9#.\[:>+~,]/.test(next)) {
+        return true;
       }
     }
 
-    if (prev && /[A-Za-z0-9_\-)\]]/.test(prev)) {
-      return true;
+    // Pseudo-element safety check
+    if (ch === ':' && i + 1 < selector.length && selector.charAt(i + 1) === ':') {
+      const pseudoRest = selector.slice(i);
+      const knownPseudoElements = [
+        '::before', '::after', '::first-line', '::first-letter',
+        '::selection', '::backdrop', '::placeholder', '::marker',
+        '::cue', '::slotted', '::part', '::file-selector-button',
+      ];
+      if (!knownPseudoElements.some(p => pseudoRest.startsWith(p))) {
+        return true; // Unknown pseudo-element — potential bypass
+      }
     }
   }
 
@@ -629,7 +766,7 @@ async function fetchAndStoreRemoteFilterSources() {
 
   for (const list of REMOTE_FILTER_LISTS) {
     try {
-      console.log(`[AdBlock] Fetching ${list.id} source bundle...`);
+      log(`[AdBlock] Fetching ${list.id} source bundle...`);
       const text = await fetchAndExpand(list.url);
       sourceBundles[list.id] = wasmReady
         ? parse_filter_source(text)
@@ -677,7 +814,9 @@ async function rebuildActiveRuleIndexFromStoredSources() {
         '',
       ];
   const totalDomains = Math.max(bloomHosts.length, 1);
-  const newBloom = wasmReady ? new WasmBloom(totalDomains * 10, 4) : BloomFilter.forCapacity(totalDomains);
+  const newBloom = wasmReady
+    ? new WasmBloom(totalDomains * CONFIG.BLOOM_BITS_PER_ITEM, 4)
+    : BloomFilter.forCapacity(totalDomains);
 
   await db.putBulkCosmeticRules(merged.cosmetic.domainSpecific || {});
 
@@ -687,10 +826,33 @@ async function rebuildActiveRuleIndexFromStoredSources() {
   }
 
   bloom = newBloom;
-  await setStorage(
-    StorageKeys.BLOOM_FILTER,
-    wasmReady ? bloom.serialize_to_json() : bloom.serialize()
-  );
+
+  // Bloom filter fill-ratio monitoring — rebuild with larger size if saturated
+  if (wasmReady && typeof bloom.fill_ratio === 'function') {
+    const ratio = bloom.fill_ratio();
+    if (ratio > CONFIG.BLOOM_FILL_THRESHOLD) {
+      console.warn(`[Nullify] Bloom filter saturated (fill ratio: ${ratio.toFixed(2)}). Rebuilding with 2x capacity...`);
+      const largerBloom = new WasmBloom(totalDomains * 20, 4);
+      for (const hostname of bloomHosts) {
+        largerBloom.add(hostname || '');
+      }
+      bloom = largerBloom;
+      log(`[Nullify] Bloom filter rebuilt. New fill ratio: ${bloom.fill_ratio().toFixed(2)}`);
+    }
+  }
+
+  let bloomData;
+  if (wasmReady) {
+    try {
+      bloomData = bloom.serialize_to_json();
+    } catch (err) {
+      console.error('[Nullify] WASM bloom serialize failed:', err);
+      bloomData = bloom.serialize(); // Fallback to JS serialization
+    }
+  } else {
+    bloomData = bloom.serialize();
+  }
+  await setStorage(StorageKeys.BLOOM_FILTER, bloomData);
 
   const genericBundle = buildPageBundle({
     generic: merged.cosmetic.generic || [],
@@ -800,7 +962,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     await ensureBackgroundSetup();
     await refreshAllBadges();
   } catch (err) {
-    console.error('[Nullify] onInstalled handler failed:', err);
+    reportError('onInstalled handler', err, { fatal: true });
   }
 });
 
@@ -813,6 +975,8 @@ function ensureBackgroundSetup() {
   if (_backgroundSetupPromise) return _backgroundSetupPromise;
 
   _backgroundSetupPromise = (async () => {
+    // Load user config overrides before any other initialization
+    await loadConfig();
     // Defaults must be persisted BEFORE applyRulesets reads ENABLED_RULESETS.
     // initializeDefaults is idempotent (returns early if SETTINGS exists).
     await initializeDefaults();
@@ -837,7 +1001,7 @@ function ensureBackgroundSetup() {
     ]);
   })().catch((err) => {
     _backgroundSetupPromise = null;
-    throw err;
+    reportError('Background setup', err, { fatal: true });
   });
 
   return _backgroundSetupPromise;
@@ -850,7 +1014,8 @@ function startInitialization() {
     // Stage 0: Initialize WASM
     try {
       const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
-      await initWasmFromUrl(init, wasmUrl);
+      wasmReadyPromise = initWasmFromUrl(init, wasmUrl);
+      await wasmReadyPromise;
       wasmReady = true;
 
       // Initialize tracker detector using string-based interface
@@ -859,9 +1024,10 @@ function startInitialization() {
       urlSanitizer = new UrlSanitizer(trackerKeywordsCsv);
       rebuildAllowlistMatcher();
 
-      console.log('[Nullify] WASM Core initialized');
+      log('[Nullify] WASM Core initialized');
     } catch (err) {
-      console.error('[Nullify] WASM initialization failed:', err);
+      reportError('WASM initialization', err, { fatal: true });
+      // Continue without WASM — JS fallbacks will be used
     }
 
     // Stage 1: Ensure the active rule index exists and is list-aware.
@@ -879,7 +1045,9 @@ function startInitialization() {
     // Stage 3: Background tasks (non-blocking for messages)
     ensureBackgroundSetup().catch(err => console.error('[Nullify] Background startup failed:', err));
 
-  })().catch(err => console.error('[Nullify] Critical startup failed:', err));
+  })().catch((err) => {
+    reportError('Critical startup', err, { fatal: true });
+  });
 
   return _criticalPromise;
 }
@@ -901,6 +1069,21 @@ function rebuildAllowlistMatcher() {
   }
 }
 
+/**
+ * Rebuild allowlist state atomically — ensures DNR rules, matcher, and
+ * dependent caches stay in sync. Returns a promise that resolves when
+ * all state is consistent.
+ */
+async function rebuildAllowlistState(normalizedAllowlist) {
+  cachedAllowlist = new Set(normalizedAllowlist);
+  await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
+  await rebuildAllowlistRules(normalizedAllowlist);
+  rebuildAllowlistMatcher();
+  // Dependent caches must be cleared AFTER DNR rules are updated
+  domainRulesCache.clear();
+  await syncYouTubeShieldRegistration();
+}
+
 function getYouTubeShieldExcludeMatches() {
   return YOUTUBE_SHIELD_TARGETS
     .filter(({ hostname }) => isHostnameAllowedCached(hostname))
@@ -915,7 +1098,17 @@ function arraysEqual(a = [], b = []) {
   return true;
 }
 
+// AbortController for YouTube shield sync — cancels stale in-flight operations
+let youtubeShieldAbortController = null;
+
 async function syncYouTubeShieldRegistration() {
+  // Abort any in-flight sync operation — new call takes precedence
+  if (youtubeShieldAbortController) {
+    youtubeShieldAbortController.abort();
+  }
+  youtubeShieldAbortController = new AbortController();
+  const { signal } = youtubeShieldAbortController;
+
   const run = async () => {
     const registration = {
       id: YOUTUBE_SHIELD_SCRIPT_ID,
@@ -931,6 +1124,7 @@ async function syncYouTubeShieldRegistration() {
     const existingScripts = await chrome.scripting.getRegisteredContentScripts({
       ids: [YOUTUBE_SHIELD_SCRIPT_ID],
     }).catch(() => []);
+    if (signal.aborted) return;
     const existing = existingScripts?.[0] || null;
 
     if (
@@ -953,24 +1147,26 @@ async function syncYouTubeShieldRegistration() {
         world: registration.world,
         allFrames: registration.allFrames,
       }]);
+      if (signal.aborted) return;
       return;
     }
 
     if (existing) {
       await chrome.scripting.unregisterContentScripts({ ids: [YOUTUBE_SHIELD_SCRIPT_ID] }).catch(() => {});
+      if (signal.aborted) return;
     }
 
     await chrome.scripting.registerContentScripts([registration]);
   };
 
-  const pending = (youtubeShieldSyncPromise || Promise.resolve())
-    .then(run)
-    .catch((err) => {
-      console.error('[Nullify] Failed to sync YouTube shield registration:', err);
-    });
+  const pending = run().catch((err) => {
+    if (signal.aborted) return; // Silently ignore aborted operations
+    console.error('[Nullify] Failed to sync YouTube shield registration:', err);
+  });
 
   youtubeShieldSyncPromise = pending.finally(() => {
-    if (youtubeShieldSyncPromise === pending) {
+    if (youtubeShieldSyncPromise === pending && !signal.aborted) {
+      youtubeShieldAbortController = null;
       youtubeShieldSyncPromise = null;
     }
   });
@@ -998,11 +1194,11 @@ async function refreshMemoryCache() {
     rawAllowlist.length !== normalizedAllowlist.length ||
     rawAllowlist.some((domain, index) => domain !== normalizedAllowlist[index])
   ) {
-    await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
-    await rebuildAllowlistRules(normalizedAllowlist);
+    await rebuildAllowlistState(normalizedAllowlist);
+  } else {
+    // Ensure matcher is built even if no change
+    rebuildAllowlistMatcher();
   }
-
-  rebuildAllowlistMatcher(); // Rebuild with fresh allowlist data — last, so matcher and DNR agree.
 
   const genericCss = data[StorageKeys.GENERIC_CSS];
   if (typeof genericCss === 'string' && genericCss.length > 0) {
@@ -1015,7 +1211,6 @@ async function refreshMemoryCache() {
     : [];
 
   domainRulesCache.clear();
-  await syncYouTubeShieldRegistration();
 }
 
 async function loadBloomFilter() {
@@ -1025,6 +1220,7 @@ async function loadBloomFilter() {
       if (typeof data === 'string') {
         if (wasmReady) {
           bloom = WasmBloom.deserialize_from_json(data);
+          checkBloomFillRatio(bloom);
         } else {
           if (await db.hasFilterSources()) {
             await rebuildActiveRuleIndexFromStoredSources();
@@ -1034,10 +1230,11 @@ async function loadBloomFilter() {
         }
         return;
       }
-      
+
       if (wasmReady) {
         // Data is a raw object, but WASM needs a JSON string
         bloom = WasmBloom.deserialize_from_json(JSON.stringify(data));
+        checkBloomFillRatio(bloom);
       } else {
         bloom = BloomFilter.deserialize(data);
       }
@@ -1047,6 +1244,21 @@ async function loadBloomFilter() {
     }
   } else {
     bloom = wasmReady ? new WasmBloom(256 * 1024, 4) : new BloomFilter(256 * 1024, 4);
+  }
+}
+
+function checkBloomFillRatio(bloomFilter) {
+  if (!wasmReady || typeof bloomFilter.fill_ratio !== 'function') return;
+  const ratio = bloomFilter.fill_ratio();
+  // Use WASM fill_threshold if available, otherwise fall back to CONFIG
+  const threshold = (typeof WasmBloomClass.fill_threshold === 'function')
+    ? WasmBloomClass.fill_threshold()
+    : CONFIG.BLOOM_FILL_THRESHOLD;
+  if (ratio > threshold) {
+    console.warn(`[Nullify] Loaded Bloom filter is saturated (fill ratio: ${ratio.toFixed(2)}). Schedule rebuild...`);
+    rebuildActiveRuleIndexFromStoredSources().catch(err => {
+      console.error('[Nullify] Bloom filter rebuild failed:', err);
+    });
   }
 }
 
@@ -1064,16 +1276,18 @@ async function ingestLegacyRules() {
     const scriptUrl = chrome.runtime.getURL('rules/scriptlet-rules.json');
     const scriptData = await (await fetch(scriptUrl)).json();
 
-    console.log(`[AdBlock] Indexing ${cosData.generic?.length || 0} generic and ${Object.keys(cosData.domainSpecific || {}).length} domain-specific cosmetic rules...`);
+    log(`[AdBlock] Indexing ${cosData.generic?.length || 0} generic and ${Object.keys(cosData.domainSpecific || {}).length} domain-specific cosmetic rules...`);
     
     // Wipe and rebuild index
     await db.clear();
 
-    // Size the Bloom Filter for actual domain count (10 bits/item → ~1% FP rate)
+    // Size the Bloom Filter for actual domain count (CONFIG.BLOOM_BITS_PER_ITEM bits/item → ~1% FP rate)
     const domainCount = Object.keys(cosData.domainSpecific || {}).length +
       (scriptData || []).reduce((n, r) => n + (r.domains?.length || 0), 0) + 1; // +1 for generic ''
-    
-    const newBloom = wasmReady ? new WasmBloom(domainCount * 10, 4) : BloomFilter.forCapacity(domainCount);
+
+    const newBloom = wasmReady
+      ? new WasmBloom(domainCount * CONFIG.BLOOM_BITS_PER_ITEM, 4)
+      : BloomFilter.forCapacity(domainCount);
 
     if (cosData.domainSpecific) {
       await db.putBulkCosmeticRules(cosData.domainSpecific);
@@ -1115,7 +1329,7 @@ async function ingestLegacyRules() {
     ]);
 
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
-    console.log('[AdBlock] Rule indexing and Bloom Filter build complete');
+    log('[AdBlock] Rule indexing and Bloom Filter build complete');
   } catch (err) {
     console.error('[AdBlock] Failed to ingest rules:', err);
   }
@@ -1168,7 +1382,7 @@ async function initializeDefaults() {
   // Enabled/disabled rulesets
   await setStorage(StorageKeys.ENABLED_RULESETS, getDefaultEnabledRulesets());
 
-  console.log('[AdBlock] Defaults initialized');
+  log('[AdBlock] Defaults initialized');
 }
 
 // ---------------------------------------------------------------------------
@@ -1433,8 +1647,8 @@ const DNR_REFERRER_RULES_START = 840_000;
 async function scheduleFilterUpdateAlarm() {
   await chrome.alarms.clear(ALARM_FILTER_UPDATE);
   chrome.alarms.create(ALARM_FILTER_UPDATE, {
-    delayInMinutes: FILTER_UPDATE_INTERVAL_MINUTES,
-    periodInMinutes: FILTER_UPDATE_INTERVAL_MINUTES,
+    delayInMinutes: CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
+    periodInMinutes: CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
   });
 
   await chrome.alarms.clear(ALARM_STATS_CLEANUP);
@@ -1470,13 +1684,13 @@ let _filterUpdateInProgress = false;
 
 async function checkFilterListUpdates() {
   if (_filterUpdateInProgress) {
-    console.log('[AdBlock] Filter update already in progress, skipping.');
+    log('[AdBlock] Filter update already in progress, skipping.');
     return;
   }
   _filterUpdateInProgress = true;
 
   try {
-    console.log('[AdBlock] Refreshing per-list cosmetic/scriptlet sources...');
+    log('[AdBlock] Refreshing per-list cosmetic/scriptlet sources...');
     const updated = await fetchAndStoreRemoteFilterSources();
     if (!updated) {
       console.warn('[AdBlock] No filter sources were refreshed');
@@ -1485,7 +1699,7 @@ async function checkFilterListUpdates() {
 
     await rebuildActiveRuleIndexFromStoredSources();
     await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
-    console.log('[AdBlock] Filter source update complete');
+    log('[AdBlock] Filter source update complete');
   } finally {
     _filterUpdateInProgress = false;
   }
@@ -1832,7 +2046,7 @@ async function applyUserFilters(filtersText) {
     cosmetic: (cosmeticRules.generic?.length || 0) + totalDomainSpecificRules
   };
 
-  console.log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic`);
+  log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic`);
   return counts;
 }
 
@@ -1884,23 +2098,15 @@ async function allowSite(domain) {
     return Array.from(cachedAllowlist);
   }
 
-  return setAllowlistDomains(Array.from(cachedAllowlist).concat(normalizedDomain));
+  const newAllowlist = Array.from(cachedAllowlist).concat(normalizedDomain);
+  await rebuildAllowlistState(newAllowlist);
+  return newAllowlist;
 }
 
 /** Replace the entire allowlist and synchronize all dependent runtime state. */
 async function setAllowlistDomains(domains) {
   const normalizedAllowlist = normalizeAllowlist(domains);
-
-  cachedAllowlist = new Set(normalizedAllowlist);
-  await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
-  await rebuildAllowlistRules(normalizedAllowlist);
-  rebuildAllowlistMatcher();
-
-  // The allowlist changes which page bundles and script registrations apply,
-  // so drop cached bundles and recompute the YouTube shield exclusions.
-  domainRulesCache.clear();
-  await syncYouTubeShieldRegistration();
-
+  await rebuildAllowlistState(normalizedAllowlist);
   return normalizedAllowlist;
 }
 
@@ -1911,7 +2117,9 @@ async function disallowSite(domain) {
     return Array.from(cachedAllowlist);
   }
 
-  return setAllowlistDomains(Array.from(cachedAllowlist).filter((entry) => entry !== normalizedDomain));
+  const newAllowlist = Array.from(cachedAllowlist).filter((entry) => entry !== normalizedDomain);
+  await rebuildAllowlistState(newAllowlist);
+  return newAllowlist;
 }
 
 /** Rebuild DNR allow-all-requests rules from allowlist. */
@@ -2161,7 +2369,7 @@ async function applyRulesets() {
 
   try {
     const enabledRulesets = await chrome.declarativeNetRequest.getEnabledRulesets();
-    console.log('[AdBlock] Enabled static rulesets:', enabledRulesets.join(', '));
+    log('[AdBlock] Enabled static rulesets:', enabledRulesets.join(', '));
   } catch (err) {
     console.warn('[AdBlock] Failed to read enabled static rulesets:', err);
   }
@@ -2574,6 +2782,22 @@ async function handleMessage(message, sender) {
 
     case 'CHECK_FILTER_UPDATES': {
       await checkFilterListUpdates();
+      return { ok: true };
+    }
+    case 'GET_ERROR_REPORT': {
+      // Return structured error report for diagnostics
+      return {
+        lastError: errorReport.lastError,
+        criticalCount: errorReport.critical.length,
+        warningCount: errorReport.warnings.length,
+        critical: errorReport.critical.slice(-20),
+        warnings: errorReport.warnings.slice(-20),
+      };
+    }
+    case 'CLEAR_ERROR_REPORT': {
+      errorReport.critical = [];
+      errorReport.warnings = [];
+      errorReport.lastError = null;
       return { ok: true };
     }
     case 'CONTENT_BLOCKED': {

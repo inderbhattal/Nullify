@@ -15,7 +15,7 @@ export function hideWindowError(pattern) {
     : null;
 
   const origError = window.onerror;
-  window.onerror = function (msg, url, line, col, error) {
+  window.onerror = function (msg, _url, _line, _col, _error) {
     const message = msg?.message || msg || '';
     const shouldHide = matchError ? matchError.test(message) : message.includes(pattern);
     

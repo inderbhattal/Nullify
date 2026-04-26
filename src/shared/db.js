@@ -237,12 +237,12 @@ export class RulesDB {
   }
 
   /** Persist a compiled page bundle for a hostname. */
-  async putPageBundle(hostname, bundle) {
+  async putPageBundle(hostname, bundle, version = null) {
     const db = await this.open();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
       const store = transaction.objectStore(STORE_PAGE_BUNDLES);
-      store.put({ hostname, bundle, updatedAt: Date.now() });
+      store.put({ hostname, bundle, version, updatedAt: Date.now() });
 
       transaction.oncomplete = () => resolve();
       transaction.onerror = (event) => reject(event.target.error);
@@ -250,7 +250,7 @@ export class RulesDB {
   }
 
   /** Get a compiled page bundle for a hostname. */
-  async getPageBundle(hostname) {
+  async getPageBundle(hostname, expectedVersion = null) {
     const db = await this.open();
     return new Promise((resolve, reject) => {
       const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
@@ -260,6 +260,10 @@ export class RulesDB {
 
       request.onsuccess = () => {
         const record = request.result;
+        if (record && expectedVersion && record.version !== expectedVersion) {
+          store.delete(hostname);
+          return;
+        }
         bundle = record?.bundle || null;
         if (record) {
           store.put({ ...record, updatedAt: Date.now() });

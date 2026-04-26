@@ -36,11 +36,8 @@ export default {
   plugins: [
     new MiniCssExtractPlugin({ filename: '[name].css' }),
     // Narrow Copy — wasm-pack emits to `src/shared/wasm/`, but the manifest
-    // + service worker reference `dist/nullify_core_bg.wasm`. Without this
-    // copy the extension 404s the WASM fetch at startup. (We deliberately
-    // do NOT copy manifest.json / assets/ / rules/ here — those already
-    // live at the paths the manifest references and must not be rewritten
-    // by the webpack pipeline.)
+    // can load either the repo-root manifest or a generated dist manifest.
+    // Keep a copy beside the generated bundles so both layouts can resolve it.
     new CopyWebpackPlugin({
       patterns: [
         {

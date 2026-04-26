@@ -62,6 +62,7 @@ const browserGlobals = {
   sessionStorage: 'readonly',
   window: 'readonly',
   AudioBuffer: 'readonly',
+  OfflineAudioContext: 'readonly',
 };
 
 const nodeGlobals = {

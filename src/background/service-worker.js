@@ -63,7 +63,12 @@ import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
-import { CORE_FILTER_SOURCE } from '../shared/core-filter-source.js';
+import {
+  COSMETIC_SELECTOR_DENYLIST,
+  CORE_FILTER_SOURCE,
+  shouldSkipDomainCosmeticSelector,
+  shouldSkipGenericCosmeticForHostname,
+} from '../shared/core-filter-source.js';
 import { initWasmFromUrl } from '../shared/wasm-loader.js';
 import init, {
   BloomFilter as WasmBloom,
@@ -102,6 +107,33 @@ const ALL_KNOWN_LIST_IDS = [
   ...REMOTE_FILTER_LIST_IDS,
 ];
 
+function runtimeAssetPath(filename) {
+  const serviceWorkerPath = chrome.runtime.getManifest?.()?.background?.service_worker || '';
+  return serviceWorkerPath.startsWith('dist/') ? `dist/${filename}` : filename;
+}
+
+function runtimeAssetCandidates(filename) {
+  const primary = runtimeAssetPath(filename);
+  const fallback = primary.startsWith('dist/') ? filename : `dist/${filename}`;
+  return [...new Set([primary, fallback])].map((path) => ({
+    path,
+    url: chrome.runtime.getURL(path),
+  }));
+}
+
+async function initWasmFromRuntimeAsset(initFn, filename) {
+  const failures = [];
+  for (const candidate of runtimeAssetCandidates(filename)) {
+    try {
+      await initWasmFromUrl(initFn, candidate.url);
+      return candidate;
+    } catch (err) {
+      failures.push(`${candidate.path}: ${err?.message || String(err)}`);
+    }
+  }
+  throw new Error(`Failed to initialize ${filename}; tried ${failures.join('; ')}`);
+}
+
 const db = new RulesDB();
 let bloom = null;
 let wasmReady = false;
@@ -111,27 +143,6 @@ let trackerMatcher = null;
 let allowlistMatcher = null;  // AllowlistMatcher: O(1) allowlist checks
 let urlSanitizer = null;      // UrlSanitizer: AC built once for tracking-param stripping
 
-/**
- * Wait for WASM to be ready, with optional timeout.
- * Returns true if WASM is ready (or becomes ready within timeout), false otherwise.
- */
-function waitForWasm(timeoutMs = 5000) {
-  if (wasmReady) return Promise.resolve(true);
-  if (!wasmReadyPromise) return Promise.resolve(false);
-
-  const timeout = new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), timeoutMs);
-    wasmReadyPromise?.then(() => {
-      clearTimeout(timer);
-      resolve(true);
-    }).catch(() => {
-      clearTimeout(timer);
-      resolve(false);
-    });
-  });
-
-  return timeout;
-}
 const trackerKeywordsCsv = [
   'telemetry', 'analytics', 'tracking', 'pixel', 'beacon', 'metrics',
   'collect', 'segment', 'mixpanel', 'hotjar', 'amplitude', 'doubleclick',
@@ -143,6 +154,7 @@ let cachedSettings = null;
 let cachedAllowlist = new Set();
 let cachedGenericCss = null;
 let cachedGenericProceduralRules = [];
+let cachedGenericCosmeticExcludedDomains = [];
 let domainRulesCache = new Map(); // hostname -> packaged page bundle (LRU, max 100 entries)
 const _inFlightRules = new Map();
 const DOMAIN_RULES_CACHE_MAX = 100;
@@ -170,7 +182,7 @@ function setCachedDomainRules(hostname, bundle) {
 const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
-const RULE_DATA_SCHEMA_VERSION = 2;
+const RULE_DATA_SCHEMA_VERSION = 3;
 
 // Load config from storage with fallback to defaults
 async function loadConfig() {
@@ -184,6 +196,7 @@ async function loadConfig() {
 }
 
 let bundledRuleDataVersionPromise = null;
+let activeRuleDataVersion = null;
 
 function getDefaultEnabledRulesets() {
   return {
@@ -226,6 +239,7 @@ function cloneFilterSource(source) {
           [...(selectors || [])],
         ])
       ),
+      genericExcludedDomains: [...(source?.cosmetic?.genericExcludedDomains || [])],
     },
     scriptlets: (source?.scriptlets || []).map((rule) => ({
       ...rule,
@@ -238,8 +252,24 @@ function cloneFilterSource(source) {
 function appendSelectorsByDomain(target, source = {}) {
   for (const [domain, selectors] of Object.entries(source)) {
     if (!target[domain]) target[domain] = [];
-    target[domain].push(...(selectors || []));
+    target[domain].push(...(selectors || []).filter(
+      (selector) => !shouldSkipDomainCosmeticSelector(domain, selector)
+    ));
   }
+}
+
+function normalizeGeneratedDomain(domain) {
+  return String(domain || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+}
+
+function dedupeGeneratedDomains(domains) {
+  return [...new Set((domains || []).map(normalizeGeneratedDomain).filter(Boolean))];
+}
+
+function collectGenericCosmeticExcludedDomains(sources) {
+  return dedupeGeneratedDomains(
+    (sources || []).flatMap((source) => source?.cosmetic?.genericExcludedDomains || [])
+  );
 }
 
 function dedupeScriptlets(rules) {
@@ -253,7 +283,12 @@ function dedupeScriptlets(rules) {
 }
 
 function buildSourceBundleFromParsed(parsed) {
-  const cosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
+  const cosmetic = {
+    generic: [],
+    domainSpecific: {},
+    exceptions: {},
+    genericExcludedDomains: dedupeGeneratedDomains(parsed?.genericCosmeticExceptionDomains),
+  };
 
   for (const rule of parsed?.cosmeticRules || []) {
     if (!rule?.selector) continue;
@@ -263,6 +298,7 @@ function buildSourceBundleFromParsed(parsed) {
     }
 
     for (const domain of rule.domains) {
+      if (shouldSkipDomainCosmeticSelector(domain, rule.selector)) continue;
       const target = rule.exception ? cosmetic.exceptions : cosmetic.domainSpecific;
       if (!target[domain]) target[domain] = [];
       target[domain].push(rule.selector);
@@ -291,6 +327,7 @@ function mergeFilterSources(listSources) {
     mergedCosmetic.generic.push(...(source?.cosmetic?.generic || []));
     appendSelectorsByDomain(mergedCosmetic.domainSpecific, source?.cosmetic?.domainSpecific);
     appendSelectorsByDomain(mergedCosmetic.exceptions, source?.cosmetic?.exceptions);
+    mergedCosmetic.genericExcludedDomains.push(...(source?.cosmetic?.genericExcludedDomains || []));
     mergedScriptlets.push(...(source?.scriptlets || []));
   }
 
@@ -322,9 +359,38 @@ function mergeFilterSources(listSources) {
   });
 
   return {
-    cosmetic: { generic, domainSpecific },
+    cosmetic: {
+      generic,
+      domainSpecific,
+      genericExcludedDomains: dedupeGeneratedDomains(mergedCosmetic.genericExcludedDomains),
+    },
     scriptlets: dedupeScriptlets(mergedScriptlets),
   };
+}
+
+function foldDomainExceptionsIntoRules(domainSpecific = {}, exceptions = {}) {
+  const merged = {};
+
+  for (const [domain, selectors] of Object.entries(domainSpecific || {})) {
+    const deduped = [...new Set((selectors || []).filter(
+      (selector) => selector && !shouldSkipDomainCosmeticSelector(domain, selector)
+    ))];
+    if (deduped.length > 0) merged[domain] = deduped;
+  }
+
+  for (const [domain, selectors] of Object.entries(exceptions || {})) {
+    if (!merged[domain]) merged[domain] = [];
+    const seen = new Set(merged[domain]);
+    for (const selector of selectors || []) {
+      if (!selector) continue;
+      const prefixed = '__exception__' + selector;
+      if (seen.has(prefixed)) continue;
+      seen.add(prefixed);
+      merged[domain].push(prefixed);
+    }
+  }
+
+  return merged;
 }
 
 function hashString(input) {
@@ -343,6 +409,7 @@ async function computeBundledRuleDataVersion() {
       return hashString(JSON.stringify({
         schema: RULE_DATA_SCHEMA_VERSION,
         core: CORE_FILTER_SOURCE,
+        cosmeticSelectorDenylist: COSMETIC_SELECTOR_DENYLIST,
         packaged: packaged || {},
       }));
     })().catch((err) => {
@@ -496,10 +563,8 @@ function classifyAndPlanSelectors(selectors) {
 function hasBalancedSelectorDelimiters(selector) {
   let bracketDepth = 0;
   let parenDepth = 0;
-  let curlyDepth = 0;
   let quote = null;
   let escaped = false;
-  let inAttributeValue = false;
 
   for (const ch of selector) {
     if (escaped) {
@@ -513,42 +578,30 @@ function hasBalancedSelectorDelimiters(selector) {
     if (quote) {
       if (ch === quote) {
         quote = null;
-        inAttributeValue = false;
       }
       continue;
     }
 
     if (ch === '"' || ch === '\'') {
-      // Only track quotes inside attribute brackets
-      if (bracketDepth > 0 && !inAttributeValue) {
-        quote = ch;
-        inAttributeValue = true;
-      }
+      quote = ch;
     } else if (ch === '[') {
-      // Reject excessive nesting (bypass attempt)
-      if (bracketDepth >= 3) return false;
+      // Nested attribute selectors are invalid unless the inner bracket is quoted.
+      if (bracketDepth > 0) return false;
       bracketDepth++;
     } else if (ch === ']') {
+      if (bracketDepth === 0) return false;
       bracketDepth--;
-      if (bracketDepth < 0) return false;
-      inAttributeValue = false;
     } else if (ch === '(') {
-      // Reject excessive nesting
-      if (parenDepth >= 5) return false;
       parenDepth++;
     } else if (ch === ')') {
+      if (parenDepth === 0) return false;
       parenDepth--;
-      if (parenDepth < 0) return false;
-    } else if (ch === '{') {
-      curlyDepth++;
-      if (curlyDepth > 0) return false;
-    } else if (ch === '}') {
-      curlyDepth--;
-      if (curlyDepth < 0) return false;
+    } else if (ch === '{' || ch === '}') {
+      return false;
     }
   }
 
-  return !quote && bracketDepth === 0 && parenDepth === 0 && curlyDepth === 0;
+  return !quote && bracketDepth === 0 && parenDepth === 0;
 }
 
 function hasInvalidUniversalUsage(selector) {
@@ -768,9 +821,17 @@ async function fetchAndStoreRemoteFilterSources() {
     try {
       log(`[AdBlock] Fetching ${list.id} source bundle...`);
       const text = await fetchAndExpand(list.url);
-      sourceBundles[list.id] = wasmReady
+      const parsed = parseFilterList(text);
+      const sourceBundle = wasmReady
         ? parse_filter_source(text)
-        : buildSourceBundleFromParsed(parseFilterList(text));
+        : buildSourceBundleFromParsed(parsed);
+      if (sourceBundle?.cosmetic) {
+        sourceBundle.cosmetic.genericExcludedDomains = dedupeGeneratedDomains([
+          ...(sourceBundle.cosmetic.genericExcludedDomains || []),
+          ...(parsed.genericCosmeticExceptionDomains || []),
+        ]);
+      }
+      sourceBundles[list.id] = sourceBundle;
       fetchedAny = true;
     } catch (err) {
       console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
@@ -792,6 +853,10 @@ async function rebuildActiveRuleIndexFromStoredSources() {
     .filter((listId) => enabledMap[listId] !== false)
     .map((listId) => sourceMap.get(listId))
     .filter(Boolean);
+  const genericCosmeticExcludedDomains = collectGenericCosmeticExcludedDomains([
+    CORE_FILTER_SOURCE,
+    ...activeSources,
+  ]);
 
   let compiled = null;
   if (wasmReady) {
@@ -803,6 +868,7 @@ async function rebuildActiveRuleIndexFromStoredSources() {
   }
 
   const merged = compiled || mergeFilterSources(activeSources);
+  cachedGenericCosmeticExcludedDomains = genericCosmeticExcludedDomains;
 
   await db.clearActiveRules();
 
@@ -864,6 +930,7 @@ async function rebuildActiveRuleIndexFromStoredSources() {
   await Promise.all([
     setStorage(StorageKeys.GENERIC_CSS, cachedGenericCss || ''),
     setStorage(StorageKeys.GENERIC_PROCEDURAL_RULES, cachedGenericProceduralRules),
+    setStorage(StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS, cachedGenericCosmeticExcludedDomains),
   ]);
 
   domainRulesCache.clear();
@@ -888,6 +955,7 @@ async function ensureRuleDataReady() {
   const existingBloom = await getStorage(StorageKeys.BLOOM_FILTER);
   const storedRuleDataVersion = await getStorage(StorageKeys.RULE_DATA_VERSION);
   const bundledRuleDataVersion = await computeBundledRuleDataVersion().catch(() => null);
+  activeRuleDataVersion = bundledRuleDataVersion || storedRuleDataVersion || null;
   const hadSources = await db.hasFilterSources();
   let sourcesReady = hadSources;
 
@@ -1013,8 +1081,7 @@ function startInitialization() {
   _criticalPromise = (async () => {
     // Stage 0: Initialize WASM
     try {
-      const wasmUrl = chrome.runtime.getURL('dist/nullify_core_bg.wasm');
-      wasmReadyPromise = initWasmFromUrl(init, wasmUrl);
+      wasmReadyPromise = initWasmFromRuntimeAsset(init, 'nullify_core_bg.wasm');
       await wasmReadyPromise;
       wasmReady = true;
 
@@ -1114,7 +1181,7 @@ async function syncYouTubeShieldRegistration() {
       id: YOUTUBE_SHIELD_SCRIPT_ID,
       matches: YOUTUBE_SHIELD_TARGETS.map(({ pattern }) => pattern),
       excludeMatches: getYouTubeShieldExcludeMatches(),
-      js: ['dist/youtube-shield.js'],
+      js: [runtimeAssetPath('youtube-shield.js')],
       runAt: 'document_start',
       world: 'MAIN',
       allFrames: true,
@@ -1131,6 +1198,7 @@ async function syncYouTubeShieldRegistration() {
       existing &&
       arraysEqual(existing.matches || [], registration.matches) &&
       arraysEqual(existing.excludeMatches || [], registration.excludeMatches) &&
+      arraysEqual(existing.js || [], registration.js) &&
       existing.runAt === registration.runAt &&
       existing.world === registration.world &&
       existing.allFrames === registration.allFrames
@@ -1180,6 +1248,7 @@ async function refreshMemoryCache() {
     StorageKeys.ALLOWLIST,
     StorageKeys.GENERIC_CSS,
     StorageKeys.GENERIC_PROCEDURAL_RULES,
+    StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS,
   ]);
 
   cachedSettings = data[StorageKeys.SETTINGS];
@@ -1208,6 +1277,9 @@ async function refreshMemoryCache() {
   }
   cachedGenericProceduralRules = Array.isArray(data[StorageKeys.GENERIC_PROCEDURAL_RULES])
     ? data[StorageKeys.GENERIC_PROCEDURAL_RULES]
+    : [];
+  cachedGenericCosmeticExcludedDomains = Array.isArray(data[StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS])
+    ? data[StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS]
     : [];
 
   domainRulesCache.clear();
@@ -1282,16 +1354,21 @@ async function ingestLegacyRules() {
     await db.clear();
 
     // Size the Bloom Filter for actual domain count (CONFIG.BLOOM_BITS_PER_ITEM bits/item → ~1% FP rate)
-    const domainCount = Object.keys(cosData.domainSpecific || {}).length +
+    const domainSpecificRules = foldDomainExceptionsIntoRules(
+      cosData.domainSpecific || {},
+      cosData.exceptions || {}
+    );
+
+    const domainCount = Object.keys(domainSpecificRules).length +
       (scriptData || []).reduce((n, r) => n + (r.domains?.length || 0), 0) + 1; // +1 for generic ''
 
     const newBloom = wasmReady
       ? new WasmBloom(domainCount * CONFIG.BLOOM_BITS_PER_ITEM, 4)
       : BloomFilter.forCapacity(domainCount);
 
-    if (cosData.domainSpecific) {
-      await db.putBulkCosmeticRules(cosData.domainSpecific);
-      for (const hostname of Object.keys(cosData.domainSpecific)) {
+    if (Object.keys(domainSpecificRules).length > 0) {
+      await db.putBulkCosmeticRules(domainSpecificRules);
+      for (const hostname of Object.keys(domainSpecificRules)) {
         newBloom.add(hostname);
       }
     }
@@ -1323,9 +1400,11 @@ async function ingestLegacyRules() {
     });
     cachedGenericCss = genericBundle.cssText || null;
     cachedGenericProceduralRules = genericBundle.rules?.domainSpecific || [];
+    cachedGenericCosmeticExcludedDomains = dedupeGeneratedDomains(cosData.genericExcludedDomains);
     await Promise.all([
       setStorage(StorageKeys.GENERIC_CSS, cachedGenericCss || ''),
       setStorage(StorageKeys.GENERIC_PROCEDURAL_RULES, cachedGenericProceduralRules),
+      setStorage(StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS, cachedGenericCosmeticExcludedDomains),
     ]);
 
     await setStorage(StorageKeys.COSMETIC_RULES_VERSION, Date.now());
@@ -1428,7 +1507,7 @@ async function applyPrivacySettings() {
   await applyUpgradeSchemeRules(settings.upgradeInsecureRequests !== false);
 
   // Update stealth rules (CSP stripping)
-  await applyStealthRules(settings.enhancedStealth === true);
+  await applyStealthRules();
 
   // Update persona rules
   await applyPersonaRules(settings.stealthPersona || 'default');
@@ -1497,7 +1576,7 @@ async function applyHeaderRules(enabled) {
 }
 
 /** Clear the legacy CSP-stripping rule. Enhanced stealth now runs in MAIN world. */
-async function applyStealthRules(enabled) {
+async function applyStealthRules() {
   const ruleId = DNR_STEALTH_RULES_START;
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: [ruleId],
@@ -2524,7 +2603,7 @@ async function ensureScriptletRegistry(tabId, frameId) {
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
-      files: ['dist/scriptlets-world.js'],
+      files: [runtimeAssetPath('scriptlets-world.js')],
     });
 
     return true;
@@ -2548,7 +2627,7 @@ function executeScriptlets(key, specs) {
   for (const spec of specs) {
     try {
       registry.run(spec.name, spec.args);
-    } catch (e) { }
+    } catch { }
   }
 }
 
@@ -2629,7 +2708,9 @@ async function handleMessage(message, sender) {
         cosmeticRules: cosmeticBundle.rules,
         cssText: cosmeticBundle.cssText || '',
         exceptionCss: cosmeticBundle.exceptionCss || '',
-        genericProceduralRules: cachedGenericProceduralRules,
+        genericProceduralRules: shouldSkipGenericCosmeticForHostname(hostname, cachedGenericCosmeticExcludedDomains)
+          ? []
+          : cachedGenericProceduralRules,
       };
 
       if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
@@ -2833,11 +2914,6 @@ async function handleMessage(message, sender) {
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
 
-async function getCosmeticRulesForPage(hostname) {
-  const bundle = await getCosmeticBundleForPage(hostname);
-  return bundle.rules;
-}
-
 async function getCosmeticBundleForPage(hostname) {
   // Wait for critical caches if they aren't ready yet
   if (!_criticalReady && _criticalPromise) await _criticalPromise;
@@ -2849,7 +2925,9 @@ async function getCosmeticBundleForPage(hostname) {
   const cached = domainRulesCache.get(hostname);
   if (cached) return cached;
 
-  const persistedBundle = normalizeStoredBundle(await db.getPageBundle(hostname));
+  const persistedBundle = normalizeStoredBundle(
+    await db.getPageBundle(hostname, activeRuleDataVersion)
+  );
   if (persistedBundle) {
     setCachedDomainRules(hostname, persistedBundle);
     return persistedBundle;
@@ -2916,7 +2994,7 @@ async function getCosmeticBundleForPage(hostname) {
   try {
     const bundle = normalizeStoredBundle(await promise);
     setCachedDomainRules(hostname, bundle); // Populate cache so GET_INIT_DATA skips IndexedDB
-    await db.putPageBundle(hostname, bundle)
+    await db.putPageBundle(hostname, bundle, activeRuleDataVersion)
       .then(() => db.prunePageBundles(PAGE_BUNDLE_DB_MAX))
       .catch(() => {});
     return bundle;
@@ -2981,35 +3059,22 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
 
   if (isHostnameAllowedCached(hostname)) return;
 
-  // 1. Inject Generic CSS
-  if (cachedGenericCss) {
-    chrome.scripting.insertCSS({
-      target: { tabId, frameIds: [frameId] },
-      css: cachedGenericCss,
-      origin: 'USER',
-    }).catch(() => { });
-  }
-
-  // 2. Inject Domain Rules
   let bundle = domainRulesCache.get(hostname);
   if (!bundle) {
     bundle = await getCosmeticBundleForPage(hostname);
     setCachedDomainRules(hostname, bundle);
   }
 
-  if (bundle.cssText) {
-    chrome.scripting.insertCSS({
-      target: { tabId, frameIds: [frameId] },
-      css: bundle.cssText,
-      origin: 'USER',
-    }).catch(() => { });
-  }
+  const cssText = [
+    shouldSkipGenericCosmeticForHostname(hostname, cachedGenericCosmeticExcludedDomains) ? null : cachedGenericCss,
+    bundle.cssText,
+    bundle.exceptionCss,
+  ].filter(Boolean).join('\n');
 
-  // 3. Inject Exceptions
-  if (bundle.exceptionCss) {
-    chrome.scripting.insertCSS({
+  if (cssText) {
+    await chrome.scripting.insertCSS({
       target: { tabId, frameIds: [frameId] },
-      css: bundle.exceptionCss,
+      css: cssText,
       origin: 'USER',
     }).catch(() => { });
   }

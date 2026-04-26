@@ -808,12 +808,7 @@ export class CosmeticEngine {
   _startCacheSweep() {
     if (this._cacheSweepInterval) return;
     this._cacheSweepInterval = setInterval(() => {
-      // Sweep match cache: remove entries where all WeakMaps have been GC'd
-      for (const [key, weakMap] of this._matchCache.entries()) {
-        // WeakMap doesn't expose iteration, so we can't clean individual entries.
-        // The GC handles this automatically; we just clear completely stale keys.
-        // For now, rely on GC — the WeakMap will release memory when elements die.
-      }
+      // WeakMap entries self-release as elements are GC'd; trim only explicit LRU metadata here.
       // Force a minor cleanup: clear _lastDirtyRoots after sweep
       this._lastDirtyRoots = [];
       // Trim LRU tracking array to prevent memory leak
@@ -895,7 +890,6 @@ export class CosmeticEngine {
       this._reportTimer = null;
       if (this._hiddenCount > 0) {
         const hostname = location.hostname.replace(/^www\./, '');
-        const total = this._hiddenCount;
         const hits = Array.from(this._selectorHits.entries());
         
         this._hiddenCount = 0;

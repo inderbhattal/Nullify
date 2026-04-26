@@ -15,11 +15,27 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   let wasmInitStarted = false;
   let wasmInitError = null;
   let wasmSource = null;
-  const getRuntimeWasmUrl = () => {
+  const getRuntimeWasmCandidates = () => {
     try {
-      return globalThis.chrome?.runtime?.getURL?.('dist/nullify_core_bg.wasm') || null;
+      const runtime = globalThis.chrome?.runtime;
+      const getURL = runtime?.getURL?.bind(runtime);
+      if (typeof getURL !== 'function') return [];
+
+      const paths = [];
+      const serviceWorkerPath = runtime.getManifest?.()?.background?.service_worker || '';
+      if (serviceWorkerPath) {
+        paths.push(serviceWorkerPath.startsWith('dist/') ? 'dist/nullify_core_bg.wasm' : 'nullify_core_bg.wasm');
+      }
+
+      // Fallbacks cover both unpacked layouts if getManifest is unavailable in MAIN world.
+      paths.push('nullify_core_bg.wasm', 'dist/nullify_core_bg.wasm');
+
+      return [...new Set(paths)].map((path) => ({
+        url: getURL(path),
+        source: path,
+      }));
     } catch {
-      return null;
+      return [];
     }
   };
   const isPlayerResponseUrl = (url) => url.includes('/v1/player');
@@ -134,16 +150,31 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   }
 
   // 2. WASM Initialization
-  const bootstrapWasm = (url, source = null) => {
-    if (wasmReady || wasmInitStarted || !url) return;
+  const bootstrapWasm = (candidates) => {
+    if (wasmReady || wasmInitStarted || candidates.length === 0) return;
     wasmInitStarted = true;
     wasmInitError = null;
-    wasmSource = source;
     updateWasmState('loading');
-    const initPromise = initWasmFromUrl(init, url);
-    initPromise.then(() => {
+
+    const initPromise = (async () => {
+      let lastError = null;
+      for (const candidate of candidates) {
+        wasmSource = candidate.source;
+        updateWasmState('loading');
+        try {
+          await initWasmFromUrl(init, candidate.url);
+          return candidate.source;
+        } catch (err) {
+          lastError = err;
+        }
+      }
+      throw lastError || new Error('No usable WASM URL');
+    })();
+
+    initPromise.then((source) => {
       wasmReady = true;
       wasmInitError = null;
+      wasmSource = source;
       updateWasmState('ready');
       console.info(`[Nullify] YouTube WASM ready (${wasmSource || 'unknown'})`);
       try {
@@ -159,9 +190,9 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     });
   };
   const startWasmBootstrap = () => {
-    const url = getRuntimeWasmUrl();
-    if (!url) return false;
-    bootstrapWasm(url, 'runtime');
+    const candidates = getRuntimeWasmCandidates();
+    if (candidates.length === 0) return false;
+    bootstrapWasm(candidates);
     return true;
   };
   startWasmBootstrap();
@@ -219,7 +250,7 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
         return fallbackScrub(data);
       }
       return data;
-    } catch (e) { return data; }
+    } catch { return data; }
   };
 
   // 4. Identity Trap-Defuser
@@ -299,7 +330,7 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
         try {
           original = super.responseText;
           this._nCached = scrub(original);
-        } catch (e) {
+        } catch {
           this._nCached = original || super.responseText;
         }
       }
@@ -390,7 +421,7 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
         Object.assign(flags, sanitized.EXPERIMENT_FLAGS);
       }
       sanitizedExperimentFlagSets.add(flags);
-    } catch (e) {}
+    } catch {}
   };
 
   if (window.ytcfg?.set) {

@@ -70,7 +70,7 @@ export function fingerprintNoise() {
         octx.putImageData(imageData, 0, 0);
         return offscreen.toDataURL.apply(offscreen, arguments);
       }
-    } catch (e) { }
+    } catch { }
     return origToDataURL.apply(this, arguments);
   };
 
@@ -82,9 +82,10 @@ export function fingerprintNoise() {
   // rendered buffer rather than the live channel data (mutating live
   // channel data corrupts playback on every audio-capable site).
   // ---------------------------------------------------------------------------
-  if (window.OfflineAudioContext?.prototype?.startRendering) {
-    const origRender = OfflineAudioContext.prototype.startRendering;
-    OfflineAudioContext.prototype.startRendering = function () {
+  const OfflineAudioContextCtor = window.OfflineAudioContext;
+  if (OfflineAudioContextCtor?.prototype?.startRendering) {
+    const origRender = OfflineAudioContextCtor.prototype.startRendering;
+    OfflineAudioContextCtor.prototype.startRendering = function () {
       const promise = origRender.apply(this, arguments);
       return promise.then((buffer) => {
         try {

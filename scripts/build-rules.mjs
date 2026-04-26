@@ -17,7 +17,10 @@ import path from 'path';
 import https from 'https';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { CORE_FILTER_SOURCE } from '../src/shared/core-filter-source.js';
+import {
+  CORE_FILTER_SOURCE,
+  shouldSkipDomainCosmeticSelector,
+} from '../src/shared/core-filter-source.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
@@ -242,9 +245,6 @@ const RESOURCE_TYPE_MAP = {
   other: 'other',
 };
 
-// DNR resource type list
-const ALL_RESOURCE_TYPES = Object.values(RESOURCE_TYPE_MAP);
-
 let ruleIdCounter = 1;
 let exceptionIdCounter = 1000000;
 
@@ -281,6 +281,46 @@ function parseScriptletArgs(str) {
 // "skipped for a documented reason".
 const SKIP_SILENT = { skip: true, reason: null };
 function skip(reason) { return { skip: true, reason }; }
+
+function normalizeCosmeticScopeDomain(domain) {
+  const normalized = String(domain || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!normalized || normalized.includes('*') || normalized.includes('/') || normalized.includes(':')) return '';
+  if (!normalized.includes('.') && normalized !== 'localhost') return '';
+  return normalized;
+}
+
+function extractCosmeticScopeExceptionDomains(pattern) {
+  const value = String(pattern || '').trim();
+  if (!value) return [];
+
+  if (value.startsWith('||')) {
+    const match = /^\|\|([^/*?^|]+)/.exec(value);
+    const domain = normalizeCosmeticScopeDomain(match?.[1]);
+    return domain ? [domain] : [];
+  }
+
+  if (value.startsWith('|http://') || value.startsWith('|https://')) {
+    try {
+      const url = new URL(value.slice(1));
+      const domain = normalizeCosmeticScopeDomain(url.hostname);
+      return domain ? [domain] : [];
+    } catch {
+      return [];
+    }
+  }
+
+  const plain = value.replace(/\^$/, '');
+  if (/^[a-z0-9.-]+$/i.test(plain)) {
+    const domain = normalizeCosmeticScopeDomain(plain);
+    return domain ? [domain] : [];
+  }
+
+  return [];
+}
+
+function dedupeDomains(domains) {
+  return [...new Set((domains || []).map(normalizeCosmeticScopeDomain).filter(Boolean))];
+}
 
 /**
  * Parse a single filter line into a structured rule object.
@@ -359,6 +399,22 @@ function parseLine(line) {
     return skip('unsupported-option-combo');
   }
 
+  if (isException && options.cosmeticScopeExceptions.length > 0) {
+    const domains = dedupeDomains([
+      ...extractCosmeticScopeExceptionDomains(pattern),
+      ...options.initiatorDomains,
+    ]);
+    if (domains.length === 0) {
+      return skip('cosmetic-scope-exception: unsupported domain pattern');
+    }
+    return {
+      type: 'cosmetic-scope-exception',
+      domains,
+      scopes: options.cosmeticScopeExceptions,
+      pattern,
+    };
+  }
+
   return {
     type: 'network',
     pattern,
@@ -382,6 +438,7 @@ function parseOptions(optionsStr) {
     redirect: null,
     removeparam: null,
     important: false,
+    cosmeticScopeExceptions: [],
   };
 
   if (!optionsStr) return options;
@@ -426,16 +483,12 @@ function parseOptions(optionsStr) {
       // Manifest V3 can't block inline scripts.
       // We don't skip the rule, we just ignore this specific option
       // so other options in the same rule (like $script) still apply.
-    } else if (
-      optName === 'genericblock' ||
-      optName === 'generichide' ||
-      optName === 'elemhide' ||
-      optName === 'specifichide'
-    ) {
+    } else if (['genericblock', 'generichide', 'elemhide', 'specifichide'].includes(optName)) {
       // Cosmetic-scope exception hints — we no longer flip `important`
       // here. Setting the priority-bumped important flag used to mask real
       // cosmetic exception rules at DNR priority 5.
       options.cosmeticScopeException = true;
+      if (!negated) options.cosmeticScopeExceptions.push(optName);
     }
     // Ignore unknown options silently (many are optional/metadata)
   }
@@ -792,7 +845,7 @@ function convertPatternToUrlFilter(pattern) {
     try {
       const decoded = decodeURIComponent(pattern);
       if (decoded && decoded.trim().length > 0) pattern = decoded;
-    } catch (e) { /* keep original */ }
+    } catch { /* keep original */ }
   }
 
   if (pattern.length < 2) { reportDrop('urlFilter: pattern too short (<2 chars)', original); return null; }
@@ -839,10 +892,11 @@ function getBlankRedirectUrl(resourceType) {
  * Also collects full skip records: every non-blank/non-comment line
  * that parseLine rejects is recorded with the reason.
  */
-function parseFilterList(text, listId = 'unknown') {
+function parseFilterList(text) {
   const networkRules = [];
   const cosmeticRules = [];
   const cosmeticExceptions = [];
+  const genericCosmeticExceptionDomains = [];
   const scriptletRules = [];
   const skippedRecords = []; // [{ reason, line }]
 
@@ -857,6 +911,10 @@ function parseFilterList(text, listId = 'unknown') {
 
     if (parsed.type === 'network') {
       networkRules.push(parsed);
+    } else if (parsed.type === 'cosmetic-scope-exception') {
+      if (parsed.scopes.includes('generichide') || parsed.scopes.includes('elemhide')) {
+        genericCosmeticExceptionDomains.push(...parsed.domains);
+      }
     } else if (parsed.type === 'cosmetic') {
       if (parsed.exception) cosmeticExceptions.push(parsed);
       else cosmeticRules.push(parsed);
@@ -865,7 +923,14 @@ function parseFilterList(text, listId = 'unknown') {
     }
   }
 
-  return { networkRules, cosmeticRules, cosmeticExceptions, scriptletRules, skippedRecords };
+  return {
+    networkRules,
+    cosmeticRules,
+    cosmeticExceptions,
+    genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
+    scriptletRules,
+    skippedRecords,
+  };
 }
 
 /**
@@ -906,7 +971,12 @@ function buildDNRRules(networkRules) {
 }
 
 function buildSourceBundleFallback(parsed) {
-  const sourceCosmetic = { generic: [], domainSpecific: {}, exceptions: {} };
+  const sourceCosmetic = {
+    generic: [],
+    domainSpecific: {},
+    exceptions: {},
+    genericExcludedDomains: dedupeDomains(parsed.genericCosmeticExceptionDomains),
+  };
   const cosmeticRules = [...(parsed.cosmeticRules || []), ...(parsed.cosmeticExceptions || [])];
   for (const r of cosmeticRules) {
     if (r.domains.length === 0) {
@@ -914,6 +984,7 @@ function buildSourceBundleFallback(parsed) {
       sourceCosmetic.generic.push(r.selector);
     } else {
       for (const d of r.domains) {
+        if (shouldSkipDomainCosmeticSelector(d, r.selector)) continue;
         if (r.exception) {
           if (!sourceCosmetic.exceptions[d]) sourceCosmetic.exceptions[d] = [];
           sourceCosmetic.exceptions[d].push(r.selector);
@@ -949,9 +1020,35 @@ function buildSourceBundleFallback(parsed) {
 
 function createEmptySourceBundle() {
   return {
-    cosmetic: { generic: [], domainSpecific: {}, exceptions: {} },
+    cosmetic: { generic: [], domainSpecific: {}, exceptions: {}, genericExcludedDomains: [] },
     scriptlets: [],
   };
+}
+
+function mergeParsedCosmeticScopeExceptions(sourceBundle, parsed) {
+  const cosmetic = sourceBundle?.cosmetic;
+  if (!cosmetic) return sourceBundle;
+  cosmetic.genericExcludedDomains = dedupeDomains([
+    ...(cosmetic.genericExcludedDomains || []),
+    ...(parsed.genericCosmeticExceptionDomains || []),
+  ]);
+  return sourceBundle;
+}
+
+function pruneDeniedCosmeticSelectors(sourceBundle) {
+  const cosmetic = sourceBundle?.cosmetic;
+  if (!cosmetic) return sourceBundle;
+
+  for (const bucketName of ['domainSpecific', 'exceptions']) {
+    const bucket = cosmetic[bucketName] || {};
+    for (const [domain, selectors] of Object.entries(bucket)) {
+      bucket[domain] = (selectors || [])
+        .filter((selector) => !shouldSkipDomainCosmeticSelector(domain, selector));
+      if (bucket[domain].length === 0) delete bucket[domain];
+    }
+  }
+
+  return sourceBundle;
 }
 
 function collectExpectedRulesetFiles() {
@@ -1294,6 +1391,7 @@ function generateSampleCosmeticRules() {
         '[data-mol-fe-page-type="ad"]',
       ],
     },
+    genericExcludedDomains: [],
   };
 }
 
@@ -1508,6 +1606,8 @@ async function main() {
         }
       }
       if (!sourceBundle) sourceBundle = buildSourceBundleFallback(parsed);
+      sourceBundle = mergeParsedCosmeticScopeExceptions(sourceBundle, parsed);
+      sourceBundle = pruneDeniedCosmeticSelectors(sourceBundle);
 
       let truncatedCount = 0;
       if (networkRules.length > config.totalLimit) {
@@ -1546,6 +1646,8 @@ async function main() {
         if (!allCosmeticRules.domainSpecific[domain]) allCosmeticRules.domainSpecific[domain] = [];
         allCosmeticRules.domainSpecific[domain].push(...selectors);
       }
+      if (!allCosmeticRules.genericExcludedDomains) allCosmeticRules.genericExcludedDomains = [];
+      allCosmeticRules.genericExcludedDomains.push(...(sourceBundle.cosmetic?.genericExcludedDomains || []));
       for (const rule of sourceBundle.scriptlets || []) {
         allScriptletRules.push(rule);
       }
@@ -1565,6 +1667,7 @@ async function main() {
   for (const d of Object.keys(allCosmeticRules.domainSpecific)) {
     allCosmeticRules.domainSpecific[d] = [...new Set(allCosmeticRules.domainSpecific[d])];
   }
+  allCosmeticRules.genericExcludedDomains = dedupeDomains(allCosmeticRules.genericExcludedDomains);
 
   writeBuildOutputs({
     rulesetOutputs,
@@ -1579,7 +1682,7 @@ async function main() {
   process.exit(0);
 }
 
-export { parseLine, networkFilterToDNR };
+export { parseLine, networkFilterToDNR, buildSourceBundleFallback };
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 

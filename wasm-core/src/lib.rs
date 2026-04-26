@@ -1,13 +1,13 @@
-use wasm_bindgen::prelude::*;
-use js_sys::{Array, Object, Reflect, Uint8Array};
-use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
 use aho_corasick::AhoCorasick;
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use rand_distr::{Distribution, Normal};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
+use wasm_bindgen::prelude::*;
 
 // Install a panic hook so Rust panics surface as readable JS errors instead
 // of opaque `RuntimeError: unreachable`, which poisons the whole module and
@@ -99,17 +99,27 @@ impl BloomFilter {
         // panicking through WASM — a corrupt stored bloom filter should
         // degrade gracefully, not crash the whole rule pipeline.
         match serde_json::from_str::<SerializedBloom>(json) {
-            Ok(s) => Self { size: s.size, hashes: s.hashes, bitset: s.data },
+            Ok(s) => Self {
+                size: s.size,
+                hashes: s.hashes,
+                bitset: s.data,
+            },
             Err(_) => Self::new(1, 1),
         }
     }
 
     pub fn check_hostname(&self, hostname: &str) -> bool {
-        if self.has("") { return true; }
+        if self.has("") {
+            return true;
+        }
         let mut d = hostname;
         loop {
-            if is_public_suffix(d) { break; }
-            if self.has(d) { return true; }
+            if is_public_suffix(d) {
+                break;
+            }
+            if self.has(d) {
+                return true;
+            }
             match d.find('.') {
                 Some(idx) => d = &d[idx + 1..],
                 None => break,
@@ -205,7 +215,8 @@ fn to_js_value<T>(value: &T) -> JsValue
 where
     T: Serialize,
 {
-    value.serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+    value
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .unwrap_or(JsValue::NULL)
 }
 
@@ -228,6 +239,16 @@ fn push_unique(list: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) 
     }
 }
 
+fn should_skip_domain_cosmetic_selector(domain: &str, selector: &str) -> bool {
+    let domain = domain.trim().to_ascii_lowercase();
+    let selector = selector.trim();
+    matches!(
+        (domain.as_str(), selector),
+        ("mail.google.com", ".nH.PS")
+            | ("mail.google.com", ".aeF > .nH > .nH[role=\"main\"] > .aKB")
+    )
+}
+
 fn push_unique_domain_selector(
     map: &mut HashMap<String, Vec<String>>,
     seen_map: &mut HashMap<String, HashSet<String>>,
@@ -236,7 +257,10 @@ fn push_unique_domain_selector(
 ) {
     let domain = domain.trim().to_lowercase();
     let selector = selector.trim();
-    if domain.is_empty() || !is_valid_selector(selector) {
+    if domain.is_empty()
+        || should_skip_domain_cosmetic_selector(&domain, selector)
+        || !is_valid_selector(selector)
+    {
         return;
     }
 
@@ -449,7 +473,9 @@ fn merge_filter_sources_internal(
         }
     }
 
-    merged.domain_specific.retain(|_, selectors| !selectors.is_empty());
+    merged
+        .domain_specific
+        .retain(|_, selectors| !selectors.is_empty());
     merged
 }
 
@@ -485,11 +511,7 @@ pub fn parse_filter_source(text: &str) -> JsValue {
 
                 if rule.domains.is_empty() {
                     if !rule.exception.unwrap_or(false) {
-                        push_unique(
-                            &mut bundle.cosmetic.generic,
-                            &mut generic_seen,
-                            selector,
-                        );
+                        push_unique(&mut bundle.cosmetic.generic, &mut generic_seen, selector);
                     }
                     continue;
                 }
@@ -551,7 +573,9 @@ fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<
 #[wasm_bindgen]
 pub fn build_allowlist_rules(allowlist: JsValue, start_id: u32) -> Result<JsValue, JsValue> {
     let allowlist: Vec<String> = from_js_value(allowlist)?;
-    Ok(to_js_value(&build_allowlist_rules_internal(allowlist, start_id)))
+    Ok(to_js_value(&build_allowlist_rules_internal(
+        allowlist, start_id,
+    )))
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -570,21 +594,48 @@ pub struct ParsedRule {
 }
 
 fn parse_line(line: &str) -> Option<ParsedRule> {
-    if line.contains("##+js(") || line.contains("#+js(") { return parse_scriptlet(line); }
+    if line.contains("##+js(") || line.contains("#+js(") {
+        return parse_scriptlet(line);
+    }
     if let Some(idx) = line.find("#@#") {
-        return Some(ParsedRule { rule_type: "cosmetic".into(), domains: parse_domains(&line[..idx]), selector: Some(line[idx+3..].into()), exception: Some(true), name: None, args: None });
+        return Some(ParsedRule {
+            rule_type: "cosmetic".into(),
+            domains: parse_domains(&line[..idx]),
+            selector: Some(line[idx + 3..].into()),
+            exception: Some(true),
+            name: None,
+            args: None,
+        });
     }
     if let Some(idx) = line.find("#?#") {
-        return Some(ParsedRule { rule_type: "cosmetic".into(), domains: parse_domains(&line[..idx]), selector: Some(line[idx+3..].into()), exception: Some(false), name: None, args: None });
+        return Some(ParsedRule {
+            rule_type: "cosmetic".into(),
+            domains: parse_domains(&line[..idx]),
+            selector: Some(line[idx + 3..].into()),
+            exception: Some(false),
+            name: None,
+            args: None,
+        });
     }
     if let Some(idx) = line.find("##") {
-        return Some(ParsedRule { rule_type: "cosmetic".into(), domains: parse_domains(&line[..idx]), selector: Some(line[idx+2..].into()), exception: Some(false), name: None, args: None });
+        return Some(ParsedRule {
+            rule_type: "cosmetic".into(),
+            domains: parse_domains(&line[..idx]),
+            selector: Some(line[idx + 2..].into()),
+            exception: Some(false),
+            name: None,
+            args: None,
+        });
     }
     None
 }
 
 fn parse_domains(domains: &str) -> Vec<String> {
-    domains.split(',').map(|d| d.trim().into()).filter(|d: &String| !d.is_empty()).collect()
+    domains
+        .split(',')
+        .map(|d| d.trim().into())
+        .filter(|d: &String| !d.is_empty())
+        .collect()
 }
 
 fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
@@ -592,38 +643,73 @@ fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
         (&line[..idx], &line[idx + 6..line.len() - 1])
     } else if let Some(idx) = line.find("#+js(") {
         (&line[..idx], &line[idx + 5..line.len() - 1])
-    } else { return None; };
+    } else {
+        return None;
+    };
     let args = parse_scriptlet_args(rest);
     let mut args_iter = args.into_iter();
     let name = args_iter.next()?;
-    Some(ParsedRule { rule_type: "scriptlet".into(), domains: parse_domains(domains), selector: None, exception: None, name: Some(name), args: Some(args_iter.collect()) })
+    Some(ParsedRule {
+        rule_type: "scriptlet".into(),
+        domains: parse_domains(domains),
+        selector: None,
+        exception: None,
+        name: Some(name),
+        args: Some(args_iter.collect()),
+    })
 }
 
 fn parse_scriptlet_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut in_single = false; let mut in_double = false;
+    let mut in_single = false;
+    let mut in_double = false;
     for ch in s.chars() {
         match ch {
             '\'' if !in_double => in_single = !in_single,
             '"' if !in_single => in_double = !in_double,
             ',' if !in_single && !in_double => {
-                args.push(current.trim().trim_matches(|c| c == '\'' || c == '"').to_string());
+                args.push(
+                    current
+                        .trim()
+                        .trim_matches(|c| c == '\'' || c == '"')
+                        .to_string(),
+                );
                 current = String::new();
             }
             _ => current.push(ch),
         }
     }
-    if !current.trim().is_empty() { args.push(current.trim().trim_matches(|c| c == '\'' || c == '"').to_string()); }
+    if !current.trim().is_empty() {
+        args.push(
+            current
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '"')
+                .to_string(),
+        );
+    }
     args
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DnrRule { id: u32, priority: u16, action: DnrAction, condition: DnrCondition }
+pub struct DnrRule {
+    id: u32,
+    priority: u16,
+    action: DnrAction,
+    condition: DnrCondition,
+}
 #[derive(Serialize, Deserialize)]
-pub struct DnrAction { #[serde(rename = "type")] action_type: String, #[serde(skip_serializing_if = "Option::is_none")] redirect: Option<DnrRedirect> }
+pub struct DnrAction {
+    #[serde(rename = "type")]
+    action_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redirect: Option<DnrRedirect>,
+}
 #[derive(Serialize, Deserialize)]
-pub struct DnrRedirect { #[serde(skip_serializing_if = "Option::is_none")] url: Option<String> }
+pub struct DnrRedirect {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct DnrCondition {
@@ -633,15 +719,24 @@ pub struct DnrCondition {
     pub regex_filter: Option<String>,
     #[serde(rename = "resourceTypes", skip_serializing_if = "Option::is_none")]
     pub resource_types: Option<Vec<String>>,
-    #[serde(rename = "excludedResourceTypes", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludedResourceTypes",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub excluded_resource_types: Option<Vec<String>>,
     #[serde(rename = "domainType", skip_serializing_if = "Option::is_none")]
     pub domain_type: Option<String>,
     #[serde(rename = "initiatorDomains", skip_serializing_if = "Option::is_none")]
     pub initiator_domains: Option<Vec<String>>,
-    #[serde(rename = "excludedInitiatorDomains", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludedInitiatorDomains",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub excluded_initiator_domains: Option<Vec<String>>,
-    #[serde(rename = "excludedRequestDomains", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "excludedRequestDomains",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub excluded_request_domains: Option<Vec<String>>,
 }
 
@@ -683,7 +778,9 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         None => (pattern_part, None),
     };
 
-    if pattern.is_empty() || pattern == "*" || pattern == "||" { return None; }
+    if pattern.is_empty() || pattern == "*" || pattern == "||" {
+        return None;
+    }
 
     // Safe Path Guard (Rust edition)
     let critical_paths = [
@@ -703,7 +800,9 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
             // Check if it's marked as important
             let mut is_important = false;
             if let Some(opts) = options_str {
-                if opts.contains("important") { is_important = true; }
+                if opts.contains("important") {
+                    is_important = true;
+                }
             }
             if !is_important {
                 // Tick diagnostic counter so silent drops are auditable.
@@ -717,7 +816,7 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
     let mut is_important = false;
 
     if pattern.starts_with('/') && pattern.ends_with('/') && pattern.len() > 2 {
-        condition.regex_filter = Some(pattern[1..pattern.len()-1].to_string());
+        condition.regex_filter = Some(pattern[1..pattern.len() - 1].to_string());
     } else {
         condition.url_filter = Some(pattern.to_string());
     }
@@ -726,7 +825,11 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         for opt in opts.split(',') {
             let opt_trimmed = opt.trim();
             let negated = opt_trimmed.starts_with('~');
-            let opt_name = if negated { &opt_trimmed[1..] } else { opt_trimmed };
+            let opt_name = if negated {
+                &opt_trimmed[1..]
+            } else {
+                opt_trimmed
+            };
 
             // Options that take an argument (key=value).
             if let Some(eq_idx) = opt_name.find('=') {
@@ -738,15 +841,21 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                         let mut excluded: Vec<String> = Vec::new();
                         for entry in value.split('|') {
                             let e = entry.trim();
-                            if e.is_empty() { continue; }
+                            if e.is_empty() {
+                                continue;
+                            }
                             if let Some(stripped) = e.strip_prefix('~') {
                                 excluded.push(stripped.to_lowercase());
                             } else {
                                 included.push(e.to_lowercase());
                             }
                         }
-                        if !included.is_empty() { condition.initiator_domains = Some(included); }
-                        if !excluded.is_empty() { condition.excluded_initiator_domains = Some(excluded); }
+                        if !included.is_empty() {
+                            condition.initiator_domains = Some(included);
+                        }
+                        if !excluded.is_empty() {
+                            condition.excluded_initiator_domains = Some(excluded);
+                        }
                     }
                     "denyallow" => {
                         // Requests to these domains are allowed despite matching.
@@ -755,7 +864,9 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                             .map(|s| s.trim().to_lowercase())
                             .filter(|s| !s.is_empty())
                             .collect();
-                        if !doms.is_empty() { condition.excluded_request_domains = Some(doms); }
+                        if !doms.is_empty() {
+                            condition.excluded_request_domains = Some(doms);
+                        }
                     }
                     // Known but unmappable-to-DNR options. Count them so the
                     // coverage gap is auditable instead of invisible.
@@ -775,20 +886,22 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                     // the safest action is to drop this rule entirely rather
                     // than emit it as a live block.
                     return None;
-                },
+                }
                 "popup" => {
                     let mut types = condition.resource_types.unwrap_or_default();
                     if !types.iter().any(|t| t == "main_frame") {
                         types.push("main_frame".to_string());
                     }
                     condition.resource_types = Some(types);
-                },
-                "script" | "image" | "stylesheet" | "xmlhttprequest" | "subdocument" | "document" | "media" | "font" | "websocket" | "ping" | "other" => {
+                }
+                "script" | "image" | "stylesheet" | "xmlhttprequest" | "subdocument"
+                | "document" | "media" | "font" | "websocket" | "ping" | "other" => {
                     let dnr_type = match opt_name {
                         "subdocument" => "sub_frame",
                         "document" => "main_frame",
                         _ => opt_name,
-                    }.to_string();
+                    }
+                    .to_string();
 
                     if negated {
                         let mut types = condition.excluded_resource_types.unwrap_or_default();
@@ -799,19 +912,27 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                         types.push(dnr_type);
                         condition.resource_types = Some(types);
                     }
-                },
+                }
                 "third-party" | "3p" => {
-                    condition.domain_type = Some(if negated { "firstParty" } else { "thirdParty" }.to_string());
-                },
+                    condition.domain_type =
+                        Some(if negated { "firstParty" } else { "thirdParty" }.to_string());
+                }
                 "first-party" | "1p" => {
-                    condition.domain_type = Some(if negated { "thirdParty" } else { "firstParty" }.to_string());
-                },
+                    condition.domain_type =
+                        Some(if negated { "thirdParty" } else { "firstParty" }.to_string());
+                }
                 _ => {}
             }
         }
     }
 
-    let priority = if is_exception { 10u16 } else if is_important { 5u16 } else { 1u16 };
+    let priority = if is_exception {
+        10u16
+    } else if is_important {
+        5u16
+    } else {
+        1u16
+    };
 
     Some(DnrRule {
         id,
@@ -829,13 +950,19 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
-pub struct KeywordMatcher { ac: AhoCorasick }
+pub struct KeywordMatcher {
+    ac: AhoCorasick,
+}
 
 #[wasm_bindgen]
 impl KeywordMatcher {
     #[wasm_bindgen(constructor)]
     pub fn new(patterns_csv: &str) -> Self {
-        let patterns: Vec<&str> = patterns_csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let patterns: Vec<&str> = patterns_csv
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         // Matches `UrlSanitizer::new` — fall back to an empty automaton on
         // AhoCorasick construction failure rather than panicking across the
         // JS boundary.
@@ -843,7 +970,9 @@ impl KeywordMatcher {
             .unwrap_or_else(|_| AhoCorasick::new::<[&str; 0], &str>([]).unwrap());
         Self { ac }
     }
-    pub fn matches(&self, text: &str) -> bool { self.ac.is_match(text) }
+    pub fn matches(&self, text: &str) -> bool {
+        self.ac.is_match(text)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -862,7 +991,8 @@ pub struct AllowlistMatcher {
 impl AllowlistMatcher {
     #[wasm_bindgen(constructor)]
     pub fn new(csv: &str) -> Self {
-        let domains = csv.split(',')
+        let domains = csv
+            .split(',')
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
@@ -877,8 +1007,12 @@ impl AllowlistMatcher {
         let lower = hostname.to_lowercase();
         let mut h: &str = &lower;
         loop {
-            if is_public_suffix(h) { return false; }
-            if self.domains.contains(h) { return true; }
+            if is_public_suffix(h) {
+                return false;
+            }
+            if self.domains.contains(h) {
+                return true;
+            }
             match h.find('.') {
                 Some(idx) => h = &h[idx + 1..],
                 None => return false,
@@ -895,7 +1029,9 @@ impl AllowlistMatcher {
         self.domains.remove(domain.trim().to_lowercase().as_str());
     }
 
-    pub fn size(&self) -> usize { self.domains.len() }
+    pub fn size(&self) -> usize {
+        self.domains.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -913,7 +1049,8 @@ pub struct UrlSanitizer {
 impl UrlSanitizer {
     #[wasm_bindgen(constructor)]
     pub fn new(patterns_csv: &str) -> Self {
-        let patterns: Vec<&str> = patterns_csv.split(',')
+        let patterns: Vec<&str> = patterns_csv
+            .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -926,14 +1063,18 @@ impl UrlSanitizer {
         let Some((base, query)) = url.split_once('?') else {
             return url.to_string();
         };
-        let clean: Vec<&str> = query.split('&')
+        let clean: Vec<&str> = query
+            .split('&')
             .filter(|pair| {
                 let key = pair.split('=').next().unwrap_or("");
                 !self.ac.is_match(key)
             })
             .collect();
-        if clean.is_empty() { base.to_string() }
-        else { format!("{}?{}", base, clean.join("&")) }
+        if clean.is_empty() {
+            base.to_string()
+        } else {
+            format!("{}?{}", base, clean.join("&"))
+        }
     }
 }
 
@@ -944,24 +1085,27 @@ impl UrlSanitizer {
 /// All uBO/ABP procedural operators, longest-first to prevent partial prefix matches.
 fn proc_op_ac() -> &'static AhoCorasick {
     static AC: OnceLock<AhoCorasick> = OnceLock::new();
-    AC.get_or_init(|| AhoCorasick::new([
-        ":matches-css-before(",
-        ":matches-css-after(",
-        ":matches-css(",
-        ":has-text(",
-        ":nth-ancestor(",
-        ":min-text-length(",
-        ":matches-path(",
-        ":matches-attr(",
-        ":watch-attr(",
-        ":upward(",
-        ":remove(",
-        ":style(",
-        ":xpath(",
-        ":if-not(",
-        ":semantic(",
-        ":if(",
-    ]).unwrap())
+    AC.get_or_init(|| {
+        AhoCorasick::new([
+            ":matches-css-before(",
+            ":matches-css-after(",
+            ":matches-css(",
+            ":has-text(",
+            ":nth-ancestor(",
+            ":min-text-length(",
+            ":matches-path(",
+            ":matches-attr(",
+            ":watch-attr(",
+            ":upward(",
+            ":remove(",
+            ":style(",
+            ":xpath(",
+            ":if-not(",
+            ":semantic(",
+            ":if(",
+        ])
+        .unwrap()
+    })
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1162,16 +1306,17 @@ fn parse_procedural_plan(selector: &str) -> Vec<ProceduralPlanStep> {
 
 fn is_valid_selector(selector: &str) -> bool {
     let trimmed = selector.trim();
-    !trimmed.is_empty() && !trimmed.contains('{') && !trimmed.contains('}') && !trimmed.contains(';')
+    !trimmed.is_empty()
+        && !trimmed.contains('{')
+        && !trimmed.contains('}')
+        && !trimmed.contains(';')
 }
 
 fn has_balanced_selector_delimiters(selector: &str) -> bool {
-    let mut bracket_depth = 0i32;
-    let mut paren_depth = 0i32;
-    let mut curly_depth = 0i32;
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
     let mut quoted: Option<char> = None;
     let mut escaped = false;
-    let mut in_attribute_value = false;
 
     for ch in selector.chars() {
         if escaped {
@@ -1187,67 +1332,40 @@ fn has_balanced_selector_delimiters(selector: &str) -> bool {
         if let Some(quote) = quoted {
             if ch == quote {
                 quoted = None;
-                in_attribute_value = false;
             }
             continue;
         }
 
         match ch {
-            '"' | '\'' => {
-                // Track quotes inside attribute brackets [...] for attribute value parsing.
-                // Note: Procedural selector args like :has-text("foo") are parsed separately
-                // and don't go through this delimiter balance check — this function validates
-                // the CSS selector portion only, before any procedural operator arguments.
-                if bracket_depth > 0 && !in_attribute_value {
-                    quoted = Some(ch);
-                    in_attribute_value = true;
-                }
-            }
+            '"' | '\'' => quoted = Some(ch),
             '[' => {
-                // Reject nested brackets without closing (bypass attempt)
-                if bracket_depth >= 3 {
+                // Nested attribute selectors are not valid CSS unless the
+                // inner bracket is quoted, in which case it is skipped above.
+                if bracket_depth > 0 {
                     return false;
                 }
                 bracket_depth += 1;
             }
             ']' => {
+                if bracket_depth == 0 {
+                    return false;
+                }
                 bracket_depth -= 1;
-                if bracket_depth < 0 {
-                    return false;
-                }
-                in_attribute_value = false;
             }
-            '(' => {
-                // Reject excessive nesting (bypass via deep nesting)
-                if paren_depth >= 5 {
-                    return false;
-                }
-                paren_depth += 1;
-            }
+            '(' => paren_depth += 1,
             ')' => {
+                if paren_depth == 0 {
+                    return false;
+                }
                 paren_depth -= 1;
-                if paren_depth < 0 {
-                    return false;
-                }
             }
-            '{' => {
-                curly_depth += 1;
-                if curly_depth > 0 {
-                    return false; // CSS selectors should not contain {
-                }
-            }
-            '}' => {
-                curly_depth -= 1;
-                if curly_depth < 0 {
-                    return false;
-                }
-            }
+            '{' | '}' => return false,
             _ => {}
         }
     }
 
     // All delimiters must be balanced and no unclosed quotes
-    quoted.is_none() && bracket_depth == 0 && paren_depth == 0 && curly_depth == 0
+    quoted.is_none() && bracket_depth == 0 && paren_depth == 0
 }
 
 fn has_invalid_universal_usage(selector: &str) -> bool {
@@ -1287,7 +1405,9 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
             }
             ']' => {
                 bracket_depth -= 1;
-                if bracket_depth < 0 { return true; }
+                if bracket_depth < 0 {
+                    return true;
+                }
                 continue;
             }
             '(' => {
@@ -1296,14 +1416,18 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
             }
             ')' => {
                 paren_depth -= 1;
-                if paren_depth < 0 { return true; }
+                if paren_depth < 0 {
+                    return true;
+                }
                 continue;
             }
             '*' if bracket_depth == 0 && paren_depth == 0 => {
                 // Universal selector (*) is invalid when preceded by alphanumeric/identifier chars
                 // This catches bypasses like `div*` or `.class*`
                 let prev = chars[..idx].iter().rev().find(|c| !c.is_whitespace());
-                if prev.is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ')' || *c == ']') {
+                if prev.is_some_and(|c| {
+                    c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ')' || *c == ']'
+                }) {
                     return true;
                 }
                 // Universal selector at start is valid only if followed by valid combinator or element
@@ -1312,8 +1436,16 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
                     let next = chars[idx + 1..].iter().find(|c| !c.is_whitespace());
                     if let Some(n) = next {
                         // After * we allow: combinator (>, +, ~, space), pseudo (:), or end
-                        if !n.is_ascii_alphanumeric() && *n != '#' && *n != '.' && *n != '[' &&
-                           *n != ':' && *n != '>' && *n != '+' && *n != '~' && *n != ',' {
+                        if !n.is_ascii_alphanumeric()
+                            && *n != '#'
+                            && *n != '.'
+                            && *n != '['
+                            && *n != ':'
+                            && *n != '>'
+                            && *n != '+'
+                            && *n != '~'
+                            && *n != ','
+                        {
                             return true;
                         }
                     }
@@ -1324,11 +1456,23 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
                 // Allow known pseudo-elements only
                 let pseudo_rest: String = chars[idx..].iter().collect();
                 let known_pseudo_elements = [
-                    "::before", "::after", "::first-line", "::first-letter",
-                    "::selection", "::backdrop", "::placeholder", "::marker",
-                    "::cue", "::slotted", "::part", "::file-selector-button",
+                    "::before",
+                    "::after",
+                    "::first-line",
+                    "::first-letter",
+                    "::selection",
+                    "::backdrop",
+                    "::placeholder",
+                    "::marker",
+                    "::cue",
+                    "::slotted",
+                    "::part",
+                    "::file-selector-button",
                 ];
-                if !known_pseudo_elements.iter().any(|p| pseudo_rest.starts_with(p)) {
+                if !known_pseudo_elements
+                    .iter()
+                    .any(|p| pseudo_rest.starts_with(p))
+                {
                     // Unknown pseudo-element — could be bypass attempt
                     return true;
                 }
@@ -1380,7 +1524,9 @@ fn build_css_from_selector_list(selectors: &[String], chunk_size: usize) -> Stri
 // the parser. Chunking contains the blast radius and matches the safety
 // profile of `build_css_from_selector_list`.
 fn build_exception_css(exceptions: &[String], chunk_size: usize) -> String {
-    if exceptions.is_empty() { return String::new(); }
+    if exceptions.is_empty() {
+        return String::new();
+    }
     let cap = if chunk_size == 0 { 100 } else { chunk_size };
     let mut out = Vec::with_capacity(exceptions.len() / cap + 1);
     for chunk in exceptions.chunks(cap) {
@@ -1392,7 +1538,11 @@ fn build_exception_css(exceptions: &[String], chunk_size: usize) -> String {
     out.join("\n")
 }
 
-fn serialize_rules_to_binary_lists(generic: &[String], domain_specific: &[String], exceptions: &[String]) -> Vec<u8> {
+fn serialize_rules_to_binary_lists(
+    generic: &[String],
+    domain_specific: &[String],
+    exceptions: &[String],
+) -> Vec<u8> {
     let mut buffer = Vec::new();
     let write_list = |buf: &mut Vec<u8>, list: &[String]| {
         buf.extend_from_slice(&(list.len() as u32).to_le_bytes());
@@ -1449,11 +1599,13 @@ fn build_page_bundle_internal(
     let css_text = build_css_from_selector_list(&css_selectors, css_chunk_size);
     let exception_css = build_exception_css(&exceptions, css_chunk_size);
 
-    let binary_domain_specific: Vec<String> = procedural_rules.iter()
+    let binary_domain_specific: Vec<String> = procedural_rules
+        .iter()
         .filter_map(|rule| serde_json::to_string(rule).ok())
         .collect();
 
-    let cosmetic_rules_binary = serialize_rules_to_binary_lists(&Vec::new(), &binary_domain_specific, &exceptions);
+    let cosmetic_rules_binary =
+        serialize_rules_to_binary_lists(&Vec::new(), &binary_domain_specific, &exceptions);
 
     BuiltPageBundle {
         rules: PageBundleRules {
@@ -1489,7 +1641,8 @@ pub fn plan_selector_rules_json(selectors_json: &str) -> String {
         }
     }
 
-    serde_json::to_string(&bundle).unwrap_or_else(|_| "{\"cssSelectors\":[],\"proceduralRules\":[]}".to_string())
+    serde_json::to_string(&bundle)
+        .unwrap_or_else(|_| "{\"cssSelectors\":[],\"proceduralRules\":[]}".to_string())
 }
 
 /// Build the per-page cosmetic bundle in one Rust pass:
@@ -1508,7 +1661,12 @@ pub fn build_page_bundle(
     let generic_in: Vec<String> = from_js_value(generic)?;
     let domain_specific_in: Vec<String> = from_js_value(domain_specific)?;
     let exceptions_in: Vec<String> = from_js_value(exceptions)?;
-    let bundle = build_page_bundle_internal(generic_in, domain_specific_in, exceptions_in, css_chunk_size);
+    let bundle = build_page_bundle_internal(
+        generic_in,
+        domain_specific_in,
+        exceptions_in,
+        css_chunk_size,
+    );
 
     let bundle_obj = Object::new();
     let rules_obj = Object::new();
@@ -1520,14 +1678,34 @@ pub fn build_page_bundle(
         .unwrap_or_else(|_| Array::new().into());
     let binary_js = Uint8Array::from(bundle.cosmetic_rules_binary.as_slice());
 
-    let _ = Reflect::set(&rules_obj, &JsValue::from_str("generic"), &generic_js.into());
-    let _ = Reflect::set(&rules_obj, &JsValue::from_str("domainSpecific"), &domain_specific_js);
+    let _ = Reflect::set(
+        &rules_obj,
+        &JsValue::from_str("generic"),
+        &generic_js.into(),
+    );
+    let _ = Reflect::set(
+        &rules_obj,
+        &JsValue::from_str("domainSpecific"),
+        &domain_specific_js,
+    );
     let _ = Reflect::set(&rules_obj, &JsValue::from_str("exceptions"), &exceptions_js);
 
     let _ = Reflect::set(&bundle_obj, &JsValue::from_str("rules"), &rules_obj.into());
-    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("cssText"), &JsValue::from_str(&bundle.css_text));
-    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("exceptionCss"), &JsValue::from_str(&bundle.exception_css));
-    let _ = Reflect::set(&bundle_obj, &JsValue::from_str("cosmeticRulesBinary"), &binary_js.into());
+    let _ = Reflect::set(
+        &bundle_obj,
+        &JsValue::from_str("cssText"),
+        &JsValue::from_str(&bundle.css_text),
+    );
+    let _ = Reflect::set(
+        &bundle_obj,
+        &JsValue::from_str("exceptionCss"),
+        &JsValue::from_str(&bundle.exception_css),
+    );
+    let _ = Reflect::set(
+        &bundle_obj,
+        &JsValue::from_str("cosmeticRulesBinary"),
+        &binary_js.into(),
+    );
 
     Ok(bundle_obj.into())
 }
@@ -1543,7 +1721,8 @@ pub fn build_page_bundle(
 /// Returns newline-separated CSS rules, one rule per chunk.
 #[wasm_bindgen]
 pub fn build_css_from_selectors(selectors: &str, exceptions: &str, chunk_size: usize) -> String {
-    let exc: HashSet<&str> = exceptions.split('\n')
+    let exc: HashSet<&str> = exceptions
+        .split('\n')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1551,15 +1730,16 @@ pub fn build_css_from_selectors(selectors: &str, exceptions: &str, chunk_size: u
     let cap = if chunk_size == 0 { 100 } else { chunk_size };
 
     let mut seen: HashSet<&str> = HashSet::new();
-    let unique: Vec<&str> = selectors.split('\n')
+    let unique: Vec<&str> = selectors
+        .split('\n')
         .map(|s| s.trim())
         .filter(|s| {
             !s.is_empty()
-            && !s.contains('{')
-            && !s.contains('}')
-            && !s.contains(';')
-            && !exc.contains(*s)
-            && seen.insert(*s)
+                && !s.contains('{')
+                && !s.contains('}')
+                && !s.contains(';')
+                && !exc.contains(*s)
+                && seen.insert(*s)
         })
         .collect();
 
@@ -1704,11 +1884,8 @@ fn compile_active_filter_index_internal(
         merge_source(source);
     }
 
-    let cosmetic = reduce_cosmetic_rules_internal(
-        merged_generic,
-        merged_domains,
-        merged_exceptions,
-    );
+    let cosmetic =
+        reduce_cosmetic_rules_internal(merged_generic, merged_domains, merged_exceptions);
 
     let mut bloom_hosts: Vec<String> = cosmetic.domain_specific.keys().cloned().collect();
     let mut bloom_seen: HashSet<String> = bloom_hosts.iter().cloned().collect();
@@ -1724,7 +1901,8 @@ fn compile_active_filter_index_internal(
         }
     }
 
-    if (!cosmetic.generic.is_empty() || merged_scriptlets.iter().any(|rule| rule.domains.is_empty()))
+    if (!cosmetic.generic.is_empty()
+        || merged_scriptlets.iter().any(|rule| rule.domains.is_empty()))
         && bloom_seen.insert(String::new())
     {
         bloom_hosts.push(String::new());
@@ -1735,7 +1913,8 @@ fn compile_active_filter_index_internal(
         Vec::new(),
         Vec::new(),
         css_chunk_size,
-    ).css_text;
+    )
+    .css_text;
 
     ActiveFilterIndex {
         cosmetic,
@@ -1746,10 +1925,18 @@ fn compile_active_filter_index_internal(
 }
 
 #[wasm_bindgen]
-pub fn compile_active_filter_index(core_source: JsValue, list_sources: JsValue, css_chunk_size: usize) -> Result<JsValue, JsValue> {
+pub fn compile_active_filter_index(
+    core_source: JsValue,
+    list_sources: JsValue,
+    css_chunk_size: usize,
+) -> Result<JsValue, JsValue> {
     let core_source: FilterSourceBundle = from_js_value(core_source)?;
     let list_sources: Vec<FilterSourceBundle> = from_js_value(list_sources)?;
-    Ok(to_js_value(&compile_active_filter_index_internal(core_source, list_sources, css_chunk_size)))
+    Ok(to_js_value(&compile_active_filter_index_internal(
+        core_source,
+        list_sources,
+        css_chunk_size,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,7 +1945,8 @@ pub fn compile_active_filter_index(core_source: JsValue, list_sources: JsValue, 
 
 #[wasm_bindgen]
 pub fn sanitize_and_compact_selectors(csv: &str, chunk_size: usize) -> String {
-    let selectors: Vec<String> = csv.split('\n')
+    let selectors: Vec<String> = csv
+        .split('\n')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1770,9 +1958,14 @@ pub fn sanitize_and_compact_selectors(csv: &str, chunk_size: usize) -> String {
 // ---------------------------------------------------------------------------
 
 #[wasm_bindgen]
-pub fn serialize_rules_to_binary_from_json(generic_json: &str, domain_specific_json: &str, exceptions_json: &str) -> Vec<u8> {
+pub fn serialize_rules_to_binary_from_json(
+    generic_json: &str,
+    domain_specific_json: &str,
+    exceptions_json: &str,
+) -> Vec<u8> {
     let generic: Vec<String> = serde_json::from_str(generic_json).unwrap_or_default();
-    let domain_specific: Vec<String> = serde_json::from_str(domain_specific_json).unwrap_or_default();
+    let domain_specific: Vec<String> =
+        serde_json::from_str(domain_specific_json).unwrap_or_default();
     let exceptions: Vec<String> = serde_json::from_str(exceptions_json).unwrap_or_default();
     serialize_rules_to_binary_lists(&generic, &domain_specific, &exceptions)
 }
@@ -1815,10 +2008,18 @@ pub fn resolve_entity(hostname: &str) -> String {
     let mut d = hostname;
     loop {
         let entity = match d {
-            "google.com" | "doubleclick.net" | "googlesyndication.com" | "google-analytics.com" | "gstatic.com" | "googleadservices.com" | "2mdn.net" => "Google",
-            "facebook.com" | "facebook.net" | "fbcdn.net" | "fbsbx.com" | "fbevents.com" | "messenger.com" | "instagram.com" => "Meta",
+            "google.com"
+            | "doubleclick.net"
+            | "googlesyndication.com"
+            | "google-analytics.com"
+            | "gstatic.com"
+            | "googleadservices.com"
+            | "2mdn.net" => "Google",
+            "facebook.com" | "facebook.net" | "fbcdn.net" | "fbsbx.com" | "fbevents.com"
+            | "messenger.com" | "instagram.com" => "Meta",
             "amazon-adsystem.com" | "media-amazon.com" | "assoc-amazon.com" => "Amazon",
-            "bing.com" | "msn.com" | "live.com" | "ads.microsoft.com" | "clarity.ms" | "azureedge.net" => "Microsoft",
+            "bing.com" | "msn.com" | "live.com" | "ads.microsoft.com" | "clarity.ms"
+            | "azureedge.net" => "Microsoft",
             "twitter.com" | "x.com" | "t.co" | "twimg.com" => "X (Twitter)",
             "tiktok.com" | "byteoversea.com" | "ibyteimg.com" | "tiktokv.com" => "TikTok",
             "adnxs.com" | "appnexus.com" => "AppNexus (Xandr)",
@@ -2001,13 +2202,15 @@ mod tests {
 
     #[test]
     fn plan_selector_rules_separates_css_and_procedural() {
-        let planned = plan_selector_rules_json(
-            "[\".ad-slot\",\"div:has-text(Sponsored):upward(article)\"]"
-        );
+        let planned =
+            plan_selector_rules_json("[\".ad-slot\",\"div:has-text(Sponsored):upward(article)\"]");
         let parsed: serde_json::Value = serde_json::from_str(&planned).unwrap();
 
         assert_eq!(parsed["cssSelectors"][0], ".ad-slot");
-        assert_eq!(parsed["proceduralRules"][0]["selector"], "div:has-text(Sponsored):upward(article)");
+        assert_eq!(
+            parsed["proceduralRules"][0]["selector"],
+            "div:has-text(Sponsored):upward(article)"
+        );
         assert_eq!(parsed["proceduralRules"][0]["plan"][0]["type"], "css");
         assert_eq!(parsed["proceduralRules"][0]["plan"][1]["type"], "op");
     }
@@ -2018,17 +2221,21 @@ mod tests {
             vec![".global-ad".into(), ".global-ad".into(), ".hero-ad".into()],
             HashMap::from([(
                 "example.com".to_string(),
-                vec![".hero-ad".to_string(), ".sidebar-ad".to_string(), ".sidebar-ad".to_string()],
+                vec![
+                    ".hero-ad".to_string(),
+                    ".sidebar-ad".to_string(),
+                    ".sidebar-ad".to_string(),
+                ],
             )]),
-            HashMap::from([(
-                "example.com".to_string(),
-                vec![".allow-me".to_string()],
-            )]),
+            HashMap::from([("example.com".to_string(), vec![".allow-me".to_string()])]),
         );
 
         assert_eq!(reduced.generic.len(), 2);
         assert_eq!(reduced.domain_specific["example.com"][0], ".sidebar-ad");
-        assert_eq!(reduced.domain_specific["example.com"][1], "__exception__.allow-me");
+        assert_eq!(
+            reduced.domain_specific["example.com"][1],
+            "__exception__.allow-me"
+        );
     }
 
     #[test]
@@ -2043,10 +2250,34 @@ mod tests {
         assert!(bundle.css_text.contains(".hero-ad"));
         assert!(!bundle.css_text.contains(".allow-me"));
         assert_eq!(bundle.rules.domain_specific.len(), 1);
-        assert_eq!(bundle.rules.domain_specific[0].selector, "div:has-text(Sponsored):upward(article)");
+        assert_eq!(
+            bundle.rules.domain_specific[0].selector,
+            "div:has-text(Sponsored):upward(article)"
+        );
         assert_eq!(bundle.rules.exceptions, vec![".allow-me".to_string()]);
         assert!(bundle.exception_css.contains(".allow-me"));
         assert!(bundle.cosmetic_rules_binary.len() > 12);
+    }
+
+    #[test]
+    fn selector_delimiter_balance_handles_quotes_and_nested_pseudos() {
+        assert!(has_balanced_selector_delimiters(
+            r#"a[href^="http://li.blogtrottr.com/click?"]"#
+        ));
+        assert!(has_balanced_selector_delimiters(r#"div:has(a[href*=")"])"#));
+        assert!(has_balanced_selector_delimiters(r#":lang("en)")"#));
+        assert!(has_balanced_selector_delimiters(
+            r#":nth-child(2n+1 of :not([hidden]))"#
+        ));
+
+        assert!(!has_balanced_selector_delimiters(r#"div[role="main""#));
+        assert!(!has_balanced_selector_delimiters(
+            r#"div[attr="unterminated]"#
+        ));
+        assert!(!has_balanced_selector_delimiters("div:has(.ad"));
+        assert!(!has_balanced_selector_delimiters("div]"));
+        assert!(!has_balanced_selector_delimiters("div)"));
+        assert!(!has_balanced_selector_delimiters("div[[data-ad]]"));
     }
 
     #[test]
@@ -2065,7 +2296,10 @@ mod tests {
         );
 
         assert_eq!(compiled.dnr_rules.len(), 1);
-        assert_eq!(compiled.cosmetic_rules.generic, vec![".global-ad".to_string()]);
+        assert_eq!(
+            compiled.cosmetic_rules.generic,
+            vec![".global-ad".to_string()]
+        );
         assert_eq!(
             compiled.cosmetic_rules.domain_specific["example.com"],
             vec![".hero-ad".to_string(), "div:has(.sponsor)".to_string()]
@@ -2104,7 +2338,11 @@ mod tests {
         assert_eq!(merged.generic, vec![".global-ad".to_string()]);
         assert_eq!(
             merged.domain_specific["example.com"],
-            vec![".hero-ad".to_string(), ".sidebar-ad".to_string(), "__exception__.sidebar-ad".to_string()]
+            vec![
+                ".hero-ad".to_string(),
+                ".sidebar-ad".to_string(),
+                "__exception__.sidebar-ad".to_string()
+            ]
         );
         assert_eq!(
             merged.domain_specific["news.example.com"],
@@ -2116,15 +2354,25 @@ mod tests {
     #[test]
     fn build_allowlist_rules_dedupes_and_normalizes_domains() {
         let rules = build_allowlist_rules_internal(
-            vec![" Example.com ".into(), "example.com".into(), "news.example.com".into()],
+            vec![
+                " Example.com ".into(),
+                "example.com".into(),
+                "news.example.com".into(),
+            ],
             990000,
         );
 
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].id, 990000);
         assert_eq!(rules[0].priority, 500);
-        assert_eq!(rules[0].condition.url_filter.as_deref(), Some("||example.com^"));
-        assert_eq!(rules[1].condition.url_filter.as_deref(), Some("||news.example.com^"));
+        assert_eq!(
+            rules[0].condition.url_filter.as_deref(),
+            Some("||example.com^")
+        );
+        assert_eq!(
+            rules[1].condition.url_filter.as_deref(),
+            Some("||news.example.com^")
+        );
     }
 
     #[test]
@@ -2150,6 +2398,50 @@ mod tests {
         assert!(!compiled.generic_css.contains("#google_ads_iframe_*"));
         assert!(!compiled.generic_css.contains(":remove("));
     }
+
+    #[test]
+    fn compile_active_filter_index_skips_denylisted_gmail_selectors() {
+        let compiled = compile_active_filter_index_internal(
+            FilterSourceBundle {
+                cosmetic: FilterSourceCosmetic {
+                    generic: Vec::new(),
+                    domain_specific: HashMap::new(),
+                    exceptions: HashMap::new(),
+                },
+                scriptlets: Vec::new(),
+            },
+            vec![FilterSourceBundle {
+                cosmetic: FilterSourceCosmetic {
+                    generic: Vec::new(),
+                    domain_specific: HashMap::from([(
+                        "mail.google.com".to_string(),
+                        vec![
+                            ".nH.PS".to_string(),
+                            ".aeF > .nH > .nH[role=\"main\"] > .aKB".to_string(),
+                            "a[href^=\"http://li.blogtrottr.com/click?\"]".to_string(),
+                        ],
+                    )]),
+                    exceptions: HashMap::new(),
+                },
+                scriptlets: Vec::new(),
+            }],
+            100,
+        );
+
+        let domain_specific = compiled.cosmetic.domain_specific["mail.google.com"].clone();
+        let exceptions = Vec::new();
+
+        let bundle = build_page_bundle_internal(Vec::new(), domain_specific, exceptions, 100);
+
+        assert!(bundle
+            .css_text
+            .contains("a[href^=\"http://li.blogtrottr.com/click?\"]"));
+        assert!(!bundle.css_text.contains(".nH.PS"));
+        assert!(!bundle
+            .css_text
+            .contains(".aeF > .nH > .nH[role=\"main\"] > .aKB"));
+        assert!(bundle.exception_css.is_empty());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2158,24 +2450,43 @@ mod tests {
 
 fn ad_keyword_ac() -> &'static AhoCorasick {
     static AC: OnceLock<AhoCorasick> = OnceLock::new();
-    AC.get_or_init(|| AhoCorasick::new([
-        "sponsored", "promoted", "advertisement", "adsby", "suggestedpost",
-        "recommendedforyou", "marketingshare", "sponsoredpost", "paidpost",
-        "publicidad", "patrocinado", "anuncio",
-        "anzeige", "gesponsert",
-        "publicit", "sponsoris",
-        "pubblicit", "sponsorizzato",
-        "reklama", "sponsorowane",
-    ]).unwrap())
+    AC.get_or_init(|| {
+        AhoCorasick::new([
+            "sponsored",
+            "promoted",
+            "advertisement",
+            "adsby",
+            "suggestedpost",
+            "recommendedforyou",
+            "marketingshare",
+            "sponsoredpost",
+            "paidpost",
+            "publicidad",
+            "patrocinado",
+            "anuncio",
+            "anzeige",
+            "gesponsert",
+            "publicit",
+            "sponsoris",
+            "pubblicit",
+            "sponsorizzato",
+            "reklama",
+            "sponsorowane",
+        ])
+        .unwrap()
+    })
 }
 
 #[wasm_bindgen]
 pub fn is_semantic_ad(text: &str) -> bool {
     // Normalize once, then do a single O(n) multi-pattern scan.
-    let normalized: String = text.chars()
+    let normalized: String = text
+        .chars()
         .filter(|c| c.is_alphanumeric())
         .flat_map(|c| c.to_lowercase())
         .collect();
-    if normalized.is_empty() { return false; }
+    if normalized.is_empty() {
+        return false;
+    }
     ad_keyword_ac().is_match(&normalized)
 }

@@ -3,7 +3,7 @@
  * Like set-constant but allows setting complex values (objects, functions).
  * "Trusted" scriptlets can only be injected via trusted filter lists.
  */
-export function trustedSetConstant(prop, value, stack) {
+export function trustedSetConstant(prop, value, _stack) {
   if (!prop) return;
 
   // Parse value — supports JSON

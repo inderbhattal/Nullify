@@ -24,7 +24,7 @@ function getLatestTag() {
   try {
     const tag = execSync('git describe --tags --abbrev=0 --match "v*"').toString().trim();
     return tag.replace(/^v/, '');
-  } catch (err) {
+  } catch {
     return null;
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "nullify",
-  "version": "3.9.0",
+  "version": "3.10.0",
   "description": "A powerful MV3 Chrome ad blocker with uBlock Origin-level features",
   "type": "module",
   "engines": {
@@ -10,13 +10,13 @@
     "setup": "npm install && npm run build:wasm && npm run build:sample-rules && npm run build:ext",
     "setup:prod": "npm install && npm run build:wasm && npm run build:rules && npm run build:ext",
     "build": "npm run build:wasm && npm run build:rules && npm run build:ext",
-    "build:rules": "node scripts/build-rules.mjs",
+    "build:rules": "node scripts/build-rules.mjs --verbose",
     "build:wasm": "cd wasm-core && wasm-pack build --target web --out-dir ../src/shared/wasm",
     "build:ext": "webpack --mode production",
     "build:sample-rules": "node scripts/build-rules.mjs --sample",
     "dev": "npm run build:wasm && npm run build:sample-rules && webpack --mode development --watch",
     "lint": "eslint src/ scripts/ --ext .js,.mjs",
-    "clean": "rm -rf dist/ && find rules/ -name '*.json' ! -name 'system-unbreak.json' -delete && rm -rf _metadata",
+    "clean": "rm -rf dist/ && find rules/ -name '*.json' ! -name 'system-unbreak.json' -delete && rm -rf _metadata && rm -rf rules/skipped",
     "clean:all": "npm run clean && rm -rf node_modules/",
     "version:sync": "node scripts/version.mjs",
     "version:bump": "f() { new_ver=$(npm version --no-git-tag-version \"$1\") && npm run version:sync -- \"${new_ver#v}\" && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to ${new_ver#v}\"; }; f",

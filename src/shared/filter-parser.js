@@ -34,6 +34,77 @@ function parseScriptletArgs(str) {
   return args;
 }
 
+function normalizeCosmeticScopeDomain(domain) {
+  const normalized = String(domain || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+  if (!normalized || normalized.includes('*') || normalized.includes('/') || normalized.includes(':')) return '';
+  if (!normalized.includes('.') && normalized !== 'localhost') return '';
+  return normalized;
+}
+
+function extractCosmeticScopeExceptionDomains(pattern) {
+  const value = String(pattern || '').trim();
+  if (!value) return [];
+
+  if (value.startsWith('||')) {
+    const match = /^\|\|([^/*?^|]+)/.exec(value);
+    const domain = normalizeCosmeticScopeDomain(match?.[1]);
+    return domain ? [domain] : [];
+  }
+
+  if (value.startsWith('|http://') || value.startsWith('|https://')) {
+    try {
+      const url = new URL(value.slice(1));
+      const domain = normalizeCosmeticScopeDomain(url.hostname);
+      return domain ? [domain] : [];
+    } catch {
+      return [];
+    }
+  }
+
+  const plain = value.replace(/\^$/, '');
+  if (/^[a-z0-9.-]+$/i.test(plain)) {
+    const domain = normalizeCosmeticScopeDomain(plain);
+    return domain ? [domain] : [];
+  }
+
+  return [];
+}
+
+function dedupeDomains(domains) {
+  return [...new Set((domains || []).map(normalizeCosmeticScopeDomain).filter(Boolean))];
+}
+
+function parseCosmeticScopeException(line) {
+  if (!line.startsWith('@@')) return null;
+  const rawRule = line.slice(2);
+  const dollarPos = rawRule.lastIndexOf('$');
+  if (dollarPos === -1 || rawRule.endsWith('$')) return null;
+
+  const pattern = rawRule.slice(0, dollarPos);
+  const optionTokens = rawRule.slice(dollarPos + 1)
+    .split(',')
+    .map((option) => option.trim());
+  const scopes = optionTokens.filter((option) => option === 'generichide' || option === 'elemhide');
+
+  if (scopes.length === 0) return null;
+  const optionDomains = optionTokens
+    .filter((option) => option.startsWith('domain='))
+    .flatMap((option) => option.slice(7).split('|'))
+    .filter((domain) => !domain.startsWith('~'));
+  const domains = dedupeDomains([
+    ...extractCosmeticScopeExceptionDomains(pattern),
+    ...optionDomains,
+  ]);
+  if (domains.length === 0) return null;
+
+  return {
+    type: 'cosmetic-scope-exception',
+    domains,
+    scopes,
+    pattern,
+  };
+}
+
 /**
  * Parse a single filter line. Returns a rule object or null if not a
  * cosmetic/scriptlet rule (or if the line is a comment/blank/network rule).
@@ -42,6 +113,9 @@ function parseLine(line) {
   line = line.trim();
   if (!line || line.startsWith('!') || line.startsWith('[') ||
     line.startsWith('%') || line.startsWith('@@#')) return null;
+
+  const scopeException = parseCosmeticScopeException(line);
+  if (scopeException) return scopeException;
 
   // Find the separator index first (#)
   const hashIdx = line.indexOf('#');
@@ -112,15 +186,26 @@ function parseLine(line) {
 export function parseFilterList(text) {
   const cosmeticRules = [];
   const scriptletRules = [];
+  const genericCosmeticExceptionDomains = [];
 
   for (const line of text.split('\n')) {
     const parsed = parseLine(line);
     if (!parsed) continue;
     if (parsed.type === 'cosmetic') cosmeticRules.push(parsed);
     else if (parsed.type === 'scriptlet') scriptletRules.push(parsed);
+    else if (
+      parsed.type === 'cosmetic-scope-exception' &&
+      (parsed.scopes.includes('generichide') || parsed.scopes.includes('elemhide'))
+    ) {
+      genericCosmeticExceptionDomains.push(...parsed.domains);
+    }
   }
 
-  return {cosmeticRules, scriptletRules};
+  return {
+    cosmeticRules,
+    scriptletRules,
+    genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
+  };
 }
 
 /**

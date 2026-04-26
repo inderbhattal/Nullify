@@ -18,7 +18,6 @@ const PICKER_DIALOG_ID    = '__adblock_picker_dialog__';
 const PICKER_STYLE_ID     = '__adblock_picker_style__';
 
 let pickerActive = false;
-let highlightEl = null;
 let lastTarget = null;
 let navStack = [];
 let currentNavTarget = null;
@@ -726,7 +725,7 @@ function updatePreviewForCustom(dialog, selector, hostname, count) {
   if (elements.length === 0) {
     preview.innerHTML = '<span style="color:#d29922">⚠ No elements match on this page</span>';
   } else {
-    const actualCount = deepQuerySelectorAll(selector).length;
+    const actualCount = Number.isFinite(count) ? count : deepQuerySelectorAll(selector).length;
     const items = elements.map((el) => {
       const tag = el.tagName.toLowerCase();
       const id = el.id ? `#${el.id}` : '';

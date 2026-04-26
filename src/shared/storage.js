@@ -25,6 +25,7 @@ export const StorageKeys = {
   BLOOM_FILTER: 'bloomFilter',
   GENERIC_CSS: 'genericCss',
   GENERIC_PROCEDURAL_RULES: 'genericProceduralRules',
+  GENERIC_COSMETIC_EXCLUDED_DOMAINS: 'genericCosmeticExcludedDomains',
   RULE_DATA_VERSION: 'ruleDataVersion',
   BLOCK_THIRD_PARTY_COOKIES: 'blockThirdPartyCookies',
   FINGERPRINT_PROTECTION: 'fingerprintProtection',

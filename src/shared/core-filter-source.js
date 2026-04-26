@@ -1,5 +1,35 @@
 export const CORE_FILTER_SOURCE_ID = '__core';
 
+export const COSMETIC_SELECTOR_DENYLIST = {
+  'mail.google.com': [
+    // EasyList periodically ships Gmail layout selectors that now match the
+    // active reading pane/message body. Drop them at ingestion instead of
+    // relying on exception CSS to undo a bad hide rule after it is emitted.
+    '.nH.PS',
+    '.aeF > .nH > .nH[role="main"] > .aKB',
+  ],
+};
+
+const COSMETIC_SELECTOR_DENYSETS = new Map(
+  Object.entries(COSMETIC_SELECTOR_DENYLIST).map(([domain, selectors]) => [
+    domain,
+    new Set(selectors),
+  ])
+);
+
+export function shouldSkipDomainCosmeticSelector(domain, selector) {
+  const normalizedDomain = String(domain || '').trim().toLowerCase();
+  const normalizedSelector = String(selector || '').trim();
+  return COSMETIC_SELECTOR_DENYSETS.get(normalizedDomain)?.has(normalizedSelector) === true;
+}
+
+export function shouldSkipGenericCosmeticForHostname(hostname, excludedDomains = []) {
+  const normalizedHostname = String(hostname || '').trim().toLowerCase();
+  return (excludedDomains || []).some(
+    (domain) => normalizedHostname === domain || normalizedHostname.endsWith(`.${domain}`)
+  );
+}
+
 export const CORE_FILTER_SOURCE = {
   cosmetic: {
     generic: [

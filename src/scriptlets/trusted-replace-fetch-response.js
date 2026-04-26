@@ -42,7 +42,7 @@ export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = ''
         statusText: response.statusText,
         headers
       });
-    } catch (e) {
+    } catch {
       return origFetch.call(this, input, init);
     }
   };

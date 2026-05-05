@@ -1178,6 +1178,77 @@ function verifyManifestRuleResourcePaths() {
   log(`✅ manifest rule_resources verified (${resources.length} paths)`);
 }
 
+// Chrome MV3 DNR static-ruleset limits. Sourced from
+// https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#property-MAX_NUMBER_OF_STATIC_RULES_PER_RULESET
+// These are absolute caps; exceeding them causes the entire ruleset to be
+// silently rejected on extension load. Assert at build time so we fail the
+// CI build instead of shipping a broken extension.
+const DNR_LIMITS = {
+  RULES_PER_RULESET: 30000,
+  REGEX_RULES_PER_RULESET: 1000,
+  GUARANTEED_MINIMUM_ENABLED: 30000,
+};
+
+function verifyDnrBudget() {
+  const manifestPath = path.resolve(__dirname, '../manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const resources = manifest?.declarative_net_request?.rule_resources || [];
+  const projectRoot = path.resolve(__dirname, '..');
+
+  const violations = [];
+  let enabledSum = 0;
+  let enabledRegexSum = 0;
+  const lines = [];
+
+  for (const entry of resources) {
+    const abs = path.resolve(projectRoot, entry.path);
+    let rules = [];
+    try {
+      rules = JSON.parse(fs.readFileSync(abs, 'utf8'));
+      if (!Array.isArray(rules)) rules = [];
+    } catch {
+      // verifyManifestRuleResourcePaths already covers missing files; skip
+      continue;
+    }
+    const regexCount = rules.filter((r) => r?.condition?.regexFilter).length;
+    if (rules.length > DNR_LIMITS.RULES_PER_RULESET) {
+      violations.push(
+        `  - ${entry.id}: ${rules.length} rules > ${DNR_LIMITS.RULES_PER_RULESET} per-ruleset cap`
+      );
+    }
+    if (regexCount > DNR_LIMITS.REGEX_RULES_PER_RULESET) {
+      violations.push(
+        `  - ${entry.id}: ${regexCount} regex rules > ${DNR_LIMITS.REGEX_RULES_PER_RULESET} per-ruleset cap`
+      );
+    }
+    if (entry.enabled) {
+      enabledSum += rules.length;
+      enabledRegexSum += regexCount;
+    }
+    lines.push(`     ${entry.enabled ? '●' : '○'} ${entry.id.padEnd(24)} ${String(rules.length).padStart(6)} rules / ${String(regexCount).padStart(4)} regex`);
+  }
+
+  if (enabledSum > DNR_LIMITS.GUARANTEED_MINIMUM_ENABLED) {
+    violations.push(
+      `  - sum of enabled rulesets: ${enabledSum} > guaranteed minimum ${DNR_LIMITS.GUARANTEED_MINIMUM_ENABLED}. ` +
+      `Some rulesets will be silently rejected at install on machines without dynamic budget headroom. ` +
+      `Disable a ruleset in manifest.json or move rules into a non-default-enabled shard.`
+    );
+  }
+
+  log('\n📊 DNR rule budget:');
+  for (const line of lines) log(line);
+  log(`     ─ enabled-by-default total: ${enabledSum} rules / ${enabledRegexSum} regex (cap ${DNR_LIMITS.GUARANTEED_MINIMUM_ENABLED} / ${DNR_LIMITS.REGEX_RULES_PER_RULESET}-per-ruleset)`);
+
+  if (violations.length > 0) {
+    throw new Error(
+      `DNR budget violations detected — Chrome will silently drop these rulesets at install:\n${violations.join('\n')}\n` +
+      `Fix by disabling rulesets in manifest.json, sharding into more files, or tightening per-list limits in LIST_CONFIG.`
+    );
+  }
+  log('✅ DNR budget verified');
+}
+
 function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }) {
   // Per-ruleset rule counts — previously hardcoded in service-worker.js and
   // drifted from reality after every filter-list refresh. Emit the actual
@@ -1720,6 +1791,7 @@ async function main() {
   });
 
   verifyManifestRuleResourcePaths();
+  verifyDnrBudget();
 
   log('\n🎉 Build complete!');
 }

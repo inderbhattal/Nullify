@@ -1005,14 +1005,34 @@ async function ensureRuleDataReady() {
 // wipe first.
 function registerContextMenus() {
   chrome.contextMenus.removeAll(() => {
-    // Swallow lastError from removeAll (no-op if nothing to remove).
-    void chrome.runtime.lastError;
+    const removeErr = chrome.runtime.lastError;
+    if (removeErr && !/No matching/i.test(removeErr.message || '')) {
+      reportError('contextMenus:removeAll', new Error(removeErr.message));
+    }
     chrome.contextMenus.create({
       id: 'nullify-block-element',
       title: 'Block element...',
       contexts: ['all'],
     }, () => {
-      void chrome.runtime.lastError;
+      const createErr = chrome.runtime.lastError;
+      if (!createErr) return;
+      // Duplicate-id can happen if a prior removeAll silently failed. Try once
+      // more after an explicit remove of the known id.
+      if (/duplicate/i.test(createErr.message || '')) {
+        chrome.contextMenus.remove('nullify-block-element', () => {
+          void chrome.runtime.lastError;
+          chrome.contextMenus.create({
+            id: 'nullify-block-element',
+            title: 'Block element...',
+            contexts: ['all'],
+          }, () => {
+            const retryErr = chrome.runtime.lastError;
+            if (retryErr) reportError('contextMenus:create:retry', new Error(retryErr.message));
+          });
+        });
+      } else {
+        reportError('contextMenus:create', new Error(createErr.message));
+      }
     });
   });
 }

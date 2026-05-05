@@ -2627,7 +2627,7 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
     });
   } catch (err) {
     if (!err.message?.includes('No frame with id')) {
-      console.warn('[AdBlock] Scriptlet injection failed:', err.message);
+      reportError('scriptlet:inject', err);
     }
   }
 }
@@ -2668,7 +2668,7 @@ async function ensureScriptletRegistry(tabId, frameId) {
     return true;
   } catch (err) {
     if (!err.message?.includes('No frame with id')) {
-      console.warn('[AdBlock] Failed to bootstrap scriptlet registry:', err.message);
+      reportError('scriptlet:bootstrap', err);
     }
     return false;
   }

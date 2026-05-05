@@ -2418,6 +2418,26 @@ function getManifestRulesetIds() {
   return rulesetIds;
 }
 
+// Boot-time invariant: every ruleset declared in the manifest must have an
+// explicit slot in RULESET_ENABLE_PRIORITY, otherwise it falls to the lowest
+// priority during budget fallback and silently loses to its peers. Run once
+// at module load so misconfigurations fail loudly in dev rather than silently
+// in production. See docs/REVIEW.md §6.3.
+(function validateRulesetPriorityAgainstManifest() {
+  const manifestIds = getManifestRulesetIds();
+  if (manifestIds.size === 0) return; // pre-test or build environment
+  const priorityIds = new Set(RULESET_ENABLE_PRIORITY);
+  const missing = [...manifestIds].filter((id) => !priorityIds.has(id));
+  const unknown = RULESET_ENABLE_PRIORITY.filter((id) => !manifestIds.has(id));
+  if (missing.length === 0 && unknown.length === 0) return;
+  const detail = `missing=[${missing.join(',')}] unknown=[${unknown.join(',')}]`;
+  reportError(
+    'rulesetPriority:mismatch',
+    new Error(`RULESET_ENABLE_PRIORITY does not match manifest: ${detail}`),
+    { fatal: true }
+  );
+})();
+
 /**
  * Run the sequential priority fallback: disable everything, then enable
  * rulesets one at a time in priority order, stopping at Chrome's static rule

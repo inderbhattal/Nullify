@@ -63,6 +63,7 @@ import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
+import { createYouTubeShieldSync } from './youtube-shield-sync.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
   CORE_FILTER_SOURCE,
@@ -166,10 +167,21 @@ const YOUTUBE_SHIELD_TARGETS = [
   { hostname: 'm.youtube.com', pattern: '*://m.youtube.com/*' },
   { hostname: 'music.youtube.com', pattern: '*://music.youtube.com/*' },
 ];
-const YOUTUBE_SHIELD_HOSTNAMES = new Set(
-  YOUTUBE_SHIELD_TARGETS.map(({ hostname }) => normalizeHostname(hostname))
-);
-let youtubeShieldSyncPromise = null;
+let _youtubeShieldSync = null;
+function getYouTubeShieldSync() {
+  if (_youtubeShieldSync) return _youtubeShieldSync;
+  _youtubeShieldSync = createYouTubeShieldSync({
+    chrome,
+    isHostnameAllowed: isHostnameAllowedCached,
+    runtimeAssetPath,
+    scriptId: YOUTUBE_SHIELD_SCRIPT_ID,
+    targets: YOUTUBE_SHIELD_TARGETS,
+  });
+  return _youtubeShieldSync;
+}
+async function syncYouTubeShieldRegistration() {
+  return getYouTubeShieldSync().syncRegistration();
+}
 
 function setCachedDomainRules(hostname, bundle) {
   // Evict oldest entry when at capacity (Map preserves insertion order)
@@ -1174,148 +1186,9 @@ async function rebuildAllowlistState(normalizedAllowlist) {
   await syncYouTubeShieldRegistration();
 }
 
-function getYouTubeShieldExcludeMatches() {
-  return YOUTUBE_SHIELD_TARGETS
-    .filter(({ hostname }) => isHostnameAllowedCached(hostname))
-    .map(({ pattern }) => pattern);
-}
-
-function arraysEqual(a = [], b = []) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) return false;
-  }
-  return true;
-}
-
-async function injectYouTubeShieldIntoOpenTabs() {
-  const tabs = await chrome.tabs.query({
-    url: YOUTUBE_SHIELD_TARGETS.map(({ pattern }) => pattern),
-  }).catch(() => []);
-
-  await Promise.all((tabs || []).map(async (tab) => {
-    if (tab.id == null) return;
-
-    const frames = await chrome.webNavigation.getAllFrames({ tabId: tab.id }).catch(() => null);
-    if (!Array.isArray(frames)) {
-      if (!tab.url) return;
-      let hostname = '';
-      try {
-        hostname = normalizeHostname(new URL(tab.url).hostname);
-      } catch {
-        return;
-      }
-      if (!YOUTUBE_SHIELD_HOSTNAMES.has(hostname) || isHostnameAllowedCached(hostname)) return;
-
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        world: 'MAIN',
-        files: [runtimeAssetPath('youtube-shield.js')],
-      }).catch(() => {});
-      return;
-    }
-
-    const frameIds = frames
-      .filter((frame) => {
-        if (!frame?.url?.startsWith('http')) return false;
-        try {
-          const hostname = normalizeHostname(new URL(frame.url).hostname);
-          return YOUTUBE_SHIELD_HOSTNAMES.has(hostname) && !isHostnameAllowedCached(hostname);
-        } catch {
-          return false;
-        }
-      })
-      .map((frame) => frame.frameId)
-      .filter((frameId) => Number.isInteger(frameId));
-
-    if (frameIds.length === 0) return;
-
-    await Promise.all(frameIds.map((frameId) => chrome.scripting.executeScript({
-      target: { tabId: tab.id, frameIds: [frameId] },
-      world: 'MAIN',
-      files: [runtimeAssetPath('youtube-shield.js')],
-    }).catch(() => {})));
-  }));
-}
-
-async function syncYouTubeShieldRegistration() {
-  const run = async () => {
-    const registration = {
-      id: YOUTUBE_SHIELD_SCRIPT_ID,
-      matches: YOUTUBE_SHIELD_TARGETS.map(({ pattern }) => pattern),
-      excludeMatches: getYouTubeShieldExcludeMatches(),
-      js: [runtimeAssetPath('youtube-shield.js')],
-      runAt: 'document_start',
-      world: 'MAIN',
-      allFrames: true,
-      persistAcrossSessions: true,
-    };
-
-    const existingScripts = await chrome.scripting.getRegisteredContentScripts({
-      ids: [YOUTUBE_SHIELD_SCRIPT_ID],
-    }).catch(() => []);
-    const existing = existingScripts?.[0] || null;
-
-    const sameRegistration =
-      existing &&
-      arraysEqual(existing.matches || [], registration.matches) &&
-      arraysEqual(existing.excludeMatches || [], registration.excludeMatches) &&
-      arraysEqual(existing.js || [], registration.js) &&
-      existing.runAt === registration.runAt &&
-      existing.world === registration.world &&
-      existing.allFrames === registration.allFrames &&
-      existing.persistAcrossSessions === registration.persistAcrossSessions;
-
-    if (sameRegistration) {
-      await injectYouTubeShieldIntoOpenTabs();
-      return;
-    }
-
-    const canUpdateExcludeMatchesOnly =
-      existing &&
-      typeof chrome.scripting.updateContentScripts === 'function' &&
-      arraysEqual(existing.matches || [], registration.matches) &&
-      arraysEqual(existing.js || [], registration.js) &&
-      existing.runAt === registration.runAt &&
-      existing.world === registration.world &&
-      existing.allFrames === registration.allFrames &&
-      existing.persistAcrossSessions === registration.persistAcrossSessions;
-
-    if (canUpdateExcludeMatchesOnly) {
-      await chrome.scripting.updateContentScripts([{
-        id: YOUTUBE_SHIELD_SCRIPT_ID,
-        excludeMatches: registration.excludeMatches,
-      }]);
-      await injectYouTubeShieldIntoOpenTabs();
-      return;
-    }
-
-    if (existing) {
-      await chrome.scripting.unregisterContentScripts({ ids: [YOUTUBE_SHIELD_SCRIPT_ID] }).catch(() => {});
-    }
-
-    await chrome.scripting.registerContentScripts([registration]);
-    await injectYouTubeShieldIntoOpenTabs();
-  };
-
-  const previous = youtubeShieldSyncPromise || Promise.resolve();
-  const pending = previous
-    .catch(() => {})
-    .then(run)
-    .catch((err) => {
-      console.error('[Nullify] Failed to sync YouTube shield registration:', err);
-    });
-
-  let tracked;
-  tracked = pending.finally(() => {
-    if (youtubeShieldSyncPromise === tracked) {
-      youtubeShieldSyncPromise = null;
-    }
-  });
-  youtubeShieldSyncPromise = tracked;
-
-  return tracked;
-}
+// YouTube shield sync is implemented in ./youtube-shield-sync.js. The factory
+// is instantiated lazily on first call so isHostnameAllowedCached and
+// runtimeAssetPath are guaranteed to exist as module-level fns by then.
 
 async function refreshMemoryCache() {
   const data = await getStorageBulk([

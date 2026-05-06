@@ -1178,6 +1178,88 @@ function verifyManifestRuleResourcePaths() {
   log(`✅ manifest rule_resources verified (${resources.length} paths)`);
 }
 
+// Chrome MV3 DNR static-ruleset limits. Sourced from
+// https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#property-MAX_NUMBER_OF_STATIC_RULES_PER_RULESET
+// These are absolute caps; exceeding them causes the entire ruleset to be
+// silently rejected on extension load. Assert at build time so we fail the
+// CI build instead of shipping a broken extension.
+const DNR_LIMITS = {
+  RULES_PER_RULESET: 30000,
+  REGEX_RULES_PER_RULESET: 1000,
+  GUARANTEED_MINIMUM_ENABLED: 30000,
+};
+
+function verifyDnrBudget() {
+  const manifestPath = path.resolve(__dirname, '../manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  const resources = manifest?.declarative_net_request?.rule_resources || [];
+  const projectRoot = path.resolve(__dirname, '..');
+
+  // Hard violations cause a build failure — these are absolute Chrome caps
+  // that, when exceeded, result in silent ruleset rejection at install.
+  const hardViolations = [];
+  // Soft warnings are surfaced but do not fail the build. The enabled-sum
+  // exceeding GUARANTEED_MINIMUM_STATIC_RULES is informational: the guarantee
+  // is a floor every extension receives unconditionally, not a ceiling. The
+  // actual ceiling is GLOBAL_STATIC_RULE_LIMIT (reported at runtime via
+  // chrome.declarativeNetRequest.getAvailableStaticRuleCount()), which on
+  // current Chrome is high enough that extensions routinely ship enabled-sum
+  // well above the guaranteed minimum without issue.
+  const warnings = [];
+  let enabledSum = 0;
+  let enabledRegexSum = 0;
+  const lines = [];
+
+  for (const entry of resources) {
+    const abs = path.resolve(projectRoot, entry.path);
+    let rules = [];
+    try {
+      rules = JSON.parse(fs.readFileSync(abs, 'utf8'));
+      if (!Array.isArray(rules)) rules = [];
+    } catch {
+      // verifyManifestRuleResourcePaths already covers missing files; skip
+      continue;
+    }
+    const regexCount = rules.filter((r) => r?.condition?.regexFilter).length;
+    if (rules.length > DNR_LIMITS.RULES_PER_RULESET) {
+      hardViolations.push(
+        `  - ${entry.id}: ${rules.length} rules > ${DNR_LIMITS.RULES_PER_RULESET} per-ruleset cap`
+      );
+    }
+    if (regexCount > DNR_LIMITS.REGEX_RULES_PER_RULESET) {
+      hardViolations.push(
+        `  - ${entry.id}: ${regexCount} regex rules > ${DNR_LIMITS.REGEX_RULES_PER_RULESET} per-ruleset cap`
+      );
+    }
+    if (entry.enabled) {
+      enabledSum += rules.length;
+      enabledRegexSum += regexCount;
+    }
+    lines.push(`     ${entry.enabled ? '●' : '○'} ${entry.id.padEnd(24)} ${String(rules.length).padStart(6)} rules / ${String(regexCount).padStart(4)} regex`);
+  }
+
+  if (enabledSum > DNR_LIMITS.GUARANTEED_MINIMUM_ENABLED) {
+    warnings.push(
+      `enabled-by-default sum (${enabledSum}) exceeds GUARANTEED_MINIMUM_STATIC_RULES (${DNR_LIMITS.GUARANTEED_MINIMUM_ENABLED}). ` +
+      `On a constrained Chrome profile (no global pool headroom), some rulesets may be silently dropped. ` +
+      `Run chrome.declarativeNetRequest.getAvailableStaticRuleCount() in the SW inspector to confirm headroom on target machines.`
+    );
+  }
+
+  log('\n📊 DNR rule budget:');
+  for (const line of lines) log(line);
+  log(`     ─ enabled-by-default total: ${enabledSum} rules / ${enabledRegexSum} regex (per-ruleset caps: ${DNR_LIMITS.RULES_PER_RULESET} / ${DNR_LIMITS.REGEX_RULES_PER_RULESET})`);
+
+  if (hardViolations.length > 0) {
+    throw new Error(
+      `DNR budget violations detected — Chrome will silently drop these rulesets at install:\n${hardViolations.join('\n')}\n` +
+      `Fix by sharding into more files or tightening per-list limits in LIST_CONFIG.`
+    );
+  }
+  for (const w of warnings) log(`⚠️  ${w}`);
+  log('✅ DNR per-ruleset budget verified');
+}
+
 function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }) {
   // Per-ruleset rule counts — previously hardcoded in service-worker.js and
   // drifted from reality after every filter-list refresh. Emit the actual
@@ -1720,6 +1802,7 @@ async function main() {
   });
 
   verifyManifestRuleResourcePaths();
+  verifyDnrBudget();
 
   log('\n🎉 Build complete!');
 }

@@ -16,6 +16,7 @@
     "build:sample-rules": "node scripts/build-rules.mjs --sample",
     "dev": "npm run build:wasm && npm run build:sample-rules && webpack --mode development --watch",
     "lint": "eslint src/ scripts/ --ext .js,.mjs",
+    "test": "node --test",
     "clean": "rm -rf dist/ && find rules/ -name '*.json' ! -name 'system-unbreak.json' -delete && rm -rf _metadata && rm -rf rules/skipped",
     "clean:all": "npm run clean && rm -rf node_modules/",
     "version:sync": "node scripts/version.mjs",

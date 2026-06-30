@@ -87,9 +87,17 @@ export class RulesDB {
     return new Promise((resolve, reject) => {
       const transaction = db.transaction([STORE_SCRIPTLET], 'readwrite');
       const store = transaction.objectStore(STORE_SCRIPTLET);
-      
+
       for (const rule of rules) {
-        store.put(rule);
+        // Generic (domain-less) scriptlets parse to `domains: []`. A multiEntry
+        // index emits NO key for an empty array, so they'd never be returned by
+        // the `''` generic-bucket query in getScriptletRules. Index them under
+        // the empty-string key so generic `##+js(...)` rules are reachable.
+        if (!rule.domains || rule.domains.length === 0) {
+          store.put({ ...rule, domains: [''] });
+        } else {
+          store.put(rule);
+        }
       }
 
       transaction.oncomplete = () => resolve();

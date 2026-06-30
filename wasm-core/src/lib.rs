@@ -48,6 +48,10 @@ pub struct BloomFilter {
 impl BloomFilter {
     #[wasm_bindgen(constructor)]
     pub fn new(size: usize, hashes: u8) -> Self {
+        // Clamp to non-zero: a zero size makes `add`/`has` divide by zero
+        // (`hash % size`) and a zero hash count makes membership meaningless.
+        let size = size.max(1);
+        let hashes = hashes.max(1);
         let bitset_size = (size + 31) / 32;
         Self {
             size,
@@ -98,13 +102,24 @@ impl BloomFilter {
         // Fall back to an empty filter on malformed input rather than
         // panicking through WASM — a corrupt stored bloom filter should
         // degrade gracefully, not crash the whole rule pipeline.
+        // Validate the semantic invariants too, not just JSON well-formedness:
+        // a non-zero size/hashes and a bitset whose length exactly matches the
+        // declared size. Otherwise `add`/`has` panic (divide-by-zero on
+        // `size == 0`, out-of-bounds on a short `data`), poisoning the whole
+        // WASM instance. Degrade to a safe empty filter instead.
         match serde_json::from_str::<SerializedBloom>(json) {
-            Ok(s) => Self {
-                size: s.size,
-                hashes: s.hashes,
-                bitset: s.data,
-            },
-            Err(_) => Self::new(1, 1),
+            Ok(s)
+                if s.size > 0
+                    && s.hashes > 0
+                    && s.data.len() == (s.size + 31) / 32 =>
+            {
+                Self {
+                    size: s.size,
+                    hashes: s.hashes,
+                    bitset: s.data,
+                }
+            }
+            _ => Self::new(1, 1),
         }
     }
 
@@ -639,13 +654,21 @@ fn parse_domains(domains: &str) -> Vec<String> {
 }
 
 fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
-    let (domains, rest) = if let Some(idx) = line.find("##+js(") {
-        (&line[..idx], &line[idx + 6..line.len() - 1])
+    let (domains, open) = if let Some(idx) = line.find("##+js(") {
+        (&line[..idx], idx + 6)
     } else if let Some(idx) = line.find("#+js(") {
-        (&line[..idx], &line[idx + 5..line.len() - 1])
+        (&line[..idx], idx + 5)
     } else {
         return None;
     };
+    // Require a real closing paren after the opener. Blindly slicing off the
+    // last byte panics on a missing ')' (start > end) or a trailing multi-byte
+    // char (non-char-boundary) — both reachable from untrusted filter text.
+    let close = line.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let rest = &line[open..close];
     let args = parse_scriptlet_args(rest);
     let mut args_iter = args.into_iter();
     let name = args_iter.next()?;
@@ -2177,6 +2200,42 @@ pub fn sanitize_youtube_experiments(json_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bloom_deserialize_rejects_corrupt_payloads_without_panicking() {
+        // size == 0 would divide-by-zero in has(); short data would index OOB.
+        let div0 = BloomFilter::deserialize_from_json("{\"size\":0,\"hashes\":1,\"data\":[]}");
+        assert!(!div0.has("anything")); // safe empty fallback, no panic
+        let short = BloomFilter::deserialize_from_json("{\"size\":1024,\"hashes\":4,\"data\":[1]}");
+        assert!(!short.has("anything"));
+        let garbage = BloomFilter::deserialize_from_json("not json");
+        assert!(!garbage.has("anything"));
+    }
+
+    #[test]
+    fn bloom_round_trips_valid_payload() {
+        let mut b = BloomFilter::new(1024, 4);
+        b.add("example.com");
+        let restored = BloomFilter::deserialize_from_json(&b.serialize_to_json().unwrap());
+        assert!(restored.has("example.com"));
+    }
+
+    #[test]
+    fn bloom_constructor_clamps_zero_to_safe_minimum() {
+        let mut b = BloomFilter::new(0, 0);
+        b.add("x"); // must not divide-by-zero
+        assert!(b.has("x"));
+    }
+
+    #[test]
+    fn parse_scriptlet_handles_malformed_input_without_panicking() {
+        assert!(parse_scriptlet("example.com##+js(").is_none()); // no closing paren
+        assert!(parse_scriptlet("example.com##+js(set-constant").is_none());
+        // trailing multi-byte char where the old `len()-1` slice was non-boundary
+        assert!(parse_scriptlet("example.com##+js(é").is_none());
+        let ok = parse_scriptlet("example.com##+js(set-constant, x, false)").unwrap();
+        assert_eq!(ok.name.as_deref(), Some("set-constant"));
+    }
 
     #[test]
     fn process_youtube_player_keeps_keys_but_neutralizes_values() {

@@ -509,11 +509,16 @@ fn merge_filter_sources_internal(
 
 #[wasm_bindgen]
 pub fn parse_filter_source(text: &str) -> JsValue {
+    to_js_value(&parse_filter_source_internal(text))
+}
+
+fn parse_filter_source_internal(text: &str) -> FilterSourceBundle {
     let mut bundle = FilterSourceBundle::default();
     let mut generic_seen = HashSet::new();
     let mut domain_seen: HashMap<String, HashSet<String>> = HashMap::new();
     let mut exception_seen: HashMap<String, HashSet<String>> = HashMap::new();
     let mut scriptlet_seen = HashSet::new();
+    let mut scriptlet_exceptions: Vec<ParsedRule> = Vec::new();
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -532,20 +537,36 @@ pub fn parse_filter_source(text: &str) -> JsValue {
                     bundle.scriptlets.push(rule);
                 }
             }
+            "scriptlet-exception" => {
+                scriptlet_exceptions.push(rule);
+            }
             "cosmetic" => {
                 let Some(selector) = rule.selector.as_deref() else {
                     continue;
                 };
+                let is_exception = rule.exception.unwrap_or(false);
 
                 if rule.domains.is_empty() {
-                    if !rule.exception.unwrap_or(false) {
+                    if !is_exception {
                         push_unique(&mut bundle.cosmetic.generic, &mut generic_seen, selector);
+                        // "everywhere except these": a generic rule plus an
+                        // exception on each excluded domain. Lookup already
+                        // gathers exceptions across the ancestor walk and
+                        // subtracts them, so this needs no new bundle field.
+                        for domain in &rule.excluded_domains {
+                            push_unique_domain_selector(
+                                &mut bundle.cosmetic.exceptions,
+                                &mut exception_seen,
+                                domain,
+                                selector,
+                            );
+                        }
                     }
                     continue;
                 }
 
                 for domain in &rule.domains {
-                    if rule.exception.unwrap_or(false) {
+                    if is_exception {
                         push_unique_domain_selector(
                             &mut bundle.cosmetic.exceptions,
                             &mut exception_seen,
@@ -561,12 +582,77 @@ pub fn parse_filter_source(text: &str) -> JsValue {
                         );
                     }
                 }
+
+                // A scoped rule carries its exclusions too: the lookup walk
+                // reaches the excluded subdomain through its parent, so the
+                // exception is what cancels it there.
+                if !is_exception {
+                    for domain in &rule.excluded_domains {
+                        push_unique_domain_selector(
+                            &mut bundle.cosmetic.exceptions,
+                            &mut exception_seen,
+                            domain,
+                            selector,
+                        );
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    to_js_value(&bundle)
+    apply_scriptlet_exceptions(&mut bundle.scriptlets, &scriptlet_exceptions);
+    bundle
+}
+
+/// Apply `#@#+js(name)` exceptions to the collected scriptlets.
+///
+/// An exception naming domains excludes the scriptlet there; a domain-less one
+/// disables it outright. Expressed as exclusions on the rule so the same
+/// lookup-time filter that handles `~domain` cancels it, rather than a second
+/// subtraction path that could drift. Mirrors `applyScriptletExceptions` in
+/// src/shared/filter-syntax.js.
+fn apply_scriptlet_exceptions(scriptlets: &mut Vec<ParsedRule>, exceptions: &[ParsedRule]) {
+    if exceptions.is_empty() {
+        return;
+    }
+
+    let mut global_kills: HashSet<&str> = HashSet::new();
+    let mut per_domain: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for exception in exceptions {
+        let Some(name) = exception.name.as_deref() else {
+            continue;
+        };
+        if exception.domains.is_empty() {
+            global_kills.insert(name);
+        } else {
+            per_domain
+                .entry(name)
+                .or_default()
+                .extend(exception.domains.iter().map(String::as_str));
+        }
+    }
+
+    scriptlets.retain(|rule| {
+        rule.name
+            .as_deref()
+            .is_none_or(|name| !global_kills.contains(name))
+    });
+
+    for rule in scriptlets.iter_mut() {
+        let Some(name) = rule.name.as_deref() else {
+            continue;
+        };
+        let Some(excepted) = per_domain.get(name) else {
+            continue;
+        };
+        for domain in excepted {
+            if !rule.excluded_domains.iter().any(|d| d == domain) {
+                rule.excluded_domains.push((*domain).to_string());
+            }
+        }
+    }
 }
 
 fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<DnrRule> {
@@ -606,11 +692,20 @@ pub fn build_allowlist_rules(allowlist: JsValue, start_id: u32) -> Result<JsValu
     )))
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ParsedRule {
     #[serde(rename = "type")]
     rule_type: String,
     domains: Vec<String>,
+    /// Domains a `~`-prefixed entry excluded. Kept separate from `domains`
+    /// because folding the two together inverts the rule's meaning. Named to
+    /// match the JS parsers, which emit the same field.
+    #[serde(
+        rename = "excludedDomains",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    excluded_domains: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -622,13 +717,37 @@ pub struct ParsedRule {
 }
 
 fn parse_line(line: &str) -> Option<ParsedRule> {
+    // `#@#+js(` must be recognised before any `+js(` test: it *contains*
+    // `#+js(`, so the scriptlet branch claimed it first and produced an active
+    // scriptlet under the garbage domain prefix "example.com#@" — the opposite
+    // of disabling it.
+    if let Some(idx) = line.find("#@#+js(") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
+        let close = line.rfind(')')?;
+        let open = idx + "#@#+js(".len();
+        if close < open {
+            return None;
+        }
+        let name = parse_scriptlet_args(&line[open..close]).into_iter().next()?;
+        return Some(ParsedRule {
+            rule_type: "scriptlet-exception".into(),
+            domains,
+            excluded_domains,
+            selector: None,
+            exception: Some(true),
+            name: Some(name),
+            args: None,
+        });
+    }
     if line.contains("##+js(") || line.contains("#+js(") {
         return parse_scriptlet(line);
     }
     if let Some(idx) = line.find("#@#") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
         return Some(ParsedRule {
             rule_type: "cosmetic".into(),
-            domains: parse_domains(&line[..idx]),
+            domains,
+            excluded_domains,
             selector: Some(line[idx + 3..].into()),
             exception: Some(true),
             name: None,
@@ -636,9 +755,11 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
         });
     }
     if let Some(idx) = line.find("#?#") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
         return Some(ParsedRule {
             rule_type: "cosmetic".into(),
-            domains: parse_domains(&line[..idx]),
+            domains,
+            excluded_domains,
             selector: Some(line[idx + 3..].into()),
             exception: Some(false),
             name: None,
@@ -646,9 +767,11 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
         });
     }
     if let Some(idx) = line.find("##") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
         return Some(ParsedRule {
             rule_type: "cosmetic".into(),
-            domains: parse_domains(&line[..idx]),
+            domains,
+            excluded_domains,
             selector: Some(line[idx + 2..].into()),
             exception: Some(false),
             name: None,
@@ -658,12 +781,31 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
     None
 }
 
-fn parse_domains(domains: &str) -> Vec<String> {
-    domains
-        .split(',')
-        .map(|d| d.trim().into())
-        .filter(|d: &String| !d.is_empty())
-        .collect()
+/// Split a comma-separated domain list into includes and `~` exclusions.
+///
+/// Mirrors `splitDomainList` in src/shared/filter-syntax.js; the two must agree
+/// or a filter means one thing at build time and another at runtime.
+fn parse_domains(domains: &str) -> (Vec<String>, Vec<String>) {
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+
+    for token in domains.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.strip_prefix('~') {
+            Some(rest) => {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    excluded.push(rest.to_string());
+                }
+            }
+            None => included.push(token.to_string()),
+        }
+    }
+
+    (included, excluded)
 }
 
 fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
@@ -685,9 +827,11 @@ fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
     let args = parse_scriptlet_args(rest);
     let mut args_iter = args.into_iter();
     let name = args_iter.next()?;
+    let (domains, excluded_domains) = parse_domains(domains);
     Some(ParsedRule {
         rule_type: "scriptlet".into(),
-        domains: parse_domains(domains),
+        domains,
+        excluded_domains,
         selector: None,
         exception: None,
         name: Some(name),
@@ -2225,6 +2369,132 @@ mod tests {
         assert!(!garbage.has("anything"));
     }
 
+    /// Selectors recorded for a domain in a bundle map, for readable asserts.
+    fn selectors_for<'a>(
+        map: &'a HashMap<String, Vec<String>>,
+        domain: &str,
+    ) -> Option<&'a Vec<String>> {
+        map.get(domain)
+    }
+
+    // A `~`-prefixed entry is an exclusion. Keeping it as a literal positive
+    // domain inverts the meaning twice over: the rule is stored under a key
+    // that matches no hostname, while the ancestor walk still reaches the
+    // subdomain the author was protecting. The JS parsers were fixed already;
+    // this is the same defect in the Rust engine.
+    #[test]
+    fn parse_domains_splits_exclusions_from_includes() {
+        let bundle = parse_filter_source_internal("example.com,~mail.example.com##.promo");
+
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.domain_specific, "example.com"),
+            Some(&vec![".promo".to_string()]),
+            "must apply on the included domain",
+        );
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.exceptions, "mail.example.com"),
+            Some(&vec![".promo".to_string()]),
+            "and be excepted on the excluded subdomain",
+        );
+        assert!(
+            !bundle.cosmetic.domain_specific.contains_key("~mail.example.com"),
+            "the ~ form must never become a positive domain key",
+        );
+    }
+
+    #[test]
+    fn pure_negation_cosmetic_is_generic_with_an_exception() {
+        // "everywhere except example.com" — previously keyed under the literal
+        // "~example.com", which equals no hostname, so it applied nowhere.
+        let bundle = parse_filter_source_internal("~example.com##.ad");
+
+        assert_eq!(bundle.cosmetic.generic, vec![".ad".to_string()]);
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.exceptions, "example.com"),
+            Some(&vec![".ad".to_string()]),
+        );
+    }
+
+    #[test]
+    fn scriptlet_exclusions_are_carried_not_flattened() {
+        let bundle =
+            parse_filter_source_internal("youtube.com,~music.youtube.com##+js(set, yt.ads, false)");
+
+        assert_eq!(bundle.scriptlets.len(), 1);
+        assert_eq!(bundle.scriptlets[0].domains, vec!["youtube.com".to_string()]);
+        assert_eq!(
+            bundle.scriptlets[0].excluded_domains,
+            vec!["music.youtube.com".to_string()],
+        );
+    }
+
+    // `#@#+js(name)` disables a scriptlet on a site. `line.contains("#+js(")`
+    // matches the substring inside `#@#+js(`, so the line was routed to
+    // parse_scriptlet and produced an *active* scriptlet whose domain was the
+    // garbage prefix "example.com#@".
+    #[test]
+    fn scriptlet_exception_is_not_parsed_as_an_active_scriptlet() {
+        let bundle = parse_filter_source_internal("example.com#@#+js(nowebrtc)");
+
+        assert!(
+            bundle.scriptlets.is_empty(),
+            "an exception must not create a scriptlet, got {:?}",
+            bundle.scriptlets,
+        );
+        assert!(
+            !bundle.cosmetic.domain_specific.contains_key("example.com#@"),
+            "and must not leave a garbage domain key",
+        );
+    }
+
+    #[test]
+    fn scriptlet_exception_excludes_the_named_scriptlet() {
+        let bundle = parse_filter_source_internal(
+            "##+js(nowebrtc)\n##+js(aopr, x)\nexample.com#@#+js(nowebrtc)",
+        );
+
+        let nowebrtc = bundle
+            .scriptlets
+            .iter()
+            .find(|s| s.name.as_deref() == Some("nowebrtc"))
+            .expect("the scriptlet must survive for other sites");
+        assert_eq!(nowebrtc.excluded_domains, vec!["example.com".to_string()]);
+
+        let aopr = bundle
+            .scriptlets
+            .iter()
+            .find(|s| s.name.as_deref() == Some("aopr"))
+            .expect("an unrelated scriptlet must be untouched");
+        assert!(aopr.excluded_domains.is_empty());
+    }
+
+    #[test]
+    fn domainless_scriptlet_exception_drops_the_scriptlet() {
+        let bundle =
+            parse_filter_source_internal("##+js(nowebrtc)\n##+js(aopr, x)\n#@#+js(nowebrtc)");
+
+        assert!(bundle
+            .scriptlets
+            .iter()
+            .all(|s| s.name.as_deref() != Some("nowebrtc")));
+        assert!(bundle
+            .scriptlets
+            .iter()
+            .any(|s| s.name.as_deref() == Some("aopr")));
+    }
+
+    #[test]
+    fn plain_cosmetic_rules_are_unaffected_by_exclusion_handling() {
+        let bundle = parse_filter_source_internal("example.com##.ad\n##.generic-ad");
+
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.domain_specific, "example.com"),
+            Some(&vec![".ad".to_string()]),
+        );
+        assert_eq!(bundle.cosmetic.generic, vec![".generic-ad".to_string()]);
+        assert!(bundle.cosmetic.exceptions.is_empty(), "no spurious exceptions");
+    }
+
     #[test]
     fn bloom_size_is_bounded_rather_than_allocated() {
         // An absurd declared size must be clamped, not honoured. Unclamped,
@@ -2448,6 +2718,7 @@ mod tests {
             vec![ParsedRule {
                 rule_type: "scriptlet".into(),
                 domains: vec!["example.com".into()],
+                excluded_domains: Vec::new(),
                 selector: None,
                 exception: None,
                 name: Some("abort-current-script".into()),

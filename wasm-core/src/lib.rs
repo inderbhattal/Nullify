@@ -1106,12 +1106,18 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         }
     }
 
-    let priority = if is_exception {
-        10u16
-    } else if is_important {
-        5u16
-    } else {
-        1u16
+    // uBO ordering: a plain exception beats a plain block, but an $important
+    // block beats that exception — overriding exceptions is the whole purpose
+    // of $important, and the anti-circumvention lists depend on it. The old
+    // scheme put every exception (10) above every important block (5), so the
+    // modifier was inert. Matches DNR_PRIORITY in scripts/build-rules.mjs;
+    // runtime rules still sit far above at 500 (allowlist) and 1000
+    // (system-unbreak).
+    let priority = match (is_exception, is_important) {
+        (true, true) => 4u16,   // @@...$important
+        (true, false) => 2u16,  // @@...
+        (false, true) => 3u16,  // ...$important
+        (false, false) => 1u16, // plain block
     };
 
     Some(DnrRule {
@@ -2493,6 +2499,34 @@ mod tests {
         );
         assert_eq!(bundle.cosmetic.generic, vec![".generic-ad".to_string()]);
         assert!(bundle.cosmetic.exceptions.is_empty(), "no spurious exceptions");
+    }
+
+    #[test]
+    fn important_blocks_outrank_plain_exceptions() {
+        // Overriding an exception is the entire purpose of $important. With
+        // exception 10 > important 5, the exception always won and the
+        // modifier did nothing — badware.txt shipping an $important block to
+        // defeat a stock exception had no effect.
+        let priority_of = |filter: &str| {
+            let compiled = compile_user_filters_internal(filter, 1);
+            compiled
+                .dnr_rules
+                .first()
+                .map(|r| r.priority)
+                .unwrap_or_else(|| panic!("no rule emitted for {filter}"))
+        };
+
+        let plain_block = priority_of("||ads.example.com^");
+        let plain_allow = priority_of("@@||ads.example.com^");
+        let important_block = priority_of("||ads.example.com^$important");
+        let important_allow = priority_of("@@||ads.example.com^$important");
+
+        assert!(plain_allow > plain_block, "allow beats block");
+        assert!(important_block > plain_allow, "important block beats allow");
+        assert!(
+            important_allow > important_block,
+            "important allow beats important block",
+        );
     }
 
     #[test]

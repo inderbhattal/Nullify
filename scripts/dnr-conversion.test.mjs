@@ -147,18 +147,21 @@ test('cosmetic and scriptlet lines are classified, never converted to network ru
   assert.deepEqual(parseLine('example.com##.ad'), {
     type: 'cosmetic',
     domains: ['example.com'],
+    excludedDomains: [],
     selector: '.ad',
     exception: false,
   });
   assert.deepEqual(parseLine('example.com#@#.ad'), {
     type: 'cosmetic',
     domains: ['example.com'],
+    excludedDomains: [],
     selector: '.ad',
     exception: true,
   });
   assert.deepEqual(parseLine('example.com##+js(aopr, x)'), {
     type: 'scriptlet',
     domains: ['example.com'],
+    excludedDomains: [],
     name: 'aopr',
     args: ['x'],
   });

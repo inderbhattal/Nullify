@@ -64,6 +64,7 @@ import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
+import { applyScriptletExceptions } from '../shared/filter-syntax.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
@@ -306,18 +307,40 @@ function buildSourceBundleFromParsed(parsed) {
     genericExcludedDomains: dedupeGeneratedDomains(parsed?.genericCosmeticExceptionDomains),
   };
 
+  const addException = (domain, selector) => {
+    if (!cosmetic.exceptions[domain]) cosmetic.exceptions[domain] = [];
+    cosmetic.exceptions[domain].push(selector);
+  };
+
   for (const rule of parsed?.cosmeticRules || []) {
     if (!rule?.selector) continue;
+
+    // `~domain` exclusions ride the existing per-domain exception map: lookup
+    // already gathers exceptions across the ancestor walk and subtracts them,
+    // which is precisely what an exclusion means. Mirrors the build-time
+    // builder in scripts/build-rules.mjs — the two must agree.
+    const excluded = rule.excludedDomains || [];
+
     if (rule.domains.length === 0) {
-      if (!rule.exception) cosmetic.generic.push(rule.selector);
+      if (!rule.exception) {
+        cosmetic.generic.push(rule.selector);
+        for (const domain of excluded) addException(domain, rule.selector);
+      }
       continue;
     }
 
     for (const domain of rule.domains) {
       if (shouldSkipDomainCosmeticSelector(domain, rule.selector)) continue;
-      const target = rule.exception ? cosmetic.exceptions : cosmetic.domainSpecific;
-      if (!target[domain]) target[domain] = [];
-      target[domain].push(rule.selector);
+      if (rule.exception) {
+        addException(domain, rule.selector);
+      } else {
+        if (!cosmetic.domainSpecific[domain]) cosmetic.domainSpecific[domain] = [];
+        cosmetic.domainSpecific[domain].push(rule.selector);
+      }
+    }
+
+    if (!rule.exception) {
+      for (const domain of excluded) addException(domain, rule.selector);
     }
   }
 
@@ -331,7 +354,10 @@ function buildSourceBundleFromParsed(parsed) {
 
   return {
     cosmetic,
-    scriptlets: dedupeScriptlets(parsed?.scriptletRules || []),
+    scriptlets: applyScriptletExceptions(
+      dedupeScriptlets(parsed?.scriptletRules || []),
+      parsed?.scriptletExceptions,
+    ),
   };
 }
 
@@ -3012,11 +3038,35 @@ async function getCosmeticBundleForPage(hostname) {
   }
 }
 
+/**
+ * Is `hostname` covered by `domain`, either exactly or as a subdomain?
+ * This is the same containment the scriptlet lookup uses to match rules, and
+ * therefore the containment an exclusion has to cancel.
+ */
+function domainCoversHostname(domain, hostname) {
+  return hostname === domain || hostname.endsWith('.' + domain);
+}
+
+/**
+ * A rule is excluded here if any of its `~domain` entries covers the hostname.
+ *
+ * Lookup finds rules by walking up the hostname's ancestors, so a rule scoped
+ * to youtube.com is returned for music.youtube.com — exactly the subdomain a
+ * `~music.youtube.com` exclusion exists to protect. Without this check the
+ * exclusion is parsed and stored and then ignored at the one moment it matters.
+ */
+function isScriptletExcludedForHostname(rule, hostname) {
+  const excluded = rule?.excludedDomains;
+  if (!excluded?.length) return false;
+  return excluded.some((domain) => domainCoversHostname(domain, hostname));
+}
+
 async function getScriptletRulesForPage(hostname) {
   const userScriptlets = (await getStorage(StorageKeys.USER_SCRIPTLET_RULES)) || [];
   const activeUserScriptlets = userScriptlets.filter(r => {
+    if (isScriptletExcludedForHostname(r, hostname)) return false;
     if (r.domains.length === 0) return true;
-    return r.domains.some(d => hostname === d || hostname.endsWith('.' + d));
+    return r.domains.some(d => domainCoversHostname(d, hostname));
   });
 
   if (!bloom) return activeUserScriptlets;
@@ -3035,7 +3085,8 @@ async function getScriptletRulesForPage(hostname) {
       })());
 
   if (!mightHaveRules) return activeUserScriptlets;
-  const dbRules = await db.getScriptletRules(hostname);
+  const dbRules = (await db.getScriptletRules(hostname))
+    .filter((rule) => !isScriptletExcludedForHostname(rule, hostname));
   return [...dbRules, ...activeUserScriptlets];
 }
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */

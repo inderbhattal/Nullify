@@ -6,6 +6,8 @@
  * are compiled at build time and remain static.
  */
 
+import { splitDomainList, evaluatePreprocessorCondition } from './filter-syntax.js';
+
 /**
  * Parse scriptlet argument string, respecting quoted commas.
  * e.g. "set-constant, ads.enabled, false" → ['set-constant', 'ads.enabled', 'false']
@@ -108,8 +110,12 @@ function parseCosmeticScopeException(line) {
 /**
  * Parse a single filter line. Returns a rule object or null if not a
  * cosmetic/scriptlet rule (or if the line is a comment/blank/network rule).
+ *
+ * Exported for the cross-engine parity suite: this parser and the build-time
+ * one in scripts/build-rules.mjs must classify identically, and the only way
+ * to keep that true is to assert it.
  */
-function parseLine(line) {
+export function parseLine(line) {
   line = line.trim();
   if (!line || line.startsWith('!') || line.startsWith('[') ||
     line.startsWith('%') || line.startsWith('@@#')) return null;
@@ -123,6 +129,23 @@ function parseLine(line) {
     line.includes('#?#') || line.includes('#+js(') || line.includes('##+js(');
   if (!hasCosmeticSep) return null; // Network rule — skip
 
+  // Scriptlet exception: example.com#@#+js(name)
+  // Must be tested BEFORE the scriptlet branch: `#@#+js(` contains the
+  // substring `#+js(`, so a plain `includes` check claims it first and the
+  // line becomes a cosmetic exception whose selector is `+js(name)` — which
+  // matches no hide rule, so the scriptlet keeps running on a site the list
+  // explicitly excepted.
+  const scriptletExceptionMatch = line.match(/^([^#]*)#@#\+js\((.+)\)$/);
+  if (scriptletExceptionMatch) {
+    const [, domains, scriptletStr] = scriptletExceptionMatch;
+    const [name] = parseScriptletArgs(scriptletStr);
+    return {
+      type: 'scriptlet-exception',
+      ...splitDomainList(domains),
+      name: (name || '').trim(),
+    };
+  }
+
   // Scriptlet: example.com##+js(name, args)
   if (line.includes('##+js(') || line.includes('#+js(')) {
     const match = line.match(/^([^#]*)#(?:#\+js\(|\+js\()(.+)\)$/);
@@ -132,7 +155,7 @@ function parseLine(line) {
       const [name, ...rest] = args;
       return {
         type: 'scriptlet',
-        domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+        ...splitDomainList(domains),
         name: name.trim(),
         args: rest,
       };
@@ -146,7 +169,7 @@ function parseLine(line) {
     const selector = line.slice(idx + 3);
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: true,
     };
@@ -159,7 +182,7 @@ function parseLine(line) {
     const selector = line.slice(idx + 3);
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -172,7 +195,7 @@ function parseLine(line) {
     const selector = line.slice(idx + 2);
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -188,6 +211,7 @@ function parseLine(line) {
 export function parseFilterList(text) {
   const cosmeticRules = [];
   const scriptletRules = [];
+  const scriptletExceptions = [];
   const genericCosmeticExceptionDomains = [];
 
   for (const line of text.split('\n')) {
@@ -195,6 +219,7 @@ export function parseFilterList(text) {
     if (!parsed) continue;
     if (parsed.type === 'cosmetic') cosmeticRules.push(parsed);
     else if (parsed.type === 'scriptlet') scriptletRules.push(parsed);
+    else if (parsed.type === 'scriptlet-exception') scriptletExceptions.push(parsed);
     else if (
       parsed.type === 'cosmetic-scope-exception' &&
       (parsed.scopes.includes('generichide') || parsed.scopes.includes('elemhide'))
@@ -206,6 +231,7 @@ export function parseFilterList(text) {
   return {
     cosmeticRules,
     scriptletRules,
+    scriptletExceptions,
     genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
   };
 }
@@ -229,14 +255,16 @@ export async function fetchAndExpand(url, depth = 0) {
 
     if (trimmed.startsWith('!#if')) {
       const condition = trimmed.slice(4).trim();
-      const isTrue = condition.includes('env_chromium') ||
-        condition.includes('cap_dnr') ||
-        !condition.includes('env_');
+      const isTrue = evaluatePreprocessorCondition(condition);
       stack.push(isTrue && stack[stack.length - 1]);
       continue;
     }
 
     if (trimmed.startsWith('!#else')) {
+      // Guard the empty stack the way !#endif already does: a stray !#else
+      // would otherwise push `!undefined && undefined` — falsy — and silently
+      // drop the entire remainder of the list.
+      if (stack.length <= 1) continue;
       const prev = stack.pop();
       const parent = stack[stack.length - 1];
       stack.push(!prev && parent);

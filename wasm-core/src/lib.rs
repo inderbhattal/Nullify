@@ -44,15 +44,27 @@ pub struct BloomFilter {
     bitset: Vec<u32>,
 }
 
+/// Upper bound on a Bloom filter's bit count: 128 Mbit, i.e. a 16 MB bitset.
+///
+/// Far above any real use — the shipped filter is 256 Kbit — while keeping the
+/// word count well inside 32-bit arithmetic, so the size maths cannot overflow
+/// on wasm32 no matter what a stored payload declares.
+const MAX_BLOOM_BITS: usize = 1 << 27;
+
 #[wasm_bindgen]
 impl BloomFilter {
     #[wasm_bindgen(constructor)]
     pub fn new(size: usize, hashes: u8) -> Self {
-        // Clamp to non-zero: a zero size makes `add`/`has` divide by zero
-        // (`hash % size`) and a zero hash count makes membership meaningless.
-        let size = size.max(1);
+        // Clamp to a sane range. Zero makes `add`/`has` divide by zero
+        // (`hash % size`) and a zero hash count makes membership meaningless;
+        // an absurd upper value allocates hundreds of megabytes inside a
+        // service worker whose heap is small.
+        let size = size.clamp(1, MAX_BLOOM_BITS);
         let hashes = hashes.max(1);
-        let bitset_size = (size + 31) / 32;
+        // div_ceil, not `(size + 31) / 32`: on wasm32 `usize` is 32-bit and
+        // release builds wrap, so the old form folded a near-u32::MAX size
+        // down to a zero-length bitset that `has()` then indexed.
+        let bitset_size = size.div_ceil(32);
         Self {
             size,
             hashes,
@@ -110,8 +122,9 @@ impl BloomFilter {
         match serde_json::from_str::<SerializedBloom>(json) {
             Ok(s)
                 if s.size > 0
+                    && s.size <= MAX_BLOOM_BITS
                     && s.hashes > 0
-                    && s.data.len() == (s.size + 31) / 32 =>
+                    && s.data.len() == s.size.div_ceil(32) =>
             {
                 Self {
                     size: s.size,
@@ -496,11 +509,16 @@ fn merge_filter_sources_internal(
 
 #[wasm_bindgen]
 pub fn parse_filter_source(text: &str) -> JsValue {
+    to_js_value(&parse_filter_source_internal(text))
+}
+
+fn parse_filter_source_internal(text: &str) -> FilterSourceBundle {
     let mut bundle = FilterSourceBundle::default();
     let mut generic_seen = HashSet::new();
     let mut domain_seen: HashMap<String, HashSet<String>> = HashMap::new();
     let mut exception_seen: HashMap<String, HashSet<String>> = HashMap::new();
     let mut scriptlet_seen = HashSet::new();
+    let mut scriptlet_exceptions: Vec<ParsedRule> = Vec::new();
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -519,20 +537,36 @@ pub fn parse_filter_source(text: &str) -> JsValue {
                     bundle.scriptlets.push(rule);
                 }
             }
+            "scriptlet-exception" => {
+                scriptlet_exceptions.push(rule);
+            }
             "cosmetic" => {
                 let Some(selector) = rule.selector.as_deref() else {
                     continue;
                 };
+                let is_exception = rule.exception.unwrap_or(false);
 
                 if rule.domains.is_empty() {
-                    if !rule.exception.unwrap_or(false) {
+                    if !is_exception {
                         push_unique(&mut bundle.cosmetic.generic, &mut generic_seen, selector);
+                        // "everywhere except these": a generic rule plus an
+                        // exception on each excluded domain. Lookup already
+                        // gathers exceptions across the ancestor walk and
+                        // subtracts them, so this needs no new bundle field.
+                        for domain in &rule.excluded_domains {
+                            push_unique_domain_selector(
+                                &mut bundle.cosmetic.exceptions,
+                                &mut exception_seen,
+                                domain,
+                                selector,
+                            );
+                        }
                     }
                     continue;
                 }
 
                 for domain in &rule.domains {
-                    if rule.exception.unwrap_or(false) {
+                    if is_exception {
                         push_unique_domain_selector(
                             &mut bundle.cosmetic.exceptions,
                             &mut exception_seen,
@@ -548,12 +582,77 @@ pub fn parse_filter_source(text: &str) -> JsValue {
                         );
                     }
                 }
+
+                // A scoped rule carries its exclusions too: the lookup walk
+                // reaches the excluded subdomain through its parent, so the
+                // exception is what cancels it there.
+                if !is_exception {
+                    for domain in &rule.excluded_domains {
+                        push_unique_domain_selector(
+                            &mut bundle.cosmetic.exceptions,
+                            &mut exception_seen,
+                            domain,
+                            selector,
+                        );
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    to_js_value(&bundle)
+    apply_scriptlet_exceptions(&mut bundle.scriptlets, &scriptlet_exceptions);
+    bundle
+}
+
+/// Apply `#@#+js(name)` exceptions to the collected scriptlets.
+///
+/// An exception naming domains excludes the scriptlet there; a domain-less one
+/// disables it outright. Expressed as exclusions on the rule so the same
+/// lookup-time filter that handles `~domain` cancels it, rather than a second
+/// subtraction path that could drift. Mirrors `applyScriptletExceptions` in
+/// src/shared/filter-syntax.js.
+fn apply_scriptlet_exceptions(scriptlets: &mut Vec<ParsedRule>, exceptions: &[ParsedRule]) {
+    if exceptions.is_empty() {
+        return;
+    }
+
+    let mut global_kills: HashSet<&str> = HashSet::new();
+    let mut per_domain: HashMap<&str, Vec<&str>> = HashMap::new();
+
+    for exception in exceptions {
+        let Some(name) = exception.name.as_deref() else {
+            continue;
+        };
+        if exception.domains.is_empty() {
+            global_kills.insert(name);
+        } else {
+            per_domain
+                .entry(name)
+                .or_default()
+                .extend(exception.domains.iter().map(String::as_str));
+        }
+    }
+
+    scriptlets.retain(|rule| {
+        rule.name
+            .as_deref()
+            .is_none_or(|name| !global_kills.contains(name))
+    });
+
+    for rule in scriptlets.iter_mut() {
+        let Some(name) = rule.name.as_deref() else {
+            continue;
+        };
+        let Some(excepted) = per_domain.get(name) else {
+            continue;
+        };
+        for domain in excepted {
+            if !rule.excluded_domains.iter().any(|d| d == domain) {
+                rule.excluded_domains.push((*domain).to_string());
+            }
+        }
+    }
 }
 
 fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<DnrRule> {
@@ -593,11 +692,20 @@ pub fn build_allowlist_rules(allowlist: JsValue, start_id: u32) -> Result<JsValu
     )))
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ParsedRule {
     #[serde(rename = "type")]
     rule_type: String,
     domains: Vec<String>,
+    /// Domains a `~`-prefixed entry excluded. Kept separate from `domains`
+    /// because folding the two together inverts the rule's meaning. Named to
+    /// match the JS parsers, which emit the same field.
+    #[serde(
+        rename = "excludedDomains",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    excluded_domains: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     selector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -609,13 +717,37 @@ pub struct ParsedRule {
 }
 
 fn parse_line(line: &str) -> Option<ParsedRule> {
+    // `#@#+js(` must be recognised before any `+js(` test: it *contains*
+    // `#+js(`, so the scriptlet branch claimed it first and produced an active
+    // scriptlet under the garbage domain prefix "example.com#@" — the opposite
+    // of disabling it.
+    if let Some(idx) = line.find("#@#+js(") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
+        let close = line.rfind(')')?;
+        let open = idx + "#@#+js(".len();
+        if close < open {
+            return None;
+        }
+        let name = parse_scriptlet_args(&line[open..close]).into_iter().next()?;
+        return Some(ParsedRule {
+            rule_type: "scriptlet-exception".into(),
+            domains,
+            excluded_domains,
+            selector: None,
+            exception: Some(true),
+            name: Some(name),
+            args: None,
+        });
+    }
     if line.contains("##+js(") || line.contains("#+js(") {
         return parse_scriptlet(line);
     }
     if let Some(idx) = line.find("#@#") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
         return Some(ParsedRule {
             rule_type: "cosmetic".into(),
-            domains: parse_domains(&line[..idx]),
+            domains,
+            excluded_domains,
             selector: Some(line[idx + 3..].into()),
             exception: Some(true),
             name: None,
@@ -623,9 +755,11 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
         });
     }
     if let Some(idx) = line.find("#?#") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
         return Some(ParsedRule {
             rule_type: "cosmetic".into(),
-            domains: parse_domains(&line[..idx]),
+            domains,
+            excluded_domains,
             selector: Some(line[idx + 3..].into()),
             exception: Some(false),
             name: None,
@@ -633,9 +767,11 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
         });
     }
     if let Some(idx) = line.find("##") {
+        let (domains, excluded_domains) = parse_domains(&line[..idx]);
         return Some(ParsedRule {
             rule_type: "cosmetic".into(),
-            domains: parse_domains(&line[..idx]),
+            domains,
+            excluded_domains,
             selector: Some(line[idx + 2..].into()),
             exception: Some(false),
             name: None,
@@ -645,12 +781,31 @@ fn parse_line(line: &str) -> Option<ParsedRule> {
     None
 }
 
-fn parse_domains(domains: &str) -> Vec<String> {
-    domains
-        .split(',')
-        .map(|d| d.trim().into())
-        .filter(|d: &String| !d.is_empty())
-        .collect()
+/// Split a comma-separated domain list into includes and `~` exclusions.
+///
+/// Mirrors `splitDomainList` in src/shared/filter-syntax.js; the two must agree
+/// or a filter means one thing at build time and another at runtime.
+fn parse_domains(domains: &str) -> (Vec<String>, Vec<String>) {
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+
+    for token in domains.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.strip_prefix('~') {
+            Some(rest) => {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    excluded.push(rest.to_string());
+                }
+            }
+            None => included.push(token.to_string()),
+        }
+    }
+
+    (included, excluded)
 }
 
 fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
@@ -672,9 +827,11 @@ fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
     let args = parse_scriptlet_args(rest);
     let mut args_iter = args.into_iter();
     let name = args_iter.next()?;
+    let (domains, excluded_domains) = parse_domains(domains);
     Some(ParsedRule {
         rule_type: "scriptlet".into(),
-        domains: parse_domains(domains),
+        domains,
+        excluded_domains,
         selector: None,
         exception: None,
         name: Some(name),
@@ -949,12 +1106,18 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         }
     }
 
-    let priority = if is_exception {
-        10u16
-    } else if is_important {
-        5u16
-    } else {
-        1u16
+    // uBO ordering: a plain exception beats a plain block, but an $important
+    // block beats that exception — overriding exceptions is the whole purpose
+    // of $important, and the anti-circumvention lists depend on it. The old
+    // scheme put every exception (10) above every important block (5), so the
+    // modifier was inert. Matches DNR_PRIORITY in scripts/build-rules.mjs;
+    // runtime rules still sit far above at 500 (allowlist) and 1000
+    // (system-unbreak).
+    let priority = match (is_exception, is_important) {
+        (true, true) => 4u16,   // @@...$important
+        (true, false) => 2u16,  // @@...
+        (false, true) => 3u16,  // ...$important
+        (false, false) => 1u16, // plain block
     };
 
     Some(DnrRule {
@@ -2212,6 +2375,217 @@ mod tests {
         assert!(!garbage.has("anything"));
     }
 
+    /// Selectors recorded for a domain in a bundle map, for readable asserts.
+    fn selectors_for<'a>(
+        map: &'a HashMap<String, Vec<String>>,
+        domain: &str,
+    ) -> Option<&'a Vec<String>> {
+        map.get(domain)
+    }
+
+    // A `~`-prefixed entry is an exclusion. Keeping it as a literal positive
+    // domain inverts the meaning twice over: the rule is stored under a key
+    // that matches no hostname, while the ancestor walk still reaches the
+    // subdomain the author was protecting. The JS parsers were fixed already;
+    // this is the same defect in the Rust engine.
+    #[test]
+    fn parse_domains_splits_exclusions_from_includes() {
+        let bundle = parse_filter_source_internal("example.com,~mail.example.com##.promo");
+
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.domain_specific, "example.com"),
+            Some(&vec![".promo".to_string()]),
+            "must apply on the included domain",
+        );
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.exceptions, "mail.example.com"),
+            Some(&vec![".promo".to_string()]),
+            "and be excepted on the excluded subdomain",
+        );
+        assert!(
+            !bundle.cosmetic.domain_specific.contains_key("~mail.example.com"),
+            "the ~ form must never become a positive domain key",
+        );
+    }
+
+    #[test]
+    fn pure_negation_cosmetic_is_generic_with_an_exception() {
+        // "everywhere except example.com" — previously keyed under the literal
+        // "~example.com", which equals no hostname, so it applied nowhere.
+        let bundle = parse_filter_source_internal("~example.com##.ad");
+
+        assert_eq!(bundle.cosmetic.generic, vec![".ad".to_string()]);
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.exceptions, "example.com"),
+            Some(&vec![".ad".to_string()]),
+        );
+    }
+
+    #[test]
+    fn scriptlet_exclusions_are_carried_not_flattened() {
+        let bundle =
+            parse_filter_source_internal("youtube.com,~music.youtube.com##+js(set, yt.ads, false)");
+
+        assert_eq!(bundle.scriptlets.len(), 1);
+        assert_eq!(bundle.scriptlets[0].domains, vec!["youtube.com".to_string()]);
+        assert_eq!(
+            bundle.scriptlets[0].excluded_domains,
+            vec!["music.youtube.com".to_string()],
+        );
+    }
+
+    // `#@#+js(name)` disables a scriptlet on a site. `line.contains("#+js(")`
+    // matches the substring inside `#@#+js(`, so the line was routed to
+    // parse_scriptlet and produced an *active* scriptlet whose domain was the
+    // garbage prefix "example.com#@".
+    #[test]
+    fn scriptlet_exception_is_not_parsed_as_an_active_scriptlet() {
+        let bundle = parse_filter_source_internal("example.com#@#+js(nowebrtc)");
+
+        assert!(
+            bundle.scriptlets.is_empty(),
+            "an exception must not create a scriptlet, got {:?}",
+            bundle.scriptlets,
+        );
+        assert!(
+            !bundle.cosmetic.domain_specific.contains_key("example.com#@"),
+            "and must not leave a garbage domain key",
+        );
+    }
+
+    #[test]
+    fn scriptlet_exception_excludes_the_named_scriptlet() {
+        let bundle = parse_filter_source_internal(
+            "##+js(nowebrtc)\n##+js(aopr, x)\nexample.com#@#+js(nowebrtc)",
+        );
+
+        let nowebrtc = bundle
+            .scriptlets
+            .iter()
+            .find(|s| s.name.as_deref() == Some("nowebrtc"))
+            .expect("the scriptlet must survive for other sites");
+        assert_eq!(nowebrtc.excluded_domains, vec!["example.com".to_string()]);
+
+        let aopr = bundle
+            .scriptlets
+            .iter()
+            .find(|s| s.name.as_deref() == Some("aopr"))
+            .expect("an unrelated scriptlet must be untouched");
+        assert!(aopr.excluded_domains.is_empty());
+    }
+
+    #[test]
+    fn domainless_scriptlet_exception_drops_the_scriptlet() {
+        let bundle =
+            parse_filter_source_internal("##+js(nowebrtc)\n##+js(aopr, x)\n#@#+js(nowebrtc)");
+
+        assert!(bundle
+            .scriptlets
+            .iter()
+            .all(|s| s.name.as_deref() != Some("nowebrtc")));
+        assert!(bundle
+            .scriptlets
+            .iter()
+            .any(|s| s.name.as_deref() == Some("aopr")));
+    }
+
+    #[test]
+    fn plain_cosmetic_rules_are_unaffected_by_exclusion_handling() {
+        let bundle = parse_filter_source_internal("example.com##.ad\n##.generic-ad");
+
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.domain_specific, "example.com"),
+            Some(&vec![".ad".to_string()]),
+        );
+        assert_eq!(bundle.cosmetic.generic, vec![".generic-ad".to_string()]);
+        assert!(bundle.cosmetic.exceptions.is_empty(), "no spurious exceptions");
+    }
+
+    #[test]
+    fn important_blocks_outrank_plain_exceptions() {
+        // Overriding an exception is the entire purpose of $important. With
+        // exception 10 > important 5, the exception always won and the
+        // modifier did nothing — badware.txt shipping an $important block to
+        // defeat a stock exception had no effect.
+        let priority_of = |filter: &str| {
+            let compiled = compile_user_filters_internal(filter, 1);
+            compiled
+                .dnr_rules
+                .first()
+                .map(|r| r.priority)
+                .unwrap_or_else(|| panic!("no rule emitted for {filter}"))
+        };
+
+        let plain_block = priority_of("||ads.example.com^");
+        let plain_allow = priority_of("@@||ads.example.com^");
+        let important_block = priority_of("||ads.example.com^$important");
+        let important_allow = priority_of("@@||ads.example.com^$important");
+
+        assert!(plain_allow > plain_block, "allow beats block");
+        assert!(important_block > plain_allow, "important block beats allow");
+        assert!(
+            important_allow > important_block,
+            "important allow beats important block",
+        );
+    }
+
+    #[test]
+    fn bloom_size_is_bounded_rather_than_allocated() {
+        // An absurd declared size must be clamped, not honoured. Unclamped,
+        // `new(u32::MAX, 4)` allocates a 134M-element Vec — half a gigabyte —
+        // inside a service worker with a small heap.
+        let filter = BloomFilter::new(u32::MAX as usize, 4);
+        assert!(
+            filter.bitset.len() <= MAX_BLOOM_BITS.div_ceil(32),
+            "bitset must be bounded, got {} words",
+            filter.bitset.len(),
+        );
+
+        // Clamping must stay self-consistent: whatever size survives, every
+        // bit index it produces has to be in range.
+        let mut bounded = BloomFilter::new(u32::MAX as usize, 4);
+        bounded.add("example.com");
+        assert!(bounded.has("example.com"));
+    }
+
+    #[test]
+    fn bloom_rejects_a_size_beyond_the_cap() {
+        // The wasm32 hazard: `usize` is 32-bit there and release builds wrap,
+        // so `(size + 31) / 32` folded u32::MAX to 0 and a payload with an
+        // empty `data` satisfied the length check — then `has()` indexed an
+        // empty Vec. A 64-bit host cannot reproduce the wrap, so guard the
+        // invariant that actually holds on both: a declared size past the cap
+        // is refused outright, whatever `data` claims.
+        let huge = format!("{{\"size\":{},\"hashes\":1,\"data\":[]}}", u32::MAX);
+        let filter = BloomFilter::deserialize_from_json(&huge);
+        assert!(!filter.has("anything"));
+        assert!(
+            filter.bitset.len() <= MAX_BLOOM_BITS.div_ceil(32),
+            "an over-cap payload must degrade to the safe fallback",
+        );
+    }
+
+    #[test]
+    fn bloom_word_count_is_computed_without_overflow() {
+        // Pins the reasoning that made the wasm32 bug possible, in u32 terms
+        // so it holds regardless of host pointer width.
+        assert_eq!(u32::MAX.wrapping_add(31) / 32, 0, "the old expression wraps to zero");
+        assert!(u32::MAX.div_ceil(32) > 0, "div_ceil cannot overflow");
+        for bits in [1u32, 31, 32, 33, 1024] {
+            assert_eq!(bits.div_ceil(32), (bits as u64).div_ceil(32) as u32);
+        }
+    }
+
+    #[test]
+    fn bloom_bitset_is_long_enough_for_the_declared_size() {
+        // Whatever clamping happens, every bit index has to be in range.
+        for size in [1usize, 31, 32, 33, 1024, 65_535] {
+            let mut filter = BloomFilter::new(size, 4);
+            filter.add("example.com");
+            assert!(filter.has("example.com"), "size {size} must round-trip");
+        }
+    }
+
     #[test]
     fn bloom_round_trips_valid_payload() {
         let mut b = BloomFilter::new(1024, 4);
@@ -2378,6 +2752,7 @@ mod tests {
             vec![ParsedRule {
                 rule_type: "scriptlet".into(),
                 domains: vec!["example.com".into()],
+                excluded_domains: Vec::new(),
                 selector: None,
                 exception: None,
                 name: Some("abort-current-script".into()),

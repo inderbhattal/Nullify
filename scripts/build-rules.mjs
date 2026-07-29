@@ -21,6 +21,11 @@ import {
   CORE_FILTER_SOURCE,
   shouldSkipDomainCosmeticSelector,
 } from '../src/shared/core-filter-source.js';
+import {
+  splitDomainList,
+  applyScriptletExceptions,
+  evaluatePreprocessorCondition,
+} from '../src/shared/filter-syntax.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
@@ -192,12 +197,15 @@ async function fetchAndExpand(url, depth = 0, listId = null) {
     // 1. Handle conditionals
     if (trimmed.startsWith('!#if')) {
       const condition = trimmed.slice(4).trim();
-      // Simple logic: if it mentions 'chromium' or 'cap_dnr', it's true for us
-      const isTrue = condition.includes('env_chromium') || condition.includes('cap_dnr') || !condition.includes('env_');
+      const isTrue = evaluatePreprocessorCondition(condition);
       stack.push(isTrue && stack[stack.length - 1]);
       continue;
     }
     if (trimmed.startsWith('!#else')) {
+      // Guard the empty stack the way !#endif already does: a stray !#else
+      // would otherwise push `!undefined && undefined` — falsy — and silently
+      // drop the entire remainder of the list.
+      if (stack.length <= 1) continue;
       const prev = stack.pop();
       const parent = stack[stack.length - 1];
       stack.push(!prev && parent);
@@ -372,6 +380,20 @@ function parseLine(line) {
   if (!line || line.startsWith('!') || line.startsWith('[')) return SKIP_SILENT;
   if (line.startsWith('@@#')) return SKIP_SILENT;
 
+  // Scriptlet exception: example.com#@#+js(name). Tested before the scriptlet
+  // branch — `#@#+js(` contains `#+js(`, so the ordinary scriptlet patterns
+  // would otherwise claim (or, for the `#@#` cosmetic branch below, mangle) it.
+  const scriptletExceptionMatch = line.match(/^([^#|/?^]*)#@#\+js\((.+)\)$/);
+  if (scriptletExceptionMatch) {
+    const [, domains, scriptletStr] = scriptletExceptionMatch;
+    const [name] = parseScriptletArgs(scriptletStr);
+    return {
+      type: 'scriptlet-exception',
+      ...splitDomainList(domains),
+      name: (name || '').trim(),
+    };
+  }
+
   const scriptletMatch = line.match(/^([^#|/?^]*)##\+js\((.+)\)$/) ||
                          line.match(/^([^#|/?^]*)#\+js\((.+)\)$/);
   if (scriptletMatch) {
@@ -380,7 +402,7 @@ function parseLine(line) {
     const [name, ...rest] = args;
     return {
       type: 'scriptlet',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       name: name.trim(),
       args: rest,
     };
@@ -391,7 +413,7 @@ function parseLine(line) {
     const [, domains, selector] = abpExtMatch;
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -402,7 +424,7 @@ function parseLine(line) {
     const [, domains, selector] = cosmeticMatch;
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -413,7 +435,7 @@ function parseLine(line) {
     const [, domains, selector] = cosmeticExceptionMatch;
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: true,
     };
@@ -1019,6 +1041,7 @@ function parseFilterList(text) {
   const cosmeticExceptions = [];
   const genericCosmeticExceptionDomains = [];
   const scriptletRules = [];
+  const scriptletExceptions = [];
   const skippedRecords = []; // [{ reason, line }]
 
   for (const line of text.split('\n')) {
@@ -1041,6 +1064,8 @@ function parseFilterList(text) {
       else cosmeticRules.push(parsed);
     } else if (parsed.type === 'scriptlet') {
       scriptletRules.push(parsed);
+    } else if (parsed.type === 'scriptlet-exception') {
+      scriptletExceptions.push(parsed);
     }
   }
 
@@ -1050,8 +1075,36 @@ function parseFilterList(text) {
     cosmeticExceptions,
     genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
     scriptletRules,
+    scriptletExceptions,
     skippedRecords,
   };
+}
+
+/** Action types that carve an exception out of some other rule. */
+const EXCEPTION_ACTION_TYPES = new Set(['allow', 'allowAllRequests']);
+
+/**
+ * Order rules so that every enabled prefix of shards is self-consistent.
+ *
+ * Filter lists put their `@@` exceptions after the blocks those exceptions
+ * carve out of, and sharding slices in array order — so all 578 EasyList
+ * exceptions landed in easylist_3.json, which the manifest ships disabled.
+ * Whenever only the leading shards were enabled (fresh install before
+ * applyRulesets completes, or the budget-constrained fallback path), the
+ * result was 50,000 live block rules with none of their false-positive
+ * escapes.
+ *
+ * Exceptions are a tiny fraction of any list, so hoisting them costs nothing.
+ * Partitioning rather than sorting keeps the operation stable, which keeps
+ * builds deterministic.
+ */
+function orderRulesForSharding(dnrRules) {
+  const exceptions = [];
+  const rest = [];
+  for (const rule of dnrRules) {
+    (EXCEPTION_ACTION_TYPES.has(rule.action?.type) ? exceptions : rest).push(rule);
+  }
+  return [...exceptions, ...rest];
 }
 
 /**
@@ -1103,21 +1156,40 @@ function buildSourceBundleFallback(parsed) {
     exceptions: {},
     genericExcludedDomains: dedupeDomains(parsed.genericCosmeticExceptionDomains),
   };
+  const addException = (domain, selector) => {
+    if (!sourceCosmetic.exceptions[domain]) sourceCosmetic.exceptions[domain] = [];
+    sourceCosmetic.exceptions[domain].push(selector);
+  };
+
   const cosmeticRules = [...(parsed.cosmeticRules || []), ...(parsed.cosmeticExceptions || [])];
   for (const r of cosmeticRules) {
+    // A `~domain` exclusion becomes an exception entry for that domain. Lookup
+    // already collects exceptions across the ancestor walk and subtracts them,
+    // which is exactly what an exclusion means — and it needs no new field in
+    // the bundle, the IndexedDB schema, the WASM serializer or the content
+    // engine. Without this, hoisting `~` out of `domains` would make a
+    // pure-negation rule apply everywhere *including* the excluded site.
+    const excluded = r.excludedDomains || [];
+
     if (r.domains.length === 0) {
       if (r.exception) continue;
       sourceCosmetic.generic.push(r.selector);
+      // "everywhere except these".
+      for (const d of excluded) addException(d, r.selector);
     } else {
       for (const d of r.domains) {
         if (shouldSkipDomainCosmeticSelector(d, r.selector)) continue;
         if (r.exception) {
-          if (!sourceCosmetic.exceptions[d]) sourceCosmetic.exceptions[d] = [];
-          sourceCosmetic.exceptions[d].push(r.selector);
+          addException(d, r.selector);
         } else {
           if (!sourceCosmetic.domainSpecific[d]) sourceCosmetic.domainSpecific[d] = [];
           sourceCosmetic.domainSpecific[d].push(r.selector);
         }
+      }
+      // Scoped rules carry their exclusions too: the lookup walk reaches the
+      // excluded subdomain through its parent, so the exception cancels it.
+      if (!r.exception) {
+        for (const d of excluded) addException(d, r.selector);
       }
     }
   }
@@ -1140,7 +1212,7 @@ function buildSourceBundleFallback(parsed) {
 
   return {
     cosmetic: sourceCosmetic,
-    scriptlets: sourceScriptlets,
+    scriptlets: applyScriptletExceptions(sourceScriptlets, parsed.scriptletExceptions),
   };
 }
 
@@ -1883,9 +1955,11 @@ async function main() {
       });
       printSkipSummary(list.id, parsed.skippedRecords, droppedRecords, truncatedCount);
 
-      // Split and stage rules for a single final write.
+      // Split and stage rules for a single final write. Exceptions first —
+      // see orderRulesForSharding.
+      const shardable = orderRulesForSharding(dnrRules);
       for (let i = 0; i < config.parts; i++) {
-        const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
+        const chunk = shardable.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
         const suffix = i === 0 ? '' : `_${i + 1}`;
         rulesetOutputs[`${list.id}${suffix}.json`] = chunk;
         log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules staged`);
@@ -1938,7 +2012,7 @@ async function main() {
   log('\n🎉 Build complete!');
 }
 
-export { parseLine, networkFilterToDNR, buildSourceBundleFallback };
+export { parseLine, networkFilterToDNR, buildSourceBundleFallback, orderRulesForSharding };
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 

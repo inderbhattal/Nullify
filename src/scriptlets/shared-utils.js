@@ -16,9 +16,12 @@ export function patternToRegex(pattern) {
   try {
     if (pattern.startsWith('/') && pattern.lastIndexOf('/') > 0) {
       const lastSlash = pattern.lastIndexOf('/');
-      return new RegExp(pattern.slice(1, lastSlash), pattern.slice(lastSlash + 1));
+      return new RegExp(
+        pattern.slice(1, lastSlash),
+        stripStatefulFlags(pattern.slice(lastSlash + 1)),
+      );
     }
-    return new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+    return new RegExp(escapeRegex(pattern));
   } catch {
     return null;
   }
@@ -33,7 +36,10 @@ export function toMatcher(pattern) {
   if (typeof pattern === 'string' && pattern.startsWith('/') && pattern.lastIndexOf('/') > 0) {
     const lastSlash = pattern.lastIndexOf('/');
     try {
-      const re = new RegExp(pattern.slice(1, lastSlash), pattern.slice(lastSlash + 1));
+      const re = new RegExp(
+        pattern.slice(1, lastSlash),
+        stripStatefulFlags(pattern.slice(lastSlash + 1)),
+      );
       return (url) => re.test(url);
     } catch {
       return () => false;
@@ -61,4 +67,17 @@ export function toRegex(pattern) {
 
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Drop `g`/`y` from a flag string.
+ *
+ * `RegExp.prototype.test` advances `lastIndex` on a stateful regex. Matchers
+ * built here are held for the lifetime of the page and reused across every
+ * request, so a stateful flag makes every second matching call return false.
+ * `toRegex` deliberately does NOT use this — it feeds `String.replace`, which
+ * needs `g` to replace more than the first occurrence.
+ */
+function stripStatefulFlags(flags) {
+  return flags.replace(/[gy]/g, '');
 }

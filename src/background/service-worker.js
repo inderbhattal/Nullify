@@ -63,6 +63,7 @@ import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
+import { encodeBinaryRules } from '../shared/rule-transport.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
@@ -2551,7 +2552,24 @@ function hasScriptletRegistry(key) {
 }
 
 function seedBootKey(key) {
-  globalThis.__nullifyBootKey = key;
+  // Use defineProperty, NOT `globalThis.x = key`. A plain assignment to the
+  // fixed-named boot property fires any setter the page pre-installed on it,
+  // leaking the capability key (page could then call window[key].run(...) with
+  // attacker-chosen args). defineProperty never invokes setters. Non-enumerable
+  // keeps it out of Object.keys; configurable lets the bundle delete it after
+  // reading. Returns false if the page pre-claimed the name with a
+  // non-configurable descriptor, so the caller can skip loading the bundle.
+  try {
+    Object.defineProperty(globalThis, '__nullifyBootKey', {
+      value: key,
+      writable: false,
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    return false;
+  }
+  return globalThis.__nullifyBootKey === key;
 }
 
 async function ensureScriptletRegistry(tabId, frameId) {
@@ -2565,12 +2583,17 @@ async function ensureScriptletRegistry(tabId, frameId) {
 
     if (ready) return true;
 
-    await chrome.scripting.executeScript({
+    const [{ result: seeded = false } = {}] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
       func: seedBootKey,
       args: [SCRIPTLET_REGISTRY_KEY],
     });
+
+    // Page hijacked the boot-key property with a non-configurable descriptor.
+    // Don't load the bundle — it would register the dispatcher under an
+    // attacker-controlled key. No scriptlets this run; safer than a leak.
+    if (!seeded) return false;
 
     await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
@@ -2688,9 +2711,13 @@ async function handleMessage(message, sender) {
 
       if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
         try {
-          responseData.cosmeticRulesBinary = cosmeticBundle.cosmeticRulesBinary;
-          delete responseData.cosmeticRules;
-          
+          // Base64, not the raw Uint8Array: runtime messages are JSON-
+          // serialized, so a typed array reaches the content script as a plain
+          // object with no `.buffer` and the decode throws. `cosmeticRules` is
+          // deliberately left in place as the fallback.
+          responseData.cosmeticRulesBinary =
+            encodeBinaryRules(cosmeticBundle.cosmeticRulesBinary);
+
           // Also provide a sanitized URL for privacy reporting/cleanup.
           // `urlSanitizer` is initialized alongside WASM readiness, so if
           // it is missing we skip sanitization rather than reconstructing
@@ -2836,6 +2863,15 @@ async function handleMessage(message, sender) {
 
     case 'CHECK_FILTER_UPDATES': {
       await checkFilterListUpdates();
+      return { ok: true };
+    }
+    case 'REPORT_CONTENT_ERROR': {
+      // Content-script init failures used to die in a bare `.catch(() => {})`.
+      // Funnel them here so GET_ERROR_REPORT reflects a broken content side
+      // instead of showing a healthy extension.
+      const host = typeof payload?.hostname === 'string' ? payload.hostname.slice(0, 253) : 'unknown';
+      const detail = typeof payload?.message === 'string' ? payload.message.slice(0, 500) : 'unknown';
+      reportError(`content:${host}`, new Error(detail));
       return { ok: true };
     }
     case 'GET_ERROR_REPORT': {

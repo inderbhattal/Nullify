@@ -4,6 +4,10 @@
 **Codebase snapshot:** `main` @ 4.0.0 (~12.5k LOC, MV3, JS + Rust/WASM core).
 **Date:** 2026-05-05.
 
+> **Superseded in part.** `docs/REVIEW-2026-07.md` (v4.1.0) re-verifies every item below at
+> `18f813a` and records the current status of each — 12 fixed, 8 partial, 19 open. Read that
+> document first; it also carries the newer findings, including seven ship-blockers.
+
 This document is a prioritized punch-list of holes found in the implementation and design, written so each item can be filed as its own issue/PR. Items are tagged **P0** (ship-blocker / data-loss / security-relevant), **P1** (correctness / parity), **P2** (hardening / polish).
 
 ---

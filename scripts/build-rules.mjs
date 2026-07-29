@@ -248,7 +248,42 @@ const RESOURCE_TYPE_MAP = {
   font: 'font',
   ping: 'ping',
   other: 'other',
+  // uBO/ABP aliases. Without these the option is unrecognised, and since
+  // unrecognised options now drop the rule, a missing alias costs real
+  // coverage rather than silently widening the rule as it used to.
+  xhr: 'xmlhttprequest',
+  css: 'stylesheet',
+  frame: 'sub_frame',
+  doc: 'main_frame',
+  beacon: 'ping',
+  'object-subrequest': 'object',
 };
+
+/**
+ * Options that are safe to ignore: dropping them cannot make the emitted rule
+ * match anything the filter author did not intend.
+ *
+ * Everything not listed here and not handled explicitly in `parseOptions`
+ * drops the whole rule. That direction matters — the previous default was to
+ * ignore unknown options and ship the remainder, which emitted a *broader*
+ * rule than was written: `$badfilter` (cancel this filter) became an active
+ * block, a bare `$removeparam` (strip all query params) became a hard block of
+ * the domain, and `$denyallow=` lost the exclusion that kept a CDN reachable.
+ */
+const IGNORABLE_OPTIONS = new Set([
+  // Cannot be expressed in MV3; other options on the rule still apply.
+  'inline-script',
+  'inline-font',
+  // DNR matches case-sensitively by default, which is the narrower reading.
+  'match-case',
+  // Redirect-to-stub shorthands. We have no resource library, so the request
+  // is blocked instead of stubbed — same direction, never broader.
+  'empty',
+  'mp4',
+  // Widens to every resource type including the document. Ignoring it yields
+  // "all types except main_frame", which is narrower.
+  'all',
+]);
 
 let ruleIdCounter = 1;
 let exceptionIdCounter = 1000000;
@@ -337,8 +372,8 @@ function parseLine(line) {
   if (!line || line.startsWith('!') || line.startsWith('[')) return SKIP_SILENT;
   if (line.startsWith('@@#')) return SKIP_SILENT;
 
-  const scriptletMatch = line.match(/^([^#|/*?^]*)##\+js\((.+)\)$/) ||
-                         line.match(/^([^#|/*?^]*)#\+js\((.+)\)$/);
+  const scriptletMatch = line.match(/^([^#|/?^]*)##\+js\((.+)\)$/) ||
+                         line.match(/^([^#|/?^]*)#\+js\((.+)\)$/);
   if (scriptletMatch) {
     const [, domains, scriptletStr] = scriptletMatch;
     const args = parseScriptletArgs(scriptletStr);
@@ -351,7 +386,7 @@ function parseLine(line) {
     };
   }
 
-  const abpExtMatch = line.match(/^([^#|/*?^]*)#\?#(.+)$/);
+  const abpExtMatch = line.match(/^([^#|/?^]*)#\?#(.+)$/);
   if (abpExtMatch) {
     const [, domains, selector] = abpExtMatch;
     return {
@@ -362,7 +397,7 @@ function parseLine(line) {
     };
   }
 
-  const cosmeticMatch = line.match(/^([^#|/*?^]*)##(.+)$/);
+  const cosmeticMatch = line.match(/^([^#|/?^]*)##(.+)$/);
   if (cosmeticMatch) {
     const [, domains, selector] = cosmeticMatch;
     return {
@@ -373,7 +408,7 @@ function parseLine(line) {
     };
   }
 
-  const cosmeticExceptionMatch = line.match(/^([^#|/*?^]*)#@#(.+)$/);
+  const cosmeticExceptionMatch = line.match(/^([^#|/?^]*)#@#(.+)$/);
   if (cosmeticExceptionMatch) {
     const [, domains, selector] = cosmeticExceptionMatch;
     return {
@@ -395,13 +430,21 @@ function parseLine(line) {
     optionsStr = rawRule.slice(dollarPos + 1);
   }
 
-  if (/(^|,)csp=/.test(optionsStr) && !isException) {
-    return skip('csp-modifier: Chrome MV3 DNR cannot inject CSP response headers via a block rule; needs modifyHeaders which we do not translate yet');
+  if (/(^|,)csp(=|,|$)/.test(optionsStr)) {
+    // Neither direction is translated. Skipping the block form is merely a
+    // parity gap; the exception form previously fell through to a network
+    // `allow`, which disabled all blocking on the domain instead of only
+    // relaxing CSP injection there.
+    return skip(isException
+      ? 'csp-exception: not translated; emitting a network allow would disable all blocking on the domain'
+      : 'csp-modifier: Chrome MV3 DNR cannot inject CSP response headers via a block rule; needs modifyHeaders which we do not translate yet');
   }
 
   const options = parseOptions(optionsStr);
   if (options === null) {
-    return skip('unsupported-option-combo');
+    const offending = lastUnsupportedOption;
+    lastUnsupportedOption = null;
+    return skip(`unsupported-option: ${offending} — dropping the rule rather than shipping it broadened`);
   }
 
   if (isException && options.cosmeticScopeExceptions.length > 0) {
@@ -420,6 +463,14 @@ function parseLine(line) {
     };
   }
 
+  // Backstop for the cosmetic-classification branches above. A line carrying a
+  // cosmetic separator that reached this point was not recognised by any of
+  // them; shipping it as a network rule produces a urlFilter containing the
+  // whole filter line, which matches nothing and burns static-rule budget.
+  if (pattern.includes('##') || pattern.includes('#@#')) {
+    return skip('cosmetic-line-in-network-path: unrecognised cosmetic syntax, not a URL pattern');
+  }
+
   return {
     type: 'network',
     pattern,
@@ -427,6 +478,30 @@ function parseLine(line) {
     exception: isException,
   };
 }
+
+/**
+ * Options that scope *cosmetic* filtering, mapped to their canonical name.
+ *
+ * uBO accepts a short spelling for each, and the lists this project fetches
+ * use them heavily (unbreak.txt ships a whole `$ghide` section). Only the long
+ * forms were recognised, so the short ones fell through to the network path
+ * and became `allow` rules at a priority above every block — turning "do not
+ * apply generic cosmetics here" into "disable all blocking on this domain".
+ * Downstream matching is by canonical name, so aliases must normalise rather
+ * than pass through.
+ */
+/** Set by `parseOptions` when it bails, so the skip reason can name the option. */
+let lastUnsupportedOption = null;
+
+const COSMETIC_SCOPE_OPTIONS = new Map([
+  ['generichide', 'generichide'],
+  ['ghide', 'generichide'],
+  ['elemhide', 'elemhide'],
+  ['ehide', 'elemhide'],
+  ['specifichide', 'specifichide'],
+  ['shide', 'specifichide'],
+  ['genericblock', 'genericblock'],
+]);
 
 /**
  * Parse option string into a structured options object.
@@ -488,14 +563,18 @@ function parseOptions(optionsStr) {
       // Manifest V3 can't block inline scripts.
       // We don't skip the rule, we just ignore this specific option
       // so other options in the same rule (like $script) still apply.
-    } else if (['genericblock', 'generichide', 'elemhide', 'specifichide'].includes(optName)) {
+    } else if (COSMETIC_SCOPE_OPTIONS.has(optName)) {
       // Cosmetic-scope exception hints — we no longer flip `important`
       // here. Setting the priority-bumped important flag used to mask real
       // cosmetic exception rules at DNR priority 5.
       options.cosmeticScopeException = true;
-      if (!negated) options.cosmeticScopeExceptions.push(optName);
+      if (!negated) options.cosmeticScopeExceptions.push(COSMETIC_SCOPE_OPTIONS.get(optName));
+    } else if (!IGNORABLE_OPTIONS.has(optName)) {
+      // Fail closed. An option we do not understand may be the one that
+      // narrows the rule, so shipping the remainder over-blocks.
+      lastUnsupportedOption = optName;
+      return null;
     }
-    // Ignore unknown options silently (many are optional/metadata)
   }
 
   return options;
@@ -680,7 +759,32 @@ function isUnsafeGlobalFragmentImageRedirect(pattern, options, exception) {
  * Convert a parsed network filter into a DNR rule object.
  * Returns null if conversion is not possible (reason is reported via reportDrop).
  */
-function networkFilterToDNR(parsed) {
+/**
+ * Resource types applied to security-list rules that name no type of their own.
+ * Enumerated rather than left implicit precisely because omitting the field
+ * excludes `main_frame`.
+ */
+const SECURITY_LIST_RESOURCE_TYPES = [
+  'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
+  'object', 'xmlhttprequest', 'ping', 'media', 'websocket', 'other',
+];
+
+/** Lists whose rules block malicious hosts outright, so navigations must match. */
+const SECURITY_LIST_IDS = new Set(['malware']);
+
+/**
+ * DNR priority bands for statically compiled rules, lowest to highest.
+ * Runtime rules sit above all of these: the user allowlist uses 500 and
+ * system-unbreak 1000.
+ */
+const DNR_PRIORITY = {
+  BLOCK: 1,
+  ALLOW: 2,
+  IMPORTANT_BLOCK: 3,
+  IMPORTANT_ALLOW: 4,
+};
+
+function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (parsed.type !== 'network') return null;
 
   const { pattern, options, exception } = parsed;
@@ -773,6 +877,12 @@ function networkFilterToDNR(parsed) {
 
   if (options.resourceTypes.length > 0) {
     condition.resourceTypes = options.resourceTypes;
+  } else if (conversionOptions.coverDocuments && !exception) {
+    // A DNR condition with no resourceTypes matches every type EXCEPT
+    // main_frame. For a malicious-URL list that silently removes the one case
+    // that matters — the user navigating to the URL — so pin the full set.
+    // Only applies where the filter author named no type of their own.
+    condition.resourceTypes = [...SECURITY_LIST_RESOURCE_TYPES];
   }
   if (options.excludedResourceTypes.length > 0) {
     condition.excludedResourceTypes = options.excludedResourceTypes;
@@ -816,9 +926,17 @@ function networkFilterToDNR(parsed) {
     action = { type: 'block' };
   }
 
-  let rulePriority = options.important ? 2 : 1;
+  // uBO ordering: a plain exception beats a plain block, but an $important
+  // block beats that exception — overriding exceptions is the whole point of
+  // $important, and the anti-circumvention lists depend on it. The previous
+  // scheme (block 1, important 2, exception 3) let the exception always win,
+  // so $important was inert. `allowAllRequests` from the user allowlist sits
+  // far above all of these at priority 500, and system-unbreak at 1000.
+  let rulePriority;
   if (exception) {
-    rulePriority = 3;
+    rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_ALLOW : DNR_PRIORITY.ALLOW;
+  } else {
+    rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_BLOCK : DNR_PRIORITY.BLOCK;
   }
 
   return {
@@ -846,12 +964,10 @@ function convertPatternToUrlFilter(pattern) {
   const original = pattern;
   if (!pattern || pattern === '*') { reportDrop('urlFilter: empty or matches-everything ("*")', original); return null; }
 
-  if (pattern.includes('%')) {
-    try {
-      const decoded = decodeURIComponent(pattern);
-      if (decoded && decoded.trim().length > 0) pattern = decoded;
-    } catch { /* keep original */ }
-  }
+  // No percent-decoding. Chrome matches urlFilter against the canonicalized
+  // URL, which is still percent-encoded, so decoding produced filters
+  // containing literal spaces that could never match — and turned valid ASCII
+  // patterns like %D0%B0 into non-ASCII, which the guard below then dropped.
 
   if (pattern.length < 2) { reportDrop('urlFilter: pattern too short (<2 chars)', original); return null; }
   if (/[^\x00-\x7F]/.test(pattern)) { reportDrop('urlFilter: non-ASCII — Chrome DNR requires ASCII', original); return null; }
@@ -942,7 +1058,7 @@ function parseFilterList(text) {
  * Convert parsed network rules to DNR rules, deduplicate, and return.
  * Populates `droppedRecords` with every rejection + dedup drop.
  */
-function buildDNRRules(networkRules) {
+function buildDNRRules(networkRules, conversionOptions = {}) {
   const dnrRules = [];
   const seen = new Set();
   const droppedRecords = [];
@@ -952,7 +1068,7 @@ function buildDNRRules(networkRules) {
 
   try {
     for (const parsed of networkRules) {
-      const rule = networkFilterToDNR(parsed);
+      const rule = networkFilterToDNR(parsed, conversionOptions);
       if (!rule) continue;
 
       const key = JSON.stringify({
@@ -1743,7 +1859,22 @@ async function main() {
         log(`   ✂️  Smart selection: ${networkRules.length} rules kept (${truncatedCount} trimmed by smartTruncate)`);
       }
 
-      const { dnrRules, droppedRecords } = buildDNRRules(networkRules);
+      const { dnrRules, droppedRecords } = buildDNRRules(networkRules, {
+        coverDocuments: SECURITY_LIST_IDS.has(list.id),
+      });
+
+      // A security list that cannot block a navigation is not doing its job.
+      // Fail the build rather than shipping one silently, the way the malware
+      // ruleset shipped 5,888 rules that could only match subresources.
+      if (SECURITY_LIST_IDS.has(list.id) && dnrRules.length > 0) {
+        const blocksNavigation = dnrRules.some((r) =>
+          r.action.type === 'block' && r.condition.resourceTypes?.includes('main_frame'));
+        if (!blocksNavigation) {
+          throw new Error(
+            `${list.id}: security ruleset has ${dnrRules.length} rules but none block main_frame — ` +
+            'navigations to listed malicious URLs would not be stopped');
+        }
+      }
 
       writeSkipLog(list.id, {
         parseSkips: parsed.skippedRecords,

@@ -372,8 +372,8 @@ function parseLine(line) {
   if (!line || line.startsWith('!') || line.startsWith('[')) return SKIP_SILENT;
   if (line.startsWith('@@#')) return SKIP_SILENT;
 
-  const scriptletMatch = line.match(/^([^#|/*?^]*)##\+js\((.+)\)$/) ||
-                         line.match(/^([^#|/*?^]*)#\+js\((.+)\)$/);
+  const scriptletMatch = line.match(/^([^#|/?^]*)##\+js\((.+)\)$/) ||
+                         line.match(/^([^#|/?^]*)#\+js\((.+)\)$/);
   if (scriptletMatch) {
     const [, domains, scriptletStr] = scriptletMatch;
     const args = parseScriptletArgs(scriptletStr);
@@ -386,7 +386,7 @@ function parseLine(line) {
     };
   }
 
-  const abpExtMatch = line.match(/^([^#|/*?^]*)#\?#(.+)$/);
+  const abpExtMatch = line.match(/^([^#|/?^]*)#\?#(.+)$/);
   if (abpExtMatch) {
     const [, domains, selector] = abpExtMatch;
     return {
@@ -397,7 +397,7 @@ function parseLine(line) {
     };
   }
 
-  const cosmeticMatch = line.match(/^([^#|/*?^]*)##(.+)$/);
+  const cosmeticMatch = line.match(/^([^#|/?^]*)##(.+)$/);
   if (cosmeticMatch) {
     const [, domains, selector] = cosmeticMatch;
     return {
@@ -408,7 +408,7 @@ function parseLine(line) {
     };
   }
 
-  const cosmeticExceptionMatch = line.match(/^([^#|/*?^]*)#@#(.+)$/);
+  const cosmeticExceptionMatch = line.match(/^([^#|/?^]*)#@#(.+)$/);
   if (cosmeticExceptionMatch) {
     const [, domains, selector] = cosmeticExceptionMatch;
     return {
@@ -461,6 +461,14 @@ function parseLine(line) {
       scopes: options.cosmeticScopeExceptions,
       pattern,
     };
+  }
+
+  // Backstop for the cosmetic-classification branches above. A line carrying a
+  // cosmetic separator that reached this point was not recognised by any of
+  // them; shipping it as a network rule produces a urlFilter containing the
+  // whole filter line, which matches nothing and burns static-rule budget.
+  if (pattern.includes('##') || pattern.includes('#@#')) {
+    return skip('cosmetic-line-in-network-path: unrecognised cosmetic syntax, not a URL pattern');
   }
 
   return {
@@ -956,12 +964,10 @@ function convertPatternToUrlFilter(pattern) {
   const original = pattern;
   if (!pattern || pattern === '*') { reportDrop('urlFilter: empty or matches-everything ("*")', original); return null; }
 
-  if (pattern.includes('%')) {
-    try {
-      const decoded = decodeURIComponent(pattern);
-      if (decoded && decoded.trim().length > 0) pattern = decoded;
-    } catch { /* keep original */ }
-  }
+  // No percent-decoding. Chrome matches urlFilter against the canonicalized
+  // URL, which is still percent-encoded, so decoding produced filters
+  // containing literal spaces that could never match — and turned valid ASCII
+  // patterns like %D0%B0 into non-ASCII, which the guard below then dropped.
 
   if (pattern.length < 2) { reportDrop('urlFilter: pattern too short (<2 chars)', original); return null; }
   if (/[^\x00-\x7F]/.test(pattern)) { reportDrop('urlFilter: non-ASCII — Chrome DNR requires ASCII', original); return null; }

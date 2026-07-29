@@ -165,6 +165,55 @@ test('cosmetic and scriptlet lines are classified, never converted to network ru
   assert.equal(parseLine('##.generic-ad').type, 'cosmetic');
 });
 
+// The domain-prefix character class excluded `*`, so uBO's wildcard-TLD form
+// matched no cosmetic branch, fell through to the network path, and shipped as
+// a block rule whose urlFilter was the entire filter line — 3,130 of them in
+// the generated artifacts, consuming static-rule budget while matching nothing,
+// and losing the cosmetic/scriptlet rule they were supposed to be.
+test('wildcard-TLD cosmetic lines classify as cosmetic, not network', () => {
+  const cosmetic = parseLine('read.amazon.*##.kw-ads-ftue-container');
+  assert.equal(cosmetic.type, 'cosmetic');
+  assert.deepEqual(cosmetic.domains, ['read.amazon.*']);
+  assert.equal(cosmetic.selector, '.kw-ads-ftue-container');
+
+  const scriptlet = parseLine('pelispedia.*##+js(aopw, document.oncontextmenu)');
+  assert.equal(scriptlet.type, 'scriptlet');
+  assert.deepEqual(scriptlet.domains, ['pelispedia.*']);
+  assert.equal(scriptlet.name, 'aopw');
+
+  const exception = parseLine('costco.*#@#.promo');
+  assert.equal(exception.type, 'cosmetic');
+  assert.equal(exception.exception, true);
+});
+
+test('a filter line containing ## never becomes a network rule', () => {
+  // Backstop for the whole class: whatever the domain prefix looks like, a
+  // cosmetic line must not reach urlFilter.
+  for (const line of ['read.amazon.*##.ad', 'a.b.*##div', '~x.com##.ad']) {
+    const parsed = parseLine(line);
+    assert.notEqual(parsed.type, 'network', `${line} must not be a network rule`);
+  }
+});
+
+// Chrome matches urlFilter against the canonicalized (still percent-encoded)
+// URL, so decoding produced filters containing literal spaces that can never
+// match — 60 dead rules including phishing blocks from the badware list.
+test('percent-encoded patterns are not decoded', () => {
+  assert.deepEqual(
+    convert('||example.com/ad%20frame/'),
+    block({ urlFilter: '||example.com/ad%20frame/' }),
+  );
+});
+
+test('a percent-encoded non-ASCII pattern is kept, not decoded then rejected', () => {
+  // Decoding turned this valid ASCII pattern into Cyrillic, which the ASCII
+  // guard then dropped.
+  assert.deepEqual(
+    convert('||example.com/%D0%B0%D0%B4/'),
+    block({ urlFilter: '||example.com/%D0%B0%D0%B4/' }),
+  );
+});
+
 test('comments and blank lines are skipped, not converted', () => {
   for (const line of ['! comment', '[Adblock Plus 2.0]', '', '   ']) {
     assert.equal(parseLine(line).skip, true, `${JSON.stringify(line)} must be skipped`);

@@ -242,6 +242,43 @@ test('resource-type aliases are recognised rather than dropped', () => {
   expectType('||e.com^$object-subrequest', ['object']);
 });
 
+// A DNR condition with no resourceTypes matches every type EXCEPT main_frame.
+// Every rule in the URLhaus malware ruleset had no resourceTypes, so navigating
+// to a listed malicious URL was not blocked — only subresources from that host
+// were. That is the one thing the list exists to stop.
+test('security lists cover main_frame so navigations are actually blocked', () => {
+  const parsed = parseLine('0011.s3.cubbit.eu');
+  const rule = networkFilterToDNR(parsed, { coverDocuments: true });
+
+  assert.ok(rule.condition.resourceTypes, 'must pin resource types explicitly');
+  assert.ok(
+    rule.condition.resourceTypes.includes('main_frame'),
+    'a malicious-URL rule must block the navigation itself',
+  );
+  assert.ok(rule.condition.resourceTypes.includes('sub_frame'));
+  assert.ok(rule.condition.resourceTypes.includes('script'));
+});
+
+test('security-list coverage does not override an explicit resource type', () => {
+  const parsed = parseLine('||evil.example^$script');
+  const rule = networkFilterToDNR(parsed, { coverDocuments: true });
+
+  assert.deepEqual(
+    rule.condition.resourceTypes,
+    ['script'],
+    'an author-specified type must win over the list-wide default',
+  );
+});
+
+test('ordinary lists are unaffected — no implicit main_frame', () => {
+  const rule = networkFilterToDNR(parseLine('||ads.example.com^'));
+  assert.equal(
+    rule.condition.resourceTypes,
+    undefined,
+    'ad lists must not start blocking navigations',
+  );
+});
+
 test('$csp exceptions are skipped, not converted to a network allow', () => {
   // $csp is not translated in either direction. Emitting an allow for the
   // exception form disables all network blocking on the domain.

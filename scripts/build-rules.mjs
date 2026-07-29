@@ -751,7 +751,20 @@ function isUnsafeGlobalFragmentImageRedirect(pattern, options, exception) {
  * Convert a parsed network filter into a DNR rule object.
  * Returns null if conversion is not possible (reason is reported via reportDrop).
  */
-function networkFilterToDNR(parsed) {
+/**
+ * Resource types applied to security-list rules that name no type of their own.
+ * Enumerated rather than left implicit precisely because omitting the field
+ * excludes `main_frame`.
+ */
+const SECURITY_LIST_RESOURCE_TYPES = [
+  'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
+  'object', 'xmlhttprequest', 'ping', 'media', 'websocket', 'other',
+];
+
+/** Lists whose rules block malicious hosts outright, so navigations must match. */
+const SECURITY_LIST_IDS = new Set(['malware']);
+
+function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (parsed.type !== 'network') return null;
 
   const { pattern, options, exception } = parsed;
@@ -844,6 +857,12 @@ function networkFilterToDNR(parsed) {
 
   if (options.resourceTypes.length > 0) {
     condition.resourceTypes = options.resourceTypes;
+  } else if (conversionOptions.coverDocuments && !exception) {
+    // A DNR condition with no resourceTypes matches every type EXCEPT
+    // main_frame. For a malicious-URL list that silently removes the one case
+    // that matters — the user navigating to the URL — so pin the full set.
+    // Only applies where the filter author named no type of their own.
+    condition.resourceTypes = [...SECURITY_LIST_RESOURCE_TYPES];
   }
   if (options.excludedResourceTypes.length > 0) {
     condition.excludedResourceTypes = options.excludedResourceTypes;
@@ -1013,7 +1032,7 @@ function parseFilterList(text) {
  * Convert parsed network rules to DNR rules, deduplicate, and return.
  * Populates `droppedRecords` with every rejection + dedup drop.
  */
-function buildDNRRules(networkRules) {
+function buildDNRRules(networkRules, conversionOptions = {}) {
   const dnrRules = [];
   const seen = new Set();
   const droppedRecords = [];
@@ -1023,7 +1042,7 @@ function buildDNRRules(networkRules) {
 
   try {
     for (const parsed of networkRules) {
-      const rule = networkFilterToDNR(parsed);
+      const rule = networkFilterToDNR(parsed, conversionOptions);
       if (!rule) continue;
 
       const key = JSON.stringify({
@@ -1814,7 +1833,22 @@ async function main() {
         log(`   ✂️  Smart selection: ${networkRules.length} rules kept (${truncatedCount} trimmed by smartTruncate)`);
       }
 
-      const { dnrRules, droppedRecords } = buildDNRRules(networkRules);
+      const { dnrRules, droppedRecords } = buildDNRRules(networkRules, {
+        coverDocuments: SECURITY_LIST_IDS.has(list.id),
+      });
+
+      // A security list that cannot block a navigation is not doing its job.
+      // Fail the build rather than shipping one silently, the way the malware
+      // ruleset shipped 5,888 rules that could only match subresources.
+      if (SECURITY_LIST_IDS.has(list.id) && dnrRules.length > 0) {
+        const blocksNavigation = dnrRules.some((r) =>
+          r.action.type === 'block' && r.condition.resourceTypes?.includes('main_frame'));
+        if (!blocksNavigation) {
+          throw new Error(
+            `${list.id}: security ruleset has ${dnrRules.length} rules but none block main_frame — ` +
+            'navigations to listed malicious URLs would not be stopped');
+        }
+      }
 
       writeSkipLog(list.id, {
         parseSkips: parsed.skippedRecords,

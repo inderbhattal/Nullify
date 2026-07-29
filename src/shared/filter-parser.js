@@ -108,8 +108,12 @@ function parseCosmeticScopeException(line) {
 /**
  * Parse a single filter line. Returns a rule object or null if not a
  * cosmetic/scriptlet rule (or if the line is a comment/blank/network rule).
+ *
+ * Exported for the cross-engine parity suite: this parser and the build-time
+ * one in scripts/build-rules.mjs must classify identically, and the only way
+ * to keep that true is to assert it.
  */
-function parseLine(line) {
+export function parseLine(line) {
   line = line.trim();
   if (!line || line.startsWith('!') || line.startsWith('[') ||
     line.startsWith('%') || line.startsWith('@@#')) return null;

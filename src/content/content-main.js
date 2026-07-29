@@ -12,6 +12,7 @@
 import { CosmeticEngine } from './cosmetic-engine.js';
 import { activatePicker, deactivatePicker } from './element-picker.js';
 import { normalizeHostname } from '../shared/hostname.js';
+import { resolvePageRules } from '../shared/rule-transport.js';
 
 const hostname = normalizeHostname(location.hostname);
 const FRAME_STYLE_ID = '__nullify_frame_css__';
@@ -49,50 +50,6 @@ function injectStyle(id, cssText, append = false) {
   else parent.prepend(style);
 }
 
-/**
- * Fast binary decoder for ruleset data.
- * @param {Uint8Array} buffer
- */
-function decodeBinaryRules(buffer) {
-  const rules = { generic: [], domainSpecific: [], exceptions: [] };
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  let offset = 0;
-  const decoder = new TextDecoder();
-
-  const decodeRuleEntry = (text) => {
-    const trimmed = text.trim();
-    if (!trimmed.startsWith('{')) return text;
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      return text;
-    }
-  };
-
-  const readStringList = () => {
-    if (offset + 4 > buffer.byteLength) return [];
-    const count = view.getUint32(offset, true);
-    offset += 4;
-    const list = [];
-    
-    for (let i = 0; i < count; i++) {
-      if (offset >= buffer.byteLength) break;
-      let start = offset;
-      while (offset < buffer.byteLength && buffer[offset] !== 0) {
-        offset++;
-      }
-      list.push(decodeRuleEntry(decoder.decode(buffer.slice(start, offset))));
-      offset++; // skip null
-    }
-    return list;
-  };
-
-  rules.generic = readStringList();
-  rules.domainSpecific = readStringList();
-  rules.exceptions = readStringList();
-  return rules;
-}
-
 async function main() {
   // Fire a single consolidated request to avoid messaging overhead and SW wake-up contention.
   let initRes;
@@ -102,32 +59,16 @@ async function main() {
     // SW not ready — proceed with defaults
   }
 
-  const {
-    isAllowed,
-    cosmeticRules,
-    cosmeticRulesBinary,
-    cssText,
-    exceptionCss,
-    genericProceduralRules,
-  } = initRes || {};
+  const { isAllowed, cssText, exceptionCss } = initRes || {};
 
   if (isAllowed === true) return;
 
   injectStyle(FRAME_STYLE_ID, cssText);
   injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
 
-  // Use binary rules if available, otherwise fallback to JSON
-  const pageRules = cosmeticRulesBinary 
-    ? decodeBinaryRules(cosmeticRulesBinary)
-    : cosmeticRules;
-  const finalRules = {
-    generic: pageRules?.generic || [],
-    domainSpecific: [
-      ...(Array.isArray(genericProceduralRules) ? genericProceduralRules : []),
-      ...(pageRules?.domainSpecific || []),
-    ],
-    exceptions: pageRules?.exceptions || [],
-  };
+  // Prefers the base64 binary bundle, falls back to the JSON rules if it is
+  // missing or undecodable — never lose procedural filtering over transport.
+  const finalRules = resolvePageRules(initRes);
 
   // Apply cosmetic rules
   const PROC_TOKEN_REGEX = /:(?:has-text|upward|matches-css|matches-css-before|matches-css-after|matches-attr|matches-path|has|xpath|min-text-length|watch-attr|remove|if|if-not|nth-ancestor|style)\(/;
@@ -157,4 +98,15 @@ chrome.runtime.onMessage.addListener((message) => {
   }
 });
 
-main().catch(() => {});
+main().catch((err) => {
+  // A bare swallow here hid a total loss of procedural cosmetic filtering for
+  // a full release: the bundle decode threw on every page and nothing said so.
+  // Report and keep going — the page must never break because of us.
+  console.error('[Nullify] content script init failed:', err);
+  try {
+    chrome.runtime.sendMessage({
+      type: 'REPORT_CONTENT_ERROR',
+      payload: { hostname, message: err?.message || String(err) },
+    });
+  } catch { /* SW asleep or context invalidated */ }
+});

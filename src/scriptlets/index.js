@@ -61,6 +61,8 @@ const REGISTRY = new Map([
   ['set', setConstant], // alias
   ['abort-current-inline-script', abortCurrentInlineScript],
   ['acis', abortCurrentInlineScript],
+  ['abort-current-script', abortCurrentInlineScript],
+  ['acs', abortCurrentInlineScript],
   ['abort-on-stack-trace', abortOnStackTrace],
   ['aost', abortOnStackTrace],
 
@@ -96,13 +98,18 @@ const REGISTRY = new Map([
   ['addeventlistener-logger', preventAddEventListener],
   ['adjust-set-timeout', adjustSetTimeout],
   ['ast', adjustSetTimeout],
+  ['nano-setTimeout-booster', adjustSetTimeout],
+  ['nano-stb', adjustSetTimeout],
   ['adjust-set-interval', adjustSetInterval],
   ['asi', adjustSetInterval],
+  ['nano-setInterval-booster', adjustSetInterval],
+  ['nano-sib', adjustSetInterval],
 
   // Cookie manipulation
   ['set-cookie', setCookie],
   ['set-cookie-reload', setCookiePath],
   ['remove-cookie', removeCookie],
+  ['cookie-remover', removeCookie],
 
   // Storage manipulation
   ['set-local-storage-item', setLocalStorageItem],
@@ -112,8 +119,10 @@ const REGISTRY = new Map([
 
   // Popup/window blocking
   ['no-window-open-if', noWindowOpenIf],
+  ['nowoif', noWindowOpenIf],
   ['prevent-window-open', preventWindowOpen],
   ['pwo', preventWindowOpen],
+  ['window.open-defuser', preventWindowOpen],
   ['disable-newtab-links', disableNewtabLinks],
 
   // Trusted (privileged) variants
@@ -143,19 +152,73 @@ const REGISTRY = new Map([
 // ---------------------------------------------------------------------------
 // Executor
 // ---------------------------------------------------------------------------
+
+// Unknown-name telemetry. A miss used to be an unlogged `return`, which is how
+// 39% of the shipped rule corpus came to name scriptlets that do not exist —
+// including ~2.4k rules using aliases of scriptlets already implemented here.
+// Counting them makes coverage regressions observable instead of silent.
+const unknownScriptlets = new Map();
+
+function recordUnknownScriptlet(name) {
+  try {
+    const key = typeof name === 'string' ? name : typeof name;
+    unknownScriptlets.set(key, (unknownScriptlets.get(key) || 0) + 1);
+  } catch { /* telemetry must never break dispatch */ }
+}
+
+/** Diagnostic: `{ [scriptletName]: missCount }` for names with no implementation. */
+function getUnknownScriptlets() {
+  const out = {};
+  for (const [name, count] of unknownScriptlets) out[name] = count;
+  return out;
+}
+
 const executed = new Set();
+
+// Bound at module load. A page that later swaps `Set.prototype.has` cannot
+// break dispatch through these.
+const executedHas = Set.prototype.has.bind(executed);
+const executedAdd = Set.prototype.add.bind(executed);
+
+/**
+ * Build the double-execution key for a spec.
+ *
+ * Deliberately avoids `JSON.stringify` and `Array.prototype.join`: both are
+ * page-replaceable, and building the key with them let one line of page script
+ * (`JSON.stringify = () => { throw 0 }`) silently disable every scriptlet on
+ * the page. String concatenation of primitives invokes only internal ToString,
+ * which page code cannot intercept. Non-primitive args collapse to their
+ * typeof — scriptlet args are strings in practice, and a weaker key is far
+ * better than a throw.
+ */
+function dedupeKey(name, args) {
+  let key = `${name}|${args.length}`;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const t = typeof arg;
+    key += '|';
+    key += t === 'string' || t === 'number' || t === 'boolean' ? arg : t;
+  }
+  return key;
+}
 
 function run(name, args = []) {
   const fn = REGISTRY.get(name);
   if (!fn) {
-    // Unknown scriptlet — skip silently
+    recordUnknownScriptlet(name);
     return;
   }
 
-  // Prevent double-execution of the same scriptlet with same args
-  const key = `${name}|${JSON.stringify(args)}`;
-  if (executed.has(key)) return;
-  executed.add(key);
+  // Dedupe is best-effort and must fail open: if key computation or the Set
+  // itself is sabotaged, run the scriptlet anyway rather than dropping it.
+  let key = null;
+  try {
+    key = dedupeKey(name, args);
+    if (executedHas(key)) return;
+    executedAdd(key);
+  } catch {
+    key = null;
+  }
 
   try {
     fn(...args);
@@ -192,4 +255,4 @@ if (typeof bootKey === 'string' && bootKey.length > 0) {
   } catch { /* ignore */ }
 }
 
-export { run };
+export { run, getUnknownScriptlets, REGISTRY };

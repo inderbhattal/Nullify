@@ -21,6 +21,7 @@ import {
   CORE_FILTER_SOURCE,
   shouldSkipDomainCosmeticSelector,
 } from '../src/shared/core-filter-source.js';
+import { splitDomainList } from '../src/shared/filter-syntax.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
@@ -380,7 +381,7 @@ function parseLine(line) {
     const [name, ...rest] = args;
     return {
       type: 'scriptlet',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       name: name.trim(),
       args: rest,
     };
@@ -391,7 +392,7 @@ function parseLine(line) {
     const [, domains, selector] = abpExtMatch;
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -402,7 +403,7 @@ function parseLine(line) {
     const [, domains, selector] = cosmeticMatch;
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -413,7 +414,7 @@ function parseLine(line) {
     const [, domains, selector] = cosmeticExceptionMatch;
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: true,
     };
@@ -1130,21 +1131,40 @@ function buildSourceBundleFallback(parsed) {
     exceptions: {},
     genericExcludedDomains: dedupeDomains(parsed.genericCosmeticExceptionDomains),
   };
+  const addException = (domain, selector) => {
+    if (!sourceCosmetic.exceptions[domain]) sourceCosmetic.exceptions[domain] = [];
+    sourceCosmetic.exceptions[domain].push(selector);
+  };
+
   const cosmeticRules = [...(parsed.cosmeticRules || []), ...(parsed.cosmeticExceptions || [])];
   for (const r of cosmeticRules) {
+    // A `~domain` exclusion becomes an exception entry for that domain. Lookup
+    // already collects exceptions across the ancestor walk and subtracts them,
+    // which is exactly what an exclusion means — and it needs no new field in
+    // the bundle, the IndexedDB schema, the WASM serializer or the content
+    // engine. Without this, hoisting `~` out of `domains` would make a
+    // pure-negation rule apply everywhere *including* the excluded site.
+    const excluded = r.excludedDomains || [];
+
     if (r.domains.length === 0) {
       if (r.exception) continue;
       sourceCosmetic.generic.push(r.selector);
+      // "everywhere except these".
+      for (const d of excluded) addException(d, r.selector);
     } else {
       for (const d of r.domains) {
         if (shouldSkipDomainCosmeticSelector(d, r.selector)) continue;
         if (r.exception) {
-          if (!sourceCosmetic.exceptions[d]) sourceCosmetic.exceptions[d] = [];
-          sourceCosmetic.exceptions[d].push(r.selector);
+          addException(d, r.selector);
         } else {
           if (!sourceCosmetic.domainSpecific[d]) sourceCosmetic.domainSpecific[d] = [];
           sourceCosmetic.domainSpecific[d].push(r.selector);
         }
+      }
+      // Scoped rules carry their exclusions too: the lookup walk reaches the
+      // excluded subdomain through its parent, so the exception cancels it.
+      if (!r.exception) {
+        for (const d of excluded) addException(d, r.selector);
       }
     }
   }

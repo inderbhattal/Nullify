@@ -6,6 +6,8 @@
  * are compiled at build time and remain static.
  */
 
+import { splitDomainList } from './filter-syntax.js';
+
 /**
  * Parse scriptlet argument string, respecting quoted commas.
  * e.g. "set-constant, ads.enabled, false" → ['set-constant', 'ads.enabled', 'false']
@@ -136,7 +138,7 @@ export function parseLine(line) {
       const [name, ...rest] = args;
       return {
         type: 'scriptlet',
-        domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+        ...splitDomainList(domains),
         name: name.trim(),
         args: rest,
       };
@@ -150,7 +152,7 @@ export function parseLine(line) {
     const selector = line.slice(idx + 3);
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: true,
     };
@@ -163,7 +165,7 @@ export function parseLine(line) {
     const selector = line.slice(idx + 3);
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };
@@ -176,7 +178,7 @@ export function parseLine(line) {
     const selector = line.slice(idx + 2);
     return {
       type: 'cosmetic',
-      domains: domains ? domains.split(',').map(d => d.trim()).filter(Boolean) : [],
+      ...splitDomainList(domains),
       selector,
       exception: false,
     };

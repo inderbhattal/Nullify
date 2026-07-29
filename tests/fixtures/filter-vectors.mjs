@@ -64,6 +64,54 @@ export const FILTER_VECTORS = [
     expect: { kind: 'scriptlet', domains: [], excludedDomains: [], name: 'nowebrtc', args: [] },
   },
 
+  // --- ~domain exclusions -------------------------------------------------
+  // Folding a `~` domain into `domains` inverts its meaning: the rule then
+  // applies precisely where the author excluded it. The ancestor walk at
+  // lookup makes it worse — a rule keyed `youtube.com` matches
+  // music.youtube.com, which is the subdomain the `~` was protecting.
+  {
+    line: 'example.com,~mail.example.com##.promo',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: ['mail.example.com'],
+      selector: '.promo',
+      exception: false,
+    },
+  },
+  {
+    line: 'youtube.com,~music.youtube.com##+js(set, yt.ads, false)',
+    expect: {
+      kind: 'scriptlet',
+      domains: ['youtube.com'],
+      excludedDomains: ['music.youtube.com'],
+      name: 'set',
+      args: ['yt.ads', 'false'],
+    },
+  },
+  {
+    // Pure negation is a generic rule with an exclusion — "everywhere except".
+    // Keying it under the literal "~example.com" made it apply nowhere.
+    line: '~example.com##.ad',
+    expect: {
+      kind: 'cosmetic',
+      domains: [],
+      excludedDomains: ['example.com'],
+      selector: '.ad',
+      exception: false,
+    },
+  },
+  {
+    line: '~a.com,~b.com##.ad',
+    expect: {
+      kind: 'cosmetic',
+      domains: [],
+      excludedDomains: ['a.com', 'b.com'],
+      selector: '.ad',
+      exception: false,
+    },
+  },
+
   // --- comments and blanks ------------------------------------------------
   { line: '! a comment', expect: { kind: 'skip' } },
   { line: '[Adblock Plus 2.0]', expect: { kind: 'skip' } },

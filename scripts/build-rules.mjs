@@ -248,7 +248,42 @@ const RESOURCE_TYPE_MAP = {
   font: 'font',
   ping: 'ping',
   other: 'other',
+  // uBO/ABP aliases. Without these the option is unrecognised, and since
+  // unrecognised options now drop the rule, a missing alias costs real
+  // coverage rather than silently widening the rule as it used to.
+  xhr: 'xmlhttprequest',
+  css: 'stylesheet',
+  frame: 'sub_frame',
+  doc: 'main_frame',
+  beacon: 'ping',
+  'object-subrequest': 'object',
 };
+
+/**
+ * Options that are safe to ignore: dropping them cannot make the emitted rule
+ * match anything the filter author did not intend.
+ *
+ * Everything not listed here and not handled explicitly in `parseOptions`
+ * drops the whole rule. That direction matters — the previous default was to
+ * ignore unknown options and ship the remainder, which emitted a *broader*
+ * rule than was written: `$badfilter` (cancel this filter) became an active
+ * block, a bare `$removeparam` (strip all query params) became a hard block of
+ * the domain, and `$denyallow=` lost the exclusion that kept a CDN reachable.
+ */
+const IGNORABLE_OPTIONS = new Set([
+  // Cannot be expressed in MV3; other options on the rule still apply.
+  'inline-script',
+  'inline-font',
+  // DNR matches case-sensitively by default, which is the narrower reading.
+  'match-case',
+  // Redirect-to-stub shorthands. We have no resource library, so the request
+  // is blocked instead of stubbed — same direction, never broader.
+  'empty',
+  'mp4',
+  // Widens to every resource type including the document. Ignoring it yields
+  // "all types except main_frame", which is narrower.
+  'all',
+]);
 
 let ruleIdCounter = 1;
 let exceptionIdCounter = 1000000;
@@ -407,7 +442,9 @@ function parseLine(line) {
 
   const options = parseOptions(optionsStr);
   if (options === null) {
-    return skip('unsupported-option-combo');
+    const offending = lastUnsupportedOption;
+    lastUnsupportedOption = null;
+    return skip(`unsupported-option: ${offending} — dropping the rule rather than shipping it broadened`);
   }
 
   if (isException && options.cosmeticScopeExceptions.length > 0) {
@@ -445,6 +482,9 @@ function parseLine(line) {
  * Downstream matching is by canonical name, so aliases must normalise rather
  * than pass through.
  */
+/** Set by `parseOptions` when it bails, so the skip reason can name the option. */
+let lastUnsupportedOption = null;
+
 const COSMETIC_SCOPE_OPTIONS = new Map([
   ['generichide', 'generichide'],
   ['ghide', 'generichide'],
@@ -521,8 +561,12 @@ function parseOptions(optionsStr) {
       // cosmetic exception rules at DNR priority 5.
       options.cosmeticScopeException = true;
       if (!negated) options.cosmeticScopeExceptions.push(COSMETIC_SCOPE_OPTIONS.get(optName));
+    } else if (!IGNORABLE_OPTIONS.has(optName)) {
+      // Fail closed. An option we do not understand may be the one that
+      // narrows the rule, so shipping the remainder over-blocks.
+      lastUnsupportedOption = optName;
+      return null;
     }
-    // Ignore unknown options silently (many are optional/metadata)
   }
 
   return options;

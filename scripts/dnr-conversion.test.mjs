@@ -183,6 +183,65 @@ test('cosmetic-scope aliases normalise to their canonical scope name', () => {
   assert.deepEqual(parseLine('@@||example.com^$shide').scopes, ['specifichide']);
 });
 
+// Unknown options were dropped and the remaining rule shipped anyway, which
+// makes the emitted rule *broader* than the filter author wrote. Every case
+// below was a live block rule before this suite.
+test('semantic modifiers we do not implement drop the whole rule', () => {
+  const cases = [
+    // Cancels a filter elsewhere in the corpus. Ignoring it instates the very
+    // rule it was written to remove.
+    '||example.com^$badfilter',
+    '@@||example.com^$badfilter',
+    // Bare $removeparam strips every query parameter. Ignoring it turned a
+    // parameter-hygiene rule into a hard block of the domain.
+    '||example.com^$removeparam',
+    // Carries an exclusion; ignoring it blocks the CDN the author protected.
+    '||example.com^$script,denyallow=cdn.example',
+    // Conditional on request/response shape; ignoring makes it unconditional.
+    '||example.com^$header=via',
+    '||example.com^$method=post',
+    '||example.com^$replace=/a/b/',
+    '||example.com^$to=tracker.example',
+    '||example.com^$permissions=geolocation',
+    '||example.com^$strict3p',
+  ];
+
+  for (const line of cases) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be skipped, not shipped broadened`);
+    assert.match(parsed.reason || '', /unsupported-option/, `${line} must say why`);
+  }
+});
+
+test('an unknown option drops the rule even alongside options we do understand', () => {
+  // The dangerous shape: the recognised half looks fine, so the rule shipped.
+  const parsed = parseLine('||example.com^$script,third-party,someFutureOption=1');
+  assert.equal(parsed.skip, true);
+});
+
+test('benign no-op options are still ignorable, keeping the rest of the rule', () => {
+  // Ignoring these cannot broaden the rule, so they must not cost us coverage.
+  assert.deepEqual(
+    convert('||ads.example.com^$script,inline-script'),
+    block({ urlFilter: '||ads.example.com^', resourceTypes: ['script'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example.com^$image,match-case'),
+    block({ urlFilter: '||ads.example.com^', resourceTypes: ['image'] }),
+  );
+});
+
+test('resource-type aliases are recognised rather than dropped', () => {
+  const expectType = (line, types) =>
+    assert.deepEqual(convert(line), block({ urlFilter: '||e.com^', resourceTypes: types }), line);
+
+  expectType('||e.com^$xhr', ['xmlhttprequest']);
+  expectType('||e.com^$css', ['stylesheet']);
+  expectType('||e.com^$frame', ['sub_frame']);
+  expectType('||e.com^$beacon', ['ping']);
+  expectType('||e.com^$object-subrequest', ['object']);
+});
+
 test('$csp exceptions are skipped, not converted to a network allow', () => {
   // $csp is not translated in either direction. Emitting an allow for the
   // exception form disables all network blocking on the domain.

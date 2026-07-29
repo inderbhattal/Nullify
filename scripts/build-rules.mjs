@@ -395,8 +395,14 @@ function parseLine(line) {
     optionsStr = rawRule.slice(dollarPos + 1);
   }
 
-  if (/(^|,)csp=/.test(optionsStr) && !isException) {
-    return skip('csp-modifier: Chrome MV3 DNR cannot inject CSP response headers via a block rule; needs modifyHeaders which we do not translate yet');
+  if (/(^|,)csp(=|,|$)/.test(optionsStr)) {
+    // Neither direction is translated. Skipping the block form is merely a
+    // parity gap; the exception form previously fell through to a network
+    // `allow`, which disabled all blocking on the domain instead of only
+    // relaxing CSP injection there.
+    return skip(isException
+      ? 'csp-exception: not translated; emitting a network allow would disable all blocking on the domain'
+      : 'csp-modifier: Chrome MV3 DNR cannot inject CSP response headers via a block rule; needs modifyHeaders which we do not translate yet');
   }
 
   const options = parseOptions(optionsStr);
@@ -427,6 +433,27 @@ function parseLine(line) {
     exception: isException,
   };
 }
+
+/**
+ * Options that scope *cosmetic* filtering, mapped to their canonical name.
+ *
+ * uBO accepts a short spelling for each, and the lists this project fetches
+ * use them heavily (unbreak.txt ships a whole `$ghide` section). Only the long
+ * forms were recognised, so the short ones fell through to the network path
+ * and became `allow` rules at a priority above every block — turning "do not
+ * apply generic cosmetics here" into "disable all blocking on this domain".
+ * Downstream matching is by canonical name, so aliases must normalise rather
+ * than pass through.
+ */
+const COSMETIC_SCOPE_OPTIONS = new Map([
+  ['generichide', 'generichide'],
+  ['ghide', 'generichide'],
+  ['elemhide', 'elemhide'],
+  ['ehide', 'elemhide'],
+  ['specifichide', 'specifichide'],
+  ['shide', 'specifichide'],
+  ['genericblock', 'genericblock'],
+]);
 
 /**
  * Parse option string into a structured options object.
@@ -488,12 +515,12 @@ function parseOptions(optionsStr) {
       // Manifest V3 can't block inline scripts.
       // We don't skip the rule, we just ignore this specific option
       // so other options in the same rule (like $script) still apply.
-    } else if (['genericblock', 'generichide', 'elemhide', 'specifichide'].includes(optName)) {
+    } else if (COSMETIC_SCOPE_OPTIONS.has(optName)) {
       // Cosmetic-scope exception hints — we no longer flip `important`
       // here. Setting the priority-bumped important flag used to mask real
       // cosmetic exception rules at DNR priority 5.
       options.cosmeticScopeException = true;
-      if (!negated) options.cosmeticScopeExceptions.push(optName);
+      if (!negated) options.cosmeticScopeExceptions.push(COSMETIC_SCOPE_OPTIONS.get(optName));
     }
     // Ignore unknown options silently (many are optional/metadata)
   }

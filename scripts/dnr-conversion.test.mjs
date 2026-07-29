@@ -157,3 +157,37 @@ test('$generichide is a cosmetic-scope exception, never a network allow', () => 
   assert.deepEqual(parsed.domains, ['example.com']);
   assert.deepEqual(parsed.scopes, ['generichide']);
 });
+
+// uBO's short spellings are used heavily by the lists this project fetches
+// (unbreak.txt has a whole $ghide section). They were absent from the
+// cosmetic-scope branch, so they fell through to networkFilterToDNR and became
+// `allow` at a priority above every block — turning "don't apply generic
+// cosmetics here" into "disable ad blocking on this domain entirely".
+test('short cosmetic-scope aliases are not network allows', () => {
+  for (const alias of ['ghide', 'ehide', 'shide']) {
+    const parsed = parseLine(`@@||example.com^$${alias}`);
+    assert.equal(
+      parsed.type,
+      'cosmetic-scope-exception',
+      `$${alias} must not produce a network rule`,
+    );
+    assert.deepEqual(parsed.domains, ['example.com']);
+  }
+});
+
+test('cosmetic-scope aliases normalise to their canonical scope name', () => {
+  // Downstream matching tests for 'generichide'/'elemhide' by name, so an
+  // alias that passes through raw would be silently ignored.
+  assert.deepEqual(parseLine('@@||example.com^$ghide').scopes, ['generichide']);
+  assert.deepEqual(parseLine('@@||example.com^$ehide').scopes, ['elemhide']);
+  assert.deepEqual(parseLine('@@||example.com^$shide').scopes, ['specifichide']);
+});
+
+test('$csp exceptions are skipped, not converted to a network allow', () => {
+  // $csp is not translated in either direction. Emitting an allow for the
+  // exception form disables all network blocking on the domain.
+  for (const line of ['@@||example.com^$csp', '@@||example.com^$csp=script-src']) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be skipped`);
+  }
+});

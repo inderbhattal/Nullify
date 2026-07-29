@@ -28,3 +28,32 @@ jobs:
 
       - name: Unit + harness tests
         run: npm test
+
+  # wasm-core is a third parser implementation alongside the build script and
+  # the service worker, and it has drifted from both. Its tests only ever ran
+  # locally, which is how ~domain, #@#+js() and the $important inversion
+  # survived there after the JS engines were fixed.
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            wasm-core/target
+          key: cargo-${{ hashFiles('wasm-core/Cargo.lock') }}
+
+      - name: Unit tests
+        run: cargo test --manifest-path wasm-core/Cargo.toml
+
+      - name: Clippy
+        run: cargo clippy --manifest-path wasm-core/Cargo.toml --all-targets

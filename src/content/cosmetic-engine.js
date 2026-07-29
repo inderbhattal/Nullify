@@ -498,6 +498,37 @@ export class CosmeticEngine {
     return results.length > 0;
   }
 
+  /**
+   * Does any descendant of `el` satisfy `arg`? Backs `:has()`, `:if()` and
+   * (negated) `:if-not()`, so the three cannot drift apart.
+   */
+  _hasDescendantMatch(el, arg) {
+    // Non-procedural argument: native check is enough.
+    if (!isProceduralSelector(arg)) {
+      try { return !!el.querySelector(arg); } catch { return false; }
+    }
+
+    // Procedural argument: only candidates matching the leading CSS step can
+    // match, so narrow before running the plan.
+    const plan = parseProceduralPlan(arg);
+    const first = plan[0];
+    let candidates = [];
+    try {
+      candidates = first?.type === 'css'
+        ? el.querySelectorAll(first.selector)
+        : el.querySelectorAll('*');
+    } catch (err) {
+      // A leading combinator (`> .x`) is not a valid querySelectorAll argument.
+      _reportError('Invalid :has() argument', err);
+      return false;
+    }
+
+    for (const cand of candidates) {
+      if (this._matchesProcedural(cand, { selector: arg, plan })) return true;
+    }
+    return false;
+  }
+
   _applyOp(el, op, arg, fullSelector) {
     return this._getCachedMatch(el, op, arg, () => {
       switch (op) {
@@ -598,27 +629,16 @@ export class CosmeticEngine {
           this._removeElement(el, fullSelector);
           return null;
 
-        case 'has': {
-          // If the argument is not procedural, we can use a fast native check
-          if (!isProceduralSelector(arg)) {
-            try { return el.querySelector(arg) ? el : null; } catch { return null; }
-          }
-          // For procedural :has(), we only need to check candidates that match the first CSS part
-          const plan = parseProceduralPlan(arg);
-          const first = plan[0];
-          let candidates = [];
-          if (first?.type === 'css') {
-            candidates = el.querySelectorAll(first.selector);
-          } else {
-            // No base CSS selector, must check all (rare for :has)
-            candidates = el.querySelectorAll('*');
-          }
-          
-          for (const cand of candidates) {
-            if (this._matchesProcedural(cand, { selector: arg, plan })) return el;
-          }
-          return null;
-        }
+        // uBO spells the legacy aliases `:if()` and `:if-not()`; they are
+        // exactly `:has()` and its negation. Both were tokenized by PROC_OPS
+        // but had no case here, so they hit `default` and reported a match
+        // unconditionally — hiding every element the base selector touched.
+        case 'has':
+        case 'if':
+          return this._hasDescendantMatch(el, arg) ? el : null;
+
+        case 'if-not':
+          return this._hasDescendantMatch(el, arg) ? null : el;
 
         case 'semantic': {
           // Skip semantic classification on article bodies — the WASM
@@ -673,7 +693,12 @@ export class CosmeticEngine {
           return this._matchesProcedural(el, arg) ? el : null;
 
         default:
-          return el;
+          // Fail closed. An operator the planner emits but this engine does not
+          // implement must not be read as "matched" — that turns a parity gap
+          // into an over-block that can blank a page. Under-blocking is the
+          // recoverable direction.
+          _reportError('Unimplemented procedural operator', new Error(op));
+          return null;
       }
     });
   }

@@ -44,15 +44,27 @@ pub struct BloomFilter {
     bitset: Vec<u32>,
 }
 
+/// Upper bound on a Bloom filter's bit count: 128 Mbit, i.e. a 16 MB bitset.
+///
+/// Far above any real use — the shipped filter is 256 Kbit — while keeping the
+/// word count well inside 32-bit arithmetic, so the size maths cannot overflow
+/// on wasm32 no matter what a stored payload declares.
+const MAX_BLOOM_BITS: usize = 1 << 27;
+
 #[wasm_bindgen]
 impl BloomFilter {
     #[wasm_bindgen(constructor)]
     pub fn new(size: usize, hashes: u8) -> Self {
-        // Clamp to non-zero: a zero size makes `add`/`has` divide by zero
-        // (`hash % size`) and a zero hash count makes membership meaningless.
-        let size = size.max(1);
+        // Clamp to a sane range. Zero makes `add`/`has` divide by zero
+        // (`hash % size`) and a zero hash count makes membership meaningless;
+        // an absurd upper value allocates hundreds of megabytes inside a
+        // service worker whose heap is small.
+        let size = size.clamp(1, MAX_BLOOM_BITS);
         let hashes = hashes.max(1);
-        let bitset_size = (size + 31) / 32;
+        // div_ceil, not `(size + 31) / 32`: on wasm32 `usize` is 32-bit and
+        // release builds wrap, so the old form folded a near-u32::MAX size
+        // down to a zero-length bitset that `has()` then indexed.
+        let bitset_size = size.div_ceil(32);
         Self {
             size,
             hashes,
@@ -110,8 +122,9 @@ impl BloomFilter {
         match serde_json::from_str::<SerializedBloom>(json) {
             Ok(s)
                 if s.size > 0
+                    && s.size <= MAX_BLOOM_BITS
                     && s.hashes > 0
-                    && s.data.len() == (s.size + 31) / 32 =>
+                    && s.data.len() == s.size.div_ceil(32) =>
             {
                 Self {
                     size: s.size,
@@ -2210,6 +2223,63 @@ mod tests {
         assert!(!short.has("anything"));
         let garbage = BloomFilter::deserialize_from_json("not json");
         assert!(!garbage.has("anything"));
+    }
+
+    #[test]
+    fn bloom_size_is_bounded_rather_than_allocated() {
+        // An absurd declared size must be clamped, not honoured. Unclamped,
+        // `new(u32::MAX, 4)` allocates a 134M-element Vec — half a gigabyte —
+        // inside a service worker with a small heap.
+        let filter = BloomFilter::new(u32::MAX as usize, 4);
+        assert!(
+            filter.bitset.len() <= MAX_BLOOM_BITS.div_ceil(32),
+            "bitset must be bounded, got {} words",
+            filter.bitset.len(),
+        );
+
+        // Clamping must stay self-consistent: whatever size survives, every
+        // bit index it produces has to be in range.
+        let mut bounded = BloomFilter::new(u32::MAX as usize, 4);
+        bounded.add("example.com");
+        assert!(bounded.has("example.com"));
+    }
+
+    #[test]
+    fn bloom_rejects_a_size_beyond_the_cap() {
+        // The wasm32 hazard: `usize` is 32-bit there and release builds wrap,
+        // so `(size + 31) / 32` folded u32::MAX to 0 and a payload with an
+        // empty `data` satisfied the length check — then `has()` indexed an
+        // empty Vec. A 64-bit host cannot reproduce the wrap, so guard the
+        // invariant that actually holds on both: a declared size past the cap
+        // is refused outright, whatever `data` claims.
+        let huge = format!("{{\"size\":{},\"hashes\":1,\"data\":[]}}", u32::MAX);
+        let filter = BloomFilter::deserialize_from_json(&huge);
+        assert!(!filter.has("anything"));
+        assert!(
+            filter.bitset.len() <= MAX_BLOOM_BITS.div_ceil(32),
+            "an over-cap payload must degrade to the safe fallback",
+        );
+    }
+
+    #[test]
+    fn bloom_word_count_is_computed_without_overflow() {
+        // Pins the reasoning that made the wasm32 bug possible, in u32 terms
+        // so it holds regardless of host pointer width.
+        assert_eq!(u32::MAX.wrapping_add(31) / 32, 0, "the old expression wraps to zero");
+        assert!(u32::MAX.div_ceil(32) > 0, "div_ceil cannot overflow");
+        for bits in [1u32, 31, 32, 33, 1024] {
+            assert_eq!(bits.div_ceil(32), (bits as u64).div_ceil(32) as u32);
+        }
+    }
+
+    #[test]
+    fn bloom_bitset_is_long_enough_for_the_declared_size() {
+        // Whatever clamping happens, every bit index has to be in range.
+        for size in [1usize, 31, 32, 33, 1024, 65_535] {
+            let mut filter = BloomFilter::new(size, 4);
+            filter.add("example.com");
+            assert!(filter.has("example.com"), "size {size} must round-trip");
+        }
     }
 
     #[test]

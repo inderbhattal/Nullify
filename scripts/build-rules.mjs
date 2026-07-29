@@ -1054,6 +1054,33 @@ function parseFilterList(text) {
   };
 }
 
+/** Action types that carve an exception out of some other rule. */
+const EXCEPTION_ACTION_TYPES = new Set(['allow', 'allowAllRequests']);
+
+/**
+ * Order rules so that every enabled prefix of shards is self-consistent.
+ *
+ * Filter lists put their `@@` exceptions after the blocks those exceptions
+ * carve out of, and sharding slices in array order — so all 578 EasyList
+ * exceptions landed in easylist_3.json, which the manifest ships disabled.
+ * Whenever only the leading shards were enabled (fresh install before
+ * applyRulesets completes, or the budget-constrained fallback path), the
+ * result was 50,000 live block rules with none of their false-positive
+ * escapes.
+ *
+ * Exceptions are a tiny fraction of any list, so hoisting them costs nothing.
+ * Partitioning rather than sorting keeps the operation stable, which keeps
+ * builds deterministic.
+ */
+function orderRulesForSharding(dnrRules) {
+  const exceptions = [];
+  const rest = [];
+  for (const rule of dnrRules) {
+    (EXCEPTION_ACTION_TYPES.has(rule.action?.type) ? exceptions : rest).push(rule);
+  }
+  return [...exceptions, ...rest];
+}
+
 /**
  * Convert parsed network rules to DNR rules, deduplicate, and return.
  * Populates `droppedRecords` with every rejection + dedup drop.
@@ -1883,9 +1910,11 @@ async function main() {
       });
       printSkipSummary(list.id, parsed.skippedRecords, droppedRecords, truncatedCount);
 
-      // Split and stage rules for a single final write.
+      // Split and stage rules for a single final write. Exceptions first —
+      // see orderRulesForSharding.
+      const shardable = orderRulesForSharding(dnrRules);
       for (let i = 0; i < config.parts; i++) {
-        const chunk = dnrRules.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
+        const chunk = shardable.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
         const suffix = i === 0 ? '' : `_${i + 1}`;
         rulesetOutputs[`${list.id}${suffix}.json`] = chunk;
         log(`✅ ${list.id}${suffix}.json — ${chunk.length} DNR rules staged`);
@@ -1938,7 +1967,7 @@ async function main() {
   log('\n🎉 Build complete!');
 }
 
-export { parseLine, networkFilterToDNR, buildSourceBundleFallback };
+export { parseLine, networkFilterToDNR, buildSourceBundleFallback, orderRulesForSharding };
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 

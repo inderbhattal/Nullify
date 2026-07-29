@@ -64,6 +64,7 @@ import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
+import { applyScriptletExceptions } from '../shared/filter-syntax.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
@@ -353,7 +354,10 @@ function buildSourceBundleFromParsed(parsed) {
 
   return {
     cosmetic,
-    scriptlets: dedupeScriptlets(parsed?.scriptletRules || []),
+    scriptlets: applyScriptletExceptions(
+      dedupeScriptlets(parsed?.scriptletRules || []),
+      parsed?.scriptletExceptions,
+    ),
   };
 }
 

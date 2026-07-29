@@ -15,17 +15,20 @@ import { parseLine, buildSourceBundleFallback } from './build-rules.mjs';
 function bundleFor(lines) {
   const cosmeticRules = [];
   const scriptletRules = [];
+  const scriptletExceptions = [];
 
   for (const line of lines) {
     const parsed = parseLine(line);
     if (parsed?.type === 'cosmetic') cosmeticRules.push(parsed);
     else if (parsed?.type === 'scriptlet') scriptletRules.push(parsed);
+    else if (parsed?.type === 'scriptlet-exception') scriptletExceptions.push(parsed);
   }
 
   return buildSourceBundleFallback({
     cosmeticRules,
     cosmeticExceptions: [],
     scriptletRules,
+    scriptletExceptions,
     genericCosmeticExceptionDomains: [],
   });
 }
@@ -85,6 +88,46 @@ test('rules without exclusions are unchanged', () => {
   assert.deepEqual(cosmetic.domainSpecific['example.com'], ['.ad']);
   assert.deepEqual(cosmetic.generic, ['.generic-ad']);
   assert.deepEqual(cosmetic.exceptions, {}, 'no spurious exceptions');
+});
+
+test('a scriptlet exception excludes that scriptlet on the excepted domain', () => {
+  // uAssets ships these to turn off a scriptlet that breaks one site while
+  // leaving it active everywhere else. Expressed as an exclusion on the rule,
+  // so the existing lookup filter cancels it.
+  const { scriptlets } = bundleFor([
+    '##+js(nowebrtc)',
+    'example.com#@#+js(nowebrtc)',
+  ]);
+
+  const rule = scriptlets.find((s) => s.name === 'nowebrtc');
+  assert.ok(rule, 'the scriptlet must still exist for other sites');
+  assert.deepEqual(rule.excludedDomains, ['example.com']);
+});
+
+test('a scriptlet exception only touches the scriptlet it names', () => {
+  const { scriptlets } = bundleFor([
+    '##+js(nowebrtc)',
+    '##+js(aopr, x)',
+    'example.com#@#+js(nowebrtc)',
+  ]);
+
+  assert.deepEqual(scriptlets.find((s) => s.name === 'nowebrtc').excludedDomains, ['example.com']);
+  assert.deepEqual(
+    scriptlets.find((s) => s.name === 'aopr').excludedDomains,
+    [],
+    'an unrelated scriptlet must be untouched',
+  );
+});
+
+test('a domain-less scriptlet exception disables the scriptlet entirely', () => {
+  const { scriptlets } = bundleFor([
+    '##+js(nowebrtc)',
+    '##+js(aopr, x)',
+    '#@#+js(nowebrtc)',
+  ]);
+
+  assert.equal(scriptlets.find((s) => s.name === 'nowebrtc'), undefined, 'must be removed');
+  assert.ok(scriptlets.find((s) => s.name === 'aopr'), 'others must survive');
 });
 
 test('scriptlet exclusions are carried on the stored rule', () => {

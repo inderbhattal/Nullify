@@ -21,7 +21,7 @@ import {
   CORE_FILTER_SOURCE,
   shouldSkipDomainCosmeticSelector,
 } from '../src/shared/core-filter-source.js';
-import { splitDomainList } from '../src/shared/filter-syntax.js';
+import { splitDomainList, applyScriptletExceptions } from '../src/shared/filter-syntax.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
@@ -372,6 +372,20 @@ function parseLine(line) {
 
   if (!line || line.startsWith('!') || line.startsWith('[')) return SKIP_SILENT;
   if (line.startsWith('@@#')) return SKIP_SILENT;
+
+  // Scriptlet exception: example.com#@#+js(name). Tested before the scriptlet
+  // branch — `#@#+js(` contains `#+js(`, so the ordinary scriptlet patterns
+  // would otherwise claim (or, for the `#@#` cosmetic branch below, mangle) it.
+  const scriptletExceptionMatch = line.match(/^([^#|/?^]*)#@#\+js\((.+)\)$/);
+  if (scriptletExceptionMatch) {
+    const [, domains, scriptletStr] = scriptletExceptionMatch;
+    const [name] = parseScriptletArgs(scriptletStr);
+    return {
+      type: 'scriptlet-exception',
+      ...splitDomainList(domains),
+      name: (name || '').trim(),
+    };
+  }
 
   const scriptletMatch = line.match(/^([^#|/?^]*)##\+js\((.+)\)$/) ||
                          line.match(/^([^#|/?^]*)#\+js\((.+)\)$/);
@@ -1020,6 +1034,7 @@ function parseFilterList(text) {
   const cosmeticExceptions = [];
   const genericCosmeticExceptionDomains = [];
   const scriptletRules = [];
+  const scriptletExceptions = [];
   const skippedRecords = []; // [{ reason, line }]
 
   for (const line of text.split('\n')) {
@@ -1042,6 +1057,8 @@ function parseFilterList(text) {
       else cosmeticRules.push(parsed);
     } else if (parsed.type === 'scriptlet') {
       scriptletRules.push(parsed);
+    } else if (parsed.type === 'scriptlet-exception') {
+      scriptletExceptions.push(parsed);
     }
   }
 
@@ -1051,6 +1068,7 @@ function parseFilterList(text) {
     cosmeticExceptions,
     genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
     scriptletRules,
+    scriptletExceptions,
     skippedRecords,
   };
 }
@@ -1187,7 +1205,7 @@ function buildSourceBundleFallback(parsed) {
 
   return {
     cosmetic: sourceCosmetic,
-    scriptlets: sourceScriptlets,
+    scriptlets: applyScriptletExceptions(sourceScriptlets, parsed.scriptletExceptions),
   };
 }
 

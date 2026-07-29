@@ -112,6 +112,42 @@ export const FILTER_VECTORS = [
     },
   },
 
+  // --- scriptlet exceptions -----------------------------------------------
+  // `#@#+js(...)` disables a scriptlet on a site. Every engine misparsed it,
+  // each differently: the runtime and build parsers produced a cosmetic
+  // exception whose "selector" was `+js(name)` and so matched nothing, while
+  // the Rust parser matched the `#+js(` substring inside `#@#+js(` and created
+  // an *active* scriptlet under the garbage domain "example.com#@". uAssets
+  // ships these to turn off scriptlets that break specific sites.
+  {
+    line: 'example.com#@#+js(nowebrtc)',
+    expect: {
+      kind: 'scriptlet-exception',
+      domains: ['example.com'],
+      excludedDomains: [],
+      name: 'nowebrtc',
+    },
+  },
+  {
+    line: 'example.com#@#+js(set, adsEnabled, false)',
+    expect: {
+      kind: 'scriptlet-exception',
+      domains: ['example.com'],
+      excludedDomains: [],
+      name: 'set',
+    },
+  },
+  {
+    // Domain-less form disables the scriptlet everywhere.
+    line: '#@#+js(nowebrtc)',
+    expect: {
+      kind: 'scriptlet-exception',
+      domains: [],
+      excludedDomains: [],
+      name: 'nowebrtc',
+    },
+  },
+
   // --- comments and blanks ------------------------------------------------
   { line: '! a comment', expect: { kind: 'skip' } },
   { line: '[Adblock Plus 2.0]', expect: { kind: 'skip' } },

@@ -41,6 +41,13 @@ function canonicalizeBuild(parsed) {
         name: parsed.name,
         args: parsed.args ?? [],
       };
+    case 'scriptlet-exception':
+      return {
+        kind: 'scriptlet-exception',
+        domains: parsed.domains ?? [],
+        excludedDomains: parsed.excludedDomains ?? [],
+        name: parsed.name,
+      };
     case 'network':
       return { kind: 'network' };
     default:

@@ -129,6 +129,23 @@ export function parseLine(line) {
     line.includes('#?#') || line.includes('#+js(') || line.includes('##+js(');
   if (!hasCosmeticSep) return null; // Network rule — skip
 
+  // Scriptlet exception: example.com#@#+js(name)
+  // Must be tested BEFORE the scriptlet branch: `#@#+js(` contains the
+  // substring `#+js(`, so a plain `includes` check claims it first and the
+  // line becomes a cosmetic exception whose selector is `+js(name)` — which
+  // matches no hide rule, so the scriptlet keeps running on a site the list
+  // explicitly excepted.
+  const scriptletExceptionMatch = line.match(/^([^#]*)#@#\+js\((.+)\)$/);
+  if (scriptletExceptionMatch) {
+    const [, domains, scriptletStr] = scriptletExceptionMatch;
+    const [name] = parseScriptletArgs(scriptletStr);
+    return {
+      type: 'scriptlet-exception',
+      ...splitDomainList(domains),
+      name: (name || '').trim(),
+    };
+  }
+
   // Scriptlet: example.com##+js(name, args)
   if (line.includes('##+js(') || line.includes('#+js(')) {
     const match = line.match(/^([^#]*)#(?:#\+js\(|\+js\()(.+)\)$/);
@@ -194,6 +211,7 @@ export function parseLine(line) {
 export function parseFilterList(text) {
   const cosmeticRules = [];
   const scriptletRules = [];
+  const scriptletExceptions = [];
   const genericCosmeticExceptionDomains = [];
 
   for (const line of text.split('\n')) {
@@ -201,6 +219,7 @@ export function parseFilterList(text) {
     if (!parsed) continue;
     if (parsed.type === 'cosmetic') cosmeticRules.push(parsed);
     else if (parsed.type === 'scriptlet') scriptletRules.push(parsed);
+    else if (parsed.type === 'scriptlet-exception') scriptletExceptions.push(parsed);
     else if (
       parsed.type === 'cosmetic-scope-exception' &&
       (parsed.scopes.includes('generichide') || parsed.scopes.includes('elemhide'))
@@ -212,6 +231,7 @@ export function parseFilterList(text) {
   return {
     cosmeticRules,
     scriptletRules,
+    scriptletExceptions,
     genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
   };
 }

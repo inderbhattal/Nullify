@@ -29,6 +29,103 @@
  * @returns {{domains: string[], excludedDomains: string[]}}
  */
 /**
+ * Preprocessor symbols that are true for this extension.
+ *
+ * Everything absent is false, including capabilities we genuinely lack —
+ * `cap_html_filtering` sections, for instance, carry `##^script:has-text(...)`
+ * rules that are meaningless under MV3 and become garbage selectors if pulled
+ * in. Defaulting unknown symbols to false under-includes, which is the
+ * recoverable direction.
+ */
+const PREPROCESSOR_DEFINES = new Set([
+  'env_chromium',
+  'env_chrome',
+  'env_mv3',
+  'cap_dnr',
+  'ublock',
+  'ext_ublock',
+]);
+
+/**
+ * Evaluate an `!#if` condition.
+ *
+ * Supports the grammar the filter lists actually use: symbols, `!`, `&&`,
+ * `||` and parentheses. The previous substring heuristic
+ *
+ *   condition.includes('env_chromium') || condition.includes('cap_dnr')
+ *     || !condition.includes('env_')
+ *
+ * got both directions wrong. `!#if !env_chromium` *contains* `env_chromium`,
+ * so Firefox-only sections were included on Chrome; and `!#if !env_mobile`
+ * contains `env_` without `env_chromium`, so desktop-applicable sections were
+ * excluded. Both forms are live in the uAssets lists this project fetches.
+ *
+ * Returns false for anything malformed — an unparsable condition must not
+ * silently pull a section in.
+ */
+export function evaluatePreprocessorCondition(condition, defines = PREPROCESSOR_DEFINES) {
+  const tokens = String(condition ?? '').match(/\(|\)|&&|\|\||!|[A-Za-z0-9_]+/g);
+  if (!tokens?.length) return false;
+
+  let pos = 0;
+  const peek = () => tokens[pos];
+  const consume = () => tokens[pos++];
+
+  // or := and ('||' and)*
+  const parseOr = () => {
+    let value = parseAnd();
+    while (peek() === '||') {
+      consume();
+      const right = parseAnd();
+      value = value || right;
+    }
+    return value;
+  };
+
+  // and := unary ('&&' unary)*
+  const parseAnd = () => {
+    let value = parseUnary();
+    while (peek() === '&&') {
+      consume();
+      const right = parseUnary();
+      value = value && right;
+    }
+    return value;
+  };
+
+  // unary := '!' unary | '(' or ')' | symbol
+  const parseUnary = () => {
+    const token = peek();
+    if (token === undefined) throw new Error('unexpected end of condition');
+
+    if (token === '!') {
+      consume();
+      return !parseUnary();
+    }
+    if (token === '(') {
+      consume();
+      const value = parseOr();
+      if (consume() !== ')') throw new Error('unbalanced parenthesis');
+      return value;
+    }
+    if (token === ')' || token === '&&' || token === '||') {
+      throw new Error(`unexpected token ${token}`);
+    }
+
+    consume();
+    return defines.has(token);
+  };
+
+  try {
+    const value = parseOr();
+    if (pos !== tokens.length) return false; // trailing junk
+    return value;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Apply `#@#+js(name)` exceptions to a set of scriptlet rules.
  *
  * A scriptlet exception disables one named scriptlet on the domains it lists —

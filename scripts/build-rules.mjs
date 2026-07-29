@@ -21,7 +21,11 @@ import {
   CORE_FILTER_SOURCE,
   shouldSkipDomainCosmeticSelector,
 } from '../src/shared/core-filter-source.js';
-import { splitDomainList, applyScriptletExceptions } from '../src/shared/filter-syntax.js';
+import {
+  splitDomainList,
+  applyScriptletExceptions,
+  evaluatePreprocessorCondition,
+} from '../src/shared/filter-syntax.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RULES_DIR = path.resolve(__dirname, '../rules');
@@ -193,12 +197,15 @@ async function fetchAndExpand(url, depth = 0, listId = null) {
     // 1. Handle conditionals
     if (trimmed.startsWith('!#if')) {
       const condition = trimmed.slice(4).trim();
-      // Simple logic: if it mentions 'chromium' or 'cap_dnr', it's true for us
-      const isTrue = condition.includes('env_chromium') || condition.includes('cap_dnr') || !condition.includes('env_');
+      const isTrue = evaluatePreprocessorCondition(condition);
       stack.push(isTrue && stack[stack.length - 1]);
       continue;
     }
     if (trimmed.startsWith('!#else')) {
+      // Guard the empty stack the way !#endif already does: a stray !#else
+      // would otherwise push `!undefined && undefined` — falsy — and silently
+      // drop the entire remainder of the list.
+      if (stack.length <= 1) continue;
       const prev = stack.pop();
       const parent = stack[stack.length - 1];
       stack.push(!prev && parent);

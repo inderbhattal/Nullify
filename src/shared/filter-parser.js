@@ -6,7 +6,7 @@
  * are compiled at build time and remain static.
  */
 
-import { splitDomainList } from './filter-syntax.js';
+import { splitDomainList, evaluatePreprocessorCondition } from './filter-syntax.js';
 
 /**
  * Parse scriptlet argument string, respecting quoted commas.
@@ -255,14 +255,16 @@ export async function fetchAndExpand(url, depth = 0) {
 
     if (trimmed.startsWith('!#if')) {
       const condition = trimmed.slice(4).trim();
-      const isTrue = condition.includes('env_chromium') ||
-        condition.includes('cap_dnr') ||
-        !condition.includes('env_');
+      const isTrue = evaluatePreprocessorCondition(condition);
       stack.push(isTrue && stack[stack.length - 1]);
       continue;
     }
 
     if (trimmed.startsWith('!#else')) {
+      // Guard the empty stack the way !#endif already does: a stray !#else
+      // would otherwise push `!undefined && undefined` — falsy — and silently
+      // drop the entire remainder of the list.
+      if (stack.length <= 1) continue;
       const prev = stack.pop();
       const parent = stack[stack.length - 1];
       stack.push(!prev && parent);

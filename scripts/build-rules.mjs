@@ -764,6 +764,18 @@ const SECURITY_LIST_RESOURCE_TYPES = [
 /** Lists whose rules block malicious hosts outright, so navigations must match. */
 const SECURITY_LIST_IDS = new Set(['malware']);
 
+/**
+ * DNR priority bands for statically compiled rules, lowest to highest.
+ * Runtime rules sit above all of these: the user allowlist uses 500 and
+ * system-unbreak 1000.
+ */
+const DNR_PRIORITY = {
+  BLOCK: 1,
+  ALLOW: 2,
+  IMPORTANT_BLOCK: 3,
+  IMPORTANT_ALLOW: 4,
+};
+
 function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (parsed.type !== 'network') return null;
 
@@ -906,9 +918,17 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
     action = { type: 'block' };
   }
 
-  let rulePriority = options.important ? 2 : 1;
+  // uBO ordering: a plain exception beats a plain block, but an $important
+  // block beats that exception — overriding exceptions is the whole point of
+  // $important, and the anti-circumvention lists depend on it. The previous
+  // scheme (block 1, important 2, exception 3) let the exception always win,
+  // so $important was inert. `allowAllRequests` from the user allowlist sits
+  // far above all of these at priority 500, and system-unbreak at 1000.
+  let rulePriority;
   if (exception) {
-    rulePriority = 3;
+    rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_ALLOW : DNR_PRIORITY.ALLOW;
+  } else {
+    rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_BLOCK : DNR_PRIORITY.BLOCK;
   }
 
   return {

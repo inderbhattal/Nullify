@@ -100,6 +100,26 @@ test('exceptions become allow rules that outrank plain blocks', () => {
   );
 });
 
+// Overriding an exception is the entire purpose of $important; the
+// anti-circumvention lists depend on it. Priorities were block 1, important 2,
+// exception 3 — so an exception always won and $important did nothing.
+test('$important ordering matches uBO: important block beats a plain exception', () => {
+  const plainBlock = convert('||ads.example.com^');
+  const plainAllow = convert('@@||ads.example.com^');
+  const importantBlock = convert('||ads.example.com^$important');
+  const importantAllow = convert('@@||ads.example.com^$important');
+
+  assert.ok(plainAllow.priority > plainBlock.priority, 'allow beats block');
+  assert.ok(importantBlock.priority > plainAllow.priority, 'important block beats allow');
+  assert.ok(
+    importantAllow.priority > importantBlock.priority,
+    'important allow beats important block',
+  );
+
+  assert.equal(importantBlock.action.type, 'block');
+  assert.equal(importantAllow.action.type, 'allow');
+});
+
 test('regex filters are emitted as regexFilter, not urlFilter', () => {
   assert.deepEqual(
     convert('/banner[0-9]+\\.gif/'),

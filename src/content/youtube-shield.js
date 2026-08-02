@@ -491,15 +491,43 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     } catch {}
   };
 
-  if (window.ytcfg?.set) {
-    const origSet = window.ytcfg.set;
-    window.ytcfg.set = function(cfg, ...args) {
-      if (cfg) poison(cfg);
-      return origSet.apply(this, [cfg, ...args]);
-    };
-    if (window.ytcfg.config_) poison(window.ytcfg.config_);
-  } else if (window.ytcfg?.config_) {
-    poison(window.ytcfg.config_);
+  const wrappedYtcfgSetters = new WeakSet();
+  const hookYtcfg = (cfg) => {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (typeof cfg.set === 'function' && !wrappedYtcfgSetters.has(cfg.set)) {
+      const origSet = cfg.set;
+      const wrappedSet = function(config, ...args) {
+        if (config) poison(config);
+        return origSet.apply(this, [config, ...args]);
+      };
+      wrappedYtcfgSetters.add(wrappedSet);
+      cfg.set = wrappedSet;
+    }
+    if (cfg.config_) poison(cfg.config_);
+  };
+
+  if (window.ytcfg) {
+    // Late-injection path (already-loaded tab): ytcfg exists — hook it now.
+    hookYtcfg(window.ytcfg);
+  } else {
+    // Fresh navigation: this script runs at document_start, before any page
+    // script has defined ytcfg, so checking window.ytcfg once here can never
+    // fire. Trap the assignment instead (same technique as shield() above):
+    // the moment YouTube's inline script assigns ytcfg we wrap .set and
+    // poison whatever config it already carries.
+    let _ytcfgValue;
+    Object.defineProperty(window, 'ytcfg', {
+      get: () => _ytcfgValue,
+      set: (v) => {
+        _ytcfgValue = v;
+        try {
+          hookYtcfg(v);
+        } catch {
+          // Never let poisoning failures break the page's ytcfg assignment.
+        }
+      },
+      configurable: true,
+    });
   }
 
   // 8. Zero-Latency Ad Skipper — MutationObserver reacts immediately when
@@ -731,4 +759,15 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   schedulePlayerPoll(true);
   window.addEventListener('yt-navigate-finish', () => schedulePlayerPoll(true));
   window.addEventListener('yt-page-data-updated', () => schedulePlayerPoll(true));
+
+  // Background tabs: the bounded chain above (~6.15 s total) can expire before
+  // a hidden tab ever constructs its player, and re-arming depended only on
+  // yt-navigate events — which focusing a tab does not fire. Re-arm the poll
+  // when the tab becomes visible and no player is hooked yet, so the DOM
+  // ad-skipper recovers instead of staying dead for the tab's lifetime.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !_observedPlayer) {
+      schedulePlayerPoll(true);
+    }
+  });
 })();

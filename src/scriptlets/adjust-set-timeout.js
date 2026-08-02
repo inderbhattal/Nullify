@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /** adjust-set-timeout.js — Adjust or multiply the delay of matching setTimeout calls. */
 export function adjustSetTimeout(pattern, delay, multiplier) {
   const re = pattern ? patternToRegex(pattern) : null;
@@ -12,9 +14,4 @@ export function adjustSetTimeout(pattern, delay, multiplier) {
     }
     return origSetTimeout.call(this, fn, ms, ...rest);
   };
-}
-
-function patternToRegex(p) {
-  if (p.startsWith('/') && p.endsWith('/')) return new RegExp(p.slice(1, -1));
-  return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 }

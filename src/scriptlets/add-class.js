@@ -1,7 +1,9 @@
 /** add-class.js — Add CSS classes to matching elements. */
-export function addClass(classNames, selector) {
+export function addClass(classNames, selector, behavior) {
   if (!classNames || !selector) return;
-  const classes = classNames.split(/\s+/);
+  // uBO separates multiple class tokens with `|`, not whitespace.
+  const classes = String(classNames).split(/\s*\|\s*/).filter(Boolean);
+  if (!classes.length) return;
   let rafId = null;
   const apply = () => {
     if (rafId) return;
@@ -13,5 +15,14 @@ export function addClass(classNames, selector) {
     });
   };
   apply();
-  new MutationObserver(apply).observe(document.documentElement, { childList: true, subtree: true });
+  const observer = new MutationObserver(apply);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  if (behavior !== 'stay') {
+    // uBO parity: without `stay`, stop observing once the page has loaded —
+    // an undisconnectable observer otherwise runs for the tab's lifetime.
+    window.addEventListener('load', () => {
+      apply();
+      observer.disconnect();
+    }, { once: true });
+  }
 }

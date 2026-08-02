@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /** prevent-add-event-listener.js — Block addEventListener calls matching a pattern. */
 export function preventAddEventListener(eventType, pattern) {
   const re = pattern ? patternToRegex(pattern) : null;
@@ -10,9 +12,4 @@ export function preventAddEventListener(eventType, pattern) {
     }
     return origAEL.call(this, type, fn, ...rest);
   };
-}
-
-function patternToRegex(p) {
-  if (p.startsWith('/') && p.endsWith('/')) return new RegExp(p.slice(1, -1));
-  return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 }

@@ -1,3 +1,5 @@
+import { ABORT_MESSAGE } from './shared-utils.js';
+
 /**
  * abort-on-property-write.js
  *
@@ -26,7 +28,7 @@ export function abortOnPropertyWrite(prop) {
     enumerable: descriptor?.enumerable ?? true,
     get: descriptor?.get ?? (() => descriptor?.value),
     set() {
-      throw new ReferenceError(`AdBlock: write to ${prop} denied`);
+      throw new ReferenceError(ABORT_MESSAGE);
     },
   });
 }

@@ -1,7 +1,9 @@
 /** remove-class.js — Remove CSS classes from matching elements. */
-export function removeClass(classNames, selector) {
+export function removeClass(classNames, selector, behavior) {
   if (!classNames) return;
-  const classes = classNames.split(/\s+/);
+  // uBO separates multiple class tokens with `|`, not whitespace.
+  const classes = String(classNames).split(/\s*\|\s*/).filter(Boolean);
+  if (!classes.length) return;
   const sel = selector || '.' + classes[0];
   let rafId = null;
   const apply = () => {
@@ -14,5 +16,14 @@ export function removeClass(classNames, selector) {
     });
   };
   apply();
-  new MutationObserver(apply).observe(document.documentElement, { childList: true, subtree: true });
+  const observer = new MutationObserver(apply);
+  observer.observe(document.documentElement, { childList: true, subtree: true });
+  if (behavior !== 'stay') {
+    // uBO parity: without `stay`, stop observing once the page has loaded —
+    // an undisconnectable observer otherwise runs for the tab's lifetime.
+    window.addEventListener('load', () => {
+      apply();
+      observer.disconnect();
+    }, { once: true });
+  }
 }

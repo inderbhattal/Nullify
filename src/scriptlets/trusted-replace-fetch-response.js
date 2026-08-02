@@ -8,12 +8,12 @@ import { toMatcher, toRegex } from './shared-utils.js';
  * a script and inspect its content.
  *
  * Usage:
- *   example.com##+js(trusted-replace-fetch-response, /adsbygoogle/, '', )
+ *   example.com##+js(trusted-replace-fetch-response, adPlacements, no_ads, player?)
  *
- * Args:
- *   1. URL pattern (string or /regex/) to match
- *   2. Text to find in the response body
- *   3. Replacement text (empty string = remove)
+ * Args (uBO order):
+ *   1. pattern      - Text or /regex/ to find in the response body
+ *   2. replacement  - Replacement text (empty string = remove)
+ *   3. propsToMatch - URL pattern (string or /regex/); empty = match all
  */
 const TEXT_LIKE_TYPES = new Set([
   'text/', 'application/javascript', 'application/json', 'application/xml',
@@ -28,10 +28,11 @@ function isTextLikeResponse(response) {
   return false;
 }
 
-export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = '') {
-  if (!urlPattern) return;
+export function trustedReplaceFetchResponse(pattern, replacement = '', propsToMatch = '') {
+  if (!pattern) return;
 
-  const matchUrl = toMatcher(urlPattern);
+  // An empty propsToMatch means every fetch is a candidate (uBO parity).
+  const matchUrl = propsToMatch ? toMatcher(propsToMatch) : () => true;
   const origFetch = window.fetch;
 
   window.fetch = async function (input, init) {
@@ -48,8 +49,8 @@ export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = ''
       if (length > 5 * 1024 * 1024) return response;
 
       const text = await response.text();
-      const findRe = toRegex(findStr);
-      const modified = findRe.test(text) ? text.replace(findRe, replaceStr) : text;
+      const findRe = toRegex(pattern);
+      const modified = findRe.test(text) ? text.replace(findRe, replacement) : text;
 
       // When returning a NEW response from text, we MUST strip encoding/length headers
       // because the new payload is raw text, not the original (likely compressed) byte-stream.
@@ -68,11 +69,12 @@ export function trustedReplaceFetchResponse(urlPattern, findStr, replaceStr = ''
   };
 }
 
-export function trustedReplaceXhrResponse(urlPattern, findStr, replaceStr = '') {
-  if (!urlPattern) return;
+export function trustedReplaceXhrResponse(pattern, replacement = '', propsToMatch = '') {
+  if (!pattern) return;
 
-  const matchUrl = toMatcher(urlPattern);
-  const findRe = toRegex(findStr);
+  // An empty propsToMatch means every request is a candidate (uBO parity).
+  const matchUrl = propsToMatch ? toMatcher(propsToMatch) : () => true;
+  const findRe = toRegex(pattern);
   const OrigXHR = window.XMLHttpRequest;
   const interceptedMap = new WeakMap();
 
@@ -95,7 +97,7 @@ export function trustedReplaceXhrResponse(urlPattern, findStr, replaceStr = '') 
         get() {
           const val = desc.get.call(this);
           if (interceptedMap.get(this) && typeof val === 'string') {
-            return val.replace(findRe, replaceStr);
+            return val.replace(findRe, replacement);
           }
           return val;
         },
@@ -108,4 +110,3 @@ export function trustedReplaceXhrResponse(urlPattern, findStr, replaceStr = '') 
     },
   });
 }
-

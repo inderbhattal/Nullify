@@ -54,32 +54,70 @@ function hasAllPaths(obj, paths) {
   return paths.every((path) => getByPath(obj, path) !== undefined);
 }
 
-function getByPath(obj, path) {
-  const parts = path.split('.');
-  let current = obj;
-  for (const part of parts) {
-    if (isProtoPollutionKey(part)) return undefined;
-    if (current == null || typeof current !== 'object') return undefined;
-    current = current[part];
+/**
+ * uBO wildcard segments: `[]`/`[-]` iterate array elements, `*` iterates own
+ * keys. Everything else is a literal key. The isProtoPollutionKey guard is
+ * applied per segment — including keys produced by a `*` expansion.
+ */
+function isArrayWildcard(part) {
+  return part === '[]' || part === '[-]';
+}
+
+function wildcardKeys(target, part) {
+  if (isArrayWildcard(part)) {
+    return Array.isArray(target) ? target.keys() : [];
   }
-  return current;
+  return Object.keys(target);
+}
+
+function getByPath(obj, path) {
+  return findByPath(obj, path.split('.'), 0);
+}
+
+function findByPath(current, parts, index) {
+  if (index === parts.length) return current;
+  if (current == null || typeof current !== 'object') return undefined;
+  const part = parts[index];
+  if (isProtoPollutionKey(part)) return undefined;
+  if (isArrayWildcard(part) || part === '*') {
+    // A wildcard path "exists" if any branch resolves to a defined value.
+    for (const key of wildcardKeys(current, part)) {
+      if (isProtoPollutionKey(String(key))) continue;
+      const found = findByPath(current[key], parts, index + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  return findByPath(current[part], parts, index + 1);
 }
 
 function pruneObject(obj, paths) {
   for (const path of paths) {
-    const parts = path.split('.');
-    const lastKey = parts[parts.length - 1];
-    if (isProtoPollutionKey(lastKey)) continue;
-
-    let target = obj;
-    for (let i = 0; i < parts.length - 1; i++) {
-      if (isProtoPollutionKey(parts[i])) { target = null; break; }
-      if (target == null || typeof target !== 'object') { target = null; break; }
-      target = target[parts[i]];
-    }
-
-    if (target && typeof target === 'object') {
-      delete target[lastKey];
-    }
+    prunePath(obj, path.split('.'), 0);
   }
+}
+
+function prunePath(target, parts, index) {
+  if (target == null || typeof target !== 'object') return;
+  const part = parts[index];
+  if (isProtoPollutionKey(part)) return;
+  const isLast = index === parts.length - 1;
+
+  if (isArrayWildcard(part) || part === '*') {
+    for (const key of [...wildcardKeys(target, part)]) {
+      if (isProtoPollutionKey(String(key))) continue;
+      if (isLast) delete target[key];
+      else prunePath(target[key], parts, index + 1);
+    }
+    // Deleting array indices leaves holes; a terminal `[]` means "drop the
+    // elements", so collapse the array too.
+    if (isLast && Array.isArray(target)) target.length = 0;
+    return;
+  }
+
+  if (isLast) {
+    delete target[part];
+    return;
+  }
+  prunePath(target[part], parts, index + 1);
 }

@@ -4,9 +4,15 @@
  * Adds small deterministic per-document noise to Canvas and Audio API outputs.
  * This is intentionally local and lazy: no service-worker chatter, no timers.
  */
+
+// Module-scope guard. A global flag was page-writable — one inline script
+// setting it disabled the scriptlet — and enumerable via Object.keys(window).
+// The bundle is one realm per frame, so a module variable suffices.
+let applied = false;
+
 export function fingerprintNoise() {
-  if (globalThis.__nullifyFingerprintNoiseApplied) return;
-  globalThis.__nullifyFingerprintNoiseApplied = true;
+  if (applied) return;
+  applied = true;
 
   const seedBuffer = new Uint32Array(1);
   crypto.getRandomValues(seedBuffer);

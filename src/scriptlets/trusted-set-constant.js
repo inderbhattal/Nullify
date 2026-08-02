@@ -30,8 +30,10 @@ export function trustedSetConstant(prop, value, _stack) {
   }
 
   try {
+    // configurable so a later rule on the same path can redefine it — locking
+    // the property made any second rule throw into a swallow.
     Object.defineProperty(obj, lastProp, {
-      configurable: false,
+      configurable: true,
       enumerable: true,
       get: () => resolvedValue,
       set: () => {},

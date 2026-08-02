@@ -1,3 +1,5 @@
+import { ABORT_MESSAGE } from './shared-utils.js';
+
 /**
  * abort-current-inline-script.js
  *
@@ -23,7 +25,11 @@ export function abortCurrentInlineScript(prop, search) {
     if (!obj) return;
   }
 
+  // Bind once, outside the descriptor. Binding inside the getter returned a
+  // fresh function on every read, so `Math.random !== Math.random` — a
+  // detection tell that also breaks identity caching in page code.
   const original = obj[lastProp];
+  const originalValue = typeof original === 'function' ? original.bind(obj) : original;
 
   Object.defineProperty(obj, lastProp, {
     configurable: true,
@@ -37,14 +43,16 @@ export function abortCurrentInlineScript(prop, search) {
       if (isInline || (currentScript && currentScript.textContent)) {
         const scriptText = currentScript?.textContent || stack;
         if (!re || re.test(scriptText)) {
-          throw new ReferenceError(`AdBlock: inline script accessing ${prop} aborted`);
+          throw new ReferenceError(ABORT_MESSAGE);
         }
       }
 
-      return typeof original === 'function' ? original.bind(obj) : original;
+      return originalValue;
     },
     set(v) {
-      obj[lastProp] = v;
+      // A plain `obj[lastProp] = v` re-enters this very setter and blows the
+      // stack. Redefining as a data property replaces the accessor instead.
+      Object.defineProperty(obj, lastProp, { configurable: true, writable: true, value: v });
     },
   });
 }

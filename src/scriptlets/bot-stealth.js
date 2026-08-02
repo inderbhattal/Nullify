@@ -37,8 +37,12 @@ function defineNavigatorValue(key, value) {
   defineGetter(navigator, key, () => value);
 }
 
+// Wrappers we installed. A WeakSet is invisible to the page, unlike the old
+// `__nullifyPatched` own property (`Object.keys(getParameter)` revealed it).
+const patchedGetParameters = new WeakSet();
+
 function patchWebGL(proto, gpu) {
-  if (!proto?.getParameter || proto.getParameter.__nullifyPatched) return;
+  if (!proto?.getParameter || patchedGetParameters.has(proto.getParameter)) return;
 
   const original = proto.getParameter;
   const wrapped = function(parameter) {
@@ -46,14 +50,18 @@ function patchWebGL(proto, gpu) {
     if (parameter === 37446) return gpu.renderer;
     return original.apply(this, arguments);
   };
-  wrapped.__nullifyPatched = true;
+  patchedGetParameters.add(wrapped);
   wrapped.toString = () => 'function getParameter() { [native code] }';
   proto.getParameter = wrapped;
 }
 
+// Module-scope guard. A global flag was page-writable — one inline script
+// setting it disabled the scriptlet — and enumerable via Object.keys(window).
+let applied = false;
+
 export function botStealth(personaId = 'default') {
-  if (globalThis.__nullifyBotStealthApplied) return;
-  globalThis.__nullifyBotStealthApplied = true;
+  if (applied) return;
+  applied = true;
 
   defineNavigatorValue('webdriver', false);
 

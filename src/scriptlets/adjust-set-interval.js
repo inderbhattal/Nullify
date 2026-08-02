@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /** adjust-set-interval.js — Adjust the delay of matching setInterval calls. */
 export function adjustSetInterval(pattern, delay, multiplier) {
   const re = pattern ? patternToRegex(pattern) : null;
@@ -12,9 +14,4 @@ export function adjustSetInterval(pattern, delay, multiplier) {
     }
     return origSetInterval.call(this, fn, ms, ...rest);
   };
-}
-
-function patternToRegex(p) {
-  if (p.startsWith('/') && p.endsWith('/')) return new RegExp(p.slice(1, -1));
-  return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 }

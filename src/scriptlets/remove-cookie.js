@@ -1,3 +1,5 @@
+import { patternToRegex } from './shared-utils.js';
+
 /** remove-cookie.js — Delete cookies matching a pattern. */
 export function removeCookie(pattern) {
   const re = pattern ? patternToRegex(pattern) : null;
@@ -12,10 +14,8 @@ export function removeCookie(pattern) {
   };
 
   removeAll();
+  // Intentionally never removed: the unload-time sweep catches cookies the
+  // page re-set after our initial pass (AdGuard's remove-cookie does the
+  // same), and the listener dies with the document — it is not a leak.
   window.addEventListener('beforeunload', removeAll);
-}
-
-function patternToRegex(p) {
-  if (p.startsWith('/') && p.endsWith('/')) return new RegExp(p.slice(1, -1));
-  return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 }

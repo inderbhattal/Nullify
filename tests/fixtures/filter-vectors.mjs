@@ -64,6 +64,33 @@ export const FILTER_VECTORS = [
     expect: { kind: 'scriptlet', domains: [], excludedDomains: [], name: 'nowebrtc', args: [] },
   },
 
+  // --- scriptlet argument quoting (§5.17) ---------------------------------
+  // Quote characters in an argument's interior are data and must survive;
+  // deleting them turns `div[id='ad']` into the different selector
+  // `div[id=ad]`. Only one *surrounding* quote pair is stripped, and a quoted
+  // comma does not split. The Rust engine mirrors these exact cases in
+  // wasm-core/src/lib.rs (`scriptlet_args_preserve_interior_quotes`).
+  {
+    line: "example.com##+js(set, div[id='ad'], x)",
+    expect: {
+      kind: 'scriptlet',
+      domains: ['example.com'],
+      excludedDomains: [],
+      name: 'set',
+      args: ["div[id='ad']", 'x'],
+    },
+  },
+  {
+    line: "example.com##+js(foo, 'a, b', c)",
+    expect: {
+      kind: 'scriptlet',
+      domains: ['example.com'],
+      excludedDomains: [],
+      name: 'foo',
+      args: ['a, b', 'c'],
+    },
+  },
+
   // --- ~domain exclusions -------------------------------------------------
   // Folding a `~` domain into `domains` inverts its meaning: the rule then
   // applies precisely where the author excluded it. The ancestor walk at

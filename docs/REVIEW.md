@@ -290,12 +290,11 @@ The UI layer is in good shape — `sender.id === chrome.runtime.id` is enforced 
 
 | Feature | Status |
 |---|---|
-| Element zapper | ✅ (`src/popup/popup.js:173-177`) |
-| Element picker | ✅ |
+| Element picker (launched from popup) | ✅ (`src/popup/popup.js:173-177`) — earlier revisions of this table called it a "zapper" |
 | Live logger | ✅ |
 | Custom filter import/export | ✅ |
 | Per-site allowlist | ✅ |
-| Settings import/export | ✅ |
+| Settings import/export | ❌ — filter and allowlist import/export exist; a full settings export does not (this row previously over-claimed ✅) |
 | Scriptlets (uBO parity) | Partial (~30 of ~80) |
 | Redirect resources | ❌ — see 4.5 |
 | `$denyallow`/`$badfilter`/`$csp`/`$header=` | ❌ — see 4.1, 4.2 |

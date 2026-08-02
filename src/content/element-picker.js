@@ -286,10 +286,25 @@ function deepQuerySelectorAll(selector, root = document) {
 }
 
 /**
+ * True when a selector matches only inside shadow roots: the picker's
+ * shadow-piercing preview shows hits, but a saved document-level CSS rule
+ * could never reach them — the rule would be dead on arrival (§5.30).
+ */
+export function isShadowOnlySelector(selector) {
+  try {
+    if (document.querySelectorAll(selector).length > 0) return false;
+    return deepQuerySelectorAll(selector).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
+ * Exported for tests.
  */
-function generateSelectors(el) {
+export function generateSelectors(el) {
   const candidates = [];
   const hostname = location.hostname.replace(/^www\./, '');
   const seen = new Set();
@@ -305,17 +320,22 @@ function generateSelectors(el) {
 
   // Check if we are inside a shadow DOM
   let root = el.getRootNode();
-  if (root instanceof ShadowRoot) {
+  if (typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot) {
     const host = root.host;
     const hostLabel = `Shadow Host <${host.tagName.toLowerCase()}>`;
-    
-    // Suggest host-level selectors first as they are the only way to hide 
-    // shadow content via global CSS.
+
+    // Host-level selectors are the only way to hide shadow content via
+    // global CSS — selectors built from the inner element would preview
+    // fine (the picker pierces shadow roots) and then persist as dead
+    // rules, so offer ONLY host-level candidates here (§5.30).
     if (host.id) add(`${hostLabel} ID`, `#${CSS.escape(host.id)}`);
     for (const cls of Array.from(host.classList).slice(0, 2)) {
       add(`${hostLabel} .${cls}`, `.${CSS.escape(cls)}`);
     }
     add(`${hostLabel} Tag`, host.tagName.toLowerCase());
+
+    candidates.sort((a, b) => selectorScore(b) - selectorScore(a));
+    return candidates;
   }
 
   // 1. By ID (most specific)
@@ -762,19 +782,30 @@ function buildCosmeticRule(selector, domain) {
 // ---------------------------------------------------------------------------
 // Save rule
 // ---------------------------------------------------------------------------
-async function savePickerRule(rule, selector, hostname, dialog) {
+export async function savePickerRule(rule, selector, hostname, dialog) {
   try {
-    // Add to user filters via message to service worker
-    const res = await chrome.runtime.sendMessage({ type: 'GET_USER_FILTERS' });
-    const existing = res?.filters || '';
-    const newFilters = existing
-      ? `${existing.trimEnd()}\n${rule}`
-      : rule;
+    // A rule that only matches inside shadow roots cannot be applied by
+    // document-level CSS — refuse clearly instead of reporting a success
+    // that evaporates on reload (§5.30).
+    if (isShadowOnlySelector(selector)) {
+      showErrorInDialog(dialog,
+        'This element is inside a shadow DOM that page-level rules cannot reach. ' +
+        'Pick the outer (shadow host) element instead.');
+      return;
+    }
 
-    await chrome.runtime.sendMessage({
-      type: 'SET_USER_FILTERS',
-      payload: { filters: newFilters },
+    // Single atomic append — reading the filter text and writing it back
+    // here races other writers (a second picker, the options page) and
+    // silently drops rules (§5.31). The SW serializes appends.
+    const res = await chrome.runtime.sendMessage({
+      type: 'APPEND_USER_FILTER',
+      payload: { line: rule },
     });
+
+    if (!res?.ok) {
+      showErrorInDialog(dialog, res?.error || 'Failed to save rule');
+      return;
+    }
 
     // Immediately hide elements on this page
     applyRuleImmediately(selector);

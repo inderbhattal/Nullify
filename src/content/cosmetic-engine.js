@@ -30,6 +30,10 @@ const ELEMENT_ATTR = '__adblock_hidden__';
 // Error tracking for content script diagnostics
 const _errorStats = { errors: 0, lastError: null, proceduralFailures: 0 };
 
+// A procedural rule that keeps throwing is disabled after this many failures
+// instead of being allowed to abort the run for every rule after it (§4.11).
+const MAX_PROC_RULE_FAILURES = 3;
+
 function _reportError(context, err) {
   _errorStats.errors++;
   _errorStats.lastError = { context, message: err?.message, timestamp: Date.now() };
@@ -98,7 +102,9 @@ function extractFirstOp(selector) {
         }
 
         const arg = selector.slice(argStart, j - 1);
-        const rest = selector.slice(j).trimStart();
+        // Keep `rest` raw — the leading whitespace (or lack of it) is what
+        // distinguishes a descendant continuation from a compound one (§4.12).
+        const rest = selector.slice(j);
         return { base, op, arg, rest };
       }
     }
@@ -139,7 +145,7 @@ function extractFirstOp(selector) {
         const base = selector.slice(0, idx).trimEnd();
         const op = pseudo.slice(1, -1); // 'has', 'not', etc.
         const arg = inner;
-        const rest = selector.slice(j).trimStart();
+        const rest = selector.slice(j); // raw — see above (§4.12)
         return { base, op, arg, rest };
       }
     }
@@ -153,31 +159,69 @@ function escapeRegex(s) {
 }
 
 /**
+ * Prefix `:scope` when a selector starts with a combinator, so it becomes a
+ * valid querySelector/querySelectorAll argument relative to an element —
+ * `querySelectorAll('> .label')` throws, `':scope > .label'` works (§4.11).
+ */
+function scopeLeadingCombinator(sel) {
+  return /^\s*[>+~]/.test(sel) ? `:scope ${sel.trim()}` : sel;
+}
+
+/** Strip a leading combinator from a selector fragment. */
+function stripLeadingCombinator(sel) {
+  return sel.replace(/^\s*[>+~]\s*/, '');
+}
+
+/** Compile a regex without letting a filter-list typo throw (§4.11). */
+function safeRegex(source, flags) {
+  try { return new RegExp(source, flags); } catch { return null; }
+}
+
+/**
+ * Build a css plan step, recording how the fragment attaches to the element
+ * produced by the previous step (§4.12):
+ *  - 'compound'   `:upward(1).cls`      — same element, checked with matches()
+ *  - 'child'      `:has-text(x) > span` — children, via `:scope > …`
+ *  - 'descendant' `:has-text(x) span`   — descendants, via `:scope …`
+ *  - 'sibling'    `+`/`~` continuations — unsupported, matches nothing
+ * The first step of a plan is an absolute selector; its kind is ignored.
+ */
+function makeCssStep(rawSelector) {
+  const trimmed = rawSelector.trim();
+  let kind = 'compound';
+  if (trimmed.startsWith('>')) kind = 'child';
+  else if (/^[+~]/.test(trimmed)) kind = 'sibling';
+  else if (/^\s/.test(rawSelector)) kind = 'descendant';
+  return { type: 'css', kind, selector: trimmed };
+}
+
+/**
  * Pre-parses a procedural selector into an execution plan (array of operations).
  * This avoids repeated string manipulation during DOM mutation scans.
+ * Exported for tests.
  */
-function parseProceduralPlan(selector) {
+export function parseProceduralPlan(selector) {
   const plan = [];
   let remaining = selector;
 
-  while (remaining) {
+  while (remaining && remaining.trim()) {
     const firstOp = extractFirstOp(remaining);
     if (!firstOp) {
       // Remaining part is plain CSS
-      plan.push({ type: 'css', selector: remaining.trim() });
+      plan.push(makeCssStep(remaining));
       break;
     }
-    
+
     // Add base CSS if present
     if (firstOp.base) {
-      plan.push({ type: 'css', selector: firstOp.base });
+      plan.push(makeCssStep(firstOp.base));
     }
-    
+
     // Add the operator
     plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
     remaining = firstOp.rest;
   }
-  
+
   return plan;
 }
 
@@ -199,9 +243,19 @@ export class CosmeticEngine {
     this._selectorHits = new Map(); // selector -> { count, action }
     this._hideQueue = new Set();    // elements pending hide
     this._removeQueue = new Set();  // elements pending physical removal
-    this._matchCache = new Map();   // selector -> WeakMap(el -> bool)
+    this._matchCache = new Map();   // `op|arg` -> WeakMap(el -> result)
     this._cacheAccessOrder = [];    // LRU tracking: most recently accessed keys
     this._cacheAccessLimit = 500;   // Max cache entries before eviction
+    // :semantic() verdicts are keyed by text, not element, so they get their
+    // own LRU map — mixing booleans into `_matchCache` type-confuses the op
+    // WeakMaps and dodges eviction (§5.24).
+    this._semanticCache = new Map(); // text prefix -> boolean verdict
+    // Synchronous dedupe markers — the rAF flush that stamps ELEMENT_ATTR
+    // never runs in hidden tabs, so counters must not depend on it (§5.27).
+    this._hiddenElements = new WeakSet();
+    this._removedElements = new WeakSet();
+    this._hasTextRules = false;     // any rule reads textContent (§5.28)
+    this._lastHref = null;          // URL seen by the last procedural run (§5.29)
     // Subtree roots mutated since the last procedural run. A match-cache
     // entry for element `e` is trusted iff none of the last-run's dirty
     // roots equal `e` or contain it. Bumps per scheduled run.
@@ -238,7 +292,16 @@ export class CosmeticEngine {
       if (exceptions.has(selector)) continue; // user excepted this selector
       
       if (isPreParsed) {
-        this._proceduralRules.push(rule);
+        // WASM-emitted plans trim the whitespace that distinguishes a
+        // descendant continuation from a compound one (§4.12). Re-plan
+        // locally whenever a css step follows an op so the continuation
+        // kind is recovered from the original selector string.
+        const needsReplan = Array.isArray(rule.plan) && rule.plan.some(
+          (step, i) => i > 0 && step.type === 'css' && rule.plan[i - 1].type === 'op'
+        );
+        this._proceduralRules.push(
+          needsReplan ? { ...rule, plan: parseProceduralPlan(selector) } : rule
+        );
         continue;
       }
 
@@ -271,6 +334,12 @@ export class CosmeticEngine {
 
     this._cssSelectors = cssSelectors;
     this._exceptions = exceptions;
+
+    // Only pay for characterData observation when a rule can read text (§5.28).
+    this._hasTextRules = this._proceduralRules.some((rule) =>
+      (rule.plan || []).some((step) =>
+        step.type === 'op' &&
+        (step.op === 'has-text' || step.op === 'min-text-length' || step.op === 'semantic')));
 
     // Only inject extra CSS if we have site-specific or user rules AND not in procedural mode.
     if (!proceduralOnly && cssSelectors.length > 0) this._injectCSS(cssSelectors);
@@ -331,8 +400,40 @@ export class CosmeticEngine {
   // ---------------------------------------------------------------------------
 
   _applyAllProcedural() {
+    // :matches-path verdicts are a function of the URL. Drop them whenever an
+    // SPA navigation (pushState/replaceState/popstate) changed it since the
+    // previous run — the elements themselves never become dirty (§5.29).
+    const href = typeof location !== 'undefined' ? location.href : '';
+    if (href !== this._lastHref) {
+      this._lastHref = href;
+      let dropped = false;
+      for (const key of [...this._matchCache.keys()]) {
+        if (key.startsWith('matches-path|')) {
+          this._matchCache.delete(key);
+          dropped = true;
+        }
+      }
+      if (dropped) {
+        this._cacheAccessOrder = this._cacheAccessOrder.filter((k) => this._matchCache.has(k));
+      }
+    }
+
     for (const rule of this._proceduralRules) {
-      this._applyProcedural(rule);
+      if (rule.disabled) continue;
+      // Per-rule isolation: one bad rule must not abort the run — or, during
+      // init(), kill the engine before the observer ever starts (§4.11).
+      try {
+        this._applyProcedural(rule);
+      } catch (err) {
+        _errorStats.proceduralFailures++;
+        rule.failures = (rule.failures || 0) + 1;
+        if (rule.failures >= MAX_PROC_RULE_FAILURES) {
+          rule.disabled = true;
+          _reportError(`Disabled procedural rule after ${rule.failures} failures: ${rule.selector}`, err);
+        } else {
+          _reportError(`Procedural rule failed: ${rule.selector}`, err);
+        }
+      }
     }
   }
 
@@ -387,13 +488,20 @@ export class CosmeticEngine {
         this._runPlanOnElement(result, nextSteps, fullSelector);
       }
     } else if (step.type === 'css') {
-      // CSS sub-selector: match within or against el
+      // Continuation semantics depend on how the fragment was attached
+      // (§4.12): a compound continuation (`:upward(1).cls`) narrows the
+      // current element, while child/descendant ones (`> span`, ` span`)
+      // walk into its subtree via :scope.
       try {
-        if (el.matches?.(step.selector)) {
+        if (step.kind === 'child' || step.kind === 'descendant') {
+          for (const child of el.querySelectorAll(`:scope ${step.selector}`)) {
+            this._runPlanOnElement(child, nextSteps, fullSelector);
+          }
+        } else if (step.kind === 'sibling') {
+          // Sibling continuations after a procedural op are unsupported —
+          // match nothing rather than guess (fail closed).
+        } else if (el.matches?.(step.selector)) {
           this._runPlanOnElement(el, nextSteps, fullSelector);
-        }
-        for (const child of el.querySelectorAll(step.selector)) {
-          this._runPlanOnElement(child, nextSteps, fullSelector);
         }
       } catch { /* invalid selector */ }
     }
@@ -466,6 +574,29 @@ export class CosmeticEngine {
     return false;
   }
 
+  /**
+   * Text-keyed :semantic() verdicts live in their own LRU map so boolean
+   * values can never collide with the op cache's WeakMaps, and so they are
+   * subject to eviction like everything else (§5.24).
+   */
+  _getSemanticVerdict(key) {
+    if (!this._semanticCache.has(key)) return undefined;
+    const verdict = this._semanticCache.get(key);
+    // Refresh LRU position (Map iteration order is insertion order)
+    this._semanticCache.delete(key);
+    this._semanticCache.set(key, verdict);
+    return verdict;
+  }
+
+  _setSemanticVerdict(key, verdict) {
+    this._semanticCache.delete(key);
+    this._semanticCache.set(key, verdict);
+    if (this._semanticCache.size > this._cacheAccessLimit) {
+      const oldest = this._semanticCache.keys().next().value;
+      this._semanticCache.delete(oldest);
+    }
+  }
+
   /** Check if an element matches a procedural selector plan (used by :has, :not, etc). */
   _matchesProcedural(el, proceduralSelector) {
     const isPreParsed = typeof proceduralSelector === 'object' && proceduralSelector.plan;
@@ -482,12 +613,28 @@ export class CosmeticEngine {
           const r = this._applyOp(res, step.op, step.arg, proceduralSelector);
           if (r) nextResults.push(r);
         } else if (step.type === 'css') {
-          if (res.matches?.(step.selector)) nextResults.push(res);
-          // Only search children for the very first step if it's a CSS selector
           if (step === plan[0]) {
-            for (const child of res.querySelectorAll(step.selector)) {
-              nextResults.push(child);
-            }
+            // Entry step: the caller anchored the candidate (e.g. the :has()
+            // candidate query), so any leading combinator is already applied.
+            const sel = stripLeadingCombinator(step.selector);
+            try {
+              if (res.matches?.(sel)) nextResults.push(res);
+              // Only search children for the very first step
+              for (const child of res.querySelectorAll(sel)) {
+                nextResults.push(child);
+              }
+            } catch { /* invalid selector */ }
+          } else if (step.kind === 'child' || step.kind === 'descendant') {
+            try {
+              for (const child of res.querySelectorAll(`:scope ${step.selector}`)) {
+                nextResults.push(child);
+              }
+            } catch { /* invalid selector */ }
+          } else if (step.kind !== 'sibling') {
+            // Compound continuation — same element (§4.12).
+            try {
+              if (res.matches?.(step.selector)) nextResults.push(res);
+            } catch { /* invalid selector */ }
           }
         }
       }
@@ -503,9 +650,10 @@ export class CosmeticEngine {
    * (negated) `:if-not()`, so the three cannot drift apart.
    */
   _hasDescendantMatch(el, arg) {
-    // Non-procedural argument: native check is enough.
+    // Non-procedural argument: native check is enough. Leading combinators
+    // (`:has(> .label)`) are rewritten as `:scope > .label` (§4.11).
     if (!isProceduralSelector(arg)) {
-      try { return !!el.querySelector(arg); } catch { return false; }
+      try { return !!el.querySelector(scopeLeadingCombinator(arg)); } catch { return false; }
     }
 
     // Procedural argument: only candidates matching the leading CSS step can
@@ -515,10 +663,9 @@ export class CosmeticEngine {
     let candidates = [];
     try {
       candidates = first?.type === 'css'
-        ? el.querySelectorAll(first.selector)
+        ? el.querySelectorAll(scopeLeadingCombinator(first.selector))
         : el.querySelectorAll('*');
     } catch (err) {
-      // A leading combinator (`> .x`) is not a valid querySelectorAll argument.
       _reportError('Invalid :has() argument', err);
       return false;
     }
@@ -552,11 +699,12 @@ export class CosmeticEngine {
           let pattern;
           if (arg.startsWith('/')) {
             const lastSlash = arg.lastIndexOf('/');
-            pattern = new RegExp(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
+            pattern = safeRegex(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
           } else {
-            pattern = new RegExp(escapeRegex(arg), 'i');
+            pattern = safeRegex(escapeRegex(arg), 'i');
           }
-          return pattern.test(el.textContent) ? el : null;
+          // An invalid regex literal from a list typo must not throw (§4.11).
+          return pattern && pattern.test(el.textContent) ? el : null;
         }
 
         case 'min-text-length': {
@@ -576,8 +724,8 @@ export class CosmeticEngine {
           const computed = getComputedStyle(el, pseudo).getPropertyValue(prop).trim();
           if (val.startsWith('/')) {
             const lastSlash = val.lastIndexOf('/');
-            const re = new RegExp(val.slice(1, lastSlash), val.slice(lastSlash + 1));
-            return re.test(computed) ? el : null;
+            const re = safeRegex(val.slice(1, lastSlash), val.slice(lastSlash + 1));
+            return re && re.test(computed) ? el : null;
           }
           return computed === val ? el : null;
         }
@@ -586,8 +734,8 @@ export class CosmeticEngine {
           const path = location.pathname + location.search;
           if (arg.startsWith('/')) {
             const lastSlash = arg.lastIndexOf('/');
-            const re = new RegExp(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
-            return re.test(path) ? el : null;
+            const re = safeRegex(arg.slice(1, lastSlash), arg.slice(lastSlash + 1) || 'i');
+            return re && re.test(path) ? el : null;
           }
           return path.includes(arg) ? el : null;
         }
@@ -600,8 +748,8 @@ export class CosmeticEngine {
           if (actual === null) return null;
           if (val.startsWith('/')) {
             const lastSlash = val.lastIndexOf('/');
-            const re = new RegExp(val.slice(1, lastSlash), val.slice(lastSlash + 1) || 'i');
-            return re.test(actual) ? el : null;
+            const re = safeRegex(val.slice(1, lastSlash), val.slice(lastSlash + 1) || 'i');
+            return re && re.test(actual) ? el : null;
           }
           return actual === val ? el : null;
         }
@@ -664,9 +812,10 @@ export class CosmeticEngine {
           }
           if (!text || text.length < 3) return null;
 
-          // Use cache to avoid redundant messages
-          const cacheKey = `semantic|${text.slice(0, 100)}`;
-          const cached = this._matchCache.get(cacheKey);
+          // Use the dedicated verdict cache to avoid redundant messages —
+          // never `_matchCache`, whose values are op WeakMaps (§5.24).
+          const cacheKey = text.slice(0, 100);
+          const cached = this._getSemanticVerdict(cacheKey);
           if (cached !== undefined) return cached ? el : null;
 
           // Perform async check
@@ -675,10 +824,10 @@ export class CosmeticEngine {
             payload: { text }
           }).then(res => {
             if (res && res.isAd) {
-              this._matchCache.set(cacheKey, true);
+              this._setSemanticVerdict(cacheKey, true);
               this._removeElement(el, fullSelector);
             } else {
-              this._matchCache.set(cacheKey, false);
+              this._setSemanticVerdict(cacheKey, false);
             }
           }).catch(() => {});
 
@@ -737,31 +886,40 @@ export class CosmeticEngine {
   // ---------------------------------------------------------------------------
 
   _detectWatchAttrRules() {
-    const attrMap = new Map(); // attr → Set of selectors to re-evaluate
+    const watchedAttrs = new Set();
 
     for (const rule of this._proceduralRules) {
-      const parsed = extractFirstOp(rule.selector);
-      if (parsed?.op !== 'watch-attr') continue;
-
-      const attrs = parsed.arg.split(',').map((a) => a.trim()).filter(Boolean);
-      const baseSelector = parsed.base;
-
-      for (const attr of attrs) {
-        if (!attrMap.has(attr)) attrMap.set(attr, new Set());
-        attrMap.get(attr).add(baseSelector || '*');
+      // A :watch-attr() step can sit anywhere in the chain, not just first —
+      // `[data-x]:watch-attr(data-x):matches-attr(…)` must install the
+      // observer too (§4.29).
+      const steps = Array.isArray(rule.plan) ? rule.plan : parseProceduralPlan(rule.selector);
+      const attrs = [];
+      for (const step of steps) {
+        if (step.type !== 'op' || step.op !== 'watch-attr') continue;
+        for (const attr of step.arg.split(',').map((a) => a.trim()).filter(Boolean)) {
+          attrs.push(attr);
+          watchedAttrs.add(attr);
+        }
       }
-      this._watchAttrRules.push({ base: parsed.base, attrs, rest: parsed.rest, fullSelector: rule.selector });
+      if (attrs.length > 0) {
+        this._watchAttrRules.push({ attrs, fullSelector: rule.selector });
+      }
     }
 
-    if (attrMap.size === 0) return;
+    if (watchedAttrs.size === 0) return;
 
-    const allAttrs = [...attrMap.keys()];
-    this._attrObserver = new MutationObserver(() => {
+    this._attrObserver = new MutationObserver((mutations) => {
+      // Record mutated elements as dirty roots so `_getCachedMatch` recomputes
+      // them — without this the cache serves the pre-change verdict and
+      // :watch-attr() never has any effect (§4.29).
+      for (const mutation of mutations) {
+        if (mutation.target?.nodeType === 1) this._dirtyRoots.add(mutation.target);
+      }
       this._scheduleProceduralRun();
     });
     this._attrObserver.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: allAttrs,
+      attributeFilter: [...watchedAttrs],
       subtree: true,
     });
   }
@@ -783,6 +941,15 @@ export class CosmeticEngine {
       let needsProcedural = false;
 
       for (const mutation of mutations) {
+        if (mutation.type === 'characterData') {
+          // Frameworks update text nodes in place, producing no childList
+          // mutation — dirty the parent element so text-matching verdicts
+          // are recomputed (§5.28).
+          needsProcedural = true;
+          const parent = mutation.target?.parentElement;
+          if (parent) this._dirtyRoots.add(parent);
+          continue;
+        }
         if (mutation.addedNodes.length > 0) {
           needsProcedural = true;
           // Record the mutation target — any descendant of this node is
@@ -795,10 +962,17 @@ export class CosmeticEngine {
         }
       }
 
-      // If dirty roots exceed cap, force immediate procedural run to prevent memory growth
+      // Too many dirty roots to track individually. Never discard the
+      // invalidation data (§5.25): drop the whole match cache instead so the
+      // next run re-evaluates everything, and let the normal debounced run
+      // pick it up — a synchronous full scan inside the observer callback
+      // would jank the page.
       if (this._dirtyRoots.size >= DIRTY_ROOTS_CAP) {
-        this._applyAllProcedural();
         this._dirtyRoots.clear();
+        this._lastDirtyRoots = [];
+        this._matchCache.clear();
+        this._cacheAccessOrder = [];
+        this._scheduleProceduralRun();
         return;
       }
 
@@ -810,6 +984,9 @@ export class CosmeticEngine {
     this._observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
+      // Gated: text-node observation is only worth paying for when a rule
+      // can actually read text (§5.28).
+      characterData: this._hasTextRules,
     });
   }
 
@@ -859,9 +1036,16 @@ export class CosmeticEngine {
   // ---------------------------------------------------------------------------
 
   _hideElement(el, selector = 'unknown') {
-    if (!el || el.getAttribute(ELEMENT_ATTR)) return;
+    if (!el || this._hiddenElements.has(el) || el.getAttribute?.(ELEMENT_ATTR)) return;
+    // Never blanket-hide the page scaffolding — an op-first plan such as
+    // `##:has-text(x)` seeds document.documentElement, and hiding it blanks
+    // the entire page (§5.26).
+    if (el === document.documentElement || el === document.head || el === document.body) return;
     if (this._exceptions.has(el.className) || this._isExcepted(el)) return;
-    
+
+    // Mark synchronously: the rAF flush that stamps ELEMENT_ATTR never runs
+    // in hidden tabs, so dedupe must not wait for it (§5.27).
+    this._hiddenElements.add(el);
     this._hideQueue.add(el);
     this._hiddenCount++;
     
@@ -874,9 +1058,12 @@ export class CosmeticEngine {
   }
 
   _removeElement(el, selector = 'unknown') {
-    if (!el || !el.parentElement) return;
+    if (!el || !el.parentElement || this._removedElements.has(el)) return;
+    if (el === document.documentElement || el === document.head || el === document.body) return;
     if (this._exceptions.has(el.className) || this._isExcepted(el)) return;
 
+    // Synchronous dedupe marker — see _hideElement (§5.27).
+    this._removedElements.add(el);
     this._removeQueue.add(el);
     this._hiddenCount++;
     

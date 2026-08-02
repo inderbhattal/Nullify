@@ -53,37 +53,54 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
   const calls = new CallLog();
 
   // ---- chrome.storage ----
+  // Mirrors Chrome's dual API: promise-based when no callback is passed,
+  // callback-based (invoked async) when one is — src/shared/storage.js uses
+  // the callback form, the service worker's storage.session usage the
+  // promise form.
   const storageArea = (initial = {}) => {
     let data = { ...initial };
+    const withCallback = (result, cb) => {
+      if (typeof cb === 'function') {
+        queueMicrotask(() => cb(result));
+        return undefined;
+      }
+      return Promise.resolve(result);
+    };
     return {
-      get: async (keys) => {
+      get: (keys, cb) => {
         calls.push({ api: 'storage.get', keys });
-        if (keys == null) return { ...data };
-        if (typeof keys === 'string') return { [keys]: data[keys] };
-        if (Array.isArray(keys)) {
-          const out = {};
+        let out;
+        if (keys == null) out = { ...data };
+        else if (typeof keys === 'string') out = { [keys]: data[keys] };
+        else if (Array.isArray(keys)) {
+          out = {};
           for (const k of keys) out[k] = data[k];
-          return out;
+        } else {
+          // object form: keys = { foo: defaultValue }
+          out = {};
+          for (const [k, def] of Object.entries(keys)) {
+            out[k] = k in data ? data[k] : def;
+          }
         }
-        // object form: keys = { foo: defaultValue }
-        const out = {};
-        for (const [k, def] of Object.entries(keys)) {
-          out[k] = k in data ? data[k] : def;
-        }
-        return out;
+        return withCallback(out, cb);
       },
-      set: async (entries) => {
+      set: (entries, cb) => {
         calls.push({ api: 'storage.set', entries });
-        Object.assign(data, entries);
+        // Clone like real chrome.storage does — storing live references lets
+        // later in-memory mutations silently rewrite "persisted" state.
+        Object.assign(data, structuredClone(entries));
+        return withCallback(undefined, cb);
       },
-      remove: async (keys) => {
+      remove: (keys, cb) => {
         calls.push({ api: 'storage.remove', keys });
         const list = Array.isArray(keys) ? keys : [keys];
         for (const k of list) delete data[k];
+        return withCallback(undefined, cb);
       },
-      clear: async () => {
+      clear: (cb) => {
         calls.push({ api: 'storage.clear' });
         data = {};
+        return withCallback(undefined, cb);
       },
       _data: () => data,
     };
@@ -100,13 +117,38 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     },
     async updateDynamicRules({ removeRuleIds = [], addRules = [] } = {}) {
       calls.push({ api: 'dnr.updateDynamicRules', removeRuleIds, addRuleCount: addRules.length });
-      for (const id of removeRuleIds) dnr._dynamic.delete(id);
+      // Chrome-parity validation (REVIEW-2026-07 §4.15): updateDynamicRules is
+      // all-or-nothing and rejects the ENTIRE batch when any rule has a
+      // non-ASCII urlFilter or an RE2-incompatible regexFilter. Validate
+      // BEFORE mutating so a rejected batch leaves state untouched, like
+      // Chrome does.
       for (const rule of addRules) {
-        if (dnr._dynamic.has(rule.id)) {
+        const condition = rule.condition || {};
+        if (typeof condition.urlFilter === 'string' && !/^[\x00-\x7F]*$/.test(condition.urlFilter)) {
+          throw new Error(`Rule with id ${rule.id} has an invalid non-ascii urlFilter`);
+        }
+        if (typeof condition.regexFilter === 'string' && /\(\?<?[=!]/.test(condition.regexFilter)) {
+          throw new Error(`Rule with id ${rule.id} has an unsupported regexFilter (RE2)`);
+        }
+      }
+      // Removals apply before additions (Chrome semantics), so re-adding an
+      // id listed in removeRuleIds within the same call is legal.
+      const removed = new Set(removeRuleIds);
+      const seen = new Set();
+      for (const rule of addRules) {
+        if (seen.has(rule.id) || (dnr._dynamic.has(rule.id) && !removed.has(rule.id))) {
           throw new Error(`Duplicate rule id ${rule.id}`);
         }
-        dnr._dynamic.set(rule.id, rule);
+        seen.add(rule.id);
       }
+      for (const id of removeRuleIds) dnr._dynamic.delete(id);
+      for (const rule of addRules) dnr._dynamic.set(rule.id, rule);
+    },
+    // Mirrors chrome.declarativeNetRequest.isRegexSupported: RE2 has no
+    // lookaround. Tests can `delete` this to simulate API drift.
+    async isRegexSupported({ regex }) {
+      calls.push({ api: 'dnr.isRegexSupported', regex });
+      return { isSupported: !/\(\?<?[=!]/.test(regex) };
     },
     async getEnabledRulesets() {
       calls.push({ api: 'dnr.getEnabledRulesets' });
@@ -226,8 +268,14 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     onStartup: makeListenerEvent(),
     onSuspend: makeListenerEvent(),
     onMessage: messageListeners,
-    sendMessage: async (message) => {
-      const sender = { id: extensionId, url: `chrome-extension://${extensionId}/test` };
+    // `senderOverrides` is a test-only extension: merged into the default
+    // sender so tests can simulate content-script senders (sender.tab etc.).
+    sendMessage: async (message, senderOverrides = null) => {
+      const sender = {
+        id: extensionId,
+        url: `chrome-extension://${extensionId}/test`,
+        ...(senderOverrides || {}),
+      };
       calls.push({ api: 'runtime.sendMessage', message, sender });
       return new Promise((resolve) => {
         let responded = false;
@@ -290,6 +338,23 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     onClicked: makeListenerEvent(),
   };
 
+  // ---- chrome.action ----
+  const action = {
+    _badges: new Map(), // tabId -> { text, color }
+    async setBadgeText({ text, tabId }) {
+      calls.push({ api: 'action.setBadgeText', text, tabId });
+      const entry = action._badges.get(tabId) || {};
+      entry.text = text;
+      action._badges.set(tabId, entry);
+    },
+    async setBadgeBackgroundColor({ color, tabId }) {
+      calls.push({ api: 'action.setBadgeBackgroundColor', color, tabId });
+      const entry = action._badges.get(tabId) || {};
+      entry.color = color;
+      action._badges.set(tabId, entry);
+    },
+  };
+
   // ---- chrome.privacy (subset used by service worker) ----
   const privacy = {
     network: {
@@ -322,6 +387,7 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     webNavigation,
     alarms,
     contextMenus,
+    action,
     privacy,
     // Test-only handles:
     calls,

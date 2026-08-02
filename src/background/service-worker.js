@@ -48,13 +48,14 @@ function reportError(context, error, options = { fatal: false }) {
 }
 
 // Configurable constants — defaults can be overridden via storage
+// Single source of truth for tunables — every consumer reads CONFIG.* directly
+// (see docs/REVIEW-2026-07.md §5.7: the previous shadow consts drifted from
+// these entries, and two entries had no consumer at all).
 const CONFIG = {
   BLOOM_FILL_THRESHOLD: 0.5,        // Rebuild bloom filter when fill ratio exceeds this
   BLOOM_BITS_PER_ITEM: 10,          // Bits per item for ~1% false positive rate
   DOMAIN_RULES_CACHE_MAX: 100,      // Max entries in LRU domain rules cache
   PAGE_BUNDLE_DB_MAX: 250,          // Max page bundles in IndexedDB
-  PROCEDURAL_DEBOUNCE_MS: 100,      // Debounce delay for procedural cosmetic runs
-  CACHE_SWEEP_INTERVAL_MS: 300000,  // 5 minutes - procedural cache sweep interval
   FILTER_UPDATE_INTERVAL_MINUTES: 1440,  // 24 hours
 };
 
@@ -62,7 +63,8 @@ import {getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/sto
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
-import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
+import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '../shared/hostname.js';
+import { ancestorDomains } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
 import { applyScriptletExceptions } from '../shared/filter-syntax.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
@@ -160,8 +162,6 @@ let cachedGenericProceduralRules = [];
 let cachedGenericCosmeticExcludedDomains = [];
 let domainRulesCache = new Map(); // hostname -> packaged page bundle (LRU, max 100 entries)
 const _inFlightRules = new Map();
-const DOMAIN_RULES_CACHE_MAX = 100;
-const PAGE_BUNDLE_DB_MAX = 250;
 const YOUTUBE_SHIELD_SCRIPT_ID = 'nullify-youtube-shield';
 const YOUTUBE_SHIELD_TARGETS = [
   { hostname: 'youtube.com', pattern: '*://youtube.com/*' },
@@ -187,7 +187,7 @@ async function syncYouTubeShieldRegistration() {
 
 function setCachedDomainRules(hostname, bundle) {
   // Evict oldest entry when at capacity (Map preserves insertion order)
-  if (domainRulesCache.size >= DOMAIN_RULES_CACHE_MAX) {
+  if (domainRulesCache.size >= CONFIG.DOMAIN_RULES_CACHE_MAX) {
     domainRulesCache.delete(domainRulesCache.keys().next().value);
   }
   domainRulesCache.set(hostname, bundle);
@@ -981,6 +981,30 @@ async function rebuildActiveRuleIndexFromStoredSources() {
   return true;
 }
 
+// All active-index rebuilds are serialized through one in-flight chain (§5.3):
+// concurrent rebuilds interleave their clear/repopulate phases, and a page
+// bundle computed against half-cleared stores must not be persisted — the
+// rebuild's final clearPageBundles() may already have run, and the version
+// check would then accept the poisoned record indefinitely. The depth counter
+// goes up at enqueue time so lookups started before the rebuild also skip
+// persistence.
+let _activeIndexRebuildChain = Promise.resolve();
+let _activeIndexRebuildDepth = 0;
+
+function isActiveIndexRebuildInFlight() {
+  return _activeIndexRebuildDepth > 0;
+}
+
+function queueActiveIndexRebuild() {
+  _activeIndexRebuildDepth++;
+  const run = _activeIndexRebuildChain
+    .catch(() => {})
+    .then(() => rebuildActiveRuleIndexFromStoredSources())
+    .finally(() => { _activeIndexRebuildDepth--; });
+  _activeIndexRebuildChain = run.catch(() => {});
+  return run;
+}
+
 async function ensureFilterSourcesReady() {
   if (await db.hasFilterSources()) return true;
 
@@ -1017,7 +1041,7 @@ async function ensureRuleDataReady() {
 
   if (sourcesReady) {
     if (!existingBloom || !hadSources || ruleDataChanged) {
-      await rebuildActiveRuleIndexFromStoredSources();
+      await queueActiveIndexRebuild();
       if (bundledRuleDataVersion) {
         await setStorage(StorageKeys.RULE_DATA_VERSION, bundledRuleDataVersion);
       }
@@ -1198,12 +1222,29 @@ function rebuildAllowlistMatcher() {
   }
 }
 
+// All allowlist mutations are serialized through one in-flight promise chain
+// (the youtube-shield-sync.js pattern). Two overlapping rebuilds otherwise
+// both snapshot getDynamicRules() before either writes, and the second batch
+// reuses the same DNR_ALLOWLIST_START ids → Chrome rejects it (§4.7).
+let _allowlistOpChain = Promise.resolve();
+
+function enqueueAllowlistOp(op) {
+  const run = _allowlistOpChain.catch(() => {}).then(op);
+  _allowlistOpChain = run.catch(() => {});
+  return run;
+}
+
 /**
  * Rebuild allowlist state atomically — ensures DNR rules, matcher, and
- * dependent caches stay in sync. Returns a promise that resolves when
- * all state is consistent.
+ * dependent caches stay in sync. Internal: callers must go through
+ * rebuildAllowlistState (or another enqueueAllowlistOp op) so rebuilds
+ * never overlap.
  */
-async function rebuildAllowlistState(normalizedAllowlist) {
+async function _rebuildAllowlistStateNow(allowlist) {
+  // §4.8 choke point: nothing that fails write-side validation may ever be
+  // stored or become a DNR allowAllRequests rule — even via legacy persisted
+  // state or a code path that skipped partitionAllowlistInput.
+  const normalizedAllowlist = partitionAllowlistInput(allowlist).valid;
   cachedAllowlist = new Set(normalizedAllowlist);
   await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
   await rebuildAllowlistRules(normalizedAllowlist);
@@ -1211,6 +1252,11 @@ async function rebuildAllowlistState(normalizedAllowlist) {
   // Dependent caches must be cleared AFTER DNR rules are updated
   domainRulesCache.clear();
   await syncYouTubeShieldRegistration();
+}
+
+/** Serialized entry point for full allowlist state rebuilds. */
+function rebuildAllowlistState(normalizedAllowlist) {
+  return enqueueAllowlistOp(() => _rebuildAllowlistStateNow(normalizedAllowlist));
 }
 
 // YouTube shield sync is implemented in ./youtube-shield-sync.js. The factory
@@ -1228,17 +1274,33 @@ async function refreshMemoryCache() {
 
   cachedSettings = data[StorageKeys.SETTINGS];
   const rawAllowlist = data[StorageKeys.ALLOWLIST] || [];
-  const normalizedAllowlist = normalizeAllowlist(rawAllowlist);
+  // §4.8: validation applies to stored state too — a legacy allowlist entry
+  // like `co.uk` (persisted before write-side validation existed) must be
+  // scrubbed on startup, not resurrected into a TLD-wide DNR allow rule.
+  const normalizedAllowlist = partitionAllowlistInput(rawAllowlist).valid;
   cachedAllowlist = new Set(normalizedAllowlist);
   let allowlistStateRebuilt = false;
+
+  const needsNormalization =
+    rawAllowlist.length !== normalizedAllowlist.length ||
+    rawAllowlist.some((domain, index) => domain !== normalizedAllowlist[index]);
+
+  // Reconcile the DNR allow rules against the stored allowlist UNCONDITIONALLY
+  // on startup (§4.7): a previous rebuildAllowlistState could have persisted
+  // the storage write and then died (SW kill / updateDynamicRules throw)
+  // before the allowAllRequests rules landed. The stored list is already
+  // normalized in that case, so a normalization-only check never repairs it.
+  const existingDynamicRules = await chrome.declarativeNetRequest
+    .getDynamicRules()
+    .catch(() => null);
+  const dnrAllowRuleCount = Array.isArray(existingDynamicRules)
+    ? existingDynamicRules.filter((rule) => rule.id >= DNR_ALLOWLIST_START).length
+    : normalizedAllowlist.length; // read failed — assume in sync, don't churn
 
   // Sync DNR state BEFORE rebuilding the in-memory matcher.
   // If we rebuilt the matcher first, content scripts could observe one
   // allowlist state while DNR still enforced the previous one.
-  if (
-    rawAllowlist.length !== normalizedAllowlist.length ||
-    rawAllowlist.some((domain, index) => domain !== normalizedAllowlist[index])
-  ) {
+  if (needsNormalization || dnrAllowRuleCount !== normalizedAllowlist.length) {
     await rebuildAllowlistState(normalizedAllowlist);
     allowlistStateRebuilt = true;
   } else {
@@ -1275,7 +1337,7 @@ async function loadBloomFilter() {
           checkBloomFillRatio(bloom);
         } else {
           if (await db.hasFilterSources()) {
-            await rebuildActiveRuleIndexFromStoredSources();
+            await queueActiveIndexRebuild();
           } else {
             await ingestLegacyRules();
           }
@@ -1308,7 +1370,7 @@ function checkBloomFillRatio(bloomFilter) {
     : CONFIG.BLOOM_FILL_THRESHOLD;
   if (ratio > threshold) {
     console.warn(`[Nullify] Loaded Bloom filter is saturated (fill ratio: ${ratio.toFixed(2)}). Schedule rebuild...`);
-    rebuildActiveRuleIndexFromStoredSources().catch(err => {
+    queueActiveIndexRebuild().catch(err => {
       console.error('[Nullify] Bloom filter rebuild failed:', err);
     });
   }
@@ -1704,17 +1766,32 @@ const DNR_REFERRER_RULES_START = 840_000;
 // Alarms — periodic filter list updates
 // ---------------------------------------------------------------------------
 async function scheduleFilterUpdateAlarm() {
-  await chrome.alarms.clear(ALARM_FILTER_UPDATE);
-  chrome.alarms.create(ALARM_FILTER_UPDATE, {
-    delayInMinutes: CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
-    periodInMinutes: CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
-  });
+  // Only create the alarms when absent (§4.5). ensureBackgroundSetup runs on
+  // every SW start; a clear+create here pushed the 24h filter alarm out by
+  // another 24h on each wake, so with the 30-minute stats alarm guaranteeing
+  // regular wakes it could never fire.
+  if (!(await chrome.alarms.get(ALARM_FILTER_UPDATE))) {
+    // Derive the initial delay from the last successful check so a user whose
+    // alarm was lost (e.g. by the pre-fix clear) catches up instead of
+    // waiting another full interval.
+    const lastCheck = await getStorage(StorageKeys.LAST_UPDATE_CHECK);
+    let delayInMinutes = CONFIG.FILTER_UPDATE_INTERVAL_MINUTES;
+    if (typeof lastCheck === 'number' && lastCheck > 0 && lastCheck <= Date.now()) {
+      const elapsedMinutes = (Date.now() - lastCheck) / 60000;
+      delayInMinutes = Math.max(1, CONFIG.FILTER_UPDATE_INTERVAL_MINUTES - elapsedMinutes);
+    }
+    chrome.alarms.create(ALARM_FILTER_UPDATE, {
+      delayInMinutes,
+      periodInMinutes: CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
+    });
+  }
 
-  await chrome.alarms.clear(ALARM_STATS_CLEANUP);
-  chrome.alarms.create(ALARM_STATS_CLEANUP, {
-    delayInMinutes: STATS_CLEANUP_INTERVAL_MINUTES,
-    periodInMinutes: STATS_CLEANUP_INTERVAL_MINUTES,
-  });
+  if (!(await chrome.alarms.get(ALARM_STATS_CLEANUP))) {
+    chrome.alarms.create(ALARM_STATS_CLEANUP, {
+      delayInMinutes: STATS_CLEANUP_INTERVAL_MINUTES,
+      periodInMinutes: STATS_CLEANUP_INTERVAL_MINUTES,
+    });
+  }
 }
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -1756,7 +1833,7 @@ async function checkFilterListUpdates() {
       return;
     }
 
-    await rebuildActiveRuleIndexFromStoredSources();
+    await queueActiveIndexRebuild();
     await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
     log('[AdBlock] Filter source update complete');
   } finally {
@@ -1820,28 +1897,84 @@ function resetTabStats(tabId, url = '') {
   schedulePersistTabStats();
 }
 
+// In-flight counters are mirrored to chrome.storage.session on every change
+// (§5.9): the 1.5s local-storage debounce means an SW kill inside the window
+// silently drops those counts. storage.session survives SW kills but not a
+// browser restart — exactly the lifetime the in-flight snapshot needs.
+const SESSION_STATS_KEY = 'nullify:inFlightStats';
+
+function snapshotStatsForSession() {
+  const obj = {};
+  for (const [tabId, stats] of tabStats) {
+    obj[tabId] = stats;
+  }
+  return {
+    tabStats: obj,
+    totalBlockedToday,
+    totalBlockedDate,
+  };
+}
+
+function mirrorStatsToSession() {
+  try {
+    chrome.storage.session
+      ?.set({ [SESSION_STATS_KEY]: snapshotStatsForSession() })
+      ?.catch?.(() => { });
+  } catch { /* storage.session unavailable — nothing to mirror to */ }
+}
+
+async function readSessionStatsSnapshot() {
+  try {
+    const data = await chrome.storage.session?.get(SESSION_STATS_KEY);
+    const snapshot = data?.[SESSION_STATS_KEY];
+    return snapshot && typeof snapshot === 'object' ? snapshot : null;
+  } catch {
+    return null;
+  }
+}
+
 async function restorePersistedStats() {
   const data = await getStorageBulk([
     StorageKeys.TAB_STATS,
     StorageKeys.TOTAL_BLOCKED_TODAY,
     StorageKeys.TOTAL_BLOCKED_DATE,
   ]);
+  // The session mirror is newer than the debounced local copy whenever both
+  // exist (it is written on every increment) — its entries win per tab, but
+  // local-only tabs are kept: an early resetTabStats in this SW life may
+  // have overwritten the mirror before this restore ran.
+  const sessionSnapshot = await readSessionStatsSnapshot();
 
-  tabStats.clear();
-  const storedStats = data[StorageKeys.TAB_STATS];
+  const localStats = data[StorageKeys.TAB_STATS];
+  const storedStats = {
+    ...(localStats && typeof localStats === 'object' ? localStats : {}),
+    ...(sessionSnapshot?.tabStats && typeof sessionSnapshot.tabStats === 'object'
+      ? sessionSnapshot.tabStats
+      : {}),
+  };
   if (storedStats && typeof storedStats === 'object') {
     for (const [key, val] of Object.entries(storedStats)) {
       const tabId = Number(key);
       if (!Number.isInteger(tabId) || tabId < 0) continue;
+      // Never clobber a tabId already tracked in memory (§5.2): the
+      // navigation that woke this SW may have already reset that tab's
+      // stats and counted new blocks before this restore ran.
+      if (tabStats.has(tabId)) continue;
       tabStats.set(tabId, normalizeTabStatsEntry(val));
     }
   }
 
   const today = getCurrentDayStamp();
-  totalBlockedDate = today;
-  totalBlockedToday = data[StorageKeys.TOTAL_BLOCKED_DATE] === today
+  const localTotal = data[StorageKeys.TOTAL_BLOCKED_DATE] === today
     ? Math.max(0, Number(data[StorageKeys.TOTAL_BLOCKED_TODAY]) || 0)
     : 0;
+  const sessionTotal = sessionSnapshot?.totalBlockedDate === today
+    ? Math.max(0, Number(sessionSnapshot?.totalBlockedToday) || 0)
+    : 0;
+  totalBlockedDate = today;
+  // max() keeps the restore idempotent (it runs from both onInstalled and
+  // startInitialization) and preserves any increments counted before it ran.
+  totalBlockedToday = Math.max(totalBlockedToday, localTotal, sessionTotal);
 
   if (
     data[StorageKeys.TOTAL_BLOCKED_DATE] !== totalBlockedDate ||
@@ -1853,6 +1986,9 @@ async function restorePersistedStats() {
 
 let _persistTimeout = null;
 function schedulePersistTabStats() {
+  // The session mirror is written immediately — an SW kill before the
+  // debounced local write then loses nothing (§5.9).
+  mirrorStatsToSession();
   if (_persistTimeout) clearTimeout(_persistTimeout);
   _persistTimeout = setTimeout(() => {
     persistTabStats();
@@ -1871,7 +2007,18 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 });
 
-chrome.declarativeNetRequest.onRuleMatchedDebug?.addListener((info) => {
+// §4.25 — `onRuleMatchedDebug` (and the declarativeNetRequestFeedback
+// permission) only function in unpacked/developer-mode installs. In the packed
+// CRX the event object is undefined, no listener registers, and every
+// network-side counter (tabStats.blocked, trackers, badge, logger network
+// events) silently stays at 0. Feature-detect once and expose the result via
+// GET_INIT_DATA / GET_TAB_STATS / GET_DAILY_BLOCKED_TOTAL as
+// `networkStatsAvailable`, so the UI can label the counters honestly
+// ("requires developer mode") instead of showing a misleading zero.
+const networkStatsAvailable =
+  typeof chrome.declarativeNetRequest?.onRuleMatchedDebug?.addListener === 'function';
+
+if (networkStatsAvailable) chrome.declarativeNetRequest.onRuleMatchedDebug.addListener((info) => {
   const { request, rule } = info;
 
   // 1. Determine action from ID ranges (new robust system)
@@ -1972,14 +2119,12 @@ function updateBadge(tabId) {
 }
 
 async function persistTabStats() {
-  const obj = {};
-  for (const [tabId, stats] of tabStats) {
-    obj[tabId] = stats;
-  }
+  const snapshot = snapshotStatsForSession();
+  mirrorStatsToSession();
   await Promise.all([
-    setStorage(StorageKeys.TAB_STATS, obj),
-    setStorage(StorageKeys.TOTAL_BLOCKED_TODAY, totalBlockedToday),
-    setStorage(StorageKeys.TOTAL_BLOCKED_DATE, totalBlockedDate),
+    setStorage(StorageKeys.TAB_STATS, snapshot.tabStats),
+    setStorage(StorageKeys.TOTAL_BLOCKED_TODAY, snapshot.totalBlockedToday),
+    setStorage(StorageKeys.TOTAL_BLOCKED_DATE, snapshot.totalBlockedDate),
   ]).catch(() => { });
 }
 
@@ -2034,26 +2179,64 @@ function parseUserCosmeticRules(text) {
   return { generic, domainSpecific, genericExceptions, domainExceptions };
 }
 
-/** Apply user-defined filters as dynamic DNR rules + cosmetic rules. */
-async function applyUserFilters(filtersText) {
+// User-filter mutations are serialized through one in-flight promise chain
+// (§4.6): two overlapping applyUserFilters runs both snapshot
+// getDynamicRules() before either writes, so the second one's addRules reuses
+// ids the first just claimed and Chrome rejects the batch.
+let _userFilterOpChain = Promise.resolve();
+
+function enqueueUserFilterOp(op) {
+  const run = _userFilterOpChain.catch(() => {}).then(op);
+  _userFilterOpChain = run.catch(() => {});
+  return run;
+}
+
+// Test-only seam (see tests/sw-harness): lets the harness simulate "WASM
+// compiled successfully and produced zero rules" — unreachable otherwise in
+// Node, where the WASM module never initializes. Never set in production.
+let _compileUserFiltersOverride = null;
+
+/**
+ * Compile user filters via the WASM compiler. Returns the compiled bundle, or
+ * `null` when WASM is unavailable or threw — the ONLY cases in which the JS
+ * fallback may run (§5.14). "WASM succeeded with zero rules" is a legitimate
+ * outcome (e.g. the critical-path guard deliberately dropped every line) and
+ * must not be resurrected by the less careful JS parser.
+ */
+function compileUserFiltersViaWasm(filtersText) {
+  const compileFn = _compileUserFiltersOverride || (wasmReady ? compile_user_filters : null);
+  if (!compileFn) return null;
+  try {
+    return compileFn(filtersText || '', DNR_USER_RULES_START) || null;
+  } catch (err) {
+    console.error('[Nullify] WASM user filter compilation failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Apply user-defined filters as dynamic DNR rules + cosmetic rules.
+ * Internal: callers go through applyUserFilters / setAndApplyUserFilters /
+ * appendUserFilterLine so runs never overlap.
+ *
+ * Returns `{network, cosmetic}` counts on success, or `{error}` when the DNR
+ * write failed — in which case USER_FILTERS_APPLIED is NOT updated, so the
+ * next startup retries the apply instead of skipping it forever (§4.6).
+ */
+async function _applyUserFiltersNow(filtersText) {
   const lines = (filtersText || '').split('\n').filter(Boolean);
   let newRules = [];
   let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
   let userScriptlets = [];
 
-  if (wasmReady) {
-    try {
-      const compiled = compile_user_filters(filtersText || '', DNR_USER_RULES_START);
-      newRules = compiled.dnrRules || [];
-      cosmeticRules = compiled.cosmeticRules || cosmeticRules;
-      userScriptlets = compiled.scriptletRules || [];
-    } catch (err) {
-      console.error('[Nullify] WASM user filter compilation failed:', err);
-    }
-  }
-
-  // Fallback to JS if WASM failed or is not ready
-  if (newRules.length === 0 && lines.length > 0) {
+  const compiled = compileUserFiltersViaWasm(filtersText);
+  const wasmSucceeded = compiled !== null;
+  if (wasmSucceeded) {
+    newRules = compiled.dnrRules || [];
+    cosmeticRules = compiled.cosmeticRules || cosmeticRules;
+    userScriptlets = compiled.scriptletRules || [];
+  } else if (lines.length > 0) {
+    // JS fallback — only on actual WASM failure/unavailability (§5.14).
     let id = DNR_USER_RULES_START;
     for (const line of lines) {
       const trimmed = line.trim();
@@ -2068,17 +2251,49 @@ async function applyUserFilters(filtersText) {
     .filter((r) => r.id >= DNR_USER_RULES_START && r.id < DNR_ALLOWLIST_START)
     .map((r) => r.id);
 
-  // Always clear the existing IDs in this range, then add new ones if any.
+  // §4.15 — `updateDynamicRules` is all-or-nothing, so one bad line (IDN
+  // urlFilter, non-RE2 regex) used to zero out the ENTIRE user ruleset.
+  // Pre-validate what we can, then add in chunks and retry per-rule so a
+  // rejection only drops the offending rule.
+  const { vetted, skipped } = await preflightUserDnrRules(newRules);
+
+  // Clear the existing user-range IDs first. If even the removal fails, old
+  // rules stay active; report failure to the caller instead of recording
+  // success — storage and DNR must not diverge silently.
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: userRuleIds,
-      addRules: newRules,
-    });
+    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: userRuleIds });
   } catch (err) {
-    console.error('[Nullify] Failed to update dynamic DNR rules:', err);
+    reportError('userFilters:updateDynamicRules', err);
+    return { error: `Failed to apply user filters: ${err?.message || String(err)}` };
   }
 
-  if (!wasmReady) {
+  let appliedNetworkRules = 0;
+  for (let i = 0; i < vetted.length; i += USER_RULE_ADD_CHUNK) {
+    const chunk = vetted.slice(i, i + USER_RULE_ADD_CHUNK);
+    try {
+      await chrome.declarativeNetRequest.updateDynamicRules({ addRules: chunk });
+      appliedNetworkRules += chunk.length;
+    } catch {
+      // Chunk rejected — isolate the offender(s) by retrying rule-by-rule.
+      for (const rule of chunk) {
+        try {
+          await chrome.declarativeNetRequest.updateDynamicRules({ addRules: [rule] });
+          appliedNetworkRules += 1;
+        } catch (ruleErr) {
+          skipped.push({ id: rule.id, reason: ruleErr?.message || String(ruleErr) });
+        }
+      }
+    }
+  }
+  if (skipped.length > 0) {
+    reportError(
+      'userFilters:skippedRules',
+      new Error(`${skipped.length} user filter rule(s) skipped: ${skipped
+        .slice(0, 5).map((s) => `#${s.id} ${s.reason}`).join('; ')}`)
+    );
+  }
+
+  if (!wasmSucceeded) {
     cosmeticRules = parseUserCosmeticRules(filtersText);
   } else if (
     (!cosmeticRules.generic?.length && !Object.keys(cosmeticRules.domainSpecific || {}).length &&
@@ -2087,7 +2302,7 @@ async function applyUserFilters(filtersText) {
   ) {
     cosmeticRules = parseUserCosmeticRules(filtersText);
   }
-    
+
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
   await setStorage(StorageKeys.USER_FILTERS_APPLIED, filtersText || '');
   await setStorage(StorageKeys.USER_SCRIPTLET_RULES, userScriptlets);
@@ -2101,12 +2316,105 @@ async function applyUserFilters(filtersText) {
     .reduce((sum, rules) => sum + (rules?.length || 0), 0);
 
   const counts = {
-    network: newRules.length,
-    cosmetic: (cosmeticRules.generic?.length || 0) + totalDomainSpecificRules
+    network: appliedNetworkRules,
+    cosmetic: (cosmeticRules.generic?.length || 0) + totalDomainSpecificRules,
+    // §4.15 — per-rule skip report so the UI can say "N lines were dropped"
+    // instead of pretending everything applied. Capped: reasons are for
+    // display, not a full audit log.
+    skippedNetwork: skipped.length,
+    skippedRules: skipped.slice(0, 20),
   };
 
-  log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic`);
+  log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic, ${counts.skippedNetwork} skipped`);
   return counts;
+}
+
+// §4.15 — chunk size for dynamic-rule adds. Small enough that a rejected
+// chunk's per-rule retry is cheap, large enough to keep call count low for
+// multi-thousand-rule user lists.
+const USER_RULE_ADD_CHUNK = 50;
+
+function isAsciiOnly(str) {
+  for (let i = 0; i < str.length; i++) {
+    if (str.charCodeAt(i) > 0x7f) return false;
+  }
+  return true;
+}
+
+/**
+ * §4.15 — validate compiled user DNR rules before handing them to Chrome.
+ * Chrome requires `urlFilter` to be ASCII and `regexFilter` to be
+ * RE2-compatible; the WASM compiler forwards patterns verbatim. Rules that
+ * fail are returned in `skipped` (with a reason) instead of poisoning the
+ * whole batch. `isRegexSupported` is feature-detected: where unavailable,
+ * regex rules pass through and the chunked add isolates any rejection.
+ */
+async function preflightUserDnrRules(rules) {
+  const vetted = [];
+  const skipped = [];
+  for (const rule of rules) {
+    const condition = rule?.condition || {};
+    if (typeof condition.urlFilter === 'string' && !isAsciiOnly(condition.urlFilter)) {
+      skipped.push({ id: rule.id, reason: 'non-ASCII urlFilter (Chrome requires punycode/percent-encoding)' });
+      continue;
+    }
+    if (typeof condition.regexFilter === 'string') {
+      if (!isAsciiOnly(condition.regexFilter)) {
+        skipped.push({ id: rule.id, reason: 'non-ASCII regexFilter' });
+        continue;
+      }
+      if (!(await isRegexFilterSupported(condition.regexFilter, condition.isCaseSensitive === true))) {
+        skipped.push({ id: rule.id, reason: 'regexFilter not supported by RE2' });
+        continue;
+      }
+    }
+    vetted.push(rule);
+  }
+  return { vetted, skipped };
+}
+
+async function isRegexFilterSupported(regex, isCaseSensitive) {
+  const check = chrome.declarativeNetRequest?.isRegexSupported;
+  if (typeof check !== 'function') return true; // packed-API drift: let the chunked add decide
+  try {
+    const result = await check.call(chrome.declarativeNetRequest, { regex, isCaseSensitive });
+    return result?.isSupported !== false;
+  } catch {
+    return true;
+  }
+}
+
+/** Serialized re-apply of already-stored user filters (startup path). */
+function applyUserFilters(filtersText) {
+  return enqueueUserFilterOp(() => _applyUserFiltersNow(filtersText));
+}
+
+/** Serialized store + apply (SET_USER_FILTERS path). */
+function setAndApplyUserFilters(filtersText) {
+  return enqueueUserFilterOp(async () => {
+    await setStorage(StorageKeys.USER_FILTERS, filtersText);
+    return _applyUserFiltersNow(filtersText);
+  });
+}
+
+/**
+ * Atomically append one filter line to the stored user filters and run the
+ * same apply path as SET_USER_FILTERS. The read-modify-write happens inside
+ * the chained op so concurrent appends cannot drop one another's line.
+ */
+function appendUserFilterLine(line) {
+  return enqueueUserFilterOp(async () => {
+    const current = (await getStorage(StorageKeys.USER_FILTERS)) || '';
+    const trimmedLine = line.trim();
+    const next = current
+      ? (current.endsWith('\n') ? current + trimmedLine : `${current}\n${trimmedLine}`)
+      : trimmedLine;
+    if (next.length > MAX_USER_FILTERS_BYTES) {
+      return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
+    }
+    await setStorage(StorageKeys.USER_FILTERS, next);
+    return _applyUserFiltersNow(next);
+  });
 }
 
 /** Parse a simple ABP-style network rule into a DNR rule object. */
@@ -2148,42 +2456,95 @@ function parseSimpleNetworkRule(line, id) {
   };
 }
 
+/**
+ * §4.8 — server-side allowlist validation. Normalizes, dedupes, then splits
+ * entries into `valid` (storable) and `rejected` (public suffixes, bare TLDs,
+ * malformed hostnames). Every allowlist write path routes through this so a
+ * `||co.uk^` allowAllRequests rule can never reach DNR, regardless of which
+ * UI surface (or import file) supplied the entry.
+ */
+function partitionAllowlistInput(domains) {
+  const valid = [];
+  const rejected = [];
+  for (const domain of normalizeAllowlist(domains)) {
+    (isValidAllowlistDomain(domain) ? valid : rejected).push(domain);
+  }
+  return { valid, rejected };
+}
+
 /** Add a site to the per-site allowlist (disable blocking for domain). */
 async function allowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
-  if (!normalizedDomain) return Array.from(cachedAllowlist);
-
-  if (cachedAllowlist.has(normalizedDomain)) {
+  if (!normalizedDomain || !isValidAllowlistDomain(normalizedDomain)) {
     return Array.from(cachedAllowlist);
   }
 
-  const newAllowlist = Array.from(cachedAllowlist).concat(normalizedDomain);
-  await rebuildAllowlistState(newAllowlist);
-  return newAllowlist;
+  // Read-modify-write happens INSIDE the chained op so two concurrent adds
+  // can't both snapshot the same base list and drop one another's entry.
+  return enqueueAllowlistOp(async () => {
+    if (cachedAllowlist.has(normalizedDomain)) {
+      return Array.from(cachedAllowlist);
+    }
+    const newAllowlist = Array.from(cachedAllowlist).concat(normalizedDomain);
+    await _rebuildAllowlistStateNow(newAllowlist);
+    return newAllowlist;
+  });
 }
 
-/** Replace the entire allowlist and synchronize all dependent runtime state. */
+/**
+ * Replace the entire allowlist and synchronize all dependent runtime state.
+ * Returns `{allowlist, rejected}` — rejected entries (§4.8) are reported so
+ * the UI can surface invalid import lines instead of silently dropping them.
+ */
 async function setAllowlistDomains(domains) {
-  const normalizedAllowlist = normalizeAllowlist(domains);
-  await rebuildAllowlistState(normalizedAllowlist);
-  return normalizedAllowlist;
+  const { valid, rejected } = partitionAllowlistInput(domains);
+  await rebuildAllowlistState(valid);
+  return { allowlist: valid, rejected };
+}
+
+/**
+ * Merge additional domains into the authoritative stored allowlist (union)
+ * and rebuild dependent state. Serialized through the allowlist op chain.
+ */
+async function addAllowlistDomains(domains) {
+  if (!Array.isArray(domains)) {
+    throw new Error('ADD_ALLOWLIST_DOMAINS requires a domains array');
+  }
+  const { valid: additions, rejected } = partitionAllowlistInput(domains);
+
+  return enqueueAllowlistOp(async () => {
+    const stored = partitionAllowlistInput((await getStorage(StorageKeys.ALLOWLIST)) || []).valid;
+    const merged = normalizeAllowlist([...stored, ...additions]);
+    const changed =
+      merged.length !== stored.length ||
+      merged.some((entry, index) => entry !== stored[index]);
+    if (changed) {
+      await _rebuildAllowlistStateNow(merged);
+    }
+    return { allowlist: merged, rejected };
+  });
 }
 
 /** Remove a site from the allowlist. */
 async function disallowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
-  if (!normalizedDomain || !cachedAllowlist.has(normalizedDomain)) {
-    return Array.from(cachedAllowlist);
-  }
+  if (!normalizedDomain) return Array.from(cachedAllowlist);
 
-  const newAllowlist = Array.from(cachedAllowlist).filter((entry) => entry !== normalizedDomain);
-  await rebuildAllowlistState(newAllowlist);
-  return newAllowlist;
+  return enqueueAllowlistOp(async () => {
+    if (!cachedAllowlist.has(normalizedDomain)) {
+      return Array.from(cachedAllowlist);
+    }
+    const newAllowlist = Array.from(cachedAllowlist).filter((entry) => entry !== normalizedDomain);
+    await _rebuildAllowlistStateNow(newAllowlist);
+    return newAllowlist;
+  });
 }
 
 /** Rebuild DNR allow-all-requests rules from allowlist. */
 async function rebuildAllowlistRules(allowlist) {
-  const normalizedAllowlist = normalizeAllowlist(allowlist);
+  // §4.8 backstop: this is the last stop before allowAllRequests rules reach
+  // DNR — a public-suffix entry here would disable blocking for a whole TLD.
+  const normalizedAllowlist = partitionAllowlistInput(allowlist).valid;
   const existing = await chrome.declarativeNetRequest.getDynamicRules();
   const allowlistRuleIds = existing
     .filter((r) => r.id >= DNR_ALLOWLIST_START)
@@ -2229,7 +2590,10 @@ const RULESET_GROUPS = {
 // literal defaults below are a frozen-in-time fallback if the build
 // artifact is missing; they will drift, but keep budget checks working.
 let RULESET_RULE_COUNTS = {
-  'system-unbreak': 18,
+  // Keep in sync with rules/ruleset-counts.json (the authoritative build
+  // artifact loaded just below) — e.g. system-unbreak gained a scoped-gstatic
+  // rule (18 → 19).
+  'system-unbreak': 19,
   'ubo-unbreak': 1479,
   'anti-adblock': 4172,
   'malware': 5236,
@@ -2388,17 +2752,14 @@ async function applyRulesets() {
     (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
   );
 
-  const allKnownListIds = [
-    'system-unbreak', 'ubo-unbreak', 'ubo-filters', 'easylist',
-    'easyprivacy', 'malware', 'annoyances', 'anti-adblock', 'ubo-cookie-annoyances'
-  ];
-
   const manifestRulesetIds = getManifestRulesetIds();
   const enableRulesetIds = [];
   const disableRulesetIds = [];
   const unknownRulesetIds = [];
 
-  for (const listId of allKnownListIds) {
+  // Derived from ALL_KNOWN_LIST_IDS — a re-declared literal here silently
+  // drifted from it, so newly added lists were never enabled (§5.7).
+  for (const listId of ALL_KNOWN_LIST_IDS) {
     const rulesets = getRulesetIdsForList(listId);
     for (const rulesetId of rulesets) {
       // Filter out IDs that the manifest no longer declares. Passing an
@@ -2477,7 +2838,7 @@ function scheduleActiveIndexRebuild() {
     _rebuildIndexResolve = null;
     try {
       if (await ensureFilterSourcesReady()) {
-        await rebuildActiveRuleIndexFromStoredSources();
+        await queueActiveIndexRebuild();
       }
     } catch (err) {
       console.error('[Nullify] Cosmetic index rebuild failed:', err);
@@ -2572,9 +2933,41 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
   }
 }
 
-function hasScriptletRegistry(key) {
-  const reg = window[key];
-  return reg && typeof reg.run === 'function';
+// TODO(REVIEW-2026-07 §4.24 fix 3 / §5.38): the real fix for the seed→load
+// gap is registering the scriptlet bundle via
+// `chrome.scripting.registerContentScripts({ world: 'MAIN', runAt:
+// 'document_start' })`, so it executes before any page script and no boot-key
+// round-trips exist at all. Until then the layered mitigations below
+// (non-configurable seed, key-shape validation in the bundle, strict registry
+// verification before specs are handed over) only raise the bar — a page
+// specifically targeting Nullify can still forge the registry shape.
+
+/**
+ * §4.24 layered fix 2 — strict registry verification, run in the MAIN world
+ * both for the "already registered?" fast path and after the bundle loads.
+ * When the page pre-claims `window[key]` with a non-configurable descriptor,
+ * the bundle's own defineProperty throws and it refuses to register — but the
+ * page's object remains at the key. The old `reg && typeof reg.run ===
+ * 'function'` check happily handed such a spy the full per-site scriptlet
+ * spec list. Require the exact descriptor + object shape the bundle produces:
+ * non-configurable/non-enumerable/non-writable data property (no accessor
+ * spies) whose value is a frozen object with exactly one own key, `run`.
+ */
+function verifyScriptletRegistry(key) {
+  try {
+    const desc = Object.getOwnPropertyDescriptor(window, key);
+    if (!desc) return false;
+    if (desc.configurable !== false || desc.enumerable !== false) return false;
+    // Accessor descriptors have no `value`/`writable` — reject getter spies.
+    if (!('value' in desc) || desc.writable !== false) return false;
+    const reg = desc.value;
+    if (!reg || typeof reg.run !== 'function') return false;
+    if (!Object.isFrozen(reg)) return false;
+    const ownKeys = Reflect.ownKeys(reg);
+    return ownKeys.length === 1 && ownKeys[0] === 'run';
+  } catch {
+    return false;
+  }
 }
 
 function seedBootKey(key) {
@@ -2582,14 +2975,20 @@ function seedBootKey(key) {
   // fixed-named boot property fires any setter the page pre-installed on it,
   // leaking the capability key (page could then call window[key].run(...) with
   // attacker-chosen args). defineProperty never invokes setters. Non-enumerable
-  // keeps it out of Object.keys; configurable lets the bundle delete it after
-  // reading. Returns false if the page pre-claimed the name with a
-  // non-configurable descriptor, so the caller can skip loading the bundle.
+  // keeps it out of Object.keys.
+  //
+  // §4.24 layered fix 1: configurable MUST be false. With configurable:true a
+  // page polling the seed→load gap could not just read the key but REDEFINE
+  // the property to a forged key, permanently killing scriptlets for itself
+  // (and worse, pre-claim the real key for a spy registry). The bundle no
+  // longer deletes the boot property; a frozen non-enumerable random string
+  // left on the global is harmless. Returns false if the page pre-claimed the
+  // name with an incompatible descriptor, so the caller skips the bundle.
   try {
     Object.defineProperty(globalThis, '__nullifyBootKey', {
       value: key,
       writable: false,
-      configurable: true,
+      configurable: false,
       enumerable: false,
     });
   } catch {
@@ -2603,11 +3002,11 @@ async function ensureScriptletRegistry(tabId, frameId) {
     const [{ result: ready = false } = {}] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
-      func: hasScriptletRegistry,
+      func: verifyScriptletRegistry,
       args: [SCRIPTLET_REGISTRY_KEY],
     });
 
-    if (ready) return true;
+    if (ready === true) return true;
 
     const [{ result: seeded = false } = {}] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
@@ -2627,7 +3026,18 @@ async function ensureScriptletRegistry(tabId, frameId) {
       files: [runtimeAssetPath('scriptlets-world.js')],
     });
 
-    return true;
+    // §4.24 layered fix 2: never trust the load. If the page pre-claimed
+    // `window[key]` during the seed→load gap, the bundle refused to register
+    // and the object sitting at the key is page-controlled — verify the
+    // registry's exact shape before any specs are ever handed to it.
+    const [{ result: verified = false } = {}] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [frameId] },
+      world: 'MAIN',
+      func: verifyScriptletRegistry,
+      args: [SCRIPTLET_REGISTRY_KEY],
+    });
+
+    return verified === true;
   } catch (err) {
     if (!err.message?.includes('No frame with id')) {
       reportError('scriptlet:bootstrap', err);
@@ -2662,6 +3072,63 @@ function executeScriptlets(key, specs) {
 const MAX_USER_FILTERS_BYTES = 2 * 1024 * 1024;   // 2 MB text cap
 const MAX_USER_FILTERS_DNR_RULES = 10_000;        // dynamic DNR budget guard
 
+// ---------------------------------------------------------------------------
+// Sender privilege classes (REVIEW.md §2.3, REVIEW-2026-07 §6 row 2.3).
+//
+// `sender.id === chrome.runtime.id` also holds for OUR content scripts running
+// inside arbitrary (potentially compromised) renderers, so it is NOT a
+// privilege boundary. Destructive/privileged handlers additionally require the
+// sender to be one of our extension pages (popup/options — `sender.url` on the
+// chrome-extension:// origin of this extension).
+//
+// Declarative map: message type → required sender class. Every handled type
+// MUST have an entry; unlisted types fail closed to SENDER_EXTENSION_PAGE, so
+// a future handler added without classification is unreachable from content
+// scripts rather than silently exposed to them.
+// ---------------------------------------------------------------------------
+const SENDER_ANY = 'any';                         // content scripts + extension pages (payload still validated)
+const SENDER_EXTENSION_PAGE = 'extension-page';   // extension pages only
+
+const MESSAGE_SENDER_POLICY = {
+  // Content-script critical path + picker/stats reporting.
+  GET_INIT_DATA: SENDER_ANY,
+  GET_COSMETIC_RULES: SENDER_ANY,
+  IS_SITE_ALLOWED: SENDER_ANY,
+  GET_TAB_STATS: SENDER_ANY,          // §5.4: payload.tabId honored only for extension pages
+  CONTENT_BLOCKED: SENDER_ANY,        // §4.13: payload validated in the handler
+  APPEND_USER_FILTER: SENDER_ANY,     // element picker; single validated line
+  REPORT_CONTENT_ERROR: SENDER_ANY,
+  CHECK_SEMANTIC_AD: SENDER_ANY,
+  GET_NOISE: SENDER_ANY,
+
+  // Extension pages only — settings/allowlist/filter/ruleset writers, bulk
+  // readers of user data, diagnostics, and destructive operations.
+  GET_SETTINGS: SENDER_EXTENSION_PAGE,
+  SET_SETTINGS: SENDER_EXTENSION_PAGE,
+  UPDATE_SETTINGS: SENDER_EXTENSION_PAGE,
+  GET_ALLOWLIST: SENDER_EXTENSION_PAGE,
+  ALLOW_SITE: SENDER_EXTENSION_PAGE,
+  DISALLOW_SITE: SENDER_EXTENSION_PAGE,
+  SET_ALLOWLIST: SENDER_EXTENSION_PAGE,
+  ADD_ALLOWLIST_DOMAINS: SENDER_EXTENSION_PAGE,
+  GET_USER_FILTERS: SENDER_EXTENSION_PAGE,
+  SET_USER_FILTERS: SENDER_EXTENSION_PAGE,
+  SET_RULESET_ENABLED: SENDER_EXTENSION_PAGE,
+  GET_ENABLED_RULESETS: SENDER_EXTENSION_PAGE,
+  GET_DAILY_BLOCKED_TOTAL: SENDER_EXTENSION_PAGE,
+  GET_ANONYMIZED_STATS: SENDER_EXTENSION_PAGE,
+  FORCE_CLEAN_ALL_DYNAMIC_RULES: SENDER_EXTENSION_PAGE,
+  CHECK_FILTER_UPDATES: SENDER_EXTENSION_PAGE,
+  GET_ERROR_REPORT: SENDER_EXTENSION_PAGE,
+  CLEAR_ERROR_REPORT: SENDER_EXTENSION_PAGE,
+};
+
+/** True when the message came from one of our own extension pages. */
+function isExtensionPageSender(sender) {
+  return typeof sender?.url === 'string' &&
+    sender.url.startsWith(chrome.runtime.getURL(''));
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!sender || sender.id !== chrome.runtime.id) {
     sendResponse({ error: 'foreign sender rejected' });
@@ -2671,13 +3138,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ error: 'malformed message' });
     return false;
   }
+  if (MESSAGE_SENDER_POLICY[message.type] !== SENDER_ANY && !isExtensionPageSender(sender)) {
+    sendResponse({ error: `${message.type}: extension-page sender required` });
+    return false;
+  }
 
   // For content-script critical-path messages, ensure caches are ready first.
   // Non-critical messages (stats, settings UI) don't need to wait.
   const needsCache = message.type === 'GET_COSMETIC_RULES' ||
-    message.type === 'GET_SCRIPTLET_RULES' ||
     message.type === 'IS_SITE_ALLOWED' ||
     message.type === 'GET_ALLOWLIST' ||
+    message.type === 'ADD_ALLOWLIST_DOMAINS' ||
     message.type === 'GET_TAB_STATS' ||
     message.type === 'GET_DAILY_BLOCKED_TOTAL' ||
     message.type === 'GET_INIT_DATA';
@@ -2726,6 +3197,7 @@ async function handleMessage(message, sender) {
 
       let responseData = {
         isAllowed,
+        networkStatsAvailable, // §4.25 — false in packed builds (no onRuleMatchedDebug)
         settings,
         cosmeticRules: cosmeticBundle.rules,
         cssText: cosmeticBundle.cssText || '',
@@ -2759,14 +3231,19 @@ async function handleMessage(message, sender) {
       return responseData;
     }
     case 'GET_TAB_STATS': {
-      const tabId = payload?.tabId ?? sender.tab?.id;
-      return normalizeTabStatsEntry(tabStats.get(tabId));
+      // §5.4 — honoring payload.tabId from any sender let a compromised
+      // renderer enumerate tab ids and read every open tab's URL. Only
+      // extension pages (no sender.tab, extension-origin sender.url) may ask
+      // about arbitrary tabs; content scripts get their own tab only.
+      const fromExtensionPage = !sender.tab && isExtensionPageSender(sender);
+      const tabId = fromExtensionPage ? payload?.tabId : sender.tab?.id;
+      return { ...normalizeTabStatsEntry(tabStats.get(tabId)), networkStatsAvailable };
     }
     case 'GET_DAILY_BLOCKED_TOTAL': {
       if (rollDailyBlockedTotalIfNeeded()) {
         await persistTabStats();
       }
-      return { total: totalBlockedToday };
+      return { total: totalBlockedToday, networkStatsAvailable };
     }
     case 'GET_SETTINGS':
       return (await getStorage(StorageKeys.SETTINGS)) || {};
@@ -2794,6 +3271,16 @@ async function handleMessage(message, sender) {
     case 'ALLOW_SITE': {
       const domain = normalizeHostname(payload.domain);
       if (!domain) return { ok: false };
+      // §4.8 — reject public suffixes / bare TLDs server-side, with an error
+      // the UI can show; silently "succeeding" here would report a TLD as
+      // protected while DNR carries an allow-everything rule.
+      if (!isValidAllowlistDomain(domain)) {
+        return {
+          ok: false,
+          error: `"${domain}" is not a valid allowlist domain`,
+          rejected: [domain],
+        };
+      }
       const allowlist = await allowSite(domain);
       return { ok: true, allowlist };
     }
@@ -2804,8 +3291,22 @@ async function handleMessage(message, sender) {
       return { ok: true, allowlist };
     }
     case 'SET_ALLOWLIST': {
-      const allowlist = await setAllowlistDomains(payload?.domains);
-      return { ok: true, allowlist };
+      // §4.8 — response stays `{ok, allowlist}` for existing consumers, with
+      // an additive `rejected` array reporting entries that failed validation.
+      const { allowlist, rejected } = await setAllowlistDomains(payload?.domains);
+      return { ok: true, allowlist, rejected };
+    }
+    case 'ADD_ALLOWLIST_DOMAINS': {
+      if (!Array.isArray(payload?.domains) ||
+          payload.domains.some((domain) => typeof domain !== 'string')) {
+        return { error: 'ADD_ALLOWLIST_DOMAINS requires a domains array of strings' };
+      }
+      try {
+        const { allowlist, rejected } = await addAllowlistDomains(payload.domains);
+        return { ok: true, allowlist, rejected };
+      } catch (err) {
+        return { error: err?.message || String(err) };
+      }
     }
     case 'IS_SITE_ALLOWED': {
       return { allowed: isHostnameAllowedCached(normalizeHostname(payload.domain)) };
@@ -2819,32 +3320,38 @@ async function handleMessage(message, sender) {
       if (raw.length > MAX_USER_FILTERS_BYTES) {
         return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
       }
-      await setStorage(StorageKeys.USER_FILTERS, raw);
-      const counts = await applyUserFilters(raw);
+      const counts = await setAndApplyUserFilters(raw);
+      if (counts?.error) return { error: counts.error };
       // Extra guard on compiled DNR output — dynamic rule budget is finite.
       if (counts && Number.isFinite(counts.network) && counts.network > MAX_USER_FILTERS_DNR_RULES) {
         return { ...counts, warning: `Network rule count ${counts.network} exceeds budget ${MAX_USER_FILTERS_DNR_RULES}` };
       }
       return counts;
     }
+    case 'APPEND_USER_FILTER': {
+      const line = payload?.line;
+      if (typeof line !== 'string' || !line.trim()) {
+        return { error: 'APPEND_USER_FILTER requires a non-empty filter line' };
+      }
+      if (line.includes('\n') || line.includes('\r')) {
+        return { error: 'APPEND_USER_FILTER accepts a single line' };
+      }
+      if (line.length > MAX_USER_FILTERS_BYTES) {
+        return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
+      }
+      const result = await appendUserFilterLine(line);
+      if (result?.error) return { error: result.error };
+      return { ok: true, counts: result };
+    }
     case 'GET_COSMETIC_RULES': {
       const bundle = await getCosmeticBundleForPage(payload.hostname);
       return bundle.rules;
     }
-    case 'GET_SCRIPTLET_RULES': {
-      const rules = await getScriptletRulesForPage(payload.hostname);
-      if (rules.length > 0 && sender.tab?.id) {
-        await injectScriptlets(sender.tab.id, sender.frameId || 0, rules);
-      }
-      return { rules };
-    }
-
-    case 'RUN_SCRIPTLETS': {
-      if (payload.scriptlets?.length > 0 && sender.tab?.id) {
-        await injectScriptlets(sender.tab.id, sender.frameId || 0, payload.scriptlets);
-      }
-      return { ok: true };
-    }
+    // §5.5 — RUN_SCRIPTLETS and GET_SCRIPTLET_RULES are deliberately gone:
+    // they had no caller anywhere in src/content, src/popup or src/options,
+    // ignored the allowlist, and accepted arbitrary scriptlet names/args from
+    // any renderer. Scriptlet injection happens exclusively through
+    // GET_INIT_DATA, which gates on the allowlist.
     case 'SET_RULESET_ENABLED': {
       const enabledMap = await setRulesetEnabled(payload.rulesetId, payload.enabled);
       return { ok: true, enabledMap };
@@ -2917,10 +3424,29 @@ async function handleMessage(message, sender) {
       return { ok: true };
     }
     case 'CONTENT_BLOCKED': {
+      // §4.13 — this payload comes straight from a content script inside a
+      // potentially compromised renderer, and `action` used to flow into the
+      // logger UI's innerHTML unescaped. Validate shape server-side before
+      // counting or broadcasting; reject rather than coerce so a poisoned
+      // renderer can't smuggle markup through the logger event stream.
+      const action = payload?.action ?? 'hide';
+      if (action !== 'hide' && action !== 'remove') {
+        return { error: 'CONTENT_BLOCKED: invalid action' };
+      }
+      if (payload?.selector != null &&
+          (typeof payload.selector !== 'string' || payload.selector.length > 1024)) {
+        return { error: 'CONTENT_BLOCKED: invalid selector' };
+      }
+      if (payload?.hostname != null &&
+          (typeof payload.hostname !== 'string' || payload.hostname.length > 253)) {
+        return { error: 'CONTENT_BLOCKED: invalid hostname' };
+      }
+
+      const count = Number(payload?.count);
+      const increment = Number.isFinite(count) && count > 0 ? count : 1;
+
       const tabId = sender.tab?.id;
       if (tabId != null && tabId >= 0) {
-        const count = Number(payload.count);
-        const increment = Number.isFinite(count) && count > 0 ? count : 1;
         const entry = ensureTabStatsEntry(tabId, sender.tab?.url || '');
         entry.blocked += increment;
         incrementDailyBlockedTotal(increment);
@@ -2931,10 +3457,10 @@ async function handleMessage(message, sender) {
       // Broadcast to Logger
       broadcastLoggerEvent({
         type: 'cosmetic',
-        action: payload.action || 'hide',
-        hostname: payload.hostname || sender.tab.url,
-        selector: payload.selector,
-        count: payload.count || 1,
+        action,
+        hostname: payload?.hostname || sender.tab?.url || '',
+        selector: typeof payload?.selector === 'string' ? payload.selector : '',
+        count: increment,
         timestamp: Date.now(),
       });
 
@@ -3029,9 +3555,15 @@ async function getCosmeticBundleForPage(hostname) {
   try {
     const bundle = normalizeStoredBundle(await promise);
     setCachedDomainRules(hostname, bundle); // Populate cache so GET_INIT_DATA skips IndexedDB
-    await db.putPageBundle(hostname, bundle, activeRuleDataVersion)
-      .then(() => db.prunePageBundles(PAGE_BUNDLE_DB_MAX))
-      .catch(() => {});
+    // Never persist a bundle while an active-index rebuild is in flight
+    // (§5.3): it may have been computed against half-cleared stores, and a
+    // write landing after the rebuild's clearPageBundles() would poison the
+    // persisted cache for this hostname indefinitely.
+    if (!isActiveIndexRebuildInFlight()) {
+      await db.putPageBundle(hostname, bundle, activeRuleDataVersion)
+        .then(() => db.prunePageBundles(CONFIG.PAGE_BUNDLE_DB_MAX))
+        .catch(() => {});
+    }
     return bundle;
   } finally {
     _inFlightRules.delete(hostname);
@@ -3089,6 +3621,26 @@ async function getScriptletRulesForPage(hostname) {
     .filter((rule) => !isScriptletExcludedForHostname(rule, hostname));
   return [...dbRules, ...activeUserScriptlets];
 }
+/**
+ * Shared allowlist-ancestry check. Walks the hostname's parent domains via the
+ * PSL-aware `ancestorDomains` generator, which stops before the first public
+ * suffix — so a `co.uk` entry can never blanket a TLD. This is the single
+ * JS-side ancestry helper; it intentionally matches the WASM
+ * AllowlistMatcher's semantics (docs/REVIEW-2026-07.md §5.8).
+ */
+function allowlistCoversHostname(allowlistSet, hostname) {
+  // §4.8 "Related": exact membership is honored BEFORE the PSL stop. The
+  // generator refuses to yield a hostname that is itself a public suffix
+  // (e.g. `netlify.app`, a real browsable site), which made an exact
+  // allowlist entry for it a silent no-op. Exact match cannot blanket a TLD —
+  // only the ancestor walk needs the public-suffix guard.
+  if (allowlistSet.has(hostname)) return true;
+  for (const candidate of ancestorDomains(hostname)) {
+    if (allowlistSet.has(candidate)) return true;
+  }
+  return false;
+}
+
 /** Check if a hostname (or any parent domain) is in the memory-cached allowlist. */
 function isHostnameAllowedCached(hostname) {
   hostname = normalizeHostname(hostname);
@@ -3098,14 +3650,7 @@ function isHostnameAllowedCached(hostname) {
   // AllowlistMatcher is built once and checks in O(1) — no Array/string alloc per call.
   if (allowlistMatcher) return allowlistMatcher.check(hostname);
 
-  let d = hostname;
-  while (d) {
-    if (cachedAllowlist.has(d)) return true;
-    const dotIdx = d.indexOf('.');
-    if (dotIdx === -1) break;
-    d = d.slice(dotIdx + 1);
-  }
-  return false;
+  return allowlistCoversHostname(cachedAllowlist, hostname);
 }
 
 /** 
@@ -3122,6 +3667,12 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
   }
   const hostname = normalizeHostname(url.hostname);
 
+  // Wait for critical caches before consulting the allowlist (§5.1). On a
+  // cold start the navigation that wakes the SW would otherwise see an empty
+  // cachedAllowlist and inject cosmetic CSS into an allowlisted page — with
+  // nothing to remove it, since the content script sees isAllowed and bails.
+  if (_criticalPromise) await _criticalPromise;
+
   if (isHostnameAllowedCached(hostname)) return;
 
   let bundle = domainRulesCache.get(hostname);
@@ -3129,6 +3680,10 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
     bundle = await getCosmeticBundleForPage(hostname);
     setCachedDomainRules(hostname, bundle);
   }
+
+  // Re-check after the awaits — the user may have allowlisted the site while
+  // the bundle was being built.
+  if (isHostnameAllowedCached(hostname)) return;
 
   const cssText = [
     shouldSkipGenericCosmeticForHostname(hostname, cachedGenericCosmeticExcludedDomains) ? null : cachedGenericCss,
@@ -3148,7 +3703,7 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
 /**
  * Stage 1: onBeforeNavigate (Warm up the cache)
  */
-chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+async function handleBeforeNavigate(details) {
   if (!details.url.startsWith('http')) return;
 
   let url;
@@ -3167,11 +3722,73 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
     const bundle = await getCosmeticBundleForPage(hostname);
     setCachedDomainRules(hostname, bundle);
   }
-});
+}
 
 /**
  * Stage 2: onCommitted (Reliability fallback)
  */
-chrome.webNavigation.onCommitted.addListener(async (details) => {
-  performEarlyInjection(details.tabId, details.frameId || 0, details.url);
+async function handleCommitted(details) {
+  await performEarlyInjection(details.tabId, details.frameId || 0, details.url);
+}
+
+// Listener bodies route failures to reportError (§5.6): a persistent
+// IndexedDB failure otherwise emits one unhandled rejection per navigation
+// while GET_ERROR_REPORT keeps showing a healthy extension.
+chrome.webNavigation.onBeforeNavigate.addListener((details) => {
+  handleBeforeNavigate(details).catch((err) => reportError('webNavigation', err));
 });
+
+chrome.webNavigation.onCommitted.addListener((details) => {
+  handleCommitted(details).catch((err) => reportError('webNavigation', err));
+});
+
+// ---------------------------------------------------------------------------
+// Test-only handles (tests/sw-harness). Do not consume from production code —
+// this mirrors the youtube-shield-sync.js convention of exporting private
+// seams for the harness. MV3 loads this file as a module service worker, so
+// the exports are inert at runtime.
+// ---------------------------------------------------------------------------
+export const __testHooks = {
+  whenCriticalReady: () => _criticalPromise || Promise.resolve(),
+  whenBackgroundSetupDone: () => _backgroundSetupPromise || Promise.resolve(),
+  // Alarms / rulesets
+  scheduleFilterUpdateAlarm,
+  applyRulesets,
+  CONFIG,
+  ALL_KNOWN_LIST_IDS,
+  // User filters
+  applyUserFilters,
+  setAndApplyUserFilters,
+  appendUserFilterLine,
+  setCompileUserFiltersOverrideForTest: (fn) => { _compileUserFiltersOverride = fn; },
+  // Allowlist
+  rebuildAllowlistState,
+  addAllowlistDomains,
+  refreshMemoryCache,
+  isHostnameAllowedCached,
+  allowlistCoversHostname,
+  partitionAllowlistInput,
+  // Scriptlet boot-key hardening (§4.24)
+  seedBootKey,
+  verifyScriptletRegistry,
+  // Stats
+  restorePersistedStats,
+  resetTabStats,
+  persistTabStats,
+  tabStats,
+  getTotals: () => ({ totalBlockedToday, totalBlockedDate }),
+  clearInMemoryStatsForTest: () => { tabStats.clear(); totalBlockedToday = 0; },
+  cancelPendingStatsPersistForTest: () => {
+    if (_persistTimeout) { clearTimeout(_persistTimeout); _persistTimeout = null; }
+  },
+  // Cosmetic index / navigation
+  getCosmeticBundleForPage,
+  queueActiveIndexRebuild,
+  isActiveIndexRebuildInFlight,
+  getActiveRuleDataVersion: () => activeRuleDataVersion,
+  performEarlyInjection,
+  handleBeforeNavigate,
+  handleCommitted,
+  db,
+  errorReport,
+};

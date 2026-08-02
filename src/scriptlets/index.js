@@ -230,16 +230,22 @@ function run(name, args = []) {
 // ---------------------------------------------------------------------------
 // Public API — capability token handed to the bundle by the service worker.
 // ---------------------------------------------------------------------------
-// The SW injects a one-shot global `__nullifyBootKey` before loading this
+// The SW injects a global `__nullifyBootKey` (non-writable, non-configurable,
+// non-enumerable — see seedBootKey in the service worker) before loading this
 // bundle. We register the dispatcher under that key (non-enumerable +
-// non-configurable so page scripts can't enumerate or replace it), then
-// delete the temporary boot key.
+// non-configurable so page scripts can't enumerate or replace it).
 //
 // No fixed sentinel. No randomized `__nu*` prefix exposed via Object.keys.
 // If the boot key is missing (e.g. direct <script> load) we refuse to
 // register — the SW is the only legitimate caller.
+//
+// §4.24 (REVIEW-2026-07): the key must match the SW generator's exact shape.
+// A page that raced the seed→load gap and redefined the boot property to an
+// arbitrary string must not get the dispatcher registered under a name it
+// chose. `__n_` + 32 lowercase hex chars is the only shape the SW ever seeds.
+const BOOT_KEY_SHAPE = /^__n_[0-9a-f]{32}$/;
 const bootKey = globalThis.__nullifyBootKey;
-if (typeof bootKey === 'string' && bootKey.length > 0) {
+if (typeof bootKey === 'string' && BOOT_KEY_SHAPE.test(bootKey)) {
   try {
     Object.defineProperty(window, bootKey, {
       value: Object.freeze({ run }),
@@ -248,11 +254,15 @@ if (typeof bootKey === 'string' && bootKey.length > 0) {
       enumerable: false,
     });
   } catch {
-    // Attacker pre-claimed the key with a non-configurable descriptor — refuse.
+    // Attacker pre-claimed the key with a non-configurable descriptor — refuse
+    // to register. We cannot remove the page's object, so the SW re-verifies
+    // the registry's descriptor shape after this bundle loads and refuses to
+    // hand it any scriptlet specs (§4.24 layered fix 2).
   }
-  try {
-    delete globalThis.__nullifyBootKey;
-  } catch { /* ignore */ }
+  // NOTE (§4.24): the boot key is deliberately NOT deleted anymore. The SW
+  // seeds it configurable:false (so a polling page can't redefine it in the
+  // seed→load gap), which also makes it undeletable. A frozen, non-enumerable
+  // random string left on the global is harmless.
 }
 
 export { run, getUnknownScriptlets, REGISTRY };

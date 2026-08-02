@@ -462,3 +462,22 @@ body {
   color: var(--text-muted);
 }
 .about-info p strong { color: var(--text); }
+
+/* ---- Keyboard focus (accessibility) ---- */
+/* Visible focus indication for keyboard users; :focus-visible keeps mouse
+   clicks from flashing outlines. */
+.nav-item:focus-visible,
+.btn:focus-visible,
+.toggle:focus-visible,
+.allowlist-remove:focus-visible,
+.text-input:focus-visible,
+.filter-editor:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+/* The filter-list toggle checkbox is visually hidden — move its focus ring
+   onto the visible track. */
+.list-toggle input:focus-visible + .list-toggle-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

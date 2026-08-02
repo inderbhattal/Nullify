@@ -244,3 +244,20 @@ body {
   color: var(--text-muted);
   text-decoration: line-through;
 }
+
+/* ---- Keyboard focus (accessibility) ---- */
+.power-btn:focus-visible,
+.action-btn:focus-visible,
+.persona-select:focus-visible {
+  outline: 2px solid var(--accent2);
+  outline-offset: 2px;
+}
+
+/* ---- Transient error status ---- */
+.popup-status {
+  display: none;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--red);
+}
+.popup-status.visible { display: block; }

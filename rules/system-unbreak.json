@@ -32,7 +32,16 @@
   {
     "id": 6,
     "priority": 1000,
-    "condition": { "urlFilter": "||gstatic.com^" },
+    "condition": { "urlFilter": "||gstatic.com/recaptcha/" },
+    "action": { "type": "allow" }
+  },
+  {
+    "id": 12,
+    "priority": 1000,
+    "condition": {
+      "urlFilter": "||gstatic.com^",
+      "resourceTypes": ["font", "stylesheet", "script"]
+    },
     "action": { "type": "allow" }
   },
   {

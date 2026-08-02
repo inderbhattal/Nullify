@@ -37,7 +37,7 @@
 | HTTP → HTTPS upgrade | ✅ | DNR `upgradeScheme` action |
 | WebRTC IP leak blocking | ✅ | `chrome.privacy` API |
 | Hyperlink auditing blocking | ✅ | `chrome.privacy` API |
-| Redirect rules ($redirect=) | ✅ | DNR redirect action |
+| Redirect rules ($redirect=) | ✅ | DNR redirect action (`$redirect-rule=` is dropped: uBO applies it only when another filter blocks, which DNR cannot express) |
 | removeparam ($removeparam=) | ✅ | DNR queryTransform |
 | Blocked count badge | ✅ | Per-tab stats |
 | Dashboard UI | ✅ | Filter lists, My Filters, Allowlist, Settings |
@@ -87,7 +87,7 @@ nullify/
 ## How It Works
 
 ### Network Blocking (declarativeNetRequest)
-Filter lists are pre-compiled at build time into Chrome's `declarativeNetRequest` format. Each list becomes an enabled static ruleset. The extension ships with 6 rulesets (30,000+ rules).
+Filter lists are pre-compiled at build time into Chrome's `declarativeNetRequest` format. Large lists are sharded across several ruleset files. The manifest declares 16 static rulesets, 7 of which are enabled by default; the service worker enables further shards at runtime as the global rule budget allows.
 
 ### Cosmetic Filtering (Content Scripts)
 The content script loads cosmetic rules from `rules/cosmetic-rules.json` and injects a `<style>` element at `document_start`, hiding ad elements before they render. A `MutationObserver` handles dynamically injected content.
@@ -98,8 +98,8 @@ The `scriptlets-world.js` bundle is injected into the page's MAIN JavaScript con
 ### MV3 Rule Limits
 | Type | Limit | Our Usage |
 |---|---|---|
-| Static rulesets | 50 enabled max | 6 |
-| Static rules | 30,000 guaranteed | ~41 (sample), ~150K+ (full) |
+| Static rulesets | 50 enabled max | 16 declared / 7 enabled by default |
+| Static rules | 30,000 guaranteed | ~22 (sample), ~65K+ compiled (full; enabled-by-default sum draws on the shared global pool) |
 | Dynamic rules | 30,000 (Chrome 121+) | User rules + allowlist |
 | Regex rules | 1,000 per type | Minimal |
 
@@ -128,7 +128,14 @@ npm run dev
 ### Full Build (downloads filter lists from internet)
 
 ```bash
-# Download EasyList, EasyPrivacy, uBO filters and compile to DNR
+# 1. Refresh the SRI lock (hashes the fully-expanded lists). Upstream lists
+#    update frequently, so do this first, review the diff, and commit it —
+#    a build FAILS on any list whose hash is missing or mismatching.
+node scripts/generate-sri-hashes.mjs
+
+# 2. Download EasyList, EasyPrivacy, uBO filters, verify against the lock,
+#    and compile to DNR. Output is staged and only swapped into rules/ on
+#    success, so a failed build never destroys the previous good rulesets.
 npm run build:rules
 
 # Then build extension
@@ -165,7 +172,8 @@ git push origin main --follow-tags
 | Script | Description |
 |---|---|
 | `npm run build` | Full build (download rules + webpack) |
-| `npm run build:rules` | Download and compile filter lists only |
+| `npm run build:rules` | Download, SRI-verify, and compile filter lists only |
+| `node scripts/generate-sri-hashes.mjs` | Refresh `scripts/filter-lists.lock.json` (commit the diff) |
 | `npm run build:sample-rules` | Generate minimal rules for local testing |
 | `npm run build:ext` | Webpack bundle only |
 | `npm run dev` | Webpack watch mode |

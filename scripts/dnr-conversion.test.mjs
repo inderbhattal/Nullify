@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseLine, networkFilterToDNR } from './build-rules.mjs';
+import {
+  parseLine,
+  networkFilterToDNR,
+  parseFilterList,
+  buildDNRRules,
+} from './build-rules.mjs';
 
 /**
  * Golden-file suite for ABP filter line -> DNR rule conversion.
@@ -30,7 +35,14 @@ function convert(line) {
   return rest;
 }
 
-const block = (condition, priority = 1) => ({ priority, condition, action: { type: 'block' } });
+// ABP filters are case-insensitive unless $match-case, and the emitted rule
+// states that explicitly rather than relying on Chrome's version-dependent
+// default (§5.46) — hence the field on every expected condition.
+const block = (condition, priority = 1) => ({
+  priority,
+  condition: { isUrlFilterCaseSensitive: false, ...condition },
+  action: { type: 'block' },
+});
 
 test('pattern anchors survive conversion unchanged', () => {
   assert.deepEqual(convert('||ads.example.com^'), block({ urlFilter: '||ads.example.com^' }));
@@ -83,7 +95,7 @@ test('$domain= splits into initiator includes and excludes', () => {
 test('$removeparam with a value becomes a queryTransform, not a block', () => {
   assert.deepEqual(convert('||example.com^$removeparam=utm_source'), {
     priority: 1,
-    condition: { urlFilter: '||example.com^' },
+    condition: { urlFilter: '||example.com^', isUrlFilterCaseSensitive: false },
     action: {
       type: 'redirect',
       redirect: { transform: { queryTransform: { removeParams: ['utm_source'] } } },
@@ -260,10 +272,6 @@ test('cosmetic-scope aliases normalise to their canonical scope name', () => {
 // below was a live block rule before this suite.
 test('semantic modifiers we do not implement drop the whole rule', () => {
   const cases = [
-    // Cancels a filter elsewhere in the corpus. Ignoring it instates the very
-    // rule it was written to remove.
-    '||example.com^$badfilter',
-    '@@||example.com^$badfilter',
     // Bare $removeparam strips every query parameter. Ignoring it turned a
     // parameter-hygiene rule into a hard block of the domain.
     '||example.com^$removeparam',
@@ -297,9 +305,14 @@ test('benign no-op options are still ignorable, keeping the rest of the rule', (
     convert('||ads.example.com^$script,inline-script'),
     block({ urlFilter: '||ads.example.com^', resourceTypes: ['script'] }),
   );
+  // $match-case is no longer merely ignorable — it is honoured (§5.46).
   assert.deepEqual(
     convert('||ads.example.com^$image,match-case'),
-    block({ urlFilter: '||ads.example.com^', resourceTypes: ['image'] }),
+    block({
+      urlFilter: '||ads.example.com^',
+      resourceTypes: ['image'],
+      isUrlFilterCaseSensitive: true,
+    }),
   );
 });
 
@@ -358,4 +371,212 @@ test('$csp exceptions are skipped, not converted to a network allow', () => {
     const parsed = parseLine(line);
     assert.equal(parsed.skip, true, `${line} must be skipped`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// $badfilter two-pass suppression (prior review 4.1)
+// ---------------------------------------------------------------------------
+
+test('$badfilter cancels its base rule instead of being dropped as unsupported', () => {
+  const text = [
+    '||ads.example.com^$script',
+    '||ads.example.com^$script,badfilter',
+    '||keep.example.com^',
+  ].join('\n');
+
+  const parsed = parseFilterList(text);
+  const patterns = parsed.networkRules.map((r) => r.pattern);
+  assert.deepEqual(patterns, ['||keep.example.com^'], 'the badfiltered base rule must be suppressed');
+
+  const suppressed = parsed.skippedRecords.filter((r) => r.reason.startsWith('badfilter-suppressed'));
+  assert.equal(suppressed.length, 1, 'the suppression must be recorded in the skip log');
+});
+
+test('$badfilter matching is canonical: option order and domain order do not matter', () => {
+  const text = [
+    '||a.example^$script,domain=b.com|c.com',
+    '||a.example^$domain=c.com|b.com,script,badfilter',
+  ].join('\n');
+
+  const parsed = parseFilterList(text);
+  assert.deepEqual(parsed.networkRules, [], 'reordered options must still match');
+});
+
+test('$badfilter does not cancel rules whose options differ', () => {
+  const text = [
+    '||a.example^$script',
+    '||a.example^$image,badfilter',
+  ].join('\n');
+
+  const parsed = parseFilterList(text);
+  assert.equal(parsed.networkRules.length, 1, 'a badfilter for a different form must not match');
+  assert.equal(parsed.networkRules[0].pattern, '||a.example^');
+});
+
+test('a $badfilter rule itself never converts to a DNR rule', () => {
+  const parsed = parseLine('||example.com^$badfilter');
+  assert.equal(parsed.type, 'network', 'badfilter parses as a network directive');
+  assert.equal(networkFilterToDNR(parsed), null, 'but must never ship');
+});
+
+// ---------------------------------------------------------------------------
+// $popup (§4.22)
+// ---------------------------------------------------------------------------
+
+test('$popup converts only for ||domain^-anchored patterns', () => {
+  assert.deepEqual(
+    convert('||popupads.example^$popup'),
+    block({ urlFilter: '||popupads.example^', resourceTypes: ['main_frame'] }),
+  );
+
+  // Broad patterns would block ordinary navigations (a full-page
+  // ERR_BLOCKED_BY_CLIENT on a legitimate link click), where ABP $popup
+  // matches only script-opened popup windows.
+  for (const line of ['/r.php?u=https$popup', '.com/smartpop/$popup', '/?usid=*&utid=$popup']) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be skipped`);
+    assert.match(parsed.reason || '', /popup/, `${line} must say why`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// redirect= / redirect-rule= (§5.42)
+// ---------------------------------------------------------------------------
+
+test('redirect-rule= is skipped — uBO applies it only when another filter blocks', () => {
+  const parsed = parseLine('||ads.example.com^$image,redirect-rule=1x1.gif');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /redirect-rule/);
+});
+
+test('$redirect= outranks a co-matching plain block but not an allow', () => {
+  const redirect = convert('||ads.example.com^$image,redirect=1x1.gif');
+  const plainBlock = convert('||ads.example.com^');
+  const allow = convert('@@||ads.example.com^');
+
+  assert.equal(redirect.action.type, 'redirect');
+  // At EQUAL priority DNR resolves allow > block > redirect, so a co-matching
+  // EasyList block would defeat the stub and hard-block where uBO serves a
+  // working placeholder.
+  assert.ok(redirect.priority > plainBlock.priority, 'redirect must beat a plain block');
+  assert.ok(allow.priority > redirect.priority, 'an exception must still beat the redirect');
+});
+
+test('$removeparam stays in the block band so a co-matching block wins the tie', () => {
+  const removeparam = convert('||example.com^$removeparam=utm_source');
+  const plainBlock = convert('||example.com^');
+  assert.equal(removeparam.priority, plainBlock.priority);
+});
+
+// ---------------------------------------------------------------------------
+// Case sensitivity (§5.46)
+// ---------------------------------------------------------------------------
+
+test('rules are case-insensitive by default, case-sensitive only with $match-case', () => {
+  assert.equal(
+    convert('||example.com/adframe.$script').condition.isUrlFilterCaseSensitive,
+    false,
+    'ABP filters are case-insensitive absent $match-case',
+  );
+  assert.equal(
+    convert('||example.com/AdFrame.$script,match-case').condition.isUrlFilterCaseSensitive,
+    true,
+    '$match-case must be honoured',
+  );
+  assert.equal(
+    convert('/banner[0-9]+\\.gif/').condition.isUrlFilterCaseSensitive,
+    false,
+    'regex rules get the explicit flag too',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Regex filters ending in `$/` (§5.45)
+// ---------------------------------------------------------------------------
+
+test('a regex filter ending in an anchor keeps its $ — not split as options', () => {
+  assert.deepEqual(
+    convert('/banner[0-9]+\\.gif$/'),
+    block({ regexFilter: 'banner[0-9]+\\.gif$' }),
+  );
+});
+
+test('options after a regex literal are still recognised', () => {
+  assert.deepEqual(
+    convert('/banner[0-9]+/$script'),
+    block({ regexFilter: 'banner[0-9]+', resourceTypes: ['script'] }),
+  );
+});
+
+test('a path-anchored (non-regex) pattern still splits options at $', () => {
+  assert.deepEqual(
+    convert('/banner-$image'),
+    block({ urlFilter: '/banner-', resourceTypes: ['image'] }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// RE2 cost estimator (§5.44)
+// ---------------------------------------------------------------------------
+
+test('patterns containing .* survive the RE2 cost estimate', () => {
+  // RE2 compiles `.` to one byte-range instruction and never backtracks; the
+  // old estimator costed it at 256 alternatives ×10 for the star, so any
+  // pattern containing `.*` blew the budget and ~100 valid rules were dropped.
+  assert.notEqual(convert('/^https?:.*\\/adframe\\/banner/'), null);
+  assert.notEqual(convert('/ads[0-9a-z]+\\.example\\.com/'), null);
+});
+
+test('regex length cap is 256 per prior review 4.4', () => {
+  const ok = `/${'a'.repeat(200)}/`;
+  const tooLong = `/${'a'.repeat(300)}/`;
+  assert.notEqual(convert(ok), null, 'a 200-char literal regex fits the 2KB RE2 budget');
+  assert.equal(convert(tooLong), null, 'beyond 256 chars is still dropped');
+});
+
+test('bounded quantifier unrolling is still costed', () => {
+  // RE2 really does unroll bounded repetition, so this guard must survive
+  // the recalibration.
+  assert.equal(convert(`/[0-9a-z]{100}[0-9a-z]{100}[0-9a-z]{100}/`), null);
+});
+
+// ---------------------------------------------------------------------------
+// Wildcard $domain= entries (§5.43)
+// ---------------------------------------------------------------------------
+
+test('wildcard-only $domain= drops the rule — gmx.* is invalid DNR', () => {
+  assert.equal(convert('||ads.example^$domain=gmx.*'), null);
+});
+
+test('wildcard $domain= entries are pruned when concrete domains remain', () => {
+  assert.deepEqual(
+    convert('||ads.example^$domain=gmx.*|real.example'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['real.example'] }),
+  );
+});
+
+test('a wildcard $domain= EXCLUSION drops the rule rather than over-applying it', () => {
+  assert.equal(convert('||ads.example^$domain=~gmx.*'), null);
+});
+
+// ---------------------------------------------------------------------------
+// Dedup key (§5.41)
+// ---------------------------------------------------------------------------
+
+test('dedup keeps rules that differ only in action payload or priority', () => {
+  const rules = [
+    parseLine('||y.example^$removeparam=utm_source'),
+    parseLine('||y.example^$removeparam=utm_medium'),
+    parseLine('||z.example^'),
+    parseLine('||z.example^$important'),
+    parseLine('||z.example^'), // true duplicate — must still dedup
+  ];
+  const { dnrRules, droppedRecords } = buildDNRRules(rules);
+
+  assert.equal(dnrRules.length, 4, 'both removeparams and both priorities must survive');
+  assert.equal(
+    droppedRecords.filter((r) => r.reason.startsWith('dedup')).length,
+    1,
+    'the true duplicate is still removed',
+  );
 });

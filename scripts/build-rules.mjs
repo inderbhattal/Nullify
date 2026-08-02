@@ -36,29 +36,48 @@ const SKIP_SRI = process.argv.includes('--skip-sri');
 const DEBUG = process.env.DEBUG === 'true' || process.argv.includes('--verbose');
 const log = DEBUG ? console.log.bind(console) : () => {};
 
-// SRI hashes for remote filter lists — loaded from rules/filter-list-hashes.json
+// SRI hashes for remote filter lists — loaded from the committed lock file.
+// The lock lives under scripts/ (not rules/) because rules/*.json is
+// gitignored: the whole point of the lock is that it is committed and
+// reviewed, so a build verifies against hashes that went through review
+// rather than against whatever the CDN served last time.
+const LOCK_FILE_PATH = path.join(__dirname, 'filter-lists.lock.json');
 let FILTER_LIST_HASHES = {};
 try {
-  const hashesPath = path.join(RULES_DIR, 'filter-list-hashes.json');
-  if (fs.existsSync(hashesPath)) {
-    FILTER_LIST_HASHES = JSON.parse(fs.readFileSync(hashesPath, 'utf8'));
+  if (fs.existsSync(LOCK_FILE_PATH)) {
+    FILTER_LIST_HASHES = JSON.parse(fs.readFileSync(LOCK_FILE_PATH, 'utf8'));
   }
 } catch (err) {
-  console.warn('[SRI] Could not load filter-list-hashes.json, SRI verification disabled:', err.message);
+  console.warn('[SRI] Could not parse filter-lists.lock.json:', err.message);
 }
 
+// NOTE: totalLimit must not exceed parts * MAX_PER_FILE — the shard writer
+// emits at most that many rules, so any excess would vanish silently with no
+// skip-log record (single-part lists used to declare 30000 against a 25000
+// write capacity). effectiveListLimit() reconciles and the build logs any
+// capping, but keep the declared numbers honest too.
 const LIST_CONFIG = {
   'easylist': { parts: 4, totalLimit: 100000 },
   'easyprivacy': { parts: 3, totalLimit: 75000 },
   'ubo-filters': { parts: 2, totalLimit: 40000 },
-  'annoyances': { parts: 1, totalLimit: 30000 },
-  'malware': { parts: 1, totalLimit: 30000 },
-  'ubo-unbreak': { parts: 1, totalLimit: 30000 },
-  'anti-adblock': { parts: 1, totalLimit: 30000 },
-  'ubo-cookie-annoyances': { parts: 1, totalLimit: 30000 },
+  'annoyances': { parts: 1, totalLimit: 25000 },
+  'malware': { parts: 1, totalLimit: 25000 },
+  'ubo-unbreak': { parts: 1, totalLimit: 25000 },
+  'anti-adblock': { parts: 1, totalLimit: 25000 },
+  'ubo-cookie-annoyances': { parts: 1, totalLimit: 25000 },
 };
 
 const MAX_PER_FILE = 25000;
+
+/**
+ * The number of rules a list can actually ship: the configured totalLimit,
+ * clamped to what the shard writer can physically emit (parts * MAX_PER_FILE).
+ */
+function effectiveListLimit(config) {
+  const parts = config.parts || 1;
+  const capacity = parts * MAX_PER_FILE;
+  return Math.min(config.totalLimit ?? capacity, capacity);
+}
 
 // ---------------------------------------------------------------------------
 // Filter list sources
@@ -109,14 +128,19 @@ const FILTER_LISTS = [
 // ---------------------------------------------------------------------------
 // HTTP fetch utility
 // ---------------------------------------------------------------------------
+const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
+
 function fetchText(url, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
     https.get(url, { headers: { 'User-Agent': 'adblock-mv3-builder/1.0' } }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
+      if (REDIRECT_STATUS_CODES.has(res.statusCode)) {
         if (maxRedirects <= 0) return reject(new Error(`Redirect limit exceeded for ${url}`));
         const location = res.headers.location;
-        if (!location || !location.startsWith('http')) {
-          return reject(new Error(`Invalid redirect location for ${url}`));
+        // https only — a redirect that downgrades to http:// would let an
+        // on-path attacker substitute list content that then gets hashed and
+        // shipped. The initial URLs are all https; keep the whole chain there.
+        if (!location || !location.startsWith('https://')) {
+          return reject(new Error(`Invalid or non-https redirect location for ${url}`));
         }
         return fetchText(location, maxRedirects - 1).then(resolve).catch(reject);
       }
@@ -132,17 +156,31 @@ function fetchText(url, maxRedirects = 5) {
 }
 
 /**
- * Verify fetched content against SRI hash if available.
- * Returns { valid: boolean, error?: string }
+ * Verify fetched content against the pinned SRI hash.
+ *
+ * `content` must be the FULLY-EXPANDED list text (after !#include resolution
+ * and preprocessor evaluation) — uBO lists carry most of their content in
+ * includes, so hashing only the top-level file would verify almost nothing.
+ *
+ * A missing hash is a FAILURE, not a pass: the previous behaviour returned
+ * `{ valid: true }` when no hash existed, and since the hash file was
+ * gitignored and absent, SRI was dead code in every real build. Sample builds
+ * never fetch, so they are unaffected; `--skip-sri` remains as an explicit,
+ * logged dev override.
+ *
+ * Returns { valid: boolean, skipped?: boolean, error?: string }
  */
-function verifySriHash(content, listId) {
+function verifySriHash(content, listId, hashes = FILTER_LIST_HASHES) {
   if (SKIP_SRI) {
     return { valid: true, skipped: true };
   }
 
-  const hashInfo = FILTER_LIST_HASHES[listId];
+  const hashInfo = hashes[listId];
   if (!hashInfo || !hashInfo.sha384) {
-    return { valid: true }; // No hash available, skip verification
+    return {
+      valid: false,
+      error: `no pinned hash in scripts/filter-lists.lock.json — run \`node scripts/generate-sri-hashes.mjs\` to (re)generate the lock, review the diff, and commit it`,
+    };
   }
 
   const expectedPrefix = 'sha384-';
@@ -166,24 +204,15 @@ function verifySriHash(content, listId) {
 /**
  * Fetch a filter list and recursively resolve !#include directives.
  * uBlock Origin's filter lists are split across many sub-files.
+ *
+ * SRI verification happens on the RETURN VALUE of the top-level call (the
+ * fully-expanded text), in `main` and in generate-sri-hashes.mjs — not here.
+ * Verifying only the top-level fetch let every !#include sub-file bypass
+ * verification entirely.
  */
-async function fetchAndExpand(url, depth = 0, listId = null) {
+async function fetchAndExpand(url, depth = 0) {
   if (depth > 5) return '';
   const text = await fetchText(url);
-
-  // Verify SRI hash for top-level fetch (not includes)
-  if (depth === 0 && listId) {
-    const verification = verifySriHash(text, listId);
-    if (!verification.valid) {
-      if (SKIP_SRI) {
-        console.warn(`[SRI] ${listId}: ${verification.error} — verification skipped via --skip-sri flag`);
-      } else {
-        throw new Error(`[SRI] ${listId}: ${verification.error} — build aborted. Use --skip-sri to override.`);
-      }
-    } else if (!verification.skipped && DEBUG) {
-      log(`[SRI] ${listId}: hash verified`);
-    }
-  }
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
   const lines = [];
 
@@ -226,7 +255,7 @@ async function fetchAndExpand(url, depth = 0, listId = null) {
       const includePath = m[1].trim();
       const includeUrl = includePath.startsWith('http') ? includePath : baseUrl + includePath;
       try {
-        lines.push(await fetchAndExpand(includeUrl, depth + 1, null));
+        lines.push(await fetchAndExpand(includeUrl, depth + 1));
       } catch (e) {
         console.warn(`  ⚠️  Skipping include ${includeUrl.split('/').pop()}: ${e.message}`);
       }
@@ -282,8 +311,6 @@ const IGNORABLE_OPTIONS = new Set([
   // Cannot be expressed in MV3; other options on the rule still apply.
   'inline-script',
   'inline-font',
-  // DNR matches case-sensitively by default, which is the narrower reading.
-  'match-case',
   // Redirect-to-stub shorthands. We have no resource library, so the request
   // is blocked instead of stubbed — same direction, never broader.
   'empty',
@@ -446,10 +473,22 @@ function parseLine(line) {
 
   let pattern = rawRule;
   let optionsStr = '';
-  const dollarPos = rawRule.lastIndexOf('$');
-  if (dollarPos !== -1 && !rawRule.endsWith('$')) {
-    pattern = rawRule.slice(0, dollarPos);
-    optionsStr = rawRule.slice(dollarPos + 1);
+  if (rawRule.startsWith('/') && rawRule.endsWith('/') && rawRule.length > 2) {
+    // A complete /regex/ literal: any `$` inside it is a regex anchor, never
+    // an option separator. `/banner[0-9]+\.gif$/` used to be split at the `$`
+    // and shipped as a literal urlFilter containing regex syntax.
+  } else if (rawRule.startsWith('/') && rawRule.lastIndexOf('/$') > 0) {
+    // /regex/$options — for a regex literal the separator is only valid
+    // after the closing slash.
+    const sepIdx = rawRule.lastIndexOf('/$');
+    pattern = rawRule.slice(0, sepIdx + 1);
+    optionsStr = rawRule.slice(sepIdx + 2);
+  } else {
+    const dollarPos = rawRule.lastIndexOf('$');
+    if (dollarPos !== -1 && !rawRule.endsWith('$')) {
+      pattern = rawRule.slice(0, dollarPos);
+      optionsStr = rawRule.slice(dollarPos + 1);
+    }
   }
 
   if (/(^|,)csp(=|,|$)/.test(optionsStr)) {
@@ -491,6 +530,24 @@ function parseLine(line) {
   // whole filter line, which matches nothing and burns static-rule budget.
   if (pattern.includes('##') || pattern.includes('#@#')) {
     return skip('cosmetic-line-in-network-path: unrecognised cosmetic syntax, not a URL pattern');
+  }
+
+  // uBO applies `redirect-rule=` only when some OTHER filter blocks the
+  // request; on its own it does nothing. DNR cannot express that
+  // conditionality, and the previous conversion emitted an unconditional
+  // redirect — rewriting requests that nothing would have blocked.
+  if (options.redirectRule !== null) {
+    return skip('redirect-rule-unsupported: uBO applies redirect-rule= only when another filter blocks; DNR cannot express the conditionality, so emitting an unconditional redirect over-applies');
+  }
+
+  // ABP $popup matches only script-opened popup windows; DNR has no popup
+  // concept, so the closest conversion is a main_frame block. That is
+  // acceptable for a rule anchored to a dedicated popup/ad domain, but for a
+  // broad pattern (`/r.php?u=https`, `.com/smartpop/`) it turns ordinary
+  // link clicks into full-page ERR_BLOCKED_BY_CLIENT. uBO Lite drops $popup
+  // entirely under DNR; we keep only the ||domain^-anchored form.
+  if (options.popup && !isException && !/^\|\|[a-z0-9.-]+\^?$/i.test(pattern)) {
+    return skip('popup-broad-pattern: $popup only converts safely for ||domain^-anchored patterns; a broad pattern would block ordinary navigations, not just popups');
   }
 
   return {
@@ -538,8 +595,12 @@ function parseOptions(optionsStr) {
     requestDomains: [],
     thirdParty: null, // null=any, true=3rd-party, false=1st-party
     redirect: null,
+    redirectRule: null,
     removeparam: null,
     important: false,
+    badfilter: false,
+    matchCase: false,
+    popup: false,
     cosmeticScopeExceptions: [],
   };
 
@@ -571,15 +632,26 @@ function parseOptions(optionsStr) {
       }
     } else if (optName === 'important') {
       options.important = true;
+    } else if (optName === 'badfilter') {
+      // Pass-1 marker for the two-pass suppression in parseFilterList. The
+      // rule itself must never ship; it exists to cancel its base form.
+      options.badfilter = true;
+    } else if (optName === 'match-case') {
+      options.matchCase = !negated;
     } else if (optName.startsWith('redirect=') || optName.startsWith('redirect-rule=')) {
       // uBO resource names are usually simple, but the value side can contain
       // '=' for base64-encoded fallbacks — slice past the FIRST '=' rather
       // than splitting, which would truncate anything after a second '='.
+      // redirect-rule= is kept separate: it is conditional on another filter
+      // blocking, which DNR cannot express, so parseLine skips those rules.
       const eqIdx = optName.indexOf('=');
-      options.redirect = eqIdx >= 0 ? optName.slice(eqIdx + 1) : '';
+      const value = eqIdx >= 0 ? optName.slice(eqIdx + 1) : '';
+      if (optName.startsWith('redirect-rule=')) options.redirectRule = value;
+      else options.redirect = value;
     } else if (optName.startsWith('removeparam=')) {
       options.removeparam = optName.slice(12);
     } else if (optName === 'popup') {
+      options.popup = true;
       options.resourceTypes.push('main_frame');
     } else if (optName === 'inline-script') {
       // Manifest V3 can't block inline scripts.
@@ -636,88 +708,72 @@ function detectNestedQuantifiers(pattern) {
 
 /**
  * Estimate RE2 NFA instruction cost for a regex pattern.
- * RE2 expands character classes into per-character alternatives and
- * unrolls bounded quantifiers, so [0-9A-Za-z]{16} = 62 × 16 = 992
- * NFA instructions from that token alone. Chrome's 2KB program memory
- * limit corresponds to roughly 500-700 raw NFA nodes (each node has
- * ~3 bytes of overhead in RE2's compiled representation).
+ *
+ * RE2 compiles to a Thompson NFA and never backtracks. Character classes
+ * compile to per-RANGE byte-range instructions (so `[0-9a-z]` is 2
+ * instructions, not 36, and `.` is one range, not 256 alternatives), and
+ * `*`/`+` add a split instruction around the body rather than unrolling it.
+ * Only BOUNDED quantifiers (`{n}`, `{n,m}`) unroll — those keep their upper
+ * bound as a multiplier. The previous estimator costed `.` at 256 and
+ * `*`/`+` at ×10, so any pattern containing `.*` blew the 500 budget: the
+ * skip logs showed ~100 valid regex rules dropped with claimed costs like
+ * 25617, against only 39 kept.
  */
 function estimateRegexNfaCost(pattern) {
   let cost = 0;
   let i = 0;
-  let quantifierDepth = 0;
-  let consecutiveQuantifiers = 0;
-  let lastQuantifierEnd = -2;
 
   while (i < pattern.length) {
     if (pattern[i] === '[') {
-      // Character class
+      // Character class — cost = number of ranges, the unit RE2 compiles to.
       let j = i + 1;
       let negated = false;
       if (j < pattern.length && pattern[j] === '^') { negated = true; j++; }
       if (j < pattern.length && pattern[j] === ']') j++;
       while (j < pattern.length && pattern[j] !== ']') j++;
       const content = pattern.slice(i + (negated ? 2 : 1), j);
-      let classSize = 0;
+      let ranges = 0;
       for (let k = 0; k < content.length; k++) {
+        if (content[k] === '\\') { ranges++; k++; continue; }
         if (k + 2 < content.length && content[k + 1] === '-') {
-          classSize += content.charCodeAt(k + 2) - content.charCodeAt(k) + 1;
+          ranges++;
           k += 2;
-        } else { classSize++; }
+        } else { ranges++; }
       }
-      // Negated classes match the complement: ~256 - classSize
-      if (negated) classSize = Math.max(256 - classSize, classSize);
+      // A negated class is the complement set: at most ranges + 1 ranges.
+      const classCost = Math.max(1, ranges) + (negated ? 1 : 0);
       i = j + 1;
       const [mult, next] = getQuantMult(pattern, i);
-      if (mult > 1) {
-        if (i - lastQuantifierEnd < 2) consecutiveQuantifiers++;
-        lastQuantifierEnd = next;
-        quantifierDepth++;
-      }
-      cost += classSize * mult;
+      cost += classCost * mult;
       i = next;
     } else if (pattern[i] === '\\' && i + 1 < pattern.length) {
       const ch = pattern[i + 1];
-      const shSize = ch === 'd' || ch === 'D' ? 10
-                   : ch === 'w' || ch === 'W' ? 63
-                   : ch === 's' || ch === 'S' ? 6
+      // Shorthand classes by range count: \d = 1 range, \w = 4 (0-9A-Z_a-z),
+      // \s = 3 (tab-CR, space, NBSP-ish), negations approximated the same.
+      const shSize = ch === 'd' || ch === 'D' ? 2
+                   : ch === 'w' || ch === 'W' ? 5
+                   : ch === 's' || ch === 'S' ? 4
                    : ch === 'b' || ch === 'B' ? 2 : 1;
       i += 2;
       const [mult, next] = getQuantMult(pattern, i);
-      if (mult > 1) {
-        if (i - lastQuantifierEnd < 2) consecutiveQuantifiers++;
-        lastQuantifierEnd = next;
-        quantifierDepth++;
-      }
       cost += shSize * mult;
       i = next;
     } else if (pattern[i] === '.') {
-      // Unescaped dot matches ANY byte — RE2 cost = 256 alternatives
+      // One byte-range instruction in RE2, not 256 alternatives.
       i++;
       const [mult, next] = getQuantMult(pattern, i);
-      if (mult > 1) {
-        if (i - lastQuantifierEnd < 2) consecutiveQuantifiers++;
-        lastQuantifierEnd = next;
-        quantifierDepth++;
-      }
-      cost += 256 * mult;
+      cost += mult;
       i = next;
-    } else if (pattern[i] === '(') {
-      // Track group depth for nested quantifier detection
-      quantifierDepth++;
-      i++;
-    } else if (pattern[i] === ')') {
-      quantifierDepth = Math.max(0, quantifierDepth - 1);
+    } else if (pattern[i] === '(' || pattern[i] === ')') {
+      // Group bookkeeping (capture instructions) — cheap.
+      cost++;
       i++;
     } else {
       cost++;
-      i++;
+      const [mult, next] = getQuantMult(pattern, i + 1);
+      cost += mult - 1;
+      i = next;
     }
-  }
-
-  // Penalty for consecutive quantifiers (exponential backtracking risk)
-  if (consecutiveQuantifiers >= 2) {
-    cost *= (1 + consecutiveQuantifiers);
   }
 
   return cost;
@@ -738,7 +794,9 @@ function getQuantMult(pattern, i) {
       return [upper, i + m[0].length];
     }
   }
-  if (pattern[i] === '+' || pattern[i] === '*') return [10, i + 1];
+  // `*` and `+` wrap the body in a split/loop pair — the body is NOT
+  // unrolled by RE2, so the cost is body + O(1), modelled as ×2.
+  if (pattern[i] === '+' || pattern[i] === '*') return [2, i + 1];
   if (pattern[i] === '?') return [1, i + 1];
   return [1, i];
 }
@@ -798,18 +856,57 @@ const SECURITY_LIST_IDS = new Set(['malware']);
  * DNR priority bands for statically compiled rules, lowest to highest.
  * Runtime rules sit above all of these: the user allowlist uses 500 and
  * system-unbreak 1000.
+ *
+ * REDIRECT sits above BLOCK because at EQUAL priority DNR resolves
+ * allow > block > redirect — so a co-matching EasyList block would defeat
+ * every $redirect= stub and hard-block where uBO serves a working
+ * placeholder, causing exactly the breakage the redirect exists to prevent.
+ * One band up, the redirect wins over plain blocks while still losing to
+ * every allow. $removeparam redirects intentionally stay in the BLOCK band:
+ * if a URL is both blocked and param-stripped, blocking must win.
  */
 const DNR_PRIORITY = {
   BLOCK: 1,
-  ALLOW: 2,
-  IMPORTANT_BLOCK: 3,
-  IMPORTANT_ALLOW: 4,
+  REDIRECT: 2,
+  ALLOW: 3,
+  IMPORTANT_BLOCK: 4,
+  IMPORTANT_REDIRECT: 5,
+  IMPORTANT_ALLOW: 6,
 };
 
 function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (parsed.type !== 'network') return null;
 
   const { pattern, options, exception } = parsed;
+
+  // $badfilter rules are pass-1 directives consumed by parseFilterList's
+  // suppression pass; converting one would ship the very rule it cancels.
+  if (options.badfilter) {
+    reportDrop('badfilter-directive: consumed by two-pass suppression, never shipped as a rule', pattern);
+    return null;
+  }
+
+  // Wildcard entity domains (`gmx.*`) are invalid DNR initiatorDomains —
+  // Chrome rejects the whole rule at ruleset indexing. The bundled PSL is a
+  // curated stop-list (membership predicate only), not an enumerable TLD set
+  // suitable for entity expansion, so these entries cannot be expanded.
+  // Fail closed in each direction:
+  //  - a wildcard EXCLUSION cannot be honoured, and dropping just the entry
+  //    would over-apply the rule on the excluded sites → drop the rule;
+  //  - a wildcard POSITIVE entry is dropped (narrower); if none remain the
+  //    rule would become unscoped (broader) → drop the rule.
+  if (options.excludedInitiatorDomains.some((d) => d.includes('*'))) {
+    reportDrop('wildcard-domain-exclusion: ~entity.* in $domain= cannot be expressed in DNR; dropping the rule rather than shipping it over-applied', pattern);
+    return null;
+  }
+  let initiatorDomains = options.initiatorDomains;
+  if (initiatorDomains.some((d) => d.includes('*'))) {
+    initiatorDomains = initiatorDomains.filter((d) => !d.includes('*'));
+    if (initiatorDomains.length === 0) {
+      reportDrop('wildcard-domain-only: entity.* is invalid as a DNR initiatorDomain and no PSL entity expansion is available', pattern);
+      return null;
+    }
+  }
 
   const lowerPattern = pattern.toLowerCase();
   for (const safePath of CRITICAL_SAFE_PATHS) {
@@ -853,8 +950,8 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
       reportDrop('regex: contains non-ASCII — DNR requires ASCII-only', pattern);
       return null;
     }
-    if (regexFilter.length > 150) {
-      reportDrop(`regex: source length ${regexFilter.length} > 150 (Chrome RE2 2KB program budget)`, pattern);
+    if (regexFilter.length > 256) {
+      reportDrop(`regex: source length ${regexFilter.length} > 256 (Chrome RE2 2KB program budget)`, pattern);
       return null;
     }
 
@@ -897,6 +994,12 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (urlFilter) condition.urlFilter = urlFilter;
   if (regexFilter) condition.regexFilter = regexFilter;
 
+  // ABP/uBO filters are case-insensitive unless $match-case; DNR's historical
+  // default was case-SENSITIVE (Chrome <118), so EasyList's `/adframe.` never
+  // matched `.../AdFrame.js`. State it explicitly in both directions rather
+  // than relying on the version-dependent default.
+  condition.isUrlFilterCaseSensitive = options.matchCase === true;
+
   if (options.resourceTypes.length > 0) {
     condition.resourceTypes = options.resourceTypes;
   } else if (conversionOptions.coverDocuments && !exception) {
@@ -909,8 +1012,8 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (options.excludedResourceTypes.length > 0) {
     condition.excludedResourceTypes = options.excludedResourceTypes;
   }
-  if (options.initiatorDomains.length > 0) {
-    condition.initiatorDomains = options.initiatorDomains;
+  if (initiatorDomains.length > 0) {
+    condition.initiatorDomains = initiatorDomains;
   }
   if (options.excludedInitiatorDomains.length > 0) {
     condition.excludedInitiatorDomains = options.excludedInitiatorDomains;
@@ -954,9 +1057,14 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   // scheme (block 1, important 2, exception 3) let the exception always win,
   // so $important was inert. `allowAllRequests` from the user allowlist sits
   // far above all of these at priority 500, and system-unbreak at 1000.
+  // $redirect= stubs sit one band above the blocks of the same importance so
+  // a co-matching block cannot defeat them (see DNR_PRIORITY); $removeparam
+  // stays in the block band so a co-matching block wins the tie.
   let rulePriority;
   if (exception) {
     rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_ALLOW : DNR_PRIORITY.ALLOW;
+  } else if (options.redirect) {
+    rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_REDIRECT : DNR_PRIORITY.REDIRECT;
   } else {
     rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_BLOCK : DNR_PRIORITY.BLOCK;
   }
@@ -1031,6 +1139,64 @@ function getBlankRedirectUrl(resourceType) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Canonical form of a parsed network filter for $badfilter matching.
+ *
+ * ABP semantics: `X$badfilter` cancels the filter whose text is `X` (with the
+ * badfilter option removed). Matching is done on the parsed, normalised form
+ * rather than raw text so option order and `domain=` list order do not defeat
+ * the comparison. The badfilter flag itself is deliberately excluded.
+ */
+function canonicalNetworkKey(parsed) {
+  const o = parsed.options;
+  return JSON.stringify({
+    p: parsed.pattern,
+    e: !!parsed.exception,
+    rt: [...o.resourceTypes].sort(),
+    ert: [...o.excludedResourceTypes].sort(),
+    id: [...o.initiatorDomains].sort(),
+    eid: [...o.excludedInitiatorDomains].sort(),
+    rd: [...o.requestDomains].sort(),
+    tp: o.thirdParty,
+    r: o.redirect,
+    rp: o.removeparam,
+    imp: !!o.important,
+    mc: o.matchCase === true,
+    pop: o.popup === true,
+  });
+}
+
+/**
+ * Two-pass $badfilter suppression (prior review 4.1).
+ *
+ * Pass 1 collects the canonical forms of every `$badfilter` rule; pass 2
+ * suppresses base rules whose canonical form matches. This replaces the
+ * fail-closed interim behaviour (dropping `$badfilter` lines as unsupported),
+ * which kept the badfilter itself from shipping as a block but left the rule
+ * it was written to cancel fully active.
+ *
+ * Scope note: suppression is per-list — each list is parsed independently, so
+ * a $badfilter in list A does not cancel a rule in list B. uBO applies it
+ * corpus-wide; in practice list authors target their own list's rules.
+ */
+function applyBadfilterSuppression(networkRules) {
+  const badKeys = new Set();
+  const baseRules = [];
+  for (const rule of networkRules) {
+    if (rule.options?.badfilter) badKeys.add(canonicalNetworkKey(rule));
+    else baseRules.push(rule);
+  }
+  if (badKeys.size === 0) return { rules: baseRules, suppressed: [] };
+
+  const kept = [];
+  const suppressed = [];
+  for (const rule of baseRules) {
+    if (badKeys.has(canonicalNetworkKey(rule))) suppressed.push(rule);
+    else kept.push(rule);
+  }
+  return { rules: kept, suppressed };
+}
+
+/**
  * Parse a complete filter list text into categorized rule sets.
  * Also collects full skip records: every non-blank/non-comment line
  * that parseLine rejects is recorded with the reason.
@@ -1069,8 +1235,18 @@ function parseFilterList(text) {
     }
   }
 
+  // Two-pass $badfilter suppression: badfilter rules never ship, and the base
+  // rules they cancel are removed with a skip record for the log.
+  const { rules: survivingNetworkRules, suppressed } = applyBadfilterSuppression(networkRules);
+  for (const rule of suppressed) {
+    skippedRecords.push({
+      reason: 'badfilter-suppressed: cancelled by a matching $badfilter rule in this list',
+      line: rule.pattern,
+    });
+  }
+
   return {
-    networkRules,
+    networkRules: survivingNetworkRules,
     cosmeticRules,
     cosmeticExceptions,
     genericCosmeticExceptionDomains: dedupeDomains(genericCosmeticExceptionDomains),
@@ -1124,6 +1300,11 @@ function buildDNRRules(networkRules, conversionOptions = {}) {
       const rule = networkFilterToDNR(parsed, conversionOptions);
       if (!rule) continue;
 
+      // The key must include priority and the FULL action payload. Keying on
+      // action.type alone collapsed `$removeparam=utm_source` with
+      // `$removeparam=utm_medium` (both `redirect`), so only the first
+      // parameter was ever stripped; omitting priority collapsed `||y.com^`
+      // with `||y.com^$important`, silently discarding the important flag.
       const key = JSON.stringify({
         uf: rule.condition.urlFilter || rule.condition.regexFilter,
         rt: rule.condition.resourceTypes,
@@ -1132,10 +1313,12 @@ function buildDNRRules(networkRules, conversionOptions = {}) {
         eid: rule.condition.excludedInitiatorDomains,
         rd: rule.condition.requestDomains,
         dt: rule.condition.domainType,
-        at: rule.action.type,
+        cs: rule.condition.isUrlFilterCaseSensitive,
+        p: rule.priority,
+        a: rule.action,
       });
       if (seen.has(key)) {
-        droppedRecords.push({ reason: 'dedup: duplicate of another DNR rule (same urlFilter+resourceTypes+action)', pattern: parsed.pattern });
+        droppedRecords.push({ reason: 'dedup: duplicate of another DNR rule (same condition+priority+action)', pattern: parsed.pattern });
         continue;
       }
       seen.add(key);
@@ -1261,7 +1444,6 @@ function collectExpectedRulesetFiles() {
   return files;
 }
 
-const SKIP_LOG_DIR = path.join(RULES_DIR, 'skipped');
 
 function groupByReason(records, keyField) {
   const groups = new Map();
@@ -1278,8 +1460,9 @@ function groupByReason(records, keyField) {
  * Each entry lists the reason and the exact source line — nothing is cut
  * so engineers can reproduce and triage individual filters.
  */
-function writeSkipLog(listId, { parseSkips, dnrDrops, truncatedCount }) {
-  fs.mkdirSync(SKIP_LOG_DIR, { recursive: true });
+function writeSkipLog(listId, { parseSkips, dnrDrops, truncatedCount }, outDir = RULES_DIR) {
+  const skipLogDir = path.join(outDir, 'skipped');
+  fs.mkdirSync(skipLogDir, { recursive: true });
   const lines = [];
   lines.push(`# Skip log for ${listId}`);
   lines.push(`# generated ${new Date().toISOString()}`);
@@ -1306,7 +1489,7 @@ function writeSkipLog(listId, { parseSkips, dnrDrops, truncatedCount }) {
     lines.push(`Individual lines not recorded: smartTruncate operates on already-parsed rules ranked by scoreNetworkRule.`);
   }
 
-  const outPath = path.join(SKIP_LOG_DIR, `${listId}.log`);
+  const outPath = path.join(skipLogDir, `${listId}.log`);
   fs.writeFileSync(outPath, lines.join('\n'));
 }
 
@@ -1315,28 +1498,59 @@ function printSkipSummary(listId, parseSkips, dnrDrops, truncatedCount) {
   log(`   📝 Skip summary for ${listId} (full log: rules/skipped/${listId}.log)`);
 }
 
-function cleanGeneratedRuleFiles() {
-  if (!fs.existsSync(RULES_DIR)) return;
+/**
+ * Atomically-ish promote a fully-staged build into rules/.
+ *
+ * The build used to wipe rules/ up front and write into it as it went, so one
+ * flaky CDN removed the previously-good rulesets and threw before writing new
+ * ones — instantly breaking any loaded developer extension (Chrome silently
+ * ignores missing static rulesets). Everything is now written to a staging
+ * directory first; only after every list has fetched, parsed, compiled and
+ * passed budget verification does this swap run. A failed build leaves
+ * rules/ exactly as it was.
+ */
+function commitStagedRules(stagingDir, targetDir = RULES_DIR) {
+  fs.mkdirSync(targetDir, { recursive: true });
 
   const generatedFiles = new Set([
     ...collectExpectedRulesetFiles(),
+    'ruleset-counts.json',
     'cosmetic-rules.json',
     'scriptlet-rules.json',
     'filter-sources.json',
   ]);
 
-  for (const entry of fs.readdirSync(RULES_DIR, { withFileTypes: true })) {
+  const stagedFiles = fs.readdirSync(stagingDir, { withFileTypes: true })
+    .filter((e) => e.isFile())
+    .map((e) => e.name);
+  const stagedSet = new Set(stagedFiles);
+
+  // Remove stale generated files this build did not regenerate, so a
+  // shrinking output set leaves no phantom shards behind. Hand-maintained
+  // files (system-unbreak.json) are never touched.
+  for (const entry of fs.readdirSync(targetDir, { withFileTypes: true })) {
     if (!entry.isFile()) continue;
     if (entry.name === 'system-unbreak.json') continue;
     if (!generatedFiles.has(entry.name)) continue;
-    fs.rmSync(path.join(RULES_DIR, entry.name), { force: true });
+    if (stagedSet.has(entry.name)) continue;
+    fs.rmSync(path.join(targetDir, entry.name), { force: true });
   }
 
-  // Wipe stale per-list skip logs so a shrinking skip set doesn't leave
+  for (const name of stagedFiles) {
+    fs.renameSync(path.join(stagingDir, name), path.join(targetDir, name));
+  }
+
+  // Skip logs: replace wholesale so a shrinking skip set doesn't leave
   // phantom entries behind from a previous build.
-  if (fs.existsSync(SKIP_LOG_DIR)) {
-    for (const entry of fs.readdirSync(SKIP_LOG_DIR)) {
-      if (entry.endsWith('.log')) fs.rmSync(path.join(SKIP_LOG_DIR, entry), { force: true });
+  const stagedSkipDir = path.join(stagingDir, 'skipped');
+  if (fs.existsSync(stagedSkipDir)) {
+    const targetSkipDir = path.join(targetDir, 'skipped');
+    fs.mkdirSync(targetSkipDir, { recursive: true });
+    for (const entry of fs.readdirSync(targetSkipDir)) {
+      if (entry.endsWith('.log')) fs.rmSync(path.join(targetSkipDir, entry), { force: true });
+    }
+    for (const entry of fs.readdirSync(stagedSkipDir)) {
+      fs.renameSync(path.join(stagedSkipDir, entry), path.join(targetSkipDir, entry));
     }
   }
 }
@@ -1377,7 +1591,7 @@ const DNR_LIMITS = {
   GUARANTEED_MINIMUM_ENABLED: 30000,
 };
 
-function verifyDnrBudget() {
+function verifyDnrBudget(rulesDirOverride = null) {
   const manifestPath = path.resolve(__dirname, '../manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
   const resources = manifest?.declarative_net_request?.rule_resources || [];
@@ -1399,7 +1613,13 @@ function verifyDnrBudget() {
   const lines = [];
 
   for (const entry of resources) {
-    const abs = path.resolve(projectRoot, entry.path);
+    let abs = path.resolve(projectRoot, entry.path);
+    // When verifying a staged (not yet committed) build, prefer the staged
+    // copy of each ruleset; hand-maintained files fall back to the repo copy.
+    if (rulesDirOverride) {
+      const staged = path.join(rulesDirOverride, path.basename(entry.path));
+      if (fs.existsSync(staged)) abs = staged;
+    }
     let rules = [];
     try {
       rules = JSON.parse(fs.readFileSync(abs, 'utf8'));
@@ -1448,32 +1668,41 @@ function verifyDnrBudget() {
   log('✅ DNR per-ruleset budget verified');
 }
 
-function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }) {
+function writeBuildOutputs({ rulesetOutputs, cosmeticRules, scriptletRules, filterSources }, outDir = RULES_DIR) {
+  fs.mkdirSync(outDir, { recursive: true });
+
   // Per-ruleset rule counts — previously hardcoded in service-worker.js and
   // drifted from reality after every filter-list refresh. Emit the actual
   // compiled counts so the SW can load them at runtime instead of guessing.
   const rulesetCounts = {};
   for (const [filename, rules] of Object.entries(rulesetOutputs)) {
-    const outPath = path.join(RULES_DIR, filename);
+    const outPath = path.join(outDir, filename);
     fs.writeFileSync(outPath, JSON.stringify(rules, null, 2));
     log(`✅ ${filename} — ${rules.length} DNR rules written`);
     const rulesetId = filename.replace(/\.json$/, '');
     rulesetCounts[rulesetId] = rules.length;
   }
 
-  const countsPath = path.join(RULES_DIR, 'ruleset-counts.json');
+  // system-unbreak.json is hand-maintained, not generated, but its count
+  // belongs in ruleset-counts.json too so the SW never has to guess it.
+  try {
+    const systemUnbreak = JSON.parse(fs.readFileSync(path.join(RULES_DIR, 'system-unbreak.json'), 'utf8'));
+    if (Array.isArray(systemUnbreak)) rulesetCounts['system-unbreak'] = systemUnbreak.length;
+  } catch { /* optional — absent in exotic layouts */ }
+
+  const countsPath = path.join(outDir, 'ruleset-counts.json');
   fs.writeFileSync(countsPath, JSON.stringify(rulesetCounts, null, 2));
   log(`✅ ruleset-counts.json — ${Object.keys(rulesetCounts).length} entries`);
 
-  const cosmeticsPath = path.join(RULES_DIR, 'cosmetic-rules.json');
+  const cosmeticsPath = path.join(outDir, 'cosmetic-rules.json');
   fs.writeFileSync(cosmeticsPath, JSON.stringify(cosmeticRules, null, 2));
   log(`\n✅ cosmetic-rules.json — ${cosmeticRules.generic.length} generic + ${Object.keys(cosmeticRules.domainSpecific).length} domain-specific`);
 
-  const scriptletsPath = path.join(RULES_DIR, 'scriptlet-rules.json');
+  const scriptletsPath = path.join(outDir, 'scriptlet-rules.json');
   fs.writeFileSync(scriptletsPath, JSON.stringify(scriptletRules, null, 2));
   log(`✅ scriptlet-rules.json — ${scriptletRules.length} rules`);
 
-  const filterSourcesPath = path.join(RULES_DIR, 'filter-sources.json');
+  const filterSourcesPath = path.join(outDir, 'filter-sources.json');
   fs.writeFileSync(filterSourcesPath, JSON.stringify(filterSources, null, 2));
   log(`✅ filter-sources.json — ${Object.keys(filterSources).length} list sources`);
 }
@@ -1533,7 +1762,7 @@ function buildSampleFilterSources() {
   ]));
 }
 
-function writeSampleOutputs() {
+function writeSampleOutputs(outDir = RULES_DIR) {
   log('🧪 Generating sample rule artifacts (offline mode)...\n');
 
   writeBuildOutputs({
@@ -1541,7 +1770,7 @@ function writeSampleOutputs() {
     cosmeticRules: generateSampleCosmeticRules(),
     scriptletRules: generateSampleScriptletRules(),
     filterSources: buildSampleFilterSources(),
-  });
+  }, outDir);
 
   log('\n🎉 Sample build complete!');
 }
@@ -1865,14 +2094,27 @@ function smartTruncate(networkRules, limit) {
 // ---------------------------------------------------------------------------
 async function main() {
   fs.mkdirSync(RULES_DIR, { recursive: true });
-  cleanGeneratedRuleFiles();
 
-  if (SAMPLE_MODE) {
-    writeSampleOutputs();
-    verifyManifestRuleResourcePaths();
-    process.exit(0);
+  // Stage everything into a sibling temp dir and swap only on success — a
+  // failed fetch/parse/verify leaves the previous good rules/ untouched
+  // (§5.48). Same parent dir so renameSync never crosses a filesystem.
+  const stagingDir = fs.mkdtempSync(path.join(path.dirname(RULES_DIR), '.rules-staging-'));
+
+  try {
+    if (SAMPLE_MODE) {
+      writeSampleOutputs(stagingDir);
+      commitStagedRules(stagingDir);
+      verifyManifestRuleResourcePaths();
+      return;
+    }
+
+    await buildFromNetwork(stagingDir);
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
   }
+}
 
+async function buildFromNetwork(stagingDir) {
   let rustSourceParserReady = false;
   let parseFilterSourceWithRust = null;
   try {
@@ -1904,11 +2146,23 @@ async function main() {
   for (const list of FILTER_LISTS) {
     try {
       log(`⬇️  Fetching ${list.description}...`);
-      const text = await fetchAndExpand(list.url, 0, list.id);
+      const text = await fetchAndExpand(list.url);
+
+      // SRI over the FULLY-EXPANDED text: includes carry most uBO content,
+      // so hashing only the top-level file would verify almost nothing.
+      const verification = verifySriHash(text, list.id);
+      if (!verification.valid) {
+        throw new Error(`[SRI] ${verification.error}`);
+      } else if (verification.skipped) {
+        console.warn(`[SRI] ${list.id}: verification skipped via --skip-sri flag`);
+      } else {
+        log(`[SRI] ${list.id}: hash verified`);
+      }
+
       const parsed = parseFilterList(text, list.id);
 
       log(`   Parsed: ${parsed.networkRules.length} network, ${parsed.cosmeticRules.length} cosmetic, ${parsed.scriptletRules.length} scriptlets, ${parsed.skippedRecords.length} skipped`);
-      const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: 30000 };
+      const config = LIST_CONFIG[list.id] || { parts: 1, totalLimit: MAX_PER_FILE };
       let networkRules = parsed.networkRules;
       let sourceBundle = null;
       if (rustSourceParserReady) {
@@ -1922,11 +2176,19 @@ async function main() {
       sourceBundle = mergeParsedCosmeticScopeExceptions(sourceBundle, parsed);
       sourceBundle = pruneDeniedCosmeticSelectors(sourceBundle);
 
+      // Clamp the configured limit to what the shards can physically hold —
+      // a totalLimit above parts*MAX_PER_FILE used to let up to 5,000 rules
+      // vanish at the shard writer with no skip-log record (§5.47).
+      const limit = effectiveListLimit(config);
+      if ((config.totalLimit ?? limit) > limit) {
+        console.warn(`   ⚠️  ${list.id}: totalLimit ${config.totalLimit} exceeds shard capacity ${limit} (${config.parts || 1} × ${MAX_PER_FILE}); using ${limit}`);
+      }
+
       let truncatedCount = 0;
-      if (networkRules.length > config.totalLimit) {
+      if (networkRules.length > limit) {
         const before = networkRules.length;
-        log(`   ⚠️  Rule count (${before}) exceeds limit for ${list.id}. Applying smart selection to ${config.totalLimit}...`);
-        networkRules = smartTruncate(networkRules, config.totalLimit);
+        log(`   ⚠️  Rule count (${before}) exceeds limit for ${list.id}. Applying smart selection to ${limit}...`);
+        networkRules = smartTruncate(networkRules, limit);
         truncatedCount = before - networkRules.length;
         log(`   ✂️  Smart selection: ${networkRules.length} rules kept (${truncatedCount} trimmed by smartTruncate)`);
       }
@@ -1948,16 +2210,25 @@ async function main() {
         }
       }
 
-      writeSkipLog(list.id, {
-        parseSkips: parsed.skippedRecords,
-        dnrDrops: droppedRecords,
-        truncatedCount,
-      });
-      printSkipSummary(list.id, parsed.skippedRecords, droppedRecords, truncatedCount);
-
       // Split and stage rules for a single final write. Exceptions first —
       // see orderRulesForSharding.
       const shardable = orderRulesForSharding(dnrRules);
+
+      // Belt and braces for §5.47: anything beyond shard capacity would
+      // vanish at the writer, so record it rather than losing it silently.
+      // (Unreachable while the pre-conversion clamp above holds.)
+      const capacityOverflow = Math.max(0, shardable.length - (config.parts || 1) * MAX_PER_FILE);
+      if (capacityOverflow > 0) {
+        console.warn(`   ⚠️  ${list.id}: ${capacityOverflow} rules exceed shard capacity and will be dropped`);
+      }
+
+      writeSkipLog(list.id, {
+        parseSkips: parsed.skippedRecords,
+        dnrDrops: droppedRecords,
+        truncatedCount: truncatedCount + capacityOverflow,
+      }, stagingDir);
+      printSkipSummary(list.id, parsed.skippedRecords, droppedRecords, truncatedCount);
+
       for (let i = 0; i < config.parts; i++) {
         const chunk = shardable.slice(i * MAX_PER_FILE, (i + 1) * MAX_PER_FILE);
         const suffix = i === 0 ? '' : `_${i + 1}`;
@@ -2004,15 +2275,33 @@ async function main() {
     cosmeticRules: allCosmeticRules,
     scriptletRules: allScriptletRules,
     filterSources,
-  });
+  }, stagingDir);
 
+  // Verify the STAGED build before promoting it; only a build that passes
+  // budget checks ever replaces the previous good rules/.
+  verifyDnrBudget(stagingDir);
+  commitStagedRules(stagingDir);
   verifyManifestRuleResourcePaths();
-  verifyDnrBudget();
 
   log('\n🎉 Build complete!');
 }
 
-export { parseLine, networkFilterToDNR, buildSourceBundleFallback, orderRulesForSharding };
+export {
+  parseLine,
+  networkFilterToDNR,
+  buildSourceBundleFallback,
+  orderRulesForSharding,
+  parseFilterList,
+  applyBadfilterSuppression,
+  buildDNRRules,
+  verifySriHash,
+  fetchAndExpand,
+  effectiveListLimit,
+  commitStagedRules,
+  FILTER_LISTS,
+  LIST_CONFIG,
+  MAX_PER_FILE,
+};
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 

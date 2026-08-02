@@ -236,15 +236,65 @@ export function parseFilterList(text) {
   };
 }
 
+// A hung or hostile CDN must not stall the service worker or OOM its small
+// heap: bound every list fetch in time and bytes (§5.10 / prior 2.6).
+const LIST_FETCH_TIMEOUT_MS = 30_000;
+const LIST_FETCH_MAX_BYTES = 25 * 1024 * 1024;
+
+async function fetchTextBounded(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LIST_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {cache: 'no-store', signal: controller.signal});
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    if (url.startsWith('https:') && res.url && !res.url.startsWith('https:')) {
+      throw new Error(`Insecure redirect for ${url} -> ${res.url}`);
+    }
+    if (!res.body?.getReader) {
+      // Environments without streaming (tests): cap after the fact.
+      const text = await res.text();
+      if (text.length > LIST_FETCH_MAX_BYTES) {
+        throw new Error(`Response exceeds ${LIST_FETCH_MAX_BYTES} bytes for ${url}`);
+      }
+      return text;
+    }
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > LIST_FETCH_MAX_BYTES) {
+        controller.abort();
+        throw new Error(`Response exceeds ${LIST_FETCH_MAX_BYTES} bytes for ${url}`);
+      }
+      chunks.push(value);
+    }
+    const merged = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(merged);
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Timeout after ${LIST_FETCH_TIMEOUT_MS}ms fetching ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Fetch a filter list URL and expand any !#include directives.
  * Uses the browser fetch() API (available in service workers).
  */
 export async function fetchAndExpand(url, depth = 0) {
   if (depth > 5) return '';
-  const res = await fetch(url, {cache: 'no-store'});
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  const text = await res.text();
+  const text = await fetchTextBounded(url);
 
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
   const lines = [];

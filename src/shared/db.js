@@ -6,6 +6,7 @@
  */
 
 import { ancestorDomains } from './psl.js';
+import { StorageQuotaError } from './storage.js';
 
 const DB_NAME = 'NullifyRules';
 const DB_VERSION = 4;
@@ -16,15 +17,49 @@ const STORE_PAGE_BUNDLES = 'page_bundles';
 
 const ALL_STORES = [STORE_COSMETIC, STORE_SCRIPTLET, STORE_FILTER_SOURCES, STORE_PAGE_BUNDLES];
 
+/**
+ * Normalize an IndexedDB transaction/request error into something callers can
+ * act on: quota failures map to the shared StorageQuotaError type, and a
+ * missing error (possible on commit-time aborts) becomes a real Error.
+ */
+function normalizeIdbError(error, fallbackMessage) {
+  if (!error) return new Error(fallbackMessage);
+  if (error.name === 'QuotaExceededError') {
+    return new StorageQuotaError(error.message || fallbackMessage, { cause: error });
+  }
+  return error;
+}
+
+/**
+ * Wire rejection for both failure paths of a transaction. Per the IndexedDB
+ * spec, a transaction that aborts without a failed request — quota exceeded
+ * at commit, forced close under storage pressure, internal IO error — fires
+ * only `abort`, not `error`. Without an onabort handler the wrapper promise
+ * would never settle. A settled promise ignores duplicate reject calls, so
+ * coexistence with per-request onerror handlers is safe.
+ */
+function rejectOnAbortOrError(transaction, reject) {
+  transaction.onabort = () =>
+    reject(normalizeIdbError(transaction.error, 'IndexedDB transaction aborted'));
+  transaction.onerror = (event) =>
+    reject(normalizeIdbError(event.target.error, 'IndexedDB transaction error'));
+}
+
 export class RulesDB {
   constructor() {
     this.db = null;
+    this._openPromise = null;
+    this._pendingCosmeticLookups = [];
   }
 
   async open() {
     if (this.db) return this.db;
+    // Concurrent open() calls must share one connection: a second physical
+    // connection would leak, and its versionchange handler would block
+    // upgrades forever. Cache the in-flight open promise.
+    if (this._openPromise) return this._openPromise;
 
-    return new Promise((resolve, reject) => {
+    this._openPromise = new Promise((resolve, reject) => {
       const request = indexedDB.open(DB_NAME, DB_VERSION);
 
       request.onupgradeneeded = (event) => {
@@ -58,27 +93,37 @@ export class RulesDB {
       };
 
       request.onsuccess = (event) => {
-        this.db = event.target.result;
+        const db = event.target.result;
         // If another tab triggers a version upgrade later, Chrome will try
         // to invalidate our open connection. Close it so the upgrade can
-        // proceed rather than stalling indefinitely.
-        this.db.onversionchange = () => {
-          try { this.db.close(); } catch { /* ignore */ }
-          this.db = null;
+        // proceed rather than stalling indefinitely. The handler is bound to
+        // ITS OWN connection (`db`), not `this.db` — otherwise a stale
+        // handler could close whatever connection happens to be current.
+        db.onversionchange = () => {
+          try { db.close(); } catch { /* ignore */ }
+          if (this.db === db) {
+            this.db = null;
+            this._openPromise = null;
+          }
         };
-        resolve(this.db);
+        this.db = db;
+        resolve(db);
       };
 
       request.onerror = (event) => {
+        this._openPromise = null;
         reject(event.target.error);
       };
 
       // Another tab already has the DB open at the old version and is
       // blocking the upgrade. Reject rather than hang forever.
       request.onblocked = () => {
+        this._openPromise = null;
         reject(new Error('IndexedDB upgrade blocked by another tab'));
       };
     });
+
+    return this._openPromise;
   }
 
   /** Bulk insert scriptlet rules. */
@@ -101,7 +146,7 @@ export class RulesDB {
       }
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 
@@ -112,12 +157,13 @@ export class RulesDB {
       const transaction = db.transaction([STORE_SCRIPTLET], 'readonly');
       const store = transaction.objectStore(STORE_SCRIPTLET);
       const index = store.index('domain');
-      
+      rejectOnAbortOrError(transaction, reject);
+
       // Stop ascending at the first public suffix so `co.uk`-indexed rules
       // cannot match every site on that TLD. Empty string key is the
       // "generic" bucket (rules with no domain).
       const domainsToCheck = ['', ...ancestorDomains(hostname)];
-      
+
       const allRules = [];
       let completed = 0;
 
@@ -157,21 +203,57 @@ export class RulesDB {
       }
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 
-  /** Get rules for a single domain. */
+  /**
+   * Get rules for a single domain.
+   *
+   * Lookups issued in the same synchronous burst — as the service worker's
+   * ancestor-domain walk does — are coalesced into ONE readonly transaction,
+   * so a concurrent rebuild (clear + repopulate) cannot interleave between
+   * two lookups and the combined result is snapshot-consistent.
+   */
   async getCosmeticRules(hostname) {
-    const db = await this.open();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction([STORE_COSMETIC], 'readonly');
-      const store = transaction.objectStore(STORE_COSMETIC);
-      const request = store.get(hostname);
-
-      request.onsuccess = () => resolve(request.result?.selectors || []);
-      request.onerror = (event) => reject(event.target.error);
+      this._pendingCosmeticLookups.push({ hostname, resolve, reject });
+      if (this._pendingCosmeticLookups.length === 1) {
+        queueMicrotask(() => { this._flushCosmeticLookups(); });
+      }
     });
+  }
+
+  /** Run all queued cosmetic lookups inside a single readonly transaction. */
+  async _flushCosmeticLookups() {
+    const batch = this._pendingCosmeticLookups;
+    this._pendingCosmeticLookups = [];
+    if (batch.length === 0) return;
+
+    const rejectAll = (err) => {
+      for (const entry of batch) entry.reject(err);
+    };
+
+    let transaction;
+    try {
+      const db = await this.open();
+      transaction = db.transaction([STORE_COSMETIC], 'readonly');
+    } catch (err) {
+      rejectAll(err);
+      return;
+    }
+
+    transaction.onabort = () =>
+      rejectAll(normalizeIdbError(transaction.error, 'IndexedDB transaction aborted'));
+    transaction.onerror = (event) =>
+      rejectAll(normalizeIdbError(event.target.error, 'IndexedDB transaction error'));
+
+    const store = transaction.objectStore(STORE_COSMETIC);
+    for (const entry of batch) {
+      const request = store.get(entry.hostname);
+      request.onsuccess = () => entry.resolve(request.result?.selectors || []);
+      request.onerror = (event) => entry.reject(event.target.error);
+    }
   }
 
   /** Clear all indexed rules. */
@@ -184,7 +266,7 @@ export class RulesDB {
       transaction.objectStore(STORE_PAGE_BUNDLES).clear();
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 
@@ -214,7 +296,7 @@ export class RulesDB {
       }
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 
@@ -225,6 +307,7 @@ export class RulesDB {
       const transaction = db.transaction([STORE_FILTER_SOURCES], 'readonly');
       const store = transaction.objectStore(STORE_FILTER_SOURCES);
       const request = store.getAll();
+      rejectOnAbortOrError(transaction, reject);
 
       request.onsuccess = () => resolve(request.result || []);
       request.onerror = (event) => reject(event.target.error);
@@ -238,6 +321,7 @@ export class RulesDB {
       const transaction = db.transaction([STORE_FILTER_SOURCES], 'readonly');
       const store = transaction.objectStore(STORE_FILTER_SOURCES);
       const request = store.count();
+      rejectOnAbortOrError(transaction, reject);
 
       request.onsuccess = () => resolve((request.result || 0) > 0);
       request.onerror = (event) => reject(event.target.error);
@@ -253,7 +337,7 @@ export class RulesDB {
       store.put({ hostname, bundle, version, updatedAt: Date.now() });
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 
@@ -278,7 +362,7 @@ export class RulesDB {
         }
       };
       transaction.oncomplete = () => resolve(bundle);
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
       request.onerror = (event) => reject(event.target.error);
     });
   }
@@ -291,7 +375,7 @@ export class RulesDB {
       transaction.objectStore(STORE_PAGE_BUNDLES).clear();
 
       transaction.oncomplete = () => resolve();
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 
@@ -304,6 +388,7 @@ export class RulesDB {
       const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readonly');
       const store = transaction.objectStore(STORE_PAGE_BUNDLES);
       const request = store.getAll();
+      rejectOnAbortOrError(transaction, reject);
 
       request.onsuccess = () => resolve(request.result || []);
       request.onerror = (event) => reject(event.target.error);
@@ -324,7 +409,7 @@ export class RulesDB {
       }
 
       transaction.oncomplete = () => resolve(staleRecords.length);
-      transaction.onerror = (event) => reject(event.target.error);
+      rejectOnAbortOrError(transaction, reject);
     });
   }
 }

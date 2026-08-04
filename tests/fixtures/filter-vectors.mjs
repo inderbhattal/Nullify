@@ -175,6 +175,177 @@ export const FILTER_VECTORS = [
     },
   },
 
+  // --- cosmetic-scope exceptions and their short aliases (§4.7) -----------
+  // `@@…$generichide` and friends turn cosmetic filtering off for a domain.
+  // uBO accepts a short spelling of each and uAssets uses them heavily —
+  // unbreak.txt ships an entire `$ghide` section. The build parser learned the
+  // aliases; the runtime parser did not, so every short-form line parsed to
+  // null at runtime and the domains uBO excepts from generic hiding kept
+  // getting generic cosmetics applied. There was no vector here, which is why
+  // the parity suite passed through the whole divergence.
+  //
+  // `expect` is the shape parser-parity's canonicalizer reduces this rule type
+  // to. `scopeException` carries the part that canonicalization drops — the
+  // alias must normalise to its canonical name, and to the RIGHT one — and is
+  // asserted against both engines in src/shared/filter-parser.test.mjs.
+  {
+    line: '@@||example.com^$generichide',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: { domains: ['example.com'], scopes: ['generichide'] },
+  },
+  {
+    line: '@@||example.com^$ghide',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: { domains: ['example.com'], scopes: ['generichide'] },
+  },
+  {
+    line: '@@||example.com^$elemhide',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: { domains: ['example.com'], scopes: ['elemhide'] },
+  },
+  {
+    line: '@@||example.com^$ehide',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: { domains: ['example.com'], scopes: ['elemhide'] },
+  },
+  {
+    line: '@@||example.com^$specifichide',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: { domains: ['example.com'], scopes: ['specifichide'] },
+  },
+  {
+    line: '@@||example.com^$shide',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: { domains: ['example.com'], scopes: ['specifichide'] },
+  },
+  {
+    // Real unbreak.txt shape: alias plus a domain= list.
+    line: '@@||cdn.example.net^$ghide,domain=example.com|example.org',
+    expect: { kind: 'cosmetic-scope-exception' },
+    scopeException: {
+      domains: ['cdn.example.net', 'example.com', 'example.org'],
+      scopes: ['generichide'],
+    },
+  },
+
+  // --- `+js(...)` must END the line (§5.14a) -------------------------------
+  // Both JS parsers match /^([^#]*)#(?:#\+js\(|\+js\()(.+)\)$/ and, when that
+  // fails, fall through to the plain `##`/`#@#` branches — so trailing text
+  // after the closing paren makes the line an inert cosmetic rule whose
+  // "selector" is the literal `+js(...)` text. Rust took `rfind(')')` from
+  // anywhere in the line and ran the scriptlet for real, so whether a user got
+  // code execution depended on whether WASM initialized. The JS reading is the
+  // safer one and is now what all three engines implement.
+  {
+    line: 'example.com##+js(foo) extra',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: [],
+      selector: '+js(foo) extra',
+      exception: false,
+    },
+  },
+  {
+    line: 'example.com#@#+js(foo) extra',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: [],
+      selector: '+js(foo) extra',
+      exception: true,
+    },
+  },
+  {
+    // `(.+)` requires at least one argument character.
+    line: 'example.com##+js()',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: [],
+      selector: '+js()',
+      exception: false,
+    },
+  },
+  {
+    // The guard is "ends with )", not "contains no )": a `)` inside an
+    // argument is ordinary data as long as one also terminates the line.
+    line: 'example.com##+js(rmnt, script, /foo)bar/)',
+    expect: {
+      kind: 'scriptlet',
+      domains: ['example.com'],
+      excludedDomains: [],
+      name: 'rmnt',
+      args: ['script', '/foo)bar/'],
+    },
+  },
+
+  // --- domain case (§5.14b) -----------------------------------------------
+  // parseLine preserves the domain text as written; the engines diverge one
+  // step later, at KEYING. Rust lowercases the key (push_unique_domain_selector),
+  // so the rule lands in the bucket the lookup walk — which lowercases the
+  // hostname — actually asks for. The JS ingestion path keys the raw token, so
+  // the same filter is dead there. Rust's behaviour is the correct one;
+  // `splitDomainList` in src/shared/filter-syntax.js needs the same fold, at
+  // which point this vector's `domains` becomes ['example.com'].
+  // tests/wasm-parity.test.mjs asserts the lowercased key against the real
+  // WASM bundle. The selector's own case is data and must survive untouched.
+  {
+    line: 'EXAMPLE.com##.Ad',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['EXAMPLE.com'],
+      excludedDomains: [],
+      selector: '.Ad',
+      exception: false,
+    },
+  },
+
+  // --- `;` inside a procedural argument (§5.14c) ---------------------------
+  // `;` is CSS-injection material only where the text is CSS. A procedural
+  // operator's argument is a regex/XPath/text needle, so a `;` in it is an
+  // ordinary character. Both JS engines ingested these; Rust's carve-out named
+  // `:style(` alone and dropped the rest, so the WASM path silently lost rules
+  // the JS path kept.
+  {
+    line: 'example.com#?#div:has-text(/ad;box/)',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: [],
+      selector: 'div:has-text(/ad;box/)',
+      exception: false,
+    },
+  },
+
+  // --- shapes that parse as cosmetic but must never reach CSS (§5.13) ------
+  // All three parsers classify these identically; the divergence they guard is
+  // one layer down, at the CSS-safety gate. Up to 100 selectors are joined
+  // into a single declaration, so one invalid selector invalidates all 100 in
+  // the browser — 99 legitimate hide rules failing open. A leading combinator
+  // and a prefix-matched pseudo-element (`::before2` is not `::before`) both
+  // used to pass that gate.
+  {
+    line: 'example.com##> .ad',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: [],
+      selector: '> .ad',
+      exception: false,
+    },
+  },
+  {
+    line: 'example.com##div::before2',
+    expect: {
+      kind: 'cosmetic',
+      domains: ['example.com'],
+      excludedDomains: [],
+      selector: 'div::before2',
+      exception: false,
+    },
+  },
+
   // --- comments and blanks ------------------------------------------------
   { line: '! a comment', expect: { kind: 'skip' } },
   { line: '[Adblock Plus 2.0]', expect: { kind: 'skip' } },

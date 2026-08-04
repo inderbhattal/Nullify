@@ -5,7 +5,7 @@
  * to avoid loading them all into memory at once.
  */
 
-import { ancestorDomains } from './psl.js';
+import { lookupDomains } from './psl.js';
 import { StorageQuotaError } from './storage.js';
 
 const DB_NAME = 'NullifyRules';
@@ -160,9 +160,11 @@ export class RulesDB {
       rejectOnAbortOrError(transaction, reject);
 
       // Stop ascending at the first public suffix so `co.uk`-indexed rules
-      // cannot match every site on that TLD. Empty string key is the
+      // cannot match every site on that TLD, but still honour an exact key on
+      // a curated suffix that is itself a browsable site — `github.io##+js(…)`
+      // on `github.io` (§5.11; see `lookupDomains`). Empty string key is the
       // "generic" bucket (rules with no domain).
-      const domainsToCheck = ['', ...ancestorDomains(hostname)];
+      const domainsToCheck = ['', ...lookupDomains(hostname)];
 
       const allRules = [];
       let completed = 0;
@@ -252,7 +254,19 @@ export class RulesDB {
     for (const entry of batch) {
       const request = store.get(entry.hostname);
       request.onsuccess = () => entry.resolve(request.result?.selectors || []);
-      request.onerror = (event) => entry.reject(event.target.error);
+      request.onerror = (event) => {
+        // §5.7: per the IndexedDB spec a request `error` event that is not
+        // preventDefault()ed propagates to the transaction and ABORTS it. Since
+        // §5.15 coalesced the service worker's whole ancestor walk into one
+        // transaction, letting it propagate turns a single failed record into
+        // "this page gets no cosmetic rules at all" via the rejectAll backstop
+        // below. Contain the failure to the entry that owns it and let the rest
+        // of the batch commit; onabort/onerror on the transaction stay as the
+        // backstop for failures no request handler claims.
+        event.preventDefault?.();
+        event.stopPropagation?.();
+        entry.reject(normalizeIdbError(event.target?.error, 'IndexedDB request error'));
+      };
     }
   }
 

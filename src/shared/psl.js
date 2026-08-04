@@ -53,23 +53,72 @@ const PUBLIC_SUFFIXES = new Set([
   's3.amazonaws.com', 'cloudfront.net',
 ]);
 
+/**
+ * Canonical form for every lookup in this module: lower-cased, whitespace
+ * trimmed, and stripped of the leading/trailing dots a hostname may carry
+ * (`bbc.co.uk.` is the fully-qualified spelling of `bbc.co.uk`).
+ *
+ * §5.11: the walk below used to trust its caller. Unnormalized input broke the
+ * one invariant this module exists to provide — `ancestorDomains('bbc.co.uk.')`
+ * walked past the suffix set to `uk.`, and `ancestorDomains('WWW.EXAMPLE.COM')`
+ * walked to `COM`, because neither trailing-dot nor upper-case spelling is in
+ * PUBLIC_SUFFIXES. Every service-worker call site happened to normalize first,
+ * but `db.getScriptletRules` takes any string. Normalizing here makes the
+ * invariant unconditional instead of a caller obligation.
+ */
+function canonicalizeHost(hostname) {
+  return String(hostname || '').trim().toLowerCase().replace(/^\.+|\.+$/g, '');
+}
+
 /** Returns true if the hostname is a public suffix itself. */
 export function isPublicSuffix(hostname) {
-  if (!hostname) return true; // empty string = the root; never allowlist-eligible
-  return PUBLIC_SUFFIXES.has(hostname);
+  const host = canonicalizeHost(hostname);
+  if (!host) return true; // empty string = the root; never allowlist-eligible
+  return PUBLIC_SUFFIXES.has(host);
 }
 
 /**
  * Walk parent domains of `hostname`, stopping before the first public suffix.
- * Yields the original hostname and each non-public ancestor in turn. The
+ * Yields the normalized hostname and each non-public ancestor in turn. The
  * public suffix itself is NOT yielded.
  */
 export function* ancestorDomains(hostname) {
-  let current = hostname;
-  while (current && !isPublicSuffix(current)) {
+  let current = canonicalizeHost(hostname);
+  while (current && !PUBLIC_SUFFIXES.has(current)) {
     yield current;
     const dotIdx = current.indexOf('.');
     if (dotIdx === -1) break;
     current = current.slice(dotIdx + 1);
   }
+}
+
+/**
+ * Domains a *site-scoped* rule lookup should consult for `hostname`, most
+ * specific first.
+ *
+ * §5.11 second half — the decision, stated explicitly because the alternative
+ * is defensible too. Exact membership is honoured BEFORE the public-suffix
+ * stop, mirroring what `allowlistCoversHostname` and the WASM
+ * `AllowlistMatcher::check` already do (§4.8):
+ *
+ *   - `github.io`, `netlify.app`, `pages.dev` … are curated public suffixes
+ *     *and* real browsable sites. `ancestorDomains` yields nothing for them,
+ *     so a rule authored as `github.io##+js(…)` could never fire on that host.
+ *     It now does.
+ *   - Inheritance is deliberately NOT granted: `user.github.io` still does not
+ *     pick up `github.io`-keyed rules. uBO would inherit (its cosmetic domain
+ *     match is a plain suffix walk with no PSL), but inheritance is exactly
+ *     the blanket-the-whole-suffix behaviour the PSL stop was added to prevent,
+ *     and it cannot be granted for `github.io` without also granting it for
+ *     `co.uk`. Exact-match-only buys back the self-host case at zero blast
+ *     radius, which is the same trade the allowlist settled on.
+ */
+export function* lookupDomains(hostname) {
+  const host = canonicalizeHost(hostname);
+  if (!host) return;
+  if (PUBLIC_SUFFIXES.has(host)) {
+    yield host; // exact membership only — do not ascend into the suffix
+    return;
+  }
+  yield* ancestorDomains(host);
 }

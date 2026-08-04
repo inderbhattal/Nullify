@@ -14,9 +14,13 @@ import { parseLine as runtimeParseLine } from '../src/shared/filter-parser.js';
  * nothing surfaces the difference. This suite asserts both engines classify
  * every vector identically, so drift fails a test instead of shipping.
  *
- * The Rust core (wasm-core/src/lib.rs) is the third implementation. It cannot
- * be driven from Node, so it is not covered here; the vectors in
- * fixtures/filter-vectors.mjs are nonetheless the specification it must meet.
+ * The Rust core (wasm-core/src/lib.rs) is the third implementation, and it IS
+ * covered — by tests/wasm-parity.test.mjs, which loads the shipped
+ * `nullify_core_bg.wasm` and runs these same vectors through it. (The older
+ * note here said Rust "cannot be driven from Node"; it can, via
+ * `mod.default({module_or_path: bytes})`, and believing otherwise is what let
+ * the §5.14 divergences sit undetected.) Keep the two files in step: a vector
+ * added below is automatically asserted against all three engines.
  */
 
 /** Reduce the build parser's output to the canonical vector shape. */

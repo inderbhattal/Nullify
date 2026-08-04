@@ -323,7 +323,7 @@ test('5.6: a $ghide user filter produces no DNR allow rule on the WASM-down path
 // ---------------------------------------------------------------------------
 
 test('5.20: :semantic() is planned as procedural, not emitted as CSS', async () => {
-  const { chrome, hooks } = await loadServiceWorker({
+  const { hooks } = await loadServiceWorker({
     seed: {
       userCosmeticRules: {
         generic: [],

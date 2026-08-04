@@ -11,18 +11,45 @@ import init, {
 import { initWasmFromUrl } from '../shared/wasm-loader.js';
 
 (function() {
-  const SHIELD_STATE_KEY = '__nullifyYoutubeShield';
-  const SHIELD_VERSION = 2;
-  const shieldState = globalThis[SHIELD_STATE_KEY] || {};
-  const installedVersions = Array.isArray(shieldState.versions) ? shieldState.versions : [];
-  if (installedVersions.includes(SHIELD_VERSION)) return;
-  globalThis[SHIELD_STATE_KEY] = {
-    loaded: true,
-    version: SHIELD_VERSION,
-    versions: installedVersions.concat(SHIELD_VERSION),
-    startedAt: shieldState.startedAt || Date.now(),
-    updatedAt: Date.now(),
+  const SHIELD_VERSION = 3;
+
+  // ---- Idempotency guard (REVIEW-2026-08 §4.12) ----
+  //
+  // This bundle is evaluated more than once per frame: registerContentScripts
+  // runs it at document_start, and injectIntoOpenTabs re-injects it into
+  // already-loaded tabs on install, update, allowlist change and settings
+  // change. Each injection is a *separate* script evaluation in the page
+  // realm, so the "already installed" marker cannot live in module scope —
+  // but it must not live in a fixed-name writable global either: that made
+  // `window.__nullifyYoutubeShield = { versions: [0,1,2,3,4,5] }` a one-line
+  // page kill switch for every layer below, and published a
+  // `{version, startedAt, updatedAt}` fingerprint on every load.
+  //
+  // Instead the marker is a symbol-keyed, non-enumerable, non-writable,
+  // non-configurable brand on the JSON.parse wrapper this shield installs,
+  // and it is honoured only when that wrapper still *behaves* like ours.
+  // Page script can plant the brand, but planting it without also rewriting
+  // ad payload keys to false no longer disables anything — the probe fails
+  // and the shield installs over the top.
+  const INSTALL_BRAND = Symbol.for('$$jsonParseHookVersion');
+  const isShieldInstalled = () => {
+    try {
+      // Behavioural probe. The randomized payload stops a page from
+      // special-casing one fixed probe string: to pass, JSON.parse has to
+      // actually neutralize ad payload keys the way the hook below does.
+      const probe = JSON.parse(`{"adPlacements":[${Math.random()}]}`);
+      if (!probe || probe.adPlacements !== false) return false;
+      const installed = JSON.parse[INSTALL_BRAND];
+      // A hook that behaves but carries an older brand is a previous shield
+      // generation, so let this one install over it. An unbranded hook is
+      // treated as installed rather than stacking a second copy of every
+      // interceptor on top of it.
+      return !(typeof installed === 'number' && installed < SHIELD_VERSION);
+    } catch {
+      return false;
+    }
   };
+  if (isShieldInstalled()) return;
 
   let wasmReady = false;
   let wasmInitStarted = false;
@@ -84,14 +111,17 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     ['"web_player_api_v2_ads_metadata":true', '"web_player_api_v2_ads_metadata":false'],
     ['"web_enable_ad_break_heartbeat":true', '"web_enable_ad_break_heartbeat":false'],
   ];
-  const WASM_STATE_KEY = '__nullifyYoutubeWasm';
+  // WASM bootstrap diagnostics. This used to be published on
+  // `globalThis.__nullifyYoutubeWasm`, which announced the extension —
+  // status, readiness, error text and asset path — to every page on every
+  // load (§4.12). Nothing outside this file ever read it, so the state now
+  // stays in the closure.
+  const wasmState = { status: 'waiting', ready: false, error: null, source: null };
   const updateWasmState = (status) => {
-    globalThis[WASM_STATE_KEY] = {
-      status,
-      ready: status === 'ready',
-      error: wasmInitError,
-      source: wasmSource,
-    };
+    wasmState.status = status;
+    wasmState.ready = status === 'ready';
+    wasmState.error = wasmInitError;
+    wasmState.source = wasmSource;
   };
   const shouldBlockRequestUrl = (url) =>
     url.includes('/ad_break') ||
@@ -180,6 +210,20 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     }
     return result;
   };
+  // Locked idempotency brand — see isShieldInstalled() above. Non-enumerable
+  // so it stays out of Object.keys/JSON output, non-writable and
+  // non-configurable so a later page script cannot forge a newer generation
+  // onto our own wrapper.
+  try {
+    Object.defineProperty(JSON.parse, INSTALL_BRAND, {
+      value: SHIELD_VERSION,
+      writable: false,
+      enumerable: false,
+      configurable: false,
+    });
+  } catch {
+    // Branding is best effort; the behavioural probe still detects the hook.
+  }
 
   // 1b. Response.json hook — keep the scope narrow and let JSON.parse handle
   // text-backed consumers. The broader text()/arrayBuffer() hooks were touching
@@ -226,7 +270,10 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       updateWasmState('ready');
       console.info(`[Nullify] YouTube WASM ready (${wasmSource || 'unknown'})`);
       try {
-        if (window.ytcfg?.config_) poison(window.ytcfg.config_);
+        // Same store resolution as the synchronous belt layer (§4.25) — the
+        // old `window.ytcfg?.config_` check never matched a real page, so the
+        // extra flags WASM covers were never applied to the live config.
+        poisonCfgStores(window.ytcfg);
       } catch {
         // Ignore late config poisoning failures.
       }
@@ -491,6 +538,37 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     } catch {}
   };
 
+  // Where the flags actually live (REVIEW-2026-08 §4.25). Real YouTube never
+  // keeps the store on `ytcfg.config_`: `ytcfg.d()` returns `window.yt.config_`
+  // and older/alternate builds back it with `ytcfg.data_`. Poisoning only
+  // `cfg.config_` made the whole belt layer — and the WASM-ready re-poison —
+  // a no-op against the real page. Collect every store shape we can see and
+  // poison all of them; they are usually the same object anyway.
+  const collectCfgStores = (cfg) => {
+    const stores = [];
+    const add = (store) => {
+      if (store && typeof store === 'object' && !stores.includes(store)) stores.push(store);
+    };
+    try {
+      if (cfg && typeof cfg === 'object') {
+        add(cfg.config_);
+        add(cfg.data_);
+      }
+    } catch {
+      // A throwing accessor on the page's ytcfg must not break the hook.
+    }
+    try {
+      add(globalThis.yt?.config_);
+    } catch {
+      // Same for window.yt.
+    }
+    return stores;
+  };
+  const poisonCfgStores = (cfg) => {
+    const stores = collectCfgStores(cfg);
+    for (let i = 0; i < stores.length; i++) poison(stores[i]);
+  };
+
   const wrappedYtcfgSetters = new WeakSet();
   const hookYtcfg = (cfg) => {
     if (!cfg || typeof cfg !== 'object') return;
@@ -503,8 +581,59 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       wrappedYtcfgSetters.add(wrappedSet);
       cfg.set = wrappedSet;
     }
-    if (cfg.config_) poison(cfg.config_);
+    poisonCfgStores(cfg);
   };
+
+  // `window.yt.config_` is the store `ytcfg.d()` reads on the real page, and
+  // the page can seed it by direct assignment without ever calling
+  // `ytcfg.set` — the case the .set wrapper cannot see. Trap it the same way
+  // shield() traps the player-response globals: once at the `window.yt`
+  // assignment, and again at the `config_` assignment on whatever object the
+  // page installs there.
+  const hookYt = (yt) => {
+    try {
+      if (!yt || typeof yt !== 'object') return;
+      let store = yt.config_;
+      // Whatever is already there gets poisoned now; the trap below then
+      // catches both the first seeding and any later wholesale replacement.
+      if (store && typeof store === 'object') poison(store);
+      const existing = Object.getOwnPropertyDescriptor(yt, 'config_');
+      if (existing && !existing.configurable) return;
+      Object.defineProperty(yt, 'config_', {
+        get: () => store,
+        set: (v) => {
+          store = v;
+          try {
+            poison(v);
+          } catch {
+            // Never let poisoning failures break the page's assignment.
+          }
+        },
+        enumerable: true,
+        configurable: true,
+      });
+    } catch {
+      // A sealed or exotic `yt` object is left alone.
+    }
+  };
+
+  if (globalThis.yt) {
+    hookYt(globalThis.yt);
+  } else {
+    let _ytValue;
+    try {
+      Object.defineProperty(window, 'yt', {
+        get: () => _ytValue,
+        set: (v) => {
+          _ytValue = v;
+          hookYt(v);
+        },
+        configurable: true,
+      });
+    } catch {
+      // Leave a non-configurable page-owned `yt` in place.
+    }
+  }
 
   if (window.ytcfg) {
     // Late-injection path (already-loaded tab): ytcfg exists — hook it now.

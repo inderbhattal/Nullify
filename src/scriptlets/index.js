@@ -307,8 +307,15 @@ const BOOT_KEY_SHAPE = /^__n_[0-9a-f]{32}$/;
 const bootKey = globalThis.__nullifyBootKey;
 if (typeof bootKey === 'string' && BOOT_KEY_SHAPE.test(bootKey)) {
   try {
+    // `getUnknownScriptlets` rides along so the SW can read back which
+    // scriptlet names this page failed to resolve (§5.22). Without it the
+    // registry-miss counter has no consumer and a coverage regression is
+    // invisible in production, which is how the rate reached 20%. The SW's
+    // `verifyScriptletRegistry` admits exactly these two keys, both callable;
+    // widening the shape costs nothing against a forger, who could always
+    // satisfy the one-key form.
     Object.defineProperty(window, bootKey, {
-      value: Object.freeze({ run }),
+      value: Object.freeze({ run, getUnknownScriptlets }),
       writable: false,
       configurable: false,
       enumerable: false,

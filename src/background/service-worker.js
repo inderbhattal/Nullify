@@ -63,7 +63,7 @@ const CONFIG = {
 import {getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
-import {fetchAndExpand, parseFilterList} from '../shared/filter-parser.js';
+import {fetchAndExpand, parseFilterList, COSMETIC_SCOPE_OPTIONS} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '../shared/hostname.js';
 import { ancestorDomains } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
@@ -2804,15 +2804,10 @@ const SIMPLE_RULE_RESOURCE_TYPES = {
 // it switched off network blocking for the whole domain (§3.3's blanket-allow
 // shape, verbatim). Recognised here purely so the line can be refused.
 //
-// TODO: this duplicates `COSMETIC_SCOPE_OPTIONS` in src/shared/filter-parser.js,
-// which is still module-private there. When that map is exported, import it
-// and delete this copy (REVIEW-2026-08 §5.6 cross-file follow-up).
-const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = new Set([
-  'generichide', 'ghide',
-  'elemhide', 'ehide',
-  'specifichide', 'shide',
-  'genericblock',
-]);
+// Shared with the runtime parser rather than restated: a scope option this set
+// misses becomes a network allow, which is the failure this guard exists to
+// prevent, so a second hand-kept copy is the wrong shape for it.
+const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = COSMETIC_SCOPE_OPTIONS;
 
 /**
  * Parse a simple ABP-style network rule into a DNR rule object.

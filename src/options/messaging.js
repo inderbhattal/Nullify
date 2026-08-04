@@ -20,14 +20,12 @@ export const MAX_USER_FILTERS_BYTES = 2 * 1024 * 1024; // 2 MB
 /**
  * Byte length of `text` as UTF-8.
  *
- * §5.33 — the three enforcers of this cap do not measure the same thing. The
- * SW compares `raw.length`, i.e. UTF-16 code units; `wasm-core` counts UTF-8
- * bytes; this page counts UTF-8 bytes. UTF-8 length is never below UTF-16
- * length for any string, so checking bytes here is the *strictest* of the
- * three: anything this page accepts, the SW accepts too, and the user gets a
- * clear over-cap message instead of the WASM path throwing (which
- * `compileUserFiltersViaWasm` cannot distinguish from "WASM unavailable").
- * Do not relax this to `text.length` to "match" the SW.
+ * All three enforcers of this cap now agree on the unit: this page,
+ * `wasm-core`, and the service worker all count UTF-8 bytes (§5.5 moved the
+ * worker off `raw.length`, which measured UTF-16 code units and so let a large
+ * non-ASCII list through to throw in Rust — indistinguishable, to
+ * `compileUserFiltersViaWasm`, from "WASM unavailable"). Do not "simplify" this
+ * to `text.length`: that would reintroduce the mismatch from the other side.
  */
 export function utf8ByteLength(text) {
   return new TextEncoder().encode(text ?? '').length;

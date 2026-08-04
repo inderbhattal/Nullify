@@ -92,7 +92,7 @@ function dedupeDomains(domains) {
  * Downstream matching is by canonical name, so aliases normalise rather than
  * pass through.
  */
-const COSMETIC_SCOPE_OPTIONS = new Map([
+export const COSMETIC_SCOPE_OPTIONS = new Map([
   ['generichide', 'generichide'],
   ['ghide', 'generichide'],
   ['elemhide', 'elemhide'],

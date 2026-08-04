@@ -160,7 +160,7 @@ test('4.24: refuses to register under a boot key that does not match the SW shap
   }
 });
 
-test('4.24: registers a frozen single-method registry under a well-shaped key', async () => {
+test('4.24: registers a frozen registry of exactly the allowed methods', async () => {
   const key = '__n_' + '0123456789abcdef'.repeat(2);
   await loadWithBootKey(key);
 
@@ -170,8 +170,15 @@ test('4.24: registers a frozen single-method registry under a well-shaped key', 
   assert.equal(desc.enumerable, false);
   assert.equal(desc.writable, false);
   assert.ok(Object.isFrozen(desc.value));
-  assert.deepEqual(Reflect.ownKeys(desc.value), ['run']);
-  assert.equal(typeof desc.value.run, 'function');
+
+  // The SW re-verifies this exact shape before handing over any specs, so the
+  // key set is a contract, not an implementation detail. `getUnknownScriptlets`
+  // is what lets the worker read back the registry-miss count (§5.22) — without
+  // it that counter has no consumer, which is how the miss rate reached 20%.
+  assert.deepEqual(Reflect.ownKeys(desc.value).sort(), ['getUnknownScriptlets', 'run']);
+  for (const name of Reflect.ownKeys(desc.value)) {
+    assert.equal(typeof desc.value[name], 'function', `${name} must be callable`);
+  }
 });
 
 test('4.24: does not delete the boot key after registering (SW seeds it non-configurable)', async () => {

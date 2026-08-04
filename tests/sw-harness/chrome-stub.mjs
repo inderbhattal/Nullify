@@ -31,6 +31,30 @@ function matchesPattern(pattern, url) {
   return new RegExp(`^${escaped}$`).test(url);
 }
 
+/**
+ * REVIEW-2026-08 §7.1 — the message bus is a serialization boundary.
+ *
+ * `chrome.runtime.sendMessage` JSON-serializes both the message and the
+ * response; passing live object references (what this stub used to do) hides
+ * every defect that depends on the shape that actually survives the trip:
+ * `undefined` properties vanish, class instances collapse to plain objects,
+ * `Error` values become `{}`, and cycles/functions are outright rejected.
+ * Round-tripping both directions is what makes §4.11-class findings
+ * (unchecked `{error: …}` response shapes) reachable from the harness.
+ */
+function serializeForBus(value, direction) {
+  if (value === undefined) return undefined;
+  let json;
+  try {
+    json = JSON.stringify(value);
+  } catch (err) {
+    throw new Error(`${direction} is not serializable: ${err.message}`);
+  }
+  // `JSON.stringify` returns undefined for functions/symbols/undefined.
+  if (json === undefined) return undefined;
+  return JSON.parse(json);
+}
+
 function makeListenerEvent() {
   const listeners = new Set();
   return {
@@ -49,6 +73,79 @@ function makeListenerEvent() {
   };
 }
 
+/**
+ * REVIEW-2026-08 §7.7 — DNR schema constraints Chrome enforces at rule
+ * indexing time and this stub used to accept silently.
+ *
+ * The two that have already shipped as live defects:
+ *   - `allowAllRequests` is rejected unless `resourceTypes` is present and
+ *     limited to main_frame/sub_frame (§4.1). A rule that violates it is
+ *     dropped by Chrome while the extension believes the site is allowlisted.
+ *   - domain lists must be non-empty, ASCII and lowercase (§5.29). One
+ *     upstream `$domain=Example.COM|` sheds the whole rule.
+ *
+ * Thrown as a batch-level rejection because that is what Chrome does:
+ * `updateDynamicRules` is all-or-nothing.
+ */
+const DNR_ALLOW_ALL_RESOURCE_TYPES = new Set(['main_frame', 'sub_frame']);
+const DNR_DOMAIN_LIST_KEYS = [
+  'initiatorDomains',
+  'excludedInitiatorDomains',
+  'requestDomains',
+  'excludedRequestDomains',
+];
+
+function validateDnrRuleSchema(rule) {
+  const id = rule?.id;
+  const action = rule?.action || {};
+  const condition = rule?.condition || {};
+
+  if (!Number.isInteger(id) || id < 1) {
+    throw new Error(`Rule id must be a positive integer (got ${JSON.stringify(id)})`);
+  }
+  if ('priority' in rule && (!Number.isInteger(rule.priority) || rule.priority < 1)) {
+    throw new Error(`Rule with id ${id} has an invalid priority ${JSON.stringify(rule.priority)}`);
+  }
+
+  if (action.type === 'allowAllRequests') {
+    const types = condition.resourceTypes;
+    if (!Array.isArray(types) || types.length === 0) {
+      throw new Error(
+        `Rule with id ${id}: allowAllRequests rules must specify resourceTypes ` +
+        `(only main_frame and sub_frame are allowed)`
+      );
+    }
+    for (const type of types) {
+      if (!DNR_ALLOW_ALL_RESOURCE_TYPES.has(type)) {
+        throw new Error(
+          `Rule with id ${id}: allowAllRequests supports only main_frame/sub_frame resourceTypes (got "${type}")`
+        );
+      }
+    }
+  }
+
+  for (const key of DNR_DOMAIN_LIST_KEYS) {
+    const list = condition[key];
+    if (list === undefined) continue;
+    if (!Array.isArray(list) || list.length === 0) {
+      throw new Error(`Rule with id ${id}: ${key} must be a non-empty array`);
+    }
+    for (const entry of list) {
+      if (typeof entry !== 'string' || entry === '') {
+        throw new Error(`Rule with id ${id}: ${key} contains an empty or non-string entry`);
+      }
+      if (!/^[\x00-\x7F]*$/.test(entry)) {
+        throw new Error(
+          `Rule with id ${id}: ${key} entry "${entry}" is not ASCII (punycode is required)`
+        );
+      }
+      if (entry !== entry.toLowerCase()) {
+        throw new Error(`Rule with id ${id}: ${key} entry "${entry}" must be lowercase`);
+      }
+    }
+  }
+}
+
 export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
   const calls = new CallLog();
 
@@ -59,14 +156,37 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
   // promise form.
   const storageArea = (initial = {}) => {
     let data = { ...initial };
-    const withCallback = (result, cb) => {
+    // §7.2 — a held read models the window every woken service worker starts
+    // in: listeners are already firing while the restore/refresh reads are
+    // still outstanding. Without it, in-harness reads resolve within a
+    // microtask and no test can observe pre-restore state.
+    let readGate = null;
+    const settle = (result, cb, gate) => {
       if (typeof cb === 'function') {
-        queueMicrotask(() => cb(result));
+        if (gate) gate.then(() => cb(result));
+        else queueMicrotask(() => cb(result));
         return undefined;
       }
-      return Promise.resolve(result);
+      return gate ? gate.then(() => result) : Promise.resolve(result);
     };
+    // Writes are never gated — Chrome does not order them behind reads.
+    const withCallback = (result, cb) => settle(result, cb, null);
+    const withReadCallback = (result, cb) => settle(result, cb, readGate);
     return {
+      /**
+       * Hold every subsequent `get` until the returned function is called.
+       * Writes are unaffected — Chrome does not order them behind reads.
+       */
+      _holdReads() {
+        let release;
+        readGate = new Promise((resolve) => { release = resolve; });
+        return () => {
+          const gate = readGate;
+          readGate = null;
+          release();
+          return gate;
+        };
+      },
       get: (keys, cb) => {
         calls.push({ api: 'storage.get', keys });
         let out;
@@ -82,7 +202,7 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
             out[k] = k in data ? data[k] : def;
           }
         }
-        return withCallback(out, cb);
+        return withReadCallback(out, cb);
       },
       set: (entries, cb) => {
         calls.push({ api: 'storage.set', entries });
@@ -130,6 +250,7 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
         if (typeof condition.regexFilter === 'string' && /\(\?<?[=!]/.test(condition.regexFilter)) {
           throw new Error(`Rule with id ${rule.id} has an unsupported regexFilter (RE2)`);
         }
+        validateDnrRuleSchema(rule);
       }
       // Removals apply before additions (Chrome semantics), so re-adding an
       // id listed in removeRuleIds within the same call is legal.
@@ -277,16 +398,22 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
         ...(senderOverrides || {}),
       };
       calls.push({ api: 'runtime.sendMessage', message, sender });
+      // §7.1 — serialize on dispatch: the handler must never see the caller's
+      // live object.
+      const delivered = serializeForBus(message, 'message');
       return new Promise((resolve) => {
         let responded = false;
         const sendResponse = (response) => {
           if (responded) return;
           responded = true;
-          resolve(response);
+          // …and again on the way back, so a handler returning a class
+          // instance, an Error, or an `undefined`-valued field is observed by
+          // the caller exactly as Chrome would deliver it.
+          resolve(serializeForBus(response, 'response'));
         };
         let anyAsync = false;
         for (const fn of messageListeners._listeners) {
-          const result = fn(message, sender, sendResponse);
+          const result = fn(delivered, sender, sendResponse);
           if (result === true) anyAsync = true;
         }
         if (!anyAsync) {

@@ -57,6 +57,7 @@ const CONFIG = {
   DOMAIN_RULES_CACHE_MAX: 100,      // Max entries in LRU domain rules cache
   PAGE_BUNDLE_DB_MAX: 250,          // Max page bundles in IndexedDB
   FILTER_UPDATE_INTERVAL_MINUTES: 1440,  // 24 hours
+  ACTIVE_INDEX_REBUILD_STALL_MS: 120_000, // §5.4 — release a rebuild that never settles
 };
 
 import {getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
@@ -575,6 +576,46 @@ function parseProceduralPlan(selector) {
 const DNR_USER_RULES_START = 900_000;
 const DNR_ALLOWLIST_START = 990_000;
 
+// ---------------------------------------------------------------------------
+// DNR priority bands. One scale is shared by static rules, dynamic user-filter
+// rules and the runtime rules this worker writes, with ties broken by action
+// precedence (allow > block > redirect) rather than by ruleset — so every
+// producer has to agree on the numbers.
+//
+//   1..6      static + user filters (DNR_PRIORITY in scripts/build-rules.mjs
+//             and compile_user_filters in wasm-core/src/lib.rs)
+//   100       this worker's privacy/header rules (§5.31)
+//   1000/1100 hand-maintained system-unbreak allows/blocks
+//   100000    the user allowlist (§4.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * §4.2 — bands for the JS user-filter fallback compiler
+ * (`parseSimpleNetworkRule`). These MUST equal `DNR_PRIORITY` in
+ * scripts/build-rules.mjs: a user's plain block competes directly with a
+ * list's plain allow, and any disagreement inverts the result across the seam.
+ * The fallback expresses no `$important`, so only the two plain bands appear.
+ */
+const DNR_USER_FILTER_PRIORITY = {
+  BLOCK: 1,
+  ALLOW: 3,
+};
+
+/**
+ * §4.5 — the user allowlist must outrank every shipped rule, including the
+ * hand-maintained `system-unbreak` blocks at 1100. "Trust this site" that
+ * loses to a shipped block is a control that silently does not work.
+ */
+const DNR_ALLOWLIST_PRIORITY = 100_000;
+
+/**
+ * §5.31 — privacy/header hardening sits in its own band above the static
+ * range: a filter-list exception says "don't ad-block this site", not "stop
+ * stripping Referer and spoofing my User-Agent here". Still below the
+ * allowlist, which is the user's own explicit opt-out.
+ */
+const DNR_PRIVACY_PRIORITY = 100;
+
 function classifyAndPlanSelectors(selectors) {
   const cleanSelectors = selectors
     .filter((selector) => typeof selector === 'string')
@@ -858,6 +899,9 @@ async function loadPackagedFilterSources() {
 async function fetchAndStoreRemoteFilterSources() {
   const sourceBundles = {};
   let fetchedAny = false;
+  // §5.3 — which lists actually refreshed, so CHECK_FILTER_UPDATES can name
+  // them instead of claiming a blanket success.
+  const updatedLists = [];
 
   for (const list of REMOTE_FILTER_LISTS) {
     try {
@@ -874,15 +918,36 @@ async function fetchAndStoreRemoteFilterSources() {
         ]);
       }
       sourceBundles[list.id] = sourceBundle;
+      updatedLists.push(list.id);
       fetchedAny = true;
     } catch (err) {
       console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
     }
   }
 
-  if (!fetchedAny) return false;
+  if (!fetchedAny) return { updated: false, updatedLists: [] };
   await db.putBulkFilterSources(sourceBundles);
-  return true;
+  return { updated: true, updatedLists };
+}
+
+// §3.2 — the active-index rebuild is a destructive clear followed by a
+// repopulation spanning five IndexedDB transactions and three storage writes.
+// Nothing in the persisted state distinguishes "rebuilt" from "cleared and
+// then killed": `hasFilterSources()` stays true (the sources store is not
+// cleared), the OLD bloom filter survives, and RULE_DATA_VERSION hashes the
+// bundled sources, not the DB contents — so startup sees a healthy index and
+// every cosmetic/scriptlet lookup silently returns nothing.
+//
+// The marker closes that gap: it is written BEFORE the clear and removed only
+// after the last write, so any interruption anywhere in between leaves proof
+// behind for the next startup.
+const RULE_INDEX_STATE_KEY = 'ruleIndexState';
+const RULE_INDEX_BUILDING = 'building';
+
+/** True when a previous rebuild started and never finished. */
+async function isRuleIndexInterrupted() {
+  const marker = await getStorage(RULE_INDEX_STATE_KEY).catch(() => null);
+  return marker?.state === RULE_INDEX_BUILDING;
 }
 
 async function rebuildActiveRuleIndexFromStoredSources() {
@@ -911,6 +976,14 @@ async function rebuildActiveRuleIndexFromStoredSources() {
 
   const merged = compiled || mergeFilterSources(activeSources);
   cachedGenericCosmeticExcludedDomains = genericCosmeticExcludedDomains;
+
+  // §3.2 — mark the index dirty BEFORE the destructive clear. Everything from
+  // here to the marker removal below is the window in which an SW kill, a
+  // browser quit or a putBulk* quota rejection leaves an empty index behind.
+  await setStorage(RULE_INDEX_STATE_KEY, {
+    state: RULE_INDEX_BUILDING,
+    version: activeRuleDataVersion || null,
+  });
 
   await db.clearActiveRules();
 
@@ -978,6 +1051,11 @@ async function rebuildActiveRuleIndexFromStoredSources() {
   domainRulesCache.clear();
   _inFlightRules.clear();
   await db.clearPageBundles();
+
+  // §3.2 — last statement: the index is now fully repopulated, so clear the
+  // dirty marker. A rebuild that throws leaves it set on purpose, and the next
+  // startup repairs the index.
+  await setStorage(RULE_INDEX_STATE_KEY, null);
   return true;
 }
 
@@ -990,18 +1068,62 @@ async function rebuildActiveRuleIndexFromStoredSources() {
 // persistence.
 let _activeIndexRebuildChain = Promise.resolve();
 let _activeIndexRebuildDepth = 0;
+// §5.4 — monotonic counter bumped when a rebuild is queued AND when it
+// releases. Any lookup that spans a rebuild boundary sees a different value at
+// persist time than it captured at lookup start, which is what the live
+// in-flight check could not detect: a lookup that *started* before the rebuild
+// and *resolved* after it was computed against pre-clear state.
+let _activeIndexRebuildGeneration = 0;
 
 function isActiveIndexRebuildInFlight() {
   return _activeIndexRebuildDepth > 0;
 }
 
+function currentRebuildGeneration() {
+  return _activeIndexRebuildGeneration;
+}
+
 function queueActiveIndexRebuild() {
   _activeIndexRebuildDepth++;
+  _activeIndexRebuildGeneration++;
+
+  let released = false;
+  let stallTimer = null;
+  const release = () => {
+    if (released) return;
+    released = true;
+    if (stallTimer !== null) { clearTimeout(stallTimer); stallTimer = null; }
+    _activeIndexRebuildDepth--;
+    _activeIndexRebuildGeneration++;
+  };
+
   const run = _activeIndexRebuildChain
     .catch(() => {})
     .then(() => rebuildActiveRuleIndexFromStoredSources())
-    .finally(() => { _activeIndexRebuildDepth--; });
-  _activeIndexRebuildChain = run.catch(() => {});
+    .finally(release);
+
+  // §5.4 — the depth counter was decremented only in `.finally()`, so a
+  // rebuild that never settles (a hung IndexedDB transaction) pinned it above
+  // zero forever: page-bundle persistence stayed disabled and every future
+  // queued rebuild sat behind a chain link that never resolved. Time-box it.
+  const unstick = new Promise((resolve) => {
+    stallTimer = setTimeout(() => {
+      stallTimer = null;
+      reportError(
+        'activeIndexRebuild:stalled',
+        new Error(`active index rebuild exceeded ${CONFIG.ACTIVE_INDEX_REBUILD_STALL_MS}ms`)
+      );
+      release();
+      resolve();
+    }, CONFIG.ACTIVE_INDEX_REBUILD_STALL_MS);
+    // Node (test harness) only: a pending stall timer must not hold the
+    // process open. `unref` does not exist on Chrome's numeric timer ids.
+    stallTimer?.unref?.();
+  });
+
+  // The chain advances on whichever comes first, so a stuck rebuild cannot
+  // block the queue permanently either.
+  _activeIndexRebuildChain = Promise.race([run.catch(() => {}), unstick]);
   return run;
 }
 
@@ -1014,7 +1136,7 @@ async function ensureFilterSourcesReady() {
     return true;
   }
 
-  return await fetchAndStoreRemoteFilterSources();
+  return (await fetchAndStoreRemoteFilterSources()).updated;
 }
 
 async function ensureRuleDataReady() {
@@ -1026,6 +1148,13 @@ async function ensureRuleDataReady() {
   let sourcesReady = hadSources;
 
   const ruleDataChanged = !!bundledRuleDataVersion && storedRuleDataVersion !== bundledRuleDataVersion;
+  // §3.2 — a surviving "building" marker means the last rebuild was cut short,
+  // so the index stores are (partly) empty even though the bloom filter and
+  // the version both look current. Treat it exactly like a rule-data change
+  // for the rebuild decision. It deliberately does NOT re-seed the packaged
+  // sources: those are intact, and overwriting them would roll back a remote
+  // list refresh that had already landed.
+  const indexInterrupted = await isRuleIndexInterrupted();
 
   if (ruleDataChanged) {
     const packaged = await loadPackagedFilterSources();
@@ -1040,7 +1169,13 @@ async function ensureRuleDataReady() {
   }
 
   if (sourcesReady) {
-    if (!existingBloom || !hadSources || ruleDataChanged) {
+    if (!existingBloom || !hadSources || ruleDataChanged || indexInterrupted) {
+      if (indexInterrupted) {
+        reportError(
+          'ruleIndex:interruptedRebuild',
+          new Error('previous active-index rebuild did not complete; rebuilding')
+        );
+      }
       await queueActiveIndexRebuild();
       if (bundledRuleDataVersion) {
         await setStorage(StorageKeys.RULE_DATA_VERSION, bundledRuleDataVersion);
@@ -1111,7 +1246,7 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     await ensureRuleDataReady();
     await Promise.all([
       refreshMemoryCache(), // Fill RAM cache for speed
-      restorePersistedStats(),
+      ensureStatsRestored(),
     ]);
     await ensureBackgroundSetup();
     await refreshAllBadges();
@@ -1190,7 +1325,7 @@ function startInitialization() {
     await Promise.all([
       loadBloomFilter(),
       refreshMemoryCache(),
-      restorePersistedStats(),
+      ensureStatsRestored(),
     ]);
     _criticalReady = true;
     refreshAllBadges().catch(err => console.error('[Nullify] Badge refresh failed:', err));
@@ -1585,7 +1720,7 @@ async function applyHeaderRules(enabled) {
   const rules = [
     {
       id: DNR_HEADER_RULES_START,
-      priority: 1,
+      priority: DNR_PRIVACY_PRIORITY,
       action: {
         type: 'modifyHeaders',
         requestHeaders: [{ header: 'referer', operation: 'remove' }]
@@ -1598,7 +1733,7 @@ async function applyHeaderRules(enabled) {
     },
     {
       id: DNR_HEADER_RULES_START + 1,
-      priority: 1,
+      priority: DNR_PRIVACY_PRIORITY,
       action: {
         type: 'modifyHeaders',
         responseHeaders: [{ header: 'set-cookie', operation: 'remove' }]
@@ -1636,7 +1771,7 @@ async function applyUpgradeSchemeRules(enabled) {
 
   const rules = [{
     id: ruleId,
-    priority: 1,
+    priority: DNR_PRIVACY_PRIORITY,
     action: { type: 'upgradeScheme' },
     condition: {
       urlFilter: '|http://',
@@ -1680,7 +1815,7 @@ async function applyPersonaRules(personaId) {
 
   const rules = [{
     id: ruleId,
-    priority: 1,
+    priority: DNR_PRIVACY_PRIORITY,
     action: {
       type: 'modifyHeaders',
       requestHeaders: [
@@ -1710,7 +1845,7 @@ async function applyCacheProtectionRules(enabled) {
 
   const rules = [{
     id: ruleId,
-    priority: 1,
+    priority: DNR_PRIVACY_PRIORITY,
     action: {
       type: 'modifyHeaders',
       responseHeaders: [
@@ -1741,7 +1876,7 @@ async function applyReferrerControlRules(enabled) {
 
   const rules = [{
     id: ruleId,
-    priority: 1,
+    priority: DNR_PRIVACY_PRIORITY,
     action: {
       type: 'modifyHeaders',
       responseHeaders: [
@@ -1818,24 +1953,45 @@ async function cleanupTabStats() {
 
 let _filterUpdateInProgress = false;
 
+/**
+ * Refresh every remote filter list and rebuild the active index.
+ *
+ * §5.3 — returns a status the caller can render honestly:
+ *   `{ok: true,  updatedLists: [...]}`  — at least one list refreshed
+ *   `{ok: false, error, updatedLists: []}` — nothing refreshed (offline), or a
+ *                                            check was already running.
+ * `{ok:true}` on total failure told the options page "done", and the page then
+ * read a LAST_UPDATE_CHECK that was never written.
+ */
 async function checkFilterListUpdates() {
   if (_filterUpdateInProgress) {
     log('[AdBlock] Filter update already in progress, skipping.');
-    return;
+    return {
+      ok: false,
+      error: 'A filter list update is already in progress',
+      inProgress: true,
+      updatedLists: [],
+    };
   }
   _filterUpdateInProgress = true;
 
   try {
     log('[AdBlock] Refreshing per-list cosmetic/scriptlet sources...');
-    const updated = await fetchAndStoreRemoteFilterSources();
+    const { updated, updatedLists } = await fetchAndStoreRemoteFilterSources();
     if (!updated) {
       console.warn('[AdBlock] No filter sources were refreshed');
-      return;
+      return {
+        ok: false,
+        error: 'No filter lists could be downloaded — check your connection',
+        updatedLists: [],
+      };
     }
 
     await queueActiveIndexRebuild();
-    await setStorage(StorageKeys.LAST_UPDATE_CHECK, Date.now());
+    const checkedAt = Date.now();
+    await setStorage(StorageKeys.LAST_UPDATE_CHECK, checkedAt);
     log('[AdBlock] Filter source update complete');
+    return { ok: true, updatedLists, lastUpdateCheck: checkedAt };
   } finally {
     _filterUpdateInProgress = false;
   }
@@ -1916,6 +2072,14 @@ function snapshotStatsForSession() {
 }
 
 function mirrorStatsToSession() {
+  // §4.14 — mirroring memory that predates the restore writes zeros over the
+  // very snapshot the restore prefers. Defer instead of dropping: the restore
+  // never clobbers counters already in memory, so replaying afterwards is
+  // both safe and lossless.
+  if (!_statsRestoreDone) {
+    ensureStatsRestored().then(mirrorStatsToSession, () => { });
+    return;
+  }
   try {
     chrome.storage.session
       ?.set({ [SESSION_STATS_KEY]: snapshotStatsForSession() })
@@ -1931,6 +2095,27 @@ async function readSessionStatsSnapshot() {
   } catch {
     return null;
   }
+}
+
+// §4.14 — `tabs.onRemoved` (and CONTENT_BLOCKED, and resetTabStats) wake a
+// terminated worker and reach the persist path while `tabStats` is still
+// empty, overwriting the stored counters AND the session mirror with zeros.
+// The restore depends on nothing but chrome.storage, so it does not belong
+// behind WASM init and the rule index in stage 2 of `_criticalPromise`: it
+// gets its own promise, started at module load, and every writer waits on it.
+let _statsRestorePromise = null;
+let _statsRestoreDone = false;
+
+function ensureStatsRestored() {
+  if (!_statsRestorePromise) {
+    _statsRestorePromise = restorePersistedStats().catch((err) => {
+      // A failed restore must not wedge the writers forever — report it and
+      // let persistence resume against whatever is in memory.
+      reportError('restorePersistedStats', err);
+      _statsRestoreDone = true;
+    });
+  }
+  return _statsRestorePromise;
 }
 
 async function restorePersistedStats() {
@@ -1976,6 +2161,10 @@ async function restorePersistedStats() {
   // startInitialization) and preserves any increments counted before it ran.
   totalBlockedToday = Math.max(totalBlockedToday, localTotal, sessionTotal);
 
+  // Set BEFORE the write-back below: persistTabStats waits on the restore, and
+  // the restore's own write must not wait on itself.
+  _statsRestoreDone = true;
+
   if (
     data[StorageKeys.TOTAL_BLOCKED_DATE] !== totalBlockedDate ||
     data[StorageKeys.TOTAL_BLOCKED_TODAY] !== totalBlockedToday
@@ -1983,6 +2172,9 @@ async function restorePersistedStats() {
     await persistTabStats();
   }
 }
+
+// Kick the restore off at module load — before any listener can fire.
+ensureStatsRestored();
 
 let _persistTimeout = null;
 function schedulePersistTabStats() {
@@ -1998,7 +2190,15 @@ function schedulePersistTabStats() {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabStats.delete(tabId);
-  persistTabStats();
+  // Delete again after the restore: closing a tab is one of the events that
+  // wakes a terminated worker, and the restore would otherwise resurrect the
+  // closed tab's entry from storage before the write-back (§4.14).
+  ensureStatsRestored()
+    .then(() => {
+      tabStats.delete(tabId);
+      return persistTabStats();
+    })
+    .catch(() => { });
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
@@ -2119,6 +2319,8 @@ function updateBadge(tabId) {
 }
 
 async function persistTabStats() {
+  // §4.14 — never write a snapshot of memory that predates the restore.
+  if (!_statsRestoreDone) await ensureStatsRestored();
   const snapshot = snapshotStatsForSession();
   mirrorStatsToSession();
   await Promise.all([
@@ -2251,11 +2453,48 @@ async function _applyUserFiltersNow(filtersText) {
     .filter((r) => r.id >= DNR_USER_RULES_START && r.id < DNR_ALLOWLIST_START)
     .map((r) => r.id);
 
+  // §4.16 — bound the batch BEFORE any DNR round-trip. A 2 MB paste (under the
+  // text cap) compiles to ~150k rules; unbounded, that is 150k sequential
+  // `updateDynamicRules` calls with the op chain held, and the worker is killed
+  // long before it converges — then the next wake re-enters the same loop.
+  // Ids are checked here too: `compile_user_filters` numbers from
+  // DNR_USER_RULES_START with no ceiling, so past ~90k rules the ids cross into
+  // the allowlist range, where the user-filter cleanup can no longer reclaim
+  // them and `rebuildAllowlistRules` will happily delete them.
+  const budgeted = [];
+  let overBudgetCount = 0;
+  let outOfRangeCount = 0;
+  for (const rule of newRules) {
+    if (!Number.isInteger(rule?.id) ||
+        rule.id < DNR_USER_RULES_START ||
+        rule.id >= DNR_ALLOWLIST_START) {
+      outOfRangeCount++;
+      continue;
+    }
+    if (budgeted.length >= MAX_USER_FILTERS_DNR_RULES) {
+      overBudgetCount++;
+      continue;
+    }
+    budgeted.push(rule);
+  }
+
   // §4.15 — `updateDynamicRules` is all-or-nothing, so one bad line (IDN
   // urlFilter, non-RE2 regex) used to zero out the ENTIRE user ruleset.
   // Pre-validate what we can, then add in chunks and retry per-rule so a
   // rejection only drops the offending rule.
-  const { vetted, skipped } = await preflightUserDnrRules(newRules);
+  const { vetted, skipped } = await preflightUserDnrRules(budgeted);
+  if (outOfRangeCount > 0) {
+    skipped.push({
+      id: null,
+      reason: `${outOfRangeCount} rule(s) outside the user id range [${DNR_USER_RULES_START}, ${DNR_ALLOWLIST_START})`,
+    });
+  }
+  if (overBudgetCount > 0) {
+    skipped.push({
+      id: null,
+      reason: `${overBudgetCount} rule(s) over the ${MAX_USER_FILTERS_DNR_RULES}-rule dynamic budget`,
+    });
+  }
 
   // Clear the existing user-range IDs first. If even the removal fails, old
   // rules stay active; report failure to the caller instead of recording
@@ -2273,22 +2512,46 @@ async function _applyUserFiltersNow(filtersText) {
     try {
       await chrome.declarativeNetRequest.updateDynamicRules({ addRules: chunk });
       appliedNetworkRules += chunk.length;
-    } catch {
+    } catch (chunkErr) {
+      // §4.16 — classify before retrying. "This rule is malformed" is worth
+      // isolating rule-by-rule; "the dynamic ruleset is full" is not — every
+      // subsequent call fails identically, so the per-rule retry degenerates
+      // into 50 guaranteed failures per chunk and never converges. Stop.
+      if (isDnrCapacityError(chunkErr)) {
+        const remaining = vetted.length - i;
+        skipped.push({
+          id: chunk[0]?.id ?? null,
+          reason: `dynamic rule capacity reached — ${remaining} rule(s) not applied: ${chunkErr?.message || String(chunkErr)}`,
+        });
+        break;
+      }
       // Chunk rejected — isolate the offender(s) by retrying rule-by-rule.
       for (const rule of chunk) {
         try {
           await chrome.declarativeNetRequest.updateDynamicRules({ addRules: [rule] });
           appliedNetworkRules += 1;
         } catch (ruleErr) {
+          if (isDnrCapacityError(ruleErr)) {
+            const remaining = vetted.length - i - chunk.indexOf(rule);
+            skipped.push({
+              id: rule.id,
+              reason: `dynamic rule capacity reached — ${remaining} rule(s) not applied: ${ruleErr?.message || String(ruleErr)}`,
+            });
+            i = vetted.length; // stop the outer loop too
+            break;
+          }
           skipped.push({ id: rule.id, reason: ruleErr?.message || String(ruleErr) });
         }
       }
     }
   }
-  if (skipped.length > 0) {
+  // Honest total: every compiled rule that is not live in DNR, whether it was
+  // truncated, out of range, rejected by preflight or lost to a capacity stop.
+  const skippedNetworkTotal = newRules.length - appliedNetworkRules;
+  if (skippedNetworkTotal > 0) {
     reportError(
       'userFilters:skippedRules',
-      new Error(`${skipped.length} user filter rule(s) skipped: ${skipped
+      new Error(`${skippedNetworkTotal} user filter rule(s) skipped: ${skipped
         .slice(0, 5).map((s) => `#${s.id} ${s.reason}`).join('; ')}`)
     );
   }
@@ -2304,13 +2567,21 @@ async function _applyUserFiltersNow(filtersText) {
   }
 
   await setStorage(StorageKeys.USER_COSMETIC_RULES, cosmeticRules);
-  await setStorage(StorageKeys.USER_FILTERS_APPLIED, filtersText || '');
   await setStorage(StorageKeys.USER_SCRIPTLET_RULES, userScriptlets);
 
   // CRITICAL: Clear memory caches so the next page load picks up the new rules immediately
   domainRulesCache.clear();
   _inFlightRules.clear();
   await db.clearPageBundles();
+
+  // §4.15 — the marker is written LAST, after every piece of state it
+  // certifies. It is the sole guard that lets startup skip the re-apply, so a
+  // worker kill or a StorageQuotaError between the scriptlet store and here
+  // must leave it unwritten: the user's new `##+js(...)` line would otherwise
+  // be dead forever, and persisted page bundles would keep serving the
+  // previous user cosmetic rules (their version key does not change on a
+  // user-filter edit).
+  await setStorage(StorageKeys.USER_FILTERS_APPLIED, filtersText || '');
 
   const totalDomainSpecificRules = Object.values(cosmeticRules.domainSpecific || {})
     .reduce((sum, rules) => sum + (rules?.length || 0), 0);
@@ -2321,7 +2592,9 @@ async function _applyUserFiltersNow(filtersText) {
     // §4.15 — per-rule skip report so the UI can say "N lines were dropped"
     // instead of pretending everything applied. Capped: reasons are for
     // display, not a full audit log.
-    skippedNetwork: skipped.length,
+    // Counted as "compiled but not live", so truncation, id-range drops,
+    // preflight rejections and capacity stops are all included.
+    skippedNetwork: skippedNetworkTotal,
     skippedRules: skipped.slice(0, 20),
   };
 
@@ -2333,6 +2606,23 @@ async function _applyUserFiltersNow(filtersText) {
 // chunk's per-rule retry is cheap, large enough to keep call count low for
 // multi-thousand-rule user lists.
 const USER_RULE_ADD_CHUNK = 50;
+
+/**
+ * §4.16 — is this `updateDynamicRules` rejection about capacity rather than
+ * about one malformed rule?
+ *
+ * Chrome's wording for the dynamic-rule ceiling has changed across versions
+ * ("exceeds the maximum number of dynamic rules", "rule count exceeded",
+ * quota), so match the family loosely. Getting it wrong in the false-negative
+ * direction only costs a per-rule retry pass; in the false-positive direction
+ * it drops the tail of a legitimate batch, so keep the pattern anchored on
+ * capacity words, never on the generic "invalid rule".
+ */
+function isDnrCapacityError(err) {
+  const message = String(err?.message ?? err ?? '');
+  return /quota|maximum number|rule count|too many rules|exceeds? the (maximum|limit)|MAX_NUMBER_OF/i
+    .test(message);
+}
 
 function isAsciiOnly(str) {
   for (let i = 0; i < str.length; i++) {
@@ -2450,7 +2740,7 @@ function parseSimpleNetworkRule(line, id) {
 
   return {
     id,
-    priority: isException ? 3 : 1,
+    priority: isException ? DNR_USER_FILTER_PRIORITY.ALLOW : DNR_USER_FILTER_PRIORITY.BLOCK,
     condition,
     action: { type: isException ? 'allow' : 'block' },
   };
@@ -2472,20 +2762,36 @@ function partitionAllowlistInput(domains) {
   return { valid, rejected };
 }
 
+/**
+ * Read the authoritative allowlist from storage, validated (§4.8).
+ *
+ * §3.1 — every read-modify-write of the allowlist MUST start here, never from
+ * `cachedAllowlist`. That cache is populated in stage 2 of `_criticalPromise`;
+ * a message that reaches a freshly-woken worker before then sees an empty set,
+ * and composing a "new" list from it silently deletes every stored entry.
+ * Storage is the only source of truth that survives an SW kill.
+ */
+async function readStoredAllowlist() {
+  return partitionAllowlistInput((await getStorage(StorageKeys.ALLOWLIST)) || []).valid;
+}
+
 /** Add a site to the per-site allowlist (disable blocking for domain). */
 async function allowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
   if (!normalizedDomain || !isValidAllowlistDomain(normalizedDomain)) {
-    return Array.from(cachedAllowlist);
+    return await readStoredAllowlist();
   }
 
   // Read-modify-write happens INSIDE the chained op so two concurrent adds
-  // can't both snapshot the same base list and drop one another's entry.
+  // can't both snapshot the same base list and drop one another's entry — and
+  // reads from STORAGE, not the memory cache, so a cold worker cannot compose
+  // the new list from an empty set (§3.1).
   return enqueueAllowlistOp(async () => {
-    if (cachedAllowlist.has(normalizedDomain)) {
-      return Array.from(cachedAllowlist);
+    const stored = await readStoredAllowlist();
+    if (stored.includes(normalizedDomain)) {
+      return stored;
     }
-    const newAllowlist = Array.from(cachedAllowlist).concat(normalizedDomain);
+    const newAllowlist = stored.concat(normalizedDomain);
     await _rebuildAllowlistStateNow(newAllowlist);
     return newAllowlist;
   });
@@ -2528,16 +2834,34 @@ async function addAllowlistDomains(domains) {
 /** Remove a site from the allowlist. */
 async function disallowSite(domain) {
   const normalizedDomain = normalizeHostname(domain);
-  if (!normalizedDomain) return Array.from(cachedAllowlist);
+  if (!normalizedDomain) return await readStoredAllowlist();
 
+  // §3.1 — same rule as allowSite: compose from stored state. Against an empty
+  // memory cache the old code reported success for a removal it never made.
   return enqueueAllowlistOp(async () => {
-    if (!cachedAllowlist.has(normalizedDomain)) {
-      return Array.from(cachedAllowlist);
+    const stored = await readStoredAllowlist();
+    if (!stored.includes(normalizedDomain)) {
+      return stored;
     }
-    const newAllowlist = Array.from(cachedAllowlist).filter((entry) => entry !== normalizedDomain);
+    const newAllowlist = stored.filter((entry) => entry !== normalizedDomain);
     await _rebuildAllowlistStateNow(newAllowlist);
     return newAllowlist;
   });
+}
+
+/**
+ * §4.5 — stamp the allowlist band on rules from EITHER builder.
+ *
+ * The band is this worker's contract, not the compiler's: `build_allowlist_rules`
+ * (wasm-core) carries its own priority literal, so without this the effective
+ * priority silently depends on WASM health — the same user action would outrank
+ * `system-unbreak`'s blocks with WASM down and lose to them with WASM up.
+ */
+function applyAllowlistPriorityBand(rules) {
+  for (const rule of rules) {
+    rule.priority = DNR_ALLOWLIST_PRIORITY;
+  }
+  return rules;
 }
 
 /** Rebuild DNR allow-all-requests rules from allowlist. */
@@ -2560,15 +2884,23 @@ async function rebuildAllowlistRules(allowlist) {
   }
 
   if (!newRules) {
+    // JS fallback — runs exactly when WASM init failed. It MUST emit the same
+    // object the Rust builder does (`build_allowlist_rules`): Chrome rejects an
+    // `allowAllRequests` rule that does not declare resourceTypes limited to
+    // main_frame/sub_frame (§4.1), and a rejected batch means storage says
+    // "allowlisted" while DNR keeps blocking.
     newRules = normalizedAllowlist.map((domain, i) => ({
       id: DNR_ALLOWLIST_START + i,
-      priority: 500, // Systematic Priority for User Allowlist
+      priority: DNR_ALLOWLIST_PRIORITY,
       condition: {
         urlFilter: `||${domain}^`,
+        resourceTypes: ['main_frame', 'sub_frame'],
       },
       action: { type: 'allowAllRequests' },
     }));
   }
+
+  applyAllowlistPriorityBand(newRules);
 
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: allowlistRuleIds,
@@ -2841,7 +3173,10 @@ function scheduleActiveIndexRebuild() {
         await queueActiveIndexRebuild();
       }
     } catch (err) {
-      console.error('[Nullify] Cosmetic index rebuild failed:', err);
+      // §3.2 — a failed rebuild leaves the index empty and every cosmetic and
+      // scriptlet lookup dead. console.error kept GET_ERROR_REPORT reporting a
+      // healthy extension; this is the one caller that can surface it.
+      reportError('activeIndexRebuild:scheduled', err, { fatal: true });
     } finally {
       resolve?.();
     }
@@ -3071,6 +3406,10 @@ function executeScriptlets(key, specs) {
 // or malformed traffic from compromised renderers).
 const MAX_USER_FILTERS_BYTES = 2 * 1024 * 1024;   // 2 MB text cap
 const MAX_USER_FILTERS_DNR_RULES = 10_000;        // dynamic DNR budget guard
+// §5.2 — upper bound on one CONTENT_BLOCKED report. The cosmetic engine sends
+// a count per observer batch; anything past this is a compromised renderer
+// inflating the badge, not a page with a million ad slots.
+const MAX_CONTENT_BLOCKED_COUNT = 1_000;
 
 // ---------------------------------------------------------------------------
 // Sender privilege classes (REVIEW.md §2.3, REVIEW-2026-07 §6 row 2.3).
@@ -3123,6 +3462,24 @@ const MESSAGE_SENDER_POLICY = {
   CLEAR_ERROR_REPORT: SENDER_EXTENSION_PAGE,
 };
 
+/**
+ * Message types that must not be answered from a half-initialized worker:
+ * they read or mutate state that `refreshMemoryCache()` / `restorePersistedStats()`
+ * populate in stage 2 of `_criticalPromise` (§3.1).
+ */
+const NEEDS_CRITICAL_CACHE = new Set([
+  'GET_COSMETIC_RULES',
+  'IS_SITE_ALLOWED',
+  'GET_ALLOWLIST',
+  'ALLOW_SITE',
+  'DISALLOW_SITE',
+  'SET_ALLOWLIST',
+  'ADD_ALLOWLIST_DOMAINS',
+  'GET_TAB_STATS',
+  'GET_DAILY_BLOCKED_TOTAL',
+  'GET_INIT_DATA',
+]);
+
 /** True when the message came from one of our own extension pages. */
 function isExtensionPageSender(sender) {
   return typeof sender?.url === 'string' &&
@@ -3145,13 +3502,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   // For content-script critical-path messages, ensure caches are ready first.
   // Non-critical messages (stats, settings UI) don't need to wait.
-  const needsCache = message.type === 'GET_COSMETIC_RULES' ||
-    message.type === 'IS_SITE_ALLOWED' ||
-    message.type === 'GET_ALLOWLIST' ||
-    message.type === 'ADD_ALLOWLIST_DOMAINS' ||
-    message.type === 'GET_TAB_STATS' ||
-    message.type === 'GET_DAILY_BLOCKED_TOTAL' ||
-    message.type === 'GET_INIT_DATA';
+  //
+  // §3.1 — EVERY allowlist reader and writer belongs here. The writers now
+  // compose from storage rather than from `cachedAllowlist`, so this gate is
+  // defence in depth rather than the fix; the readers (`GET_ALLOWLIST`,
+  // `IS_SITE_ALLOWED`) genuinely need the cache to be populated or they answer
+  // "not allowlisted" for a site the user has allowlisted.
+  const needsCache = NEEDS_CRITICAL_CACHE.has(message.type);
 
   const run = needsCache && !_criticalReady
     ? _criticalPromise.then(() => handleMessage(message, sender))
@@ -3322,9 +3679,14 @@ async function handleMessage(message, sender) {
       }
       const counts = await setAndApplyUserFilters(raw);
       if (counts?.error) return { error: counts.error };
-      // Extra guard on compiled DNR output — dynamic rule budget is finite.
-      if (counts && Number.isFinite(counts.network) && counts.network > MAX_USER_FILTERS_DNR_RULES) {
-        return { ...counts, warning: `Network rule count ${counts.network} exceeds budget ${MAX_USER_FILTERS_DNR_RULES}` };
+      // §4.16 — the budget is now enforced inside the apply (rules past it are
+      // truncated before any DNR round-trip), so this is the honesty channel
+      // for it: say the list was cut rather than reporting a clean success.
+      if (counts && counts.network >= MAX_USER_FILTERS_DNR_RULES && counts.skippedNetwork > 0) {
+        return {
+          ...counts,
+          warning: `Only the first ${MAX_USER_FILTERS_DNR_RULES} network rules were applied (${counts.skippedNetwork} dropped)`,
+        };
       }
       return counts;
     }
@@ -3389,14 +3751,20 @@ async function handleMessage(message, sender) {
       if (ids.length > 0) {
         await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ids });
       }
+      // §5.1 — the user-filter DNR rules were just deleted, so the "already
+      // applied" marker is now a lie. Left in place, the startup short-circuit
+      // (`userFilters === appliedUserFilters`) means they never come back.
+      await setStorage(StorageKeys.USER_FILTERS_APPLIED, '');
       domainRulesCache.clear();
       _inFlightRules.clear();
       return { cleared: ids.length, rules: existing };
     }
 
     case 'CHECK_FILTER_UPDATES': {
-      await checkFilterListUpdates();
-      return { ok: true };
+      // §5.3 — report what actually happened. `{ok:true}` on a total fetch
+      // failure made "Update All" a silent no-op offline, and made the options
+      // page render a `lastUpdateCheck` the SW never wrote.
+      return await checkFilterListUpdates();
     }
     case 'REPORT_CONTENT_ERROR': {
       // Content-script init failures used to die in a bare `.catch(() => {})`.
@@ -3442,8 +3810,14 @@ async function handleMessage(message, sender) {
         return { error: 'CONTENT_BLOCKED: invalid hostname' };
       }
 
+      // §5.2 — `Number.isFinite(1e308)` passes, so an unbounded count let a
+      // hostile page drive totalBlockedToday to a nonsense value that was then
+      // persisted to storage AND the session mirror. Clamp to a plausible
+      // per-message batch instead of trusting the renderer.
       const count = Number(payload?.count);
-      const increment = Number.isFinite(count) && count > 0 ? count : 1;
+      const increment = Number.isFinite(count) && count > 0
+        ? Math.min(Math.floor(count), MAX_CONTENT_BLOCKED_COUNT)
+        : 1;
 
       const tabId = sender.tab?.id;
       if (tabId != null && tabId >= 0) {
@@ -3496,6 +3870,12 @@ async function getCosmeticBundleForPage(hostname) {
 
   // Deduplicate: If we are already fetching rules for this domain, return the same promise.
   if (_inFlightRules.has(hostname)) return _inFlightRules.get(hostname);
+
+  // §5.4 — snapshot the rebuild generation before reading a single store. Any
+  // rebuild that starts, finishes, or is still running when this lookup
+  // resolves changes the number, and the result is then cache-only for this
+  // request rather than being written anywhere durable.
+  const generationAtLookupStart = currentRebuildGeneration();
 
   const promise = (async () => {
     const domainSpecific = [];
@@ -3554,12 +3934,20 @@ async function getCosmeticBundleForPage(hostname) {
   _inFlightRules.set(hostname, promise);
   try {
     const bundle = normalizeStoredBundle(await promise);
-    setCachedDomainRules(hostname, bundle); // Populate cache so GET_INIT_DATA skips IndexedDB
-    // Never persist a bundle while an active-index rebuild is in flight
-    // (§5.3): it may have been computed against half-cleared stores, and a
-    // write landing after the rebuild's clearPageBundles() would poison the
-    // persisted cache for this hostname indefinitely.
-    if (!isActiveIndexRebuildInFlight()) {
+    // Never keep a bundle that may have been computed against half-cleared
+    // stores (§5.3/§5.4). Two independent signals, because neither alone is
+    // sufficient: the generation compare catches a lookup that started before
+    // a rebuild and resolved after it, and the in-flight check catches a
+    // lookup that ran entirely inside one.
+    const indexStable =
+      currentRebuildGeneration() === generationAtLookupStart &&
+      !isActiveIndexRebuildInFlight();
+
+    if (indexStable) {
+      // Populate cache so GET_INIT_DATA skips IndexedDB. Gated too: the
+      // rebuild's `domainRulesCache.clear()` has already run by then, so an
+      // ungated write reseeds the memory cache the rebuild just emptied.
+      setCachedDomainRules(hostname, bundle);
       await db.putPageBundle(hostname, bundle, activeRuleDataVersion)
         .then(() => db.prunePageBundles(CONFIG.PAGE_BUNDLE_DB_MAX))
         .catch(() => {});
@@ -3761,8 +4149,18 @@ export const __testHooks = {
   setAndApplyUserFilters,
   appendUserFilterLine,
   setCompileUserFiltersOverrideForTest: (fn) => { _compileUserFiltersOverride = fn; },
+  parseSimpleNetworkRule,
+  DNR_USER_FILTER_PRIORITY,
+  DNR_ALLOWLIST_PRIORITY,
+  DNR_PRIVACY_PRIORITY,
+  MAX_USER_FILTERS_DNR_RULES,
+  DNR_USER_RULES_START,
+  DNR_ALLOWLIST_START,
   // Allowlist
   rebuildAllowlistState,
+  applyAllowlistPriorityBand,
+  allowSite,
+  disallowSite,
   addAllowlistDomains,
   refreshMemoryCache,
   isHostnameAllowedCached,
@@ -3785,6 +4183,10 @@ export const __testHooks = {
   getCosmeticBundleForPage,
   queueActiveIndexRebuild,
   isActiveIndexRebuildInFlight,
+  currentRebuildGeneration,
+  isRuleIndexInterrupted,
+  RULE_INDEX_STATE_KEY,
+  checkFilterListUpdates,
   getActiveRuleDataVersion: () => activeRuleDataVersion,
   performEarlyInjection,
   handleBeforeNavigate,

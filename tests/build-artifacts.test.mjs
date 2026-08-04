@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -97,5 +98,154 @@ test('all workflow actions are pinned to full commit SHAs', () => {
         `${file}: "${m[1]}" must be pinned to a 40-char commit SHA`,
       );
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Priority bands: the user allowlist must outrank every shipped rule (§4.5)
+// ---------------------------------------------------------------------------
+
+test('no static rule outranks the runtime allowlist unless it is an allow', async () => {
+  // The runtime `allowAllRequests` sits at 100000. A static BLOCK at or above
+  // that silently overrides "trust this site" — which is how four
+  // system-unbreak blocks at 1100 beat the old 500 allowlist and kept
+  // datadome.co blocked on allowlisted sites, with no user-level escape.
+  const { assertStaticRulePriorityBands } = await import('../scripts/build-rules.mjs');
+  assertStaticRulePriorityBands();
+});
+
+test('the band assertion rejects a static block that would outrank the allowlist', async () => {
+  const {
+    assertStaticRulePriorityBands,
+    RUNTIME_ALLOWLIST_PRIORITY,
+  } = await import('../scripts/build-rules.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nullify-bands-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'system-unbreak.json'), JSON.stringify([
+      {
+        id: 1,
+        priority: RUNTIME_ALLOWLIST_PRIORITY,
+        condition: { urlFilter: '||tracker.example^' },
+        action: { type: 'block' },
+      },
+    ]));
+    assert.throws(() => assertStaticRulePriorityBands(dir), /would override the user allowlist/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('system-unbreak priorities stay inside the documented band', async () => {
+  const {
+    SYSTEM_UNBREAK_PRIORITY,
+    SYSTEM_UNBREAK_OVERRIDE_PRIORITY,
+  } = await import('../scripts/build-rules.mjs');
+  const rules = readJson('rules/system-unbreak.json');
+  const baseAllows = rules.filter((r) =>
+    r.priority === SYSTEM_UNBREAK_PRIORITY && r.action?.type === 'allow');
+
+  for (const rule of rules) {
+    assert.ok(
+      rule.priority === SYSTEM_UNBREAK_PRIORITY || rule.priority === SYSTEM_UNBREAK_OVERRIDE_PRIORITY,
+      `rule ${rule.id}: priority ${rule.priority} is outside the documented band`,
+    );
+    if (rule.priority !== SYSTEM_UNBREAK_OVERRIDE_PRIORITY) continue;
+    // The override slot exists for exactly one shape: a block that has to beat
+    // a co-matching allow in this same file (youtubei/v1/ad_break inside the
+    // youtubei/v1/* allow). Anything else there is an unexplained magic number.
+    const covered = baseAllows.some((allow) =>
+      rule.condition.urlFilter.startsWith((allow.condition.urlFilter || '').replace(/\*+$/, '')));
+    assert.ok(
+      covered,
+      `rule ${rule.id} (${rule.condition.urlFilter}) sits at ${SYSTEM_UNBREAK_OVERRIDE_PRIORITY} but overrides no allow`,
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Release workflow: tag names are data, not shell (§5.28)
+// ---------------------------------------------------------------------------
+
+test('no workflow interpolates attacker-controllable context into a run: block', () => {
+  // `git check-ref-format 'refs/tags/v4.3.0$(id)'` exits 0, so a tag name can
+  // carry `$(…)` or `${IFS}` and would execute inside the contents:write job.
+  // The fix is an `env:` entry plus a quoted "$TAG".
+  const injectable = /\$\{\{\s*(github\.(ref_name|ref|head_ref|event\b)|inputs\.)/;
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const lines = fs.readFileSync(path.join(workflowDir, file), 'utf8').split('\n');
+    let runIndent = null;
+    for (const line of lines) {
+      if (runIndent !== null) {
+        const indent = line.search(/\S/);
+        if (line.trim() !== '' && indent <= runIndent) runIndent = null;
+      }
+      const runMatch = line.match(/^(\s*)(?:-\s+)?run:\s*(.*)$/);
+      if (runMatch) {
+        assert.doesNotMatch(runMatch[2], injectable, `${file}: run: interpolates a tag/ref — pass it via env:`);
+        runIndent = runMatch[1].length;
+        continue;
+      }
+      if (runIndent === null) continue;
+      assert.doesNotMatch(
+        line,
+        injectable,
+        `${file}: run: block interpolates a tag/ref — pass it via env: and quote "$TAG"`,
+      );
+    }
+  }
+});
+
+test('the release build compiles rules offline from committed snapshots', () => {
+  // Every tag build used to recompile from eight live upstreams, so the
+  // release window was however long it took the first list to rotate.
+  const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'build.yml'), 'utf8');
+  assert.match(workflow, /npm run build:rules/);
+  assert.doesNotMatch(
+    workflow,
+    /^\s*run:.*refresh:lists/m,
+    'fetching upstream during a release re-introduces the rotation race',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// WASM web-accessible resource carries a per-session URL (§4.13)
+// ---------------------------------------------------------------------------
+
+test('the WASM blob is exposed through a dynamic, per-session URL', () => {
+  // exposeYouTubeWasmUrl() publishes this URL into every YouTube page before
+  // the allowlist is even known. Without use_dynamic_url it is
+  // chrome-extension://<stable-extension-id>/… — a one-line fingerprint.
+  const manifest = readJson('manifest.json');
+  const entries = manifest.web_accessible_resources || [];
+  const wasmEntries = entries.filter((e) =>
+    (e.resources || []).some((r) => r.endsWith('nullify_core_bg.wasm')));
+  assert.equal(wasmEntries.length, 1, 'the wasm blob must be declared exactly once');
+  assert.equal(wasmEntries[0].use_dynamic_url, true);
+  assert.deepEqual(wasmEntries[0].matches, ['<all_urls>']);
+});
+
+test('all three engines agree on the runtime allowlist band', async () => {
+  // Three files have to agree for §4.5 to stay fixed: both allowlist rule
+  // builders pick the priority they write on `allowAllRequests`, and the build
+  // refuses to ship any static rule at or above it. Nothing else compares
+  // them — the last time a band was documented in one file and implemented in
+  // another, four system-unbreak blocks quietly outranked the user allowlist
+  // and `datadome.co` stayed blocked on sites the user had explicitly trusted.
+  const { RUNTIME_ALLOWLIST_PRIORITY } = await import('../scripts/build-rules.mjs');
+
+  const seams = [
+    ['src/background/service-worker.js', /const DNR_ALLOWLIST_PRIORITY\s*=\s*([\d_]+)/],
+    ['wasm-core/src/lib.rs', /const DNR_ALLOWLIST_PRIORITY:\s*u32\s*=\s*([\d_]+)/],
+  ];
+  for (const [file, pattern] of seams) {
+    const match = fs.readFileSync(path.join(ROOT, file), 'utf8').match(pattern);
+    assert.ok(match, `${file} must define DNR_ALLOWLIST_PRIORITY`);
+    assert.equal(
+      Number(match[1].replace(/_/g, '')),
+      RUNTIME_ALLOWLIST_PRIORITY,
+      `${file} and scripts/build-rules.mjs RUNTIME_ALLOWLIST_PRIORITY must be the same number`,
+    );
   }
 });

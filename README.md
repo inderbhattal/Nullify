@@ -125,22 +125,54 @@ npm run build:ext
 npm run dev
 ```
 
-### Full Build (downloads filter lists from internet)
+### Full Build (compiles the vendored filter lists)
+
+`npm run build:rules` does **not** touch the network. It compiles the
+fully-expanded list snapshots committed under `scripts/filter-lists/`, after
+verifying each one against `scripts/filter-lists.lock.json`.
 
 ```bash
-# 1. Refresh the SRI lock (hashes the fully-expanded lists). Upstream lists
-#    update frequently, so do this first, review the diff, and commit it —
-#    a build FAILS on any list whose hash is missing or mismatching.
-node scripts/generate-sri-hashes.mjs
-
-# 2. Download EasyList, EasyPrivacy, uBO filters, verify against the lock,
-#    and compile to DNR. Output is staged and only swapped into rules/ on
-#    success, so a failed build never destroys the previous good rulesets.
+# Compile EasyList, EasyPrivacy, uBO filters, … to DNR rulesets. Offline.
+# Output is staged and only swapped into rules/ on success — as one directory
+# rename — so a failed build never destroys or half-replaces the previous
+# good rulesets.
 npm run build:rules
 
 # Then build extension
 npm run build:ext
 ```
+
+#### Refreshing the upstream lists
+
+Upstream rotates constantly: measured, **6 of 8 lists changed within ~48 h** of
+a lock refresh. When the build fetched at build time, any list rotating between
+`git tag` and the CI build failed SRI and killed the release — a success window
+of minutes. Fetching is now a separate, deliberate step whose output is
+reviewed and committed:
+
+```bash
+# 1. Fetch upstream, expand every !#include, and write BOTH the snapshots and
+#    the SRI lock from the same bytes (they can never disagree).
+npm run refresh:lists
+
+# 2. Review what actually changed. This is the one moment upstream content
+#    enters the repo, and it is a plain text diff.
+git diff --stat scripts/filter-lists/
+git diff scripts/filter-lists/ubo-unbreak.txt
+
+# 3. Recompile and run the gates.
+npm run build:rules && npm test
+
+# 4. Commit the snapshots and the lock together.
+git add scripts/filter-lists scripts/filter-lists.lock.json
+```
+
+A missing snapshot, or a snapshot whose hash does not match the lock, fails the
+build with the command to run. Nothing falls back to the network.
+
+Cosmetic filters and scriptlets still refresh for users on the runtime's own
+24 h update alarm; the snapshots pin what the *static DNR rulesets* are
+compiled from.
 
 ### Load in Chrome
 
@@ -171,9 +203,9 @@ git push origin main --follow-tags
 
 | Script | Description |
 |---|---|
-| `npm run build` | Full build (download rules + webpack) |
-| `npm run build:rules` | Download, SRI-verify, and compile filter lists only |
-| `node scripts/generate-sri-hashes.mjs` | Refresh `scripts/filter-lists.lock.json` (commit the diff) |
+| `npm run build` | Full build (compile rules + webpack) |
+| `npm run build:rules` | Compile the vendored lists to DNR rulesets (offline, SRI-verified) |
+| `npm run refresh:lists` | Fetch upstream and rewrite `scripts/filter-lists/` + the SRI lock (review and commit the diff) |
 | `npm run build:sample-rules` | Generate minimal rules for local testing |
 | `npm run build:ext` | Webpack bundle only |
 | `npm run dev` | Webpack watch mode |

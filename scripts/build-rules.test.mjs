@@ -11,6 +11,9 @@ import {
   verifySriHash,
   effectiveListLimit,
   commitStagedRules,
+  fetchAndExpand,
+  vendoredListPath,
+  FILTER_LISTS,
   LIST_CONFIG,
   MAX_PER_FILE,
 } from './build-rules.mjs';
@@ -224,5 +227,148 @@ test('a build that never commits leaves the previous rules untouched', () => {
     assert.equal(fs.readFileSync(path.join(targetDir, 'easylist.json'), 'utf8'), '["good"]');
   } finally {
     fs.rmSync(targetDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// !#include failures fail CLOSED (§5.10)
+// ---------------------------------------------------------------------------
+
+test('a failed !#include aborts the build instead of silently truncating the list', async () => {
+  // The catch used to warn and continue, so a persistent 404 on one sub-file
+  // was skipped identically when the lock was generated and when the build
+  // ran: the truncated corpus hashed consistently and shipped "verified".
+  const fakeFetch = async (url) => {
+    if (url.endsWith('top.txt')) return '||keep.example^\n!#include sub.txt\n';
+    throw new Error('HTTP 404');
+  };
+  await assert.rejects(
+    () => fetchAndExpand('https://lists.example/top.txt', 0, fakeFetch),
+    /!#include .*sub\.txt failed/,
+  );
+});
+
+test('!#include nesting past the depth limit throws instead of returning empty text', async () => {
+  // `return ''` at depth > 5 was the same fail-open shape: a cycle silently
+  // truncated every list that reached it.
+  const fakeFetch = async () => '!#include deeper.txt\n';
+  await assert.rejects(
+    () => fetchAndExpand('https://lists.example/top.txt', 0, fakeFetch),
+    /nesting deeper than 5 levels/,
+  );
+});
+
+test('a resolvable !#include is still inlined', async () => {
+  const fakeFetch = async (url) => (url.endsWith('sub.txt')
+    ? '||from-include.example^\n'
+    : '||top.example^\n!#include sub.txt\n');
+  const text = await fetchAndExpand('https://lists.example/top.txt', 0, fakeFetch);
+  assert.match(text, /\|\|top\.example\^/);
+  assert.match(text, /\|\|from-include\.example\^/);
+});
+
+// ---------------------------------------------------------------------------
+// Vendored list snapshots (§4.6)
+// ---------------------------------------------------------------------------
+
+test('every fetched list has a committed snapshot whose hash matches the lock', async () => {
+  // build:rules compiles these instead of fetching, so a release cannot lose
+  // a race with upstream rotation. The pair must be refreshed together —
+  // `npm run refresh:lists` writes both from the same bytes.
+  const { createHash } = await import('node:crypto');
+  const lock = JSON.parse(fs.readFileSync(new URL('./filter-lists.lock.json', import.meta.url), 'utf8'));
+  for (const list of FILTER_LISTS) {
+    const snapshot = vendoredListPath(list.id);
+    assert.ok(
+      fs.existsSync(snapshot),
+      `${list.id}: missing scripts/filter-lists/${list.id}.txt — run \`npm run refresh:lists\``,
+    );
+    const text = fs.readFileSync(snapshot, 'utf8');
+    const actual = `sha384-${createHash('sha384').update(text, 'utf8').digest('base64')}`;
+    assert.equal(
+      actual,
+      lock[list.id]?.sha384,
+      `${list.id}: snapshot and lock disagree — regenerate both with \`npm run refresh:lists\``,
+    );
+  }
+});
+
+test('a missing snapshot fails the build with the refresh instructions', () => {
+  // The failure has to name the command, because the build no longer has a
+  // network fallback that would quietly paper over the missing file.
+  const result = verifySriHash('anything', 'no-such-list', {});
+  assert.equal(result.valid, false);
+  assert.match(result.error || '', /filter-lists\.lock\.json/);
+});
+
+// ---------------------------------------------------------------------------
+// Crash-atomic promotion (§5.27)
+// ---------------------------------------------------------------------------
+
+test('commitStagedRules swaps rules/ as one directory, not file by file', () => {
+  // Delete-then-rename per file left rules/ mixed-generation on a crash:
+  // shards from two builds, plus a stale ruleset-counts.json that the service
+  // worker's budget fallback trusts. A directory swap has no such window.
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nullify-swap-'));
+  const stagingDir = fs.mkdtempSync(path.join(parent, 'staging-'));
+  const targetDir = fs.mkdtempSync(path.join(parent, 'rules-'));
+  try {
+    fs.writeFileSync(path.join(targetDir, 'easylist.json'), '["old"]');
+    fs.writeFileSync(path.join(targetDir, 'ruleset-counts.json'), '{"easylist":1}');
+    fs.writeFileSync(path.join(targetDir, 'system-unbreak.json'), '[{"id":1}]');
+    const inodeBefore = fs.statSync(targetDir).ino;
+
+    fs.writeFileSync(path.join(stagingDir, 'easylist.json'), '["new"]');
+    fs.writeFileSync(path.join(stagingDir, 'ruleset-counts.json'), '{"easylist":2}');
+
+    commitStagedRules(stagingDir, targetDir);
+
+    assert.notEqual(
+      fs.statSync(targetDir).ino,
+      inodeBefore,
+      'rules/ must be replaced as a whole directory, so no half-swapped state can exist',
+    );
+    assert.equal(fs.readFileSync(path.join(targetDir, 'easylist.json'), 'utf8'), '["new"]');
+    assert.equal(fs.readFileSync(path.join(targetDir, 'ruleset-counts.json'), 'utf8'), '{"easylist":2}');
+    assert.equal(
+      fs.readFileSync(path.join(targetDir, 'system-unbreak.json'), 'utf8'),
+      '[{"id":1}]',
+      'hand-maintained files are carried into the new generation',
+    );
+    assert.deepEqual(
+      fs.readdirSync(parent).filter((e) => e.includes('.old-')),
+      [],
+      'the retired generation must be cleaned up',
+    );
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
+});
+
+test('a promotion that cannot complete leaves the previous generation whole', { skip: process.getuid?.() === 0 ? 'runs as root, permissions are not enforced' : false }, () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'nullify-swap-'));
+  const stagingDir = fs.mkdtempSync(path.join(parent, 'staging-'));
+  const targetDir = fs.mkdtempSync(path.join(parent, 'rules-'));
+  try {
+    fs.writeFileSync(path.join(targetDir, 'easylist.json'), '["old"]');
+    fs.writeFileSync(path.join(targetDir, 'easylist_4.json'), '["stale"]');
+    fs.writeFileSync(path.join(stagingDir, 'easylist.json'), '["new"]');
+
+    // Renames inside `parent` now fail. The old per-file promotion had already
+    // deleted the stale shard by this point; the directory swap has not
+    // touched the target at all.
+    fs.chmodSync(parent, 0o555);
+    assert.throws(() => commitStagedRules(stagingDir, targetDir));
+    fs.chmodSync(parent, 0o755);
+
+    assert.equal(fs.readFileSync(path.join(targetDir, 'easylist.json'), 'utf8'), '["old"]');
+    assert.equal(
+      fs.existsSync(path.join(targetDir, 'easylist_4.json')),
+      true,
+      'a failed promotion must not leave rules/ mixed-generation',
+    );
+  } finally {
+    fs.chmodSync(parent, 0o755);
+    fs.rmSync(parent, { recursive: true, force: true });
   }
 });

@@ -2,39 +2,50 @@
 /**
  * generate-sri-hashes.mjs
  *
- * Regenerates the committed filter-list lock file used by build-rules.mjs for
- * Subresource Integrity verification.
+ * Refreshes the vendored filter-list snapshots AND the committed SRI lock they
+ * are verified against. This is the ONLY script in the repo that fetches
+ * upstream lists — `build:rules` compiles from what this writes.
  *
- * The hash covers the FULLY-EXPANDED list text — the same
- * fetchAndExpand() output the build compiles — so !#include sub-files (where
- * uBO lists carry most of their content) are covered, and redirects are
- * required to stay on https. Hashing only the top-level file, as an earlier
- * version of this script did, verified almost nothing.
+ * Both artifacts are written in the same pass, from the same bytes, so the
+ * snapshot and its hash can never disagree:
+ *
+ *   scripts/filter-lists/<id>.txt      fully-expanded list text (committed)
+ *   scripts/filter-lists.lock.json     sha384 of each snapshot   (committed)
+ *
+ * The hash covers the FULLY-EXPANDED list text — the same fetchAndExpand()
+ * output the build compiles — so !#include sub-files (where uBO lists carry
+ * most of their content) are covered, and redirects are required to stay on
+ * https. Hashing only the top-level file, as an earlier version of this script
+ * did, verified almost nothing.
  *
  * Workflow:
- *   1. node scripts/generate-sri-hashes.mjs
- *   2. Review the diff of scripts/filter-lists.lock.json
- *   3. Commit it — a non-sample build FAILS on any list with no pinned hash
- *      or a mismatching hash (upstream lists update frequently, so regenerate
- *      the lock as the first step of a rules refresh).
+ *   1. npm run refresh:lists
+ *   2. Review `git diff scripts/filter-lists/` — this is the one moment
+ *      upstream content enters the repo. The lock diff alone tells you
+ *      nothing; the text diff tells you what changed.
+ *   3. npm run build:rules   (offline — compiles the reviewed snapshots)
+ *   4. Commit the snapshots and the lock together.
  *
- * Output: scripts/filter-lists.lock.json
+ * Why snapshots: builds used to verify the lock against a LIVE fetch, so a
+ * release raced upstream rotation (measured: 6 of 8 lists rotated within ~48 h
+ * of a lock refresh). Any list rotating between tag and build failed SRI and
+ * killed the release. Rotation now only matters here, at review time (§4.6).
  */
 
 import fs from 'fs';
 import path from 'path';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
-import { fetchAndExpand, FILTER_LISTS } from './build-rules.mjs';
+import { fetchAndExpand, FILTER_LISTS, VENDORED_LISTS_DIR, vendoredListPath } from './build-rules.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOCK_FILE = path.join(__dirname, 'filter-lists.lock.json');
 
 async function main() {
-  console.log('[SRI] Generating Subresource Integrity hashes for filter lists (fully-expanded text)...\n');
+  console.log('[lists] Fetching upstream filter lists (fully-expanded text)...\n');
 
   const hashes = {};
-  let successCount = 0;
+  const snapshots = new Map();
   let failCount = 0;
 
   for (const list of FILTER_LISTS) {
@@ -46,8 +57,8 @@ async function main() {
         sha384: hash,
         generatedAt: new Date().toISOString(),
       };
-      console.log(`✓ ${list.id}: ${hash.slice(0, 24)}...`);
-      successCount++;
+      snapshots.set(list.id, expanded);
+      console.log(`✓ ${list.id}: ${(expanded.length / 1024).toFixed(0)} KiB  ${hash.slice(0, 24)}...`);
     } catch (err) {
       console.error(`✗ ${list.id}: ${err.message}`);
       failCount++;
@@ -55,19 +66,25 @@ async function main() {
   }
 
   if (failCount > 0) {
-    // Fail closed without touching the existing lock: a partial lock would
-    // make the next build fail on the missing entries anyway, but silently
-    // replacing reviewed hashes on a flaky network helps no one.
-    console.error(`\n[SRI] ${failCount} list(s) failed — lock file NOT updated`);
+    // Fail closed without touching the existing snapshots or lock: a partial
+    // refresh would leave the repo compiling a mix of generations, and
+    // silently replacing reviewed content on a flaky network helps no one.
+    console.error(`\n[lists] ${failCount} list(s) failed — nothing written`);
     process.exit(1);
   }
 
+  fs.mkdirSync(VENDORED_LISTS_DIR, { recursive: true });
+  for (const [id, text] of snapshots) {
+    fs.writeFileSync(vendoredListPath(id), text);
+  }
   fs.writeFileSync(LOCK_FILE, JSON.stringify(hashes, null, 2) + '\n');
-  console.log(`\n[SRI] Lock file written to ${LOCK_FILE}`);
-  console.log(`[SRI] Complete: ${successCount} hashed. Review and commit the lock file.`);
+
+  console.log(`\n[lists] ${snapshots.size} snapshots written to ${VENDORED_LISTS_DIR}`);
+  console.log(`[lists] Lock file written to ${LOCK_FILE}`);
+  console.log('[lists] Review `git diff scripts/filter-lists/`, then run `npm run build:rules`.');
 }
 
 main().catch((err) => {
-  console.error('[SRI] Fatal error:', err);
+  console.error('[lists] Fatal error:', err);
   process.exit(1);
 });

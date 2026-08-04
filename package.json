@@ -11,6 +11,7 @@
     "setup:prod": "npm install && npm run build:wasm && npm run build:rules && npm run build:ext",
     "build": "npm run build:wasm && npm run build:rules && npm run build:ext",
     "build:rules": "node scripts/build-rules.mjs --verbose",
+    "refresh:lists": "node scripts/generate-sri-hashes.mjs",
     "build:wasm": "cd wasm-core && wasm-pack build --target web --out-dir ../src/shared/wasm",
     "build:ext": "webpack --mode production",
     "build:sample-rules": "node scripts/build-rules.mjs --sample",

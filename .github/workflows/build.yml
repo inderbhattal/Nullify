@@ -40,9 +40,16 @@ jobs:
       - name: Unit + harness tests
         run: npm test
 
+      # `${{ github.ref_name }}` interpolated straight into a `run:` block is
+      # shell-injectable: `git check-ref-format 'refs/tags/v4.3.0$(id)'` exits
+      # 0, so `$(…)` and `${IFS}` are legal in a tag name and would execute
+      # inside the job. Pass it through the environment and quote it, so the
+      # value is data the shell never parses.
       - name: Assert tag matches shipped version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: node scripts/assert-release-version.mjs "${{ github.ref_name }}"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node scripts/assert-release-version.mjs "$TAG"
 
   build:
     needs: verify
@@ -76,16 +83,23 @@ jobs:
       - name: Build WASM Core
         run: npm run build:wasm
 
-      - name: Build filter rules
+      # Compiles the committed snapshots under scripts/filter-lists/ and
+      # verifies them against scripts/filter-lists.lock.json. No network: a
+      # release can no longer lose a race with upstream list rotation, which
+      # used to reduce the window between tag and build to minutes (§4.6).
+      # Refresh upstream content with `npm run refresh:lists` on a branch.
+      - name: Build filter rules (offline, from vendored snapshots)
         run: npm run build:rules
 
       - name: Build extension
         run: npm run build:ext
 
       - name: Package extension ZIP
+        env:
+          TAG: ${{ github.ref_name || 'dev' }}
         run: |
           mkdir -p release
-          zip -r release/nullify-${{ github.ref_name || 'dev' }}.zip \
+          zip -r "release/nullify-$TAG.zip" \
             manifest.json \
             assets/ \
             rules/ \
@@ -111,23 +125,29 @@ jobs:
             release/*.zip
             release/SHA256SUMS
 
+      # `env.TAG` is the same value as github.ref_name, but routing every
+      # reference through one place means a future `run:` step cannot pick up
+      # the raw expression by copy-paste. Action inputs are not shell, so this
+      # is consistency rather than a second injection sink.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        env:
+          TAG: ${{ github.ref_name }}
         with:
           files: |
             release/*.zip
             release/SHA256SUMS
           generate_release_notes: true
           body: |
-            ## Nullify ${{ github.ref_name }}
+            ## Nullify ${{ env.TAG }}
 
             ### Install
-            1. Download `nullify-${{ github.ref_name }}.zip` below
+            1. Download `nullify-${{ env.TAG }}.zip` below
             2. Unzip to a folder
             3. Open `chrome://extensions` → enable **Developer mode**
             4. Click **Load unpacked** → select the unzipped folder
             5. Done! Nullify is active.
 
             ### Verify
-            Compare `sha256sum nullify-${{ github.ref_name }}.zip` against the `SHA256SUMS` asset.
+            Compare `sha256sum nullify-${{ env.TAG }}.zip` against the `SHA256SUMS` asset.

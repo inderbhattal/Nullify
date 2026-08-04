@@ -137,12 +137,20 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "dist/scriptlets-world.js",
-        "dist/nullify_core_bg.wasm"
+        "dist/scriptlets-world.js"
       ],
       "matches": [
         "<all_urls>"
       ]
+    },
+    {
+      "resources": [
+        "dist/nullify_core_bg.wasm"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "use_dynamic_url": true
     }
   ],
   "content_security_policy": {

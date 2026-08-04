@@ -76,19 +76,19 @@
   },
   {
     "id": 100,
-    "priority": 1100,
+    "priority": 1000,
     "condition": { "urlFilter": "||datadome.co^" },
     "action": { "type": "block" }
   },
   {
     "id": 101,
-    "priority": 1100,
+    "priority": 1000,
     "condition": { "urlFilter": "||fingerprintjs.com^" },
     "action": { "type": "block" }
   },
   {
     "id": 102,
-    "priority": 1100,
+    "priority": 1000,
     "condition": { "urlFilter": "||fpjs.io^" },
     "action": { "type": "block" }
   },

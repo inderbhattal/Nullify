@@ -5,6 +5,7 @@ import {
   parseLine,
   networkFilterToDNR,
   parseFilterList,
+  applyBadfilterSuppression,
   buildDNRRules,
 } from './build-rules.mjs';
 
@@ -579,4 +580,172 @@ test('dedup keeps rules that differ only in action payload or priority', () => {
     1,
     'the true duplicate is still removed',
   );
+});
+
+// ---------------------------------------------------------------------------
+// TLD guard operates on the whole host, not the first label (§4.3)
+// ---------------------------------------------------------------------------
+
+test('the bare-TLD guard rejects a TLD-only host, not a subdomain that shares a TLD name', () => {
+  // The guard captured only up to the first dot, so every pattern whose first
+  // SUBDOMAIN label collided with a TLD name was dropped as "anchors on TLD":
+  // 1,907 valid filters on a live corpus, 35 of them `@@` exceptions (16 in
+  // unbreak.txt, so EasyPrivacy's block shipped while its escape was deleted).
+  for (const line of [
+    '||app.adjust.com^',
+    '||app.link/_r?',
+    '||app.clickfunnels.com/cf.js',
+    '||cc.naver.com/cc',
+    '||tv.example.org^',
+    '||dev.example.co.uk^',
+    '||in.com/common/script_catch.js',
+  ]) {
+    assert.ok(convert(line), `${line} must survive the TLD guard`);
+  }
+
+  const exception = convert('@@||dev.visualwebsiteoptimizer.com^');
+  assert.deepEqual(exception, {
+    priority: 3,
+    condition: { urlFilter: '||dev.visualwebsiteoptimizer.com^', isUrlFilterCaseSensitive: false },
+    action: { type: 'allow' },
+  });
+});
+
+test('a genuinely bare TLD anchor is still rejected', () => {
+  // The guard exists because ||com^ matches every .com host.
+  for (const line of ['||com^', '||xyz^', '||co.', '||tv^', '||com/path/ads.js']) {
+    assert.equal(convert(line), null, `${line} must still be dropped`);
+  }
+});
+
+test('an unscoped multi-label public suffix is rejected, a $domain=-scoped one is kept', () => {
+  // ||co.uk^ is as broad as ||com^ — but the corpus ships several deliberate
+  // narrow rules on public suffixes (||cloudfront.net^$domain=…,
+  // ||pages.dev^$script,domain=…), and dropping those costs real coverage.
+  assert.equal(convert('||co.uk^'), null);
+  assert.equal(convert('||com.br^'), null);
+  assert.deepEqual(
+    convert('||cloudfront.net^$domain=a.example|b.example'),
+    block({ urlFilter: '||cloudfront.net^', initiatorDomains: ['a.example', 'b.example'] }),
+  );
+  assert.ok(convert('||cloudfront.net/ads/banner.js'), 'a path-scoped rule is not a suffix anchor');
+});
+
+// ---------------------------------------------------------------------------
+// $badfilter is resolved corpus-wide, not per list (§4.4)
+// ---------------------------------------------------------------------------
+
+test('parseFilterList reports the list\'s own $badfilter keys for a corpus-wide pass', () => {
+  const unbreak = parseFilterList('||sumo.com^$third-party,badfilter\n||keep.example^\n');
+  assert.equal(unbreak.badfilterKeys.size, 1);
+  assert.equal(unbreak.networkRules.length, 1, 'the badfilter directive itself never ships');
+});
+
+test('a $badfilter in one list cancels a matching rule in another list', () => {
+  // unbreak.txt ships 204 badfilters, NONE of which match a rule in
+  // unbreak.txt itself while 34 exactly match live EasyList/EasyPrivacy rules.
+  // Per-list scope therefore delivered ~0% of the feature to its only real
+  // consumer, and `||sumo.com^` kept breaking sites.
+  const unbreak = parseFilterList('||sumo.com^$third-party,badfilter\n');
+  const privacy = parseFilterList('||sumo.com^$third-party\n||other.example^\n');
+
+  // Phase 1 leaves the victim alive — its own list carries no badfilter.
+  assert.equal(privacy.networkRules.length, 2);
+
+  const corpusKeys = new Set([...unbreak.badfilterKeys]);
+  const { rules, suppressed } = applyBadfilterSuppression(privacy.networkRules, corpusKeys);
+  assert.equal(suppressed.length, 1);
+  assert.equal(suppressed[0].pattern, '||sumo.com^');
+  assert.deepEqual(rules.map((r) => r.pattern), ['||other.example^']);
+});
+
+test('per-list $badfilter suppression still applies with no corpus keys supplied', () => {
+  const parsed = parseFilterList('||ads.example^\n||ads.example^$badfilter\n||keep.example^\n');
+  assert.deepEqual(parsed.networkRules.map((r) => r.pattern), ['||keep.example^']);
+  assert.equal(
+    parsed.skippedRecords.filter((r) => r.reason.startsWith('badfilter-suppressed')).length,
+    1,
+  );
+});
+
+test('a corpus-wide badfilter still requires an exact canonical match', () => {
+  // uBO's subset-$domain= narrowing cannot be expressed by exact matching, and
+  // guessing would cancel rules the author never targeted.
+  const bad = parseFilterList('||ads.example^$third-party,badfilter\n');
+  const victim = parseFilterList('||ads.example^\n');
+  const { suppressed } = applyBadfilterSuppression(
+    victim.networkRules,
+    new Set([...bad.badfilterKeys]),
+  );
+  assert.equal(suppressed.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// $domain= values are validated against the DNR schema (§5.29)
+// ---------------------------------------------------------------------------
+
+test('$domain= entries are lowercased, punycoded, and empty entries dropped', () => {
+  // Chrome rejects the whole rule at ruleset indexing if any entry is
+  // uppercase, non-ASCII or empty — `$domain=foo.com|` used to emit
+  // ["foo.com", ""] and cost the entire filter.
+  assert.deepEqual(
+    convert('||ads.example^$domain=foo.com|'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['foo.com'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example^$domain=Example.COM'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['example.com'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example^$domain=bücher.de'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['xn--bcher-kva.de'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example^$domain=~Example.COM'),
+    block({ urlFilter: '||ads.example^', excludedInitiatorDomains: ['example.com'] }),
+  );
+});
+
+test('a $domain= list that normalises to nothing drops the rule instead of shipping it unscoped', () => {
+  // Mirrors the wildcard-domain handling: losing every positive entry would
+  // widen the rule from "on these sites" to "everywhere".
+  assert.equal(convert('||ads.example^$domain=|'), null);
+  assert.equal(convert('||ads.example^$domain=ex ample.com'), null);
+});
+
+test('an unencodable ~exclusion drops the rule rather than over-applying it', () => {
+  assert.equal(convert('||ads.example^$domain=~ex ample.com'), null);
+});
+
+// ---------------------------------------------------------------------------
+// $removeparam forms we cannot express (§5.30)
+// ---------------------------------------------------------------------------
+
+test('$removeparam=~keep is skipped, not shipped stripping a param called "~keep"', () => {
+  const parsed = parseLine('||ads.example^$removeparam=~keep');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /removeparam-negation/);
+});
+
+test('$removeparam=/regex/ is skipped, not shipped stripping a param called "/regex/"', () => {
+  const parsed = parseLine('||content.example/api*&ad=$xhr,removeparam=/^ad/,domain=a.example');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /removeparam-regex/);
+});
+
+test('$removeparam with no value is skipped rather than falling through to a hard block', () => {
+  const parsed = parseLine('||ads.example^$removeparam=');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /removeparam-all/);
+});
+
+test('a literal $removeparam=name still becomes a queryTransform', () => {
+  assert.deepEqual(convert('||ads.example^$removeparam=utm_source'), {
+    priority: 1,
+    condition: { urlFilter: '||ads.example^', isUrlFilterCaseSensitive: false },
+    action: {
+      type: 'redirect',
+      redirect: { transform: { queryTransform: { removeParams: ['utm_source'] } } },
+    },
+  });
 });

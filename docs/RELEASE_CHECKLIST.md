@@ -89,16 +89,25 @@ These are the scenarios the unit harness cannot reach.
 - [ ] Toggle a filter list off then on; popup blocked count updates.
 - [ ] Add a domain to the allowlist via the options page; popup
       reflects it on a tab matching that domain.
-- [ ] Live Logger view streams events.
-- [ ] Settings export → import round-trip preserves allowlist + user
-      filters.
+- [ ] Live Logger view streams events; Export writes a file.
+- [ ] My Filters export → import round-trip preserves the filter text.
+- [ ] Allowlist export → import round-trip preserves the domains, and an
+      import containing an invalid entry (e.g. `co.uk`) reports it as
+      rejected rather than silently dropping it.
 
 ## Diagnostics
 
 - [ ] `chrome://extensions` inspector shows zero unhandled errors over
       5 minutes of normal browsing.
-- [ ] `GET_ERROR_REPORT` (via the options diagnostic surface) returns
-      `criticalCount === 0` on a clean install.
+- [ ] From the service-worker console, `chrome.runtime.sendMessage(
+      {type:'GET_ERROR_REPORT'})` returns `criticalCount === 0` on a
+      clean install, and `scriptlets.unknown` is empty or small.
+
+      There is no options-page diagnostic surface, so this step is
+      console-only. `GET_ERROR_REPORT` now aggregates the unknown-scriptlet
+      counter and the refused-untrusted-scriptlet counter, neither of which
+      any UI displays — worth building a view for, since a coverage
+      regression is only observable if somebody looks.
 
 ## Incognito (separate storage)
 

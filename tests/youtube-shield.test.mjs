@@ -103,11 +103,20 @@ function makePlayerStub() {
   };
 }
 
+// The shield patches `Response.prototype.json`. Handing it the host realm's
+// global Response would permanently mutate this test process's Response, so
+// every harness gets its *own* throwaway subclass: the patch lands as an own
+// property on that subclass's prototype and the real prototype is left alone.
+// Everything else (clone/text/headers/status) is the genuine platform
+// implementation, which is what the fetch body scrubber has to survive.
+const makeHarnessResponse = () => class HarnessResponse extends Response {};
+
 async function makeShieldHarness({
   visibilityState = 'visible',
   player = null,
   setup,
   wasmUrl = null,
+  fetchImpl = null,
 } = {}) {
   const timers = makeTimers();
   const observers = [];
@@ -184,12 +193,10 @@ async function makeShieldHarness({
     ProgressEvent: class ProgressEvent {
       constructor(type) { this.type = type; }
     },
-    Response: class Response {
-      constructor(body) { this.body = body; }
-      async json() { return {}; }
-    },
+    Response: makeHarnessResponse(),
+    Headers,
     // Named so a test can tell the page's own fetch from the shield's wrapper.
-    fetch: async function pageFetch() { return { ok: true }; },
+    fetch: fetchImpl || async function pageFetch() { return { ok: true }; },
     addEventListener: addListener(winListeners),
     removeEventListener: () => {},
   };
@@ -608,4 +615,384 @@ test('§5.32 (didn\'t re-break): yt-navigate-finish still re-arms an exhausted p
   h.emitWindow('yt-navigate-finish');
 
   assert.equal(h.playerObservers().length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Gap 1 — path-targeted pruning (uBO parity)
+//
+// The JSON.parse hook ran a *shallow* key prune, which only ever looks at the
+// parsed root and its `playerResponse`. Whole ad surfaces sit deeper than that
+// and carry no AD_KEYS name at a visited level, so they passed through intact.
+// uBO prunes them by explicit path; these pin the paths it actually ships.
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs a value through the shield's hooked JSON.parse inside the vm realm and
+ * brings the result back as plain host-realm data. The round trip matters:
+ * objects built in the vm carry that realm's prototypes, which deepStrictEqual
+ * refuses to match. `JSON.stringify` is not one of the hooked surfaces.
+ */
+function parseInShield(h, value) {
+  const literal = JSON.stringify(JSON.stringify(value));
+  return JSON.parse(h.run(`JSON.stringify(JSON.parse(${literal}))`));
+}
+
+const shortsEntry = (videoId, isAd) => ({
+  command: {
+    reelWatchEndpoint: {
+      videoId,
+      adClientParams: isAd ? { isAd: true } : {},
+    },
+  },
+});
+
+test('Gap 1: a Shorts ad reel is spliced out of entries[] (uBO: entries.[-]...adClientParams.isAd)', async () => {
+  const h = await makeShieldHarness();
+
+  const parsed = parseInShield(h, {
+    entries: [shortsEntry('real1', false), shortsEntry('ad1', true), shortsEntry('real2', false)],
+  });
+
+  assert.deepEqual(
+    parsed.entries.map((e) => e.command.reelWatchEndpoint.videoId),
+    ['real1', 'real2'],
+    'the flagged reel must be removed, not left as a neutered husk (uBO `[-]` semantics)',
+  );
+});
+
+test('Gap 1: reelWatchSequenceResponse-wrapped Shorts entries are pruned the same way', async () => {
+  const h = await makeShieldHarness();
+
+  const parsed = parseInShield(h, {
+    reelWatchSequenceResponse: {
+      entries: [shortsEntry('ad1', true), shortsEntry('real1', false)],
+    },
+  });
+
+  assert.deepEqual(
+    parsed.reelWatchSequenceResponse.entries.map((e) => e.command.reelWatchEndpoint.videoId),
+    ['real1'],
+  );
+});
+
+test('Gap 1: a homepage rich-grid adSlotRenderer item is removed from the feed', async () => {
+  const h = await makeShieldHarness();
+
+  const gridItem = (content) => ({ richItemRenderer: { content } });
+  const parsed = parseInShield(h, {
+    contents: {
+      twoColumnBrowseResultsRenderer: {
+        tabs: [
+          {
+            tabRenderer: {
+              content: {
+                richGridRenderer: {
+                  contents: [
+                    gridItem({ videoRenderer: { videoId: 'v1' } }),
+                    gridItem({ adSlotRenderer: { adSlotMetadata: {} } }),
+                    gridItem({ videoRenderer: { videoId: 'v2' } }),
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+    },
+  });
+
+  const items =
+    parsed.contents.twoColumnBrowseResultsRenderer.tabs[0]
+      .tabRenderer.content.richGridRenderer.contents;
+  assert.equal(items.length, 2, 'the ad slot item must be spliced out of the grid');
+  assert.deepEqual(items.map((i) => i.richItemRenderer.content.videoRenderer.videoId), ['v1', 'v2']);
+});
+
+test('Gap 1: the Premium upsellDialogRenderer nag is neutralized', async () => {
+  const h = await makeShieldHarness();
+
+  const parsed = parseInShield(h, {
+    auxiliaryUi: {
+      messageRenderers: {
+        upsellDialogRenderer: { title: 'Try Premium' },
+        someOtherRenderer: { keep: true },
+      },
+    },
+  });
+
+  assert.equal(parsed.auxiliaryUi.messageRenderers.upsellDialogRenderer, false);
+  assert.deepEqual(parsed.auxiliaryUi.messageRenderers.someOtherRenderer, { keep: true },
+    'sibling renderers must survive');
+});
+
+test('Gap 1: array-wrapped playerResponse ad payloads are neutralized', async () => {
+  // A root array cannot match the `result.playerResponse` shape gate at all, so
+  // uBO covers it with `[].playerResponse.adPlacements` / `.adSlots`.
+  const h = await makeShieldHarness();
+
+  const parsed = parseInShield(h, [
+    { playerResponse: { streamingData: {}, adPlacements: [1], adSlots: [2] } },
+    { playerResponse: { streamingData: {} } },
+  ]);
+
+  assert.equal(parsed[0].playerResponse.adPlacements, false);
+  assert.equal(parsed[0].playerResponse.adSlots, false);
+});
+
+test('Gap 1: an ad payload nested under a recognised player envelope is reached', async () => {
+  // The shape gate matched on `playerResponse.streamingData` and then ran the
+  // shallow prune, which steps straight past sibling containers.
+  const h = await makeShieldHarness();
+
+  const parsed = parseInShield(h, {
+    playerResponse: { streamingData: {}, x: { adPlacements: [1] } },
+  });
+
+  assert.equal(parsed.playerResponse.x.adPlacements, false);
+});
+
+test('Gap 1 (no over-reach): arbitrary page JSON is not deep-walked', async () => {
+  // The JSON.parse hook is page-global. Deep pruning is only licensed once a
+  // payload has been positively identified as a YouTube player envelope.
+  const h = await makeShieldHarness();
+
+  const parsed = parseInShield(h, { foo: { bar: { adPlacements: [1] } } });
+
+  assert.deepEqual(parsed.foo.bar.adPlacements, [1],
+    'an unrelated object must not be traversed by the page-global hook');
+});
+
+test('Gap 1: path pruning stays inside the node budget on a pathological payload', async () => {
+  const h = await makeShieldHarness();
+
+  const entries = [];
+  for (let i = 0; i < 60000; i++) entries.push(shortsEntry(`v${i}`, true));
+  const literal = JSON.stringify(JSON.stringify({ entries }));
+
+  const started = Date.now();
+  const remaining = h.run(`JSON.parse(${literal}).entries.length`);
+  const elapsed = Date.now() - started;
+
+  assert.ok(remaining < entries.length, 'some ad reels must have been spliced');
+  assert.ok(remaining > 0,
+    'PRUNE_NODE_LIMIT must stop the walk rather than chewing through the whole array');
+  assert.ok(elapsed < 5000, `path pruning must stay bounded (took ${elapsed}ms)`);
+});
+
+// ---------------------------------------------------------------------------
+// Gap 2 — /reel_watch_sequence must be a player-like URL
+// ---------------------------------------------------------------------------
+
+test('Gap 2: a /reel_watch_sequence response takes the deep player path', async () => {
+  const h = await makeShieldHarness();
+
+  const body = JSON.stringify({ contents: { nested: { adPlacements: [1] } } });
+  h.run(`
+    globalThis.__res = new Response(${JSON.stringify(body)}, {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+    Object.defineProperty(globalThis.__res, 'url', {
+      value: 'https://www.youtube.com/youtubei/v1/reel_watch_sequence?prettyPrint=false',
+    });
+  `);
+
+  const parsed = await h.run('globalThis.__res.json()');
+
+  assert.equal(parsed.contents.nested.adPlacements, false,
+    'Shorts sequence responses must be recognised as player-like and deep-pruned');
+});
+
+test('Gap 2: the retired /get_video_info endpoint is no longer probed', async () => {
+  // YouTube removed /get_video_info in 2020; the check could never match.
+  const source = await readFile(SHIELD_URL, 'utf8');
+  assert.equal(/includes\(\s*'\/get_video_info'\s*\)/.test(source), false,
+    'the dead /get_video_info check must not come back');
+  assert.equal(/includes\(\s*'\/reel_watch_sequence'\s*\)/.test(source), true,
+    '/reel_watch_sequence must be part of the player-like URL set');
+});
+
+// ---------------------------------------------------------------------------
+// Gap 3 — fetch bodies must actually reach the scrubber
+//
+// scrub() had exactly one call site (the XHR responseText path) while modern
+// YouTube fetches /youtubei/v1/player, so the string neutralizer was near-dead
+// in production. Player fetches now come back with a scrubbed body.
+// ---------------------------------------------------------------------------
+
+const PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+
+const AD_PLAYER_BODY = JSON.stringify({
+  responseContext: {},
+  streamingData: { formats: [{ itag: 18 }] },
+  adPlacements: [{ adPlacementRenderer: { config: {} } }],
+});
+
+const CLEAN_PLAYER_BODY = JSON.stringify({
+  responseContext: {},
+  streamingData: { formats: [{ itag: 18 }] },
+});
+
+/** A page fetch that records its calls and answers with a real Response. */
+function makeRecordingFetch(body) {
+  const calls = [];
+  let last = null;
+  const impl = async function pageFetch(input) {
+    const url = typeof input === 'string' ? input : input?.url || '';
+    calls.push(url);
+    last = new Response(body, {
+      status: 200,
+      statusText: 'OK',
+      headers: {
+        'content-type': 'application/json',
+        'content-encoding': 'gzip',
+        'content-length': String(body.length),
+      },
+    });
+    Object.defineProperty(last, 'url', { value: url });
+    return last;
+  };
+  return { impl, calls, lastResponse: () => last };
+}
+
+test('Gap 3: a player fetch comes back with a scrubbed body', async () => {
+  const recorder = makeRecordingFetch(AD_PLAYER_BODY);
+  const h = await makeShieldHarness({ fetchImpl: recorder.impl });
+
+  const response = await h.run(`window.fetch(${JSON.stringify(PLAYER_URL)})`);
+  const text = await response.text();
+
+  assert.ok(text.includes('"adPlacements":false'),
+    'the fetch body must reach scrub() — it never did before');
+  assert.notEqual(response, recorder.lastResponse(),
+    'a changed body means a rebuilt Response');
+});
+
+test('Gap 3: the rebuilt Response preserves ok/status/redirected/type/url', async () => {
+  const recorder = makeRecordingFetch(AD_PLAYER_BODY);
+  const h = await makeShieldHarness({ fetchImpl: recorder.impl });
+
+  const response = await h.run(`window.fetch(${JSON.stringify(PLAYER_URL)})`);
+  const original = recorder.lastResponse();
+
+  assert.equal(response.ok, original.ok);
+  assert.equal(response.status, original.status);
+  assert.equal(response.statusText, original.statusText);
+  assert.equal(response.redirected, original.redirected);
+  assert.equal(response.type, original.type);
+  assert.equal(response.url, PLAYER_URL);
+  assert.equal(response.headers.get('content-type'), 'application/json');
+  // The rebuilt payload is raw text, so byte-level headers of the original
+  // (compressed) stream must not survive onto it.
+  assert.equal(response.headers.get('content-encoding'), null);
+  assert.equal(response.headers.get('content-length'), null);
+});
+
+test('Gap 3: .json() on the rebuilt Response still deep-prunes', async () => {
+  const recorder = makeRecordingFetch(AD_PLAYER_BODY);
+  const h = await makeShieldHarness({ fetchImpl: recorder.impl });
+
+  const response = await h.run(`window.fetch(${JSON.stringify(PLAYER_URL)})`);
+  const parsed = await response.json();
+
+  assert.equal(parsed.adPlacements, false);
+  assert.deepEqual(parsed.streamingData.formats, [{ itag: 18 }],
+    'playback data must survive the rewrite untouched');
+});
+
+test('Gap 3: a clean player body is returned as the original, stream unread', async () => {
+  const recorder = makeRecordingFetch(CLEAN_PLAYER_BODY);
+  const h = await makeShieldHarness({ fetchImpl: recorder.impl });
+
+  const response = await h.run(`window.fetch(${JSON.stringify(PLAYER_URL)})`);
+
+  assert.equal(response, recorder.lastResponse(),
+    'nothing to change means the untouched original Response');
+  assert.equal(response.bodyUsed, false, 'the original body stream must still be readable');
+  assert.equal(await response.text(), CLEAN_PLAYER_BODY);
+});
+
+test('Gap 3: a non-player fetch is passed through untouched', async () => {
+  const recorder = makeRecordingFetch(AD_PLAYER_BODY);
+  const h = await makeShieldHarness({ fetchImpl: recorder.impl });
+
+  const response = await h.run("window.fetch('https://www.youtube.com/api/stats/qoe')");
+
+  assert.equal(response, recorder.lastResponse(), 'unrelated traffic must not be reconstructed');
+  assert.equal(response.bodyUsed, false);
+});
+
+test('Gap 3 (didn\'t re-break): the pre-flight block still short-circuits the network', async () => {
+  const recorder = makeRecordingFetch(AD_PLAYER_BODY);
+  const h = await makeShieldHarness({ fetchImpl: recorder.impl });
+
+  const response = await h.run("window.fetch('https://www.youtube.com/api/stats/ad_break')");
+
+  assert.deepEqual(recorder.calls, [], 'ad-only endpoints must never reach the network');
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), '{}');
+});
+
+// ---------------------------------------------------------------------------
+// Gap 4 — #player-ads is bait, and must never be hidden
+//
+// uBO ships `youtube.com#@##player-ads`: an exception that deliberately
+// UN-hides the element, because YouTube checks whether it got hidden and reads
+// a hidden one as adblock detection. Nothing we ship may hide it.
+// ---------------------------------------------------------------------------
+
+const BAIT_ID = 'player-ads';
+
+/**
+ * Whether a raw CSS selector can match an element carrying `id`. Covers the
+ * forms the seed list actually uses: `#id` (optionally qualified) and
+ * `[id<op>=value]` attribute selectors. Class selectors such as EasyList's
+ * `.player-ads` deliberately do NOT count — a class never matches an id.
+ */
+function selectorTargetsId(selector, id) {
+  if (new RegExp(`#${id}(?![\\w-])`).test(selector)) return true;
+  const attrRe = /\[\s*id\s*([~^$*|]?=)\s*(['"]?)([^\]'"]*)\2\s*[isIS]?\s*\]/g;
+  for (const match of selector.matchAll(attrRe)) {
+    const [, op, , value] = match;
+    if (value === '') continue;
+    if (op === '=' && value === id) return true;
+    if (op === '*=' && id.includes(value)) return true;
+    if (op === '^=' && id.startsWith(value)) return true;
+    if (op === '$=' && id.endsWith(value)) return true;
+    if (op === '~=' && id.split(/\s+/).includes(value)) return true;
+    if (op === '|=' && (id === value || id.startsWith(`${value}-`))) return true;
+  }
+  return false;
+}
+
+test('Gap 4: no seed cosmetic selector hides the #player-ads bait element', async () => {
+  const { CORE_FILTER_SOURCE } = await import('../src/shared/core-filter-source.js');
+  const { generic, domainSpecific } = CORE_FILTER_SOURCE.cosmetic;
+
+  const candidates = [...generic];
+  for (const [domain, selectors] of Object.entries(domainSpecific)) {
+    if (domain.includes('youtube')) candidates.push(...selectors);
+  }
+
+  const offenders = candidates.filter((selector) => selectorTargetsId(selector, BAIT_ID));
+  assert.deepEqual(offenders, [],
+    'hiding #player-ads is how YouTube detects adblockers — uBO un-hides it on purpose',
+  );
+});
+
+test('Gap 4: the sanity check itself catches an id-targeting selector', () => {
+  // Guards the pin above against silently degrading into a tautology.
+  assert.equal(selectorTargetsId('#player-ads', BAIT_ID), true);
+  assert.equal(selectorTargetsId('div#player-ads', BAIT_ID), true);
+  assert.equal(selectorTargetsId('[id*="player-ad"]', BAIT_ID), true);
+  assert.equal(selectorTargetsId('[id^="player"]', BAIT_ID), true);
+  assert.equal(selectorTargetsId('.player-ads', BAIT_ID), false, 'a class is not an id');
+  assert.equal(selectorTargetsId('#player-ads-container', BAIT_ID), false);
+});
+
+test('Gap 4: the shield itself never touches #player-ads', async () => {
+  const source = await readFile(SHIELD_URL, 'utf8');
+  assert.equal(source.includes('player-ads'), false,
+    'the shield must not query, hide or remove the bait element',
+  );
 });

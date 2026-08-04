@@ -359,9 +359,19 @@ test('user-filter bands equal the static compiler bands, number for number', { s
     'a user $important exception must beat a list $important redirect',
   );
 
-  // The allowlist band still sits far above every static band.
+  // The allowlist band still sits far above every static band — and above the
+  // hand-maintained system-unbreak blocks at 1100, which used to beat it (§4.5).
+  // Pinned against the worker's own constant rather than a literal: the two are
+  // separate declarations in separate languages, and a drift between them is
+  // silent, so read the value the worker actually ships.
+  const swSource = fs.readFileSync(
+    new URL('../src/background/service-worker.js', import.meta.url), 'utf8');
+  const bandMatch = /const DNR_ALLOWLIST_PRIORITY\s*=\s*([\d_]+)/.exec(swSource);
+  assert.ok(bandMatch, 'service-worker.js must declare DNR_ALLOWLIST_PRIORITY');
+  const expectedBand = Number(bandMatch[1].replace(/_/g, ''));
+
   const allowlist = wasm.build_allowlist_rules(['example.com'], 1);
-  assert.equal(allowlist[0].priority, 500);
+  assert.equal(allowlist[0].priority, expectedBand);
   for (const line of [`@@${pattern}$important`, '||x^$important,redirect=noop.js']) {
     assert.ok(allowlist[0].priority > staticPriority(line), line);
   }

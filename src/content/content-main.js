@@ -17,21 +17,40 @@ import { resolvePageRules } from '../shared/rule-transport.js';
 const hostname = normalizeHostname(location.hostname);
 const FRAME_STYLE_ID = '__nullify_frame_css__';
 const FRAME_EXCEPTION_STYLE_ID = '__nullify_exception_css__';
+const WASM_ATTR = 'data-nullify-wasm';
 const YOUTUBE_HOSTNAMES = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
 
+// Retained so the observer and its 5-minute interval can be torn down when the
+// document goes away — `stopObserver()` previously had no production caller
+// because the engine was a local of `main()` (§5.19).
+let engine = null;
+
+/**
+ * Hand the MAIN-world YouTube shield a URL for the WASM binary, which it
+ * cannot build itself (`chrome.runtime.getURL` is not reliably available
+ * there).
+ *
+ * The attribute publishes the extension ID to page script, so it is written
+ * only once the page is known *not* to be allowlisted, and only for as long as
+ * the shield needs to read it (§4.13). The shield reads it synchronously at
+ * document_start and otherwise picks it up through a MutationObserver on
+ * `documentElement`; observer callbacks are delivered as microtasks, so by the
+ * next macrotask the URL has been captured and the attribute can go.
+ */
 function exposeYouTubeWasmUrl() {
   if (!YOUTUBE_HOSTNAMES.has(hostname)) return;
   try {
     const root = document.documentElement;
     const getURL = chrome.runtime?.getURL?.bind(chrome.runtime);
     if (!root || typeof getURL !== 'function') return;
-    root.setAttribute('data-nullify-wasm', getURL('dist/nullify_core_bg.wasm'));
+    root.setAttribute(WASM_ATTR, getURL('dist/nullify_core_bg.wasm'));
+    setTimeout(() => {
+      try { root.removeAttribute(WASM_ATTR); } catch { /* document torn down */ }
+    }, 0);
   } catch {
     // MAIN-world youtube-shield falls back to its own chrome.runtime path.
   }
 }
-
-exposeYouTubeWasmUrl();
 
 function injectStyle(id, cssText, append = false) {
   if (!cssText) return;
@@ -59,9 +78,19 @@ async function main() {
     // SW not ready — proceed with defaults
   }
 
+  // The message bus resolves with `{error: …}` rather than rejecting, so a
+  // failed GET_INIT_DATA looked exactly like a healthy "nothing to do" reply:
+  // no CSS, no procedural rules, no exceptions, and nothing reported (§4.11).
+  if (initRes?.error) {
+    throw new Error(`GET_INIT_DATA failed: ${initRes.error}`);
+  }
+
   const { isAllowed, cssText, exceptionCss } = initRes || {};
 
   if (isAllowed === true) return;
+
+  // Only now is the page known not to be allowlisted (§4.13).
+  exposeYouTubeWasmUrl();
 
   injectStyle(FRAME_STYLE_ID, cssText);
   injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
@@ -70,8 +99,9 @@ async function main() {
   // missing or undecodable — never lose procedural filtering over transport.
   const finalRules = resolvePageRules(initRes);
 
-  // Apply cosmetic rules
-  const PROC_TOKEN_REGEX = /:(?:has-text|upward|matches-css|matches-css-before|matches-css-after|matches-attr|matches-path|has|xpath|min-text-length|watch-attr|remove|if|if-not|nth-ancestor|style)\(/;
+  // Apply cosmetic rules. `semantic` belongs in this list: without it a
+  // string-form `div:semantic(x)` rule never constructs the engine (§5.20).
+  const PROC_TOKEN_REGEX = /:(?:has-text|upward|matches-css|matches-css-before|matches-css-after|matches-attr|matches-path|has|xpath|min-text-length|watch-attr|remove|if|if-not|nth-ancestor|style|semantic)\(/;
   const isProceduralRule = (r) => typeof r === 'object' || (typeof r === 'string' && PROC_TOKEN_REGEX.test(r));
   const hasProcedural = finalRules?.generic?.some(isProceduralRule) ||
                        finalRules?.domainSpecific?.some(isProceduralRule);
@@ -79,20 +109,35 @@ async function main() {
   
   if (!hasProcedural && !hasExceptions) return;
 
-  const engine = new CosmeticEngine();
+  engine = new CosmeticEngine();
   engine.init(finalRules, true);
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
-      engine._applyAllProcedural?.();
+      // Route through the scheduler, not straight at `_applyAllProcedural`:
+      // the debounced path swaps the dirty-roots snapshot first, so the re-run
+      // sees everything the parser added since init instead of evaluating
+      // against a stale (empty) snapshot and caching those verdicts (§3.3).
+      engine?._scheduleProceduralRun?.();
     });
   }
+
+  // The observer and its 5-minute sweep interval outlive the page otherwise
+  // (§5.19). A bfcache-persisted document can come back, so only tear down
+  // when it is really going away.
+  window.addEventListener('pagehide', (event) => {
+    if (!event?.persisted) engine?.stopObserver?.();
+  });
 }
 
 // ---- Listen for picker activation from popup ----
 chrome.runtime.onMessage.addListener((message) => {
   if (message.type === 'ACTIVATE_PICKER') {
-    activatePicker();
+    // Senders target `{frameId: 0}`; `allowInFrame` is the explicit opt-in for
+    // a deliberately frame-scoped activation. Without it the picker refuses to
+    // mount in subframes, where a broadcast used to leave one undismissable
+    // overlay per iframe (§4.24).
+    activatePicker({ allowInFrame: message.allowInFrame === true });
   } else if (message.type === 'DEACTIVATE_PICKER') {
     deactivatePicker();
   }

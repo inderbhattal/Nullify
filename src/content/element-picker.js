@@ -22,11 +22,31 @@ let lastTarget = null;
 let navStack = [];
 let currentNavTarget = null;
 
+// Every key event is swallowed while the picker is up, so the page's own
+// single-key shortcuts (YouTube's k/j/space/f) cannot fire while the user
+// types a selector (§5.17).
+const KEY_EVENTS = ['keydown', 'keypress', 'keyup'];
+// `click` alone left mousedown/pointerdown reaching the page (§5.17).
+const POINTER_EVENTS = ['mousedown', 'pointerdown'];
+
+/** True in a subframe. The picker is a top-frame-only UI (§4.24). */
+function isSubframe() {
+  return typeof window !== 'undefined' && window.top !== window;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
-export function activatePicker() {
+/**
+ * @param {{allowInFrame?: boolean}} [options] `allowInFrame` opts a subframe in
+ *   explicitly. Without it a broadcast `ACTIVATE_PICKER` (the message carries
+ *   no frameId today) mounted a full-viewport overlay in every iframe on the
+ *   page, and ESC — which does not cross frame boundaries — could only dismiss
+ *   the focused one (§4.24).
+ */
+export function activatePicker(options = {}) {
   if (pickerActive) return;
+  if (isSubframe() && options?.allowInFrame !== true) return;
   pickerActive = true;
   navStack = [];
   currentNavTarget = null;
@@ -34,7 +54,8 @@ export function activatePicker() {
   createOverlay();
   document.addEventListener('mousemove', onMouseMove, { capture: true, passive: true });
   document.addEventListener('click', onClick, { capture: true });
-  document.addEventListener('keydown', onKeyDown, { capture: true });
+  for (const type of KEY_EVENTS) document.addEventListener(type, onKeyEvent, { capture: true });
+  for (const type of POINTER_EVENTS) document.addEventListener(type, onPointerDown, { capture: true });
   showPickerToast('🎯 Click any element to create a blocking rule. Press ESC to cancel.');
 }
 
@@ -43,7 +64,11 @@ export function deactivatePicker() {
   pickerActive = false;
   document.removeEventListener('mousemove', onMouseMove, { capture: true });
   document.removeEventListener('click', onClick, { capture: true });
-  document.removeEventListener('keydown', onKeyDown, { capture: true });
+  for (const type of KEY_EVENTS) document.removeEventListener(type, onKeyEvent, { capture: true });
+  for (const type of POINTER_EVENTS) document.removeEventListener(type, onPointerDown, { capture: true });
+  lastTarget = null;
+  navStack = [];
+  currentNavTarget = null;
   removeHighlight();
   removeOverlay();
   removeDialog();
@@ -171,6 +196,17 @@ function removeOverlay() {
 }
 
 /**
+ * The overlay used to be removed the moment the dialog opened, after which
+ * every press landed on the page's own handlers. Keep it mounted and just stop
+ * it from swallowing pointer events aimed at the dialog (§5.17).
+ */
+function disableOverlayPointerEvents() {
+  const overlay = document.getElementById(PICKER_OVERLAY_ID);
+  if (!overlay) return;
+  overlay.style.pointerEvents = 'none';
+}
+
+/**
  * Pierces Shadow DOM to find the deepest element at a given point.
  */
 function getDeepElementFromPoint(x, y) {
@@ -228,21 +264,55 @@ function onClick(e) {
 
   if (!target || isPickerDialog(target)) return;
 
-  // Pause hover tracking while dialog is open
+  // Pause hover tracking while dialog is open. The overlay stays mounted so
+  // later presses keep being intercepted; it just stops eating the dialog's
+  // own pointer events (§5.17).
   document.removeEventListener('mousemove', onMouseMove, { capture: true });
-  removeOverlay();
+  disableOverlayPointerEvents();
 
   openPickerDialog(target);
 }
 
-function onKeyDown(e) {
+/** Swallow an event so no page handler ever sees it. */
+function suppressEvent(e) {
+  e.preventDefault?.();
+  e.stopPropagation?.();
+  e.stopImmediatePropagation?.();
+}
+
+function onKeyEvent(e) {
+  if (!pickerActive) return;
+
   if (e.key === 'Escape') {
-    e.preventDefault();
-    e.stopPropagation();
-    deactivatePicker();
-    showPickerToast('❌ Element picker cancelled');
-    setTimeout(() => document.querySelector('.__adblock_picker_toast__')?.remove(), 2000);
+    if (e.type === 'keydown') {
+      deactivatePicker();
+      showPickerToast('❌ Element picker cancelled');
+      setTimeout(() => document.querySelector('.__adblock_picker_toast__')?.remove(), 2000);
+    }
+    suppressEvent(e);
+    return;
   }
+
+  // Keys the dialog needs. They must reach it, so nothing is stopped here at
+  // capture time — `stopDialogEvent` (bubble phase, on the dialog itself)
+  // keeps them from continuing on to the page (§5.17).
+  if (isPickerDialog(e.target)) return;
+
+  suppressEvent(e);
+}
+
+function onPointerDown(e) {
+  if (!pickerActive || isPickerDialog(e.target)) return;
+  suppressEvent(e);
+}
+
+/**
+ * Bubble-phase stopper mounted on the dialog element: the event has already
+ * reached the input (so typing and button clicks work) but never continues to
+ * the page's document-level handlers (§5.17).
+ */
+function stopDialogEvent(e) {
+  e.stopPropagation?.();
 }
 
 /** Returns true only for the dialog and toast — UI the user clicks on directly. */
@@ -459,8 +529,13 @@ function openPickerDialog(target) {
 
   const dialog = document.createElement('div');
   dialog.id = PICKER_DIALOG_ID;
+  // Mounted on the dialog element (not its children), so it survives the
+  // `innerHTML` rewrites in `updatePickerDialog` (§5.17).
+  for (const type of [...KEY_EVENTS, ...POINTER_EVENTS, 'click']) {
+    dialog.addEventListener?.(type, stopDialogEvent);
+  }
   document.documentElement.appendChild(dialog);
-  
+
   updatePickerDialog(dialog);
 }
 
@@ -841,11 +916,25 @@ function showSuccessInDialog(dialog, rule) {
   }
 }
 
+const PICKER_ERROR_CLASS = '__adblock_picker_error__';
+
 function showErrorInDialog(dialog, msg) {
   const footer = dialog.querySelector('.adblock-picker-footer');
-  if (footer) {
-    footer.innerHTML += `<div style="color:#f85149;font-size:12px">Error: ${escHTML(msg)}</div>`;
-  }
+  if (!footer) return;
+
+  // `innerHTML +=` re-parses the whole footer, replacing Cancel and Create
+  // with fresh nodes that carry none of the listeners wired in
+  // `updatePickerDialog` — so the shadow-DOM refusal (§5.30) told the user to
+  // pick the outer element and then ignored every click (§5.16). Append a
+  // node: the existing buttons, and their listeners, are left alone.
+  footer.querySelector?.(`.${PICKER_ERROR_CLASS}`)?.remove();
+
+  const note = document.createElement('div');
+  note.className = PICKER_ERROR_CLASS;
+  note.style.color = '#f85149';
+  note.style.fontSize = '12px';
+  note.textContent = `Error: ${msg}`;
+  footer.appendChild(note);
 }
 
 function removeDialog() {

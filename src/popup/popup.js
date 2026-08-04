@@ -4,6 +4,7 @@
 
 import './popup.css';
 import { normalizeHostname } from '../shared/hostname.js';
+import { formatStatCount } from './format-count.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -107,7 +108,19 @@ async function loadTabStats() {
     } else {
       $('blockedCount').textContent = stats?.blocked ?? 0;
       $('trackerCount').textContent = stats?.trackers ?? 0;
-      $('totalBlocked').textContent = dailyTotal?.total ?? 0;
+
+      // The daily total is the one counter with no ceiling, so it is the one
+      // that outgrows its tile. Cap the label, put the exact figure on hover.
+      const today = formatStatCount(dailyTotal?.total);
+      const todayEl = $('totalBlocked');
+      todayEl.textContent = today.text;
+      if (today.title) {
+        todayEl.title = today.title;
+        todayEl.parentElement?.setAttribute('title', today.title);
+      } else {
+        todayEl.removeAttribute('title');
+        todayEl.parentElement?.removeAttribute('title');
+      }
     }
   } catch {
     $('blockedCount').textContent = '—';

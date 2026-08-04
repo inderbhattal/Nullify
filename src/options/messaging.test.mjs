@@ -3,12 +3,14 @@
  *
  * The service worker reports failure as `undefined`, `{error}`, or
  * `{ok:false}` — none of which reject the raw sendMessage promise. These
- * tests pin the wrapper's handling of every shape, plus the UTF-8 byte-cap
- * logic (the SW budget is bytes; `String.length` under-counts multi-byte).
+ * tests pin the wrapper's handling of every shape, plus the cap logic: the UI
+ * measures UTF-8 bytes while the SW measures UTF-16 code units (§5.33), so the
+ * invariant that matters is that the UI check is never the weaker of the two.
  */
 
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 // Minimal chrome stub, local to this test. The wrapper only touches
 // chrome.runtime.sendMessage.
@@ -86,7 +88,7 @@ test('call() propagates sendMessage rejections (port closed)', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// Byte-cap logic
+// Cap logic (§5.33)
 // ---------------------------------------------------------------------------
 
 test('utf8ByteLength counts ASCII 1:1 and multi-byte per encoded byte', () => {
@@ -103,6 +105,39 @@ test('cap check catches text whose .length is under budget but bytes are over', 
   assert.ok(utf8ByteLength(text) > MAX_USER_FILTERS_BYTES);
 });
 
-test('MAX_USER_FILTERS_BYTES matches the service-worker cap (2 MB)', () => {
-  assert.equal(MAX_USER_FILTERS_BYTES, 2 * 1024 * 1024);
+test('the UI check is never weaker than a UTF-16 code-unit check', () => {
+  // The SW compares `raw.length`; this page compares UTF-8 bytes. UTF-8 length
+  // is >= UTF-16 length for every string, so anything the page accepts the SW
+  // accepts too — the error direction §5.33 calls safe. If the SW is ever
+  // realigned to bytes this invariant still holds (it becomes equality).
+  for (const sample of ['', 'abc', '||ads.example.com^', '€', 'ü'.repeat(10), '😀', '𝕏a€', '\u0000\u007f\u0080']) {
+    assert.ok(
+      utf8ByteLength(sample) >= sample.length,
+      `UTF-8 length must not be below UTF-16 length for ${JSON.stringify(sample)}`,
+    );
+  }
+});
+
+test('MAX_USER_FILTERS_BYTES tracks the value declared in the service worker', () => {
+  // Read as text rather than importing: importing src/background/ would
+  // execute the worker. This fails on drift instead of pinning a literal that
+  // silently diverges (§5.33).
+  const swPath = new URL('../background/service-worker.js', import.meta.url);
+  const source = readFileSync(swPath, 'utf8');
+  const match = source.match(/\bMAX_USER_FILTERS_BYTES\s*=\s*([^;\n]+)/);
+  assert.ok(match, 'MAX_USER_FILTERS_BYTES declaration not found in service-worker.js');
+
+  // Accepts `2097152` and `2 * 1024 * 1024`. Anything else means the extractor
+  // needs updating — deliberately loud rather than silently passing.
+  const factors = match[1].split('*').map((part) => part.trim());
+  assert.ok(
+    factors.every((part) => /^\d+$/.test(part)),
+    `Cannot evaluate SW cap expression "${match[1].trim()}" — update this extractor`,
+  );
+  const swCap = factors.reduce((product, part) => product * Number(part), 1);
+  assert.equal(
+    MAX_USER_FILTERS_BYTES,
+    swCap,
+    'options/messaging.js and the service worker disagree on the user-filter cap',
+  );
 });

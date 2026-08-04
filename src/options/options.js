@@ -6,6 +6,12 @@ import './options.css';
 
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import { call, MAX_USER_FILTERS_BYTES, utf8ByteLength } from './messaging.js';
+import {
+  describeAllowlistImport,
+  describeFilterApply,
+  describeFilterImport,
+  describeUpdateResult,
+} from './status-format.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -62,9 +68,12 @@ function initNav() {
 // ---------------------------------------------------------------------------
 // Filter Lists
 // ---------------------------------------------------------------------------
-function showListsStatus(msg, type) {
-  showStatus('listsStatus', msg, type);
+function showListsStatus(msg, type, detail) {
+  showStatus('listsStatus', msg, type, detail);
 }
+
+/** Display name for a ruleset id, falling back to the id itself. */
+const listNameFor = (id) => FILTER_LISTS.find((list) => list.id === id)?.name || id;
 
 async function initFilterLists() {
   const getStatusText = (state) => state === false ? 'Disabled' : state === 'partial' ? 'Partial' : 'Active';
@@ -155,12 +164,18 @@ async function initFilterLists() {
     $('btnUpdateAll').disabled = true;
 
     try {
-      // Trigger background update check
-      await call('CHECK_FILTER_UPDATES');
+      // Trigger background update check. §5.3 — a total fetch failure comes
+      // back as `{ok:false, error}`, which `call()` turns into a rejection, so
+      // "Update All" while offline reports instead of silently no-opping.
+      const res = await call('CHECK_FILTER_UPDATES');
+      const outcome = describeUpdateResult(res, listNameFor);
+      showListsStatus(outcome.message, outcome.type, outcome.detail);
 
-      // Refresh last update time
-      const res = await chrome.storage.local.get('lastUpdateCheck');
-      lastUpdate = res.lastUpdateCheck || Date.now();
+      // Refresh last update time from what the SW actually wrote. Falling back
+      // to `Date.now()` here would render a "Last check" the SW never
+      // recorded — the §5.3 lie one layer up.
+      const stored = await chrome.storage.local.get('lastUpdateCheck');
+      lastUpdate = Number(stored?.lastUpdateCheck) || lastUpdate;
       updateStatusText();
     } catch (err) {
       showListsStatus('✗ Update failed: ' + err.message, 'error');
@@ -184,29 +199,28 @@ async function initMyFilters() {
     showFilterStatus('✗ Failed to load filters: ' + err.message, 'error');
   }
 
-  // Returns true when the filters were accepted by the SW.
+  // Resolves with the applied-status descriptor (see status-format.js) when
+  // the SW accepted the filters, or `null` when it did not.
   const saveFilters = async () => {
     const filters = $('userFiltersArea').value;
-    // The SW enforces a 2 MB byte budget; check bytes (not .length) here so
-    // an over-cap paste fails with a clear message instead of a silent drop.
+    // The UI budget is UTF-8 bytes and the SW's is UTF-16 code units, which is
+    // never larger — so an over-cap paste fails here, with a clear message,
+    // before the SW can reject it (see messaging.js).
     if (utf8ByteLength(filters) > MAX_USER_FILTERS_BYTES) {
       showFilterStatus(`✗ Filters exceed the ${MAX_USER_FILTERS_BYTES / (1024 * 1024)} MB limit`, 'error');
-      return false;
+      return null;
     }
     try {
+      // §5.32 — `counts.skippedNetwork` / `counts.skippedRules` report the
+      // lines Chrome refused. Reporting only `network`/`cosmetic` claimed
+      // success over every dropped rule.
       const counts = await call('SET_USER_FILTERS', { filters });
-      if (counts?.warning) {
-        showFilterStatus('⚠ ' + counts.warning, 'warning');
-        return true;
-      }
-      const msg = counts && Number.isFinite(counts.network)
-        ? `✓ Applied ${counts.network} network and ${counts.cosmetic} cosmetic rules`
-        : '✓ Filters applied successfully';
-      showFilterStatus(msg, 'success');
-      return true;
+      const applied = describeFilterApply(counts);
+      showFilterStatus(applied.message, applied.type, applied.detail);
+      return applied;
     } catch (err) {
       showFilterStatus('✗ Error: ' + err.message, 'error');
-      return false;
+      return null;
     }
   };
 
@@ -281,10 +295,12 @@ async function initMyFilters() {
         area.value = merged;
 
         // Auto-apply for better UX. Only report the import as done when the
-        // SW actually accepted the merged filters.
+        // SW actually accepted the merged filters — and carry the skip report
+        // into the import message, since it replaces the save status.
         const applied = await saveFilters();
         if (applied) {
-          showFilterStatus(`✓ Imported ${file.name} (${newRules.length} rules added)`, 'success');
+          const outcome = describeFilterImport(file.name, newRules.length, applied);
+          showFilterStatus(outcome.message, outcome.type, outcome.detail);
         }
       } catch (err) {
         showFilterStatus('✗ Import failed: ' + err.message, 'error');
@@ -294,29 +310,66 @@ async function initMyFilters() {
   });
 }
 
-function showFilterStatus(msg, type) {
-  showStatus('filterStatus', msg, type);
+function showFilterStatus(msg, type, detail) {
+  showStatus('filterStatus', msg, type, detail);
 }
 
-function showAllowlistStatus(msg, type) {
-  showStatus('allowlistStatus', msg, type);
+function showAllowlistStatus(msg, type, detail) {
+  showStatus('allowlistStatus', msg, type, detail);
 }
 
 function showSettingsStatus(msg, type) {
   showStatus('settingsStatus', msg, type);
 }
 
-function showStatus(id, msg, type) {
+/**
+ * Render a status line. `detail` (optional array of strings) becomes a
+ * collapsed <details> disclosure beneath it — that is how the §5.32 honesty
+ * fields (per-rule skip reasons, rejected allowlist entries) reach the user
+ * without turning the one-line status into a wall of text.
+ *
+ * A status carrying detail is *not* auto-cleared: the 3 s timer would delete
+ * the disclosure before it could be opened. It stays until the next status
+ * replaces it.
+ */
+function showStatus(id, msg, type, detail) {
   const el = $(id);
   if (!el) return;
-  el.textContent = msg;
+  el.textContent = '';
   el.style.color = type === 'error'
     ? 'var(--red)'
     : type === 'warning'
       ? 'var(--yellow)'
       : 'var(--accent2)';
+
+  const line = document.createElement('span');
+  line.textContent = msg;
+  el.appendChild(line);
+
+  const lines = (Array.isArray(detail) ? detail : []).filter(Boolean);
+  if (lines.length > 0) {
+    const details = document.createElement('details');
+    details.className = 'status-detail';
+    const summary = document.createElement('summary');
+    summary.textContent = `Show details (${lines.length})`;
+    details.appendChild(summary);
+
+    const ul = document.createElement('ul');
+    for (const text of lines) {
+      const li = document.createElement('li');
+      // textContent, not innerHTML — reasons come from Chrome's DNR errors and
+      // domains from the imported file; neither is trusted markup.
+      li.textContent = text;
+      ul.appendChild(li);
+    }
+    details.appendChild(ul);
+    el.appendChild(details);
+  }
+
   if (el._clearTimer) clearTimeout(el._clearTimer);
-  el._clearTimer = setTimeout(() => { el.textContent = ''; }, 3000);
+  el._clearTimer = lines.length > 0
+    ? null
+    : setTimeout(() => { el.textContent = ''; }, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -337,8 +390,11 @@ async function initAllowlist() {
       const res = await call('ALLOW_SITE', { domain });
       $('allowlistInput').value = '';
       await renderAllowlist(res?.allowlist);
-    } catch {
-      showAllowlistStatus('Enter a valid hostname or URL', 'error');
+    } catch (err) {
+      // §5.32 — the SW rejects public suffixes and bare TLDs with an error
+      // naming the domain (and a `rejected` array). Show its reason rather
+      // than a generic "invalid" that hides which entry was refused.
+      showAllowlistStatus('✗ ' + (err?.message || 'Enter a valid hostname or URL'), 'error');
     }
   });
 
@@ -408,11 +464,11 @@ async function initAllowlist() {
         const addedCount = Math.max(0, merged.length - current.length);
 
         await renderAllowlist(merged);
-        if (addedCount === 0) {
-          showAllowlistStatus('No new sites to import', 'warning');
-        } else {
-          showAllowlistStatus(`✓ Imported ${file.name} (${addedCount} sites added)`, 'success');
-        }
+        // §5.32 — `res.rejected` lists the entries the SW's validator refused
+        // (public suffixes, bare TLDs). Reporting only the added count made
+        // those disappear behind a success message.
+        const outcome = describeAllowlistImport(file.name, addedCount, res?.rejected);
+        showAllowlistStatus(outcome.message, outcome.type, outcome.detail);
       } catch (err) {
         showAllowlistStatus('✗ Import failed: ' + err.message, 'error');
       }

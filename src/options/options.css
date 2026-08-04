@@ -253,6 +253,28 @@ body {
   min-height: 18px;
 }
 
+/* Expandable detail for a status line — skipped filter rules, rejected
+   allowlist entries. Collapsed by default so the status stays one line. */
+.status-detail {
+  margin-top: 6px;
+  color: var(--text-muted);
+}
+
+.status-detail > summary {
+  cursor: pointer;
+  color: inherit;
+  user-select: none;
+}
+
+.status-detail > ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  max-height: 180px;
+  overflow-y: auto;
+  list-style: disc;
+  word-break: break-word;
+}
+
 /* ---- Allowlist ---- */
 .add-site-row {
   display: flex;

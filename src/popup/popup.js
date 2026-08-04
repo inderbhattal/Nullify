@@ -209,10 +209,15 @@ function bindEvents() {
     window.close();
   });
 
-  // Element picker — activate on the current tab then close popup
+  // Element picker — activate on the current tab then close popup.
+  // §4.24 — target the top frame only. The content script runs in all frames,
+  // so an untargeted send gives every iframe its own full-viewport overlay,
+  // and ESC (which does not cross frame boundaries) dismisses just one.
   $('btnPicker').addEventListener('click', async () => {
     if (!currentTab?.id) return;
-    await chrome.tabs.sendMessage(currentTab.id, { type: 'ACTIVATE_PICKER' }).catch(() => {});
+    await chrome.tabs
+      .sendMessage(currentTab.id, { type: 'ACTIVATE_PICKER' }, { frameId: 0 })
+      .catch(() => {});
     window.close();
   });
 

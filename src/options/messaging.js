@@ -10,12 +10,24 @@
  * caller can surface, instead of being rendered as success.
  */
 
-/** Raw-text budget for user filters. Must match MAX_USER_FILTERS_BYTES in the service worker. */
+/**
+ * Raw-text budget for user filters. The numeric value must match
+ * MAX_USER_FILTERS_BYTES in the service worker (pinned by a drift test in
+ * messaging.test.mjs).
+ */
 export const MAX_USER_FILTERS_BYTES = 2 * 1024 * 1024; // 2 MB
 
 /**
- * Byte length of `text` as UTF-8. The SW's cap is a byte budget; comparing
- * `text.length` (UTF-16 code units) under-counts multi-byte characters.
+ * Byte length of `text` as UTF-8.
+ *
+ * §5.33 — the three enforcers of this cap do not measure the same thing. The
+ * SW compares `raw.length`, i.e. UTF-16 code units; `wasm-core` counts UTF-8
+ * bytes; this page counts UTF-8 bytes. UTF-8 length is never below UTF-16
+ * length for any string, so checking bytes here is the *strictest* of the
+ * three: anything this page accepts, the SW accepts too, and the user gets a
+ * clear over-cap message instead of the WASM path throwing (which
+ * `compileUserFiltersViaWasm` cannot distinguish from "WASM unavailable").
+ * Do not relax this to `text.length` to "match" the SW.
  */
 export function utf8ByteLength(text) {
   return new TextEncoder().encode(text ?? '').length;

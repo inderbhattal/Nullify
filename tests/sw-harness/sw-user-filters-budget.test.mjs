@@ -209,25 +209,8 @@ test('4.16 (didn\'t re-break): a single malformed rule is still isolated by the 
   hooks.cancelPendingStatsPersistForTest();
 });
 
-// ---------------------------------------------------------------------------
-// §5.1 — a forced clean must not leave the marker behind
-// ---------------------------------------------------------------------------
-
-test('5.1: FORCE_CLEAN_ALL_DYNAMIC_RULES clears the applied marker so startup re-applies', async () => {
-  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
-
-  await hooks.setAndApplyUserFilters('||ads.example^');
-  assert.equal(chrome.storage.local._data().userFiltersApplied, '||ads.example^');
-  assert.equal(userRules(chrome).length, 1);
-
-  const res = await chrome.runtime.sendMessage({ type: 'FORCE_CLEAN_ALL_DYNAMIC_RULES' });
-  assert.ok(res.cleared >= 1);
-  assert.equal(chrome.storage.local._data().userFiltersApplied, '',
-    'the marker must not outlive the rules it certifies');
-
-  // A fresh worker on the same storage re-applies them.
-  hooks.cancelPendingStatsPersistForTest();
-  const second = await loadServiceWorker({ stub: chrome, awaitReady: true });
-  assert.equal(userRules(chrome).length, 1, 'the user filter rules must come back on the next start');
-  second.hooks.cancelPendingStatsPersistForTest();
-});
+// §5.1's regression test lived here: FORCE_CLEAN_ALL_DYNAMIC_RULES had to
+// clear USER_FILTERS_APPLIED, or the startup short-circuit meant the user's
+// filter rules never came back. The handler itself is deleted in this pass
+// (§5.33 — no caller in any surface, and unreachable destructive code is how
+// that defect survived), so the behaviour it certified no longer exists.

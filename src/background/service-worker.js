@@ -86,13 +86,11 @@ import init, {
   build_css_from_selectors,
   build_page_bundle,
   compile_user_filters,
-  generate_gaussian_noise,
   parse_filter_source,
   plan_selector_rules_json,
   serialize_rules_to_binary_from_json,
   resolve_entity,
   is_semantic_ad,
-  anonymize_stats_json,
   BloomFilter as WasmBloomClass
 } from '../shared/wasm/nullify_core.js';
 
@@ -463,7 +461,18 @@ async function computeBundledRuleDataVersion() {
   return bundledRuleDataVersionPromise;
 }
 
-// All known procedural operators that require JS evaluation
+// All known procedural operators that require JS evaluation.
+//
+// §5.20 — this list MUST equal `PROC_OPS` in src/content/cosmetic-engine.js
+// (and the operator set wasm-core plans against). `semantic` was missing here
+// only, so on the WASM-down path `div:semantic(x)` was not recognised as
+// procedural, passed `isSafeCssSelector`, and shipped to the page as literal
+// CSS — a selector no browser matches, i.e. the rule silently died. Which
+// rules a user got therefore depended on WASM health.
+//
+// TODO: there is still no canonical shared list; this is a hand-kept mirror of
+// the content-script one. Unifying the two (plus content-main's
+// PROC_TOKEN_REGEX) into src/shared/ is open work — see REVIEW-2026-08 §5.20.
 const PROC_OPS = [
   'matches-css-before',
   'matches-css-after',
@@ -480,6 +489,7 @@ const PROC_OPS = [
   'matches-attr',
   'if-not',
   'if',
+  'semantic',
 ];
 
 // Compiled regex for high-performance detection (avoiding O(N) loops)
@@ -1462,6 +1472,73 @@ async function refreshMemoryCache() {
   }
 }
 
+/**
+ * True when the filter matches nothing at all.
+ *
+ * Both deserializers now degrade to an EMPTY filter rather than throwing when
+ * a stored payload fails validation — `BloomFilter.deserialize` on an unknown
+ * `format` tag, and (since the wasm-core parity pass) `deserialize_from_json`
+ * on a payload with no `format` tag, which is exactly the shape every
+ * wasm-produced legacy blob has. Degrading is the right call; silently
+ * *continuing* with the result is not, and neither deserializer can tell the
+ * caller which happened.
+ *
+ * Engine-agnostic: WASM filters expose `fill_ratio()`, the JS class exposes
+ * its bitset. Bails out at the first set bit, so the populated case is O(1)
+ * and only the (about-to-be-rebuilt) empty case walks the whole bitset.
+ */
+function isBloomEmpty(filter) {
+  if (!filter) return true;
+  if (typeof filter.fill_ratio === 'function') {
+    try {
+      return filter.fill_ratio() === 0;
+    } catch {
+      return false; // can't tell — don't force a rebuild on a guess
+    }
+  }
+  const bits = filter.bitset;
+  if (!bits || typeof bits.length !== 'number') return false;
+  for (let i = 0; i < bits.length; i++) {
+    if (bits[i] !== 0) return false;
+  }
+  return true;
+}
+
+/**
+ * §3.2, second door — a bloom that loads empty while the filter sources are
+ * populated is a dead index, and nothing else notices.
+ *
+ * `ensureRuleDataReady` decides whether to rebuild from what is *in storage*
+ * (a bloom key exists, the version matches, no interrupt marker), so a stored
+ * payload that deserializes to nothing sails through it. `checkBloomFillRatio`
+ * only fires above the saturation threshold, and an empty filter's ratio is 0.
+ * The result is that `bloom.has(d)` returns false for every domain: every
+ * domain-specific cosmetic and every scriptlet is dead until some unrelated
+ * change happens to trigger a rebuild — up to 24 hours, and silently.
+ */
+async function ensureLoadedBloomUsable() {
+  if (!isBloomEmpty(bloom)) return false;
+
+  let hasSources = false;
+  try {
+    hasSources = await db.hasFilterSources();
+  } catch {
+    return false;
+  }
+  if (!hasSources) return false; // genuinely nothing indexed yet — not a fault
+
+  reportError(
+    'bloom:emptyWithSources',
+    new Error('stored bloom filter deserialized to an empty filter while filter sources are populated; rebuilding index')
+  );
+  try {
+    await queueActiveIndexRebuild();
+  } catch (err) {
+    reportError('bloom:emptyWithSources:rebuild', err, { fatal: true });
+  }
+  return true;
+}
+
 async function loadBloomFilter() {
   const data = await getStorage(StorageKeys.BLOOM_FILTER);
   if (data) {
@@ -1476,11 +1553,9 @@ async function loadBloomFilter() {
           } else {
             await ingestLegacyRules();
           }
+          return;
         }
-        return;
-      }
-
-      if (wasmReady) {
+      } else if (wasmReady) {
         // Data is a raw object, but WASM needs a JSON string
         bloom = WasmBloom.deserialize_from_json(JSON.stringify(data));
         checkBloomFillRatio(bloom);
@@ -1494,6 +1569,8 @@ async function loadBloomFilter() {
   } else {
     bloom = wasmReady ? new WasmBloom(256 * 1024, 4) : new BloomFilter(256 * 1024, 4);
   }
+
+  await ensureLoadedBloomUsable();
 }
 
 function checkBloomFillRatio(bloomFilter) {
@@ -1597,7 +1674,13 @@ async function ingestLegacyRules() {
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
   if (info.menuItemId === 'nullify-block-element' && tab?.id) {
-    chrome.tabs.sendMessage(tab.id, { type: 'ACTIVATE_PICKER' }).catch(() => {
+    // §4.24 — `{frameId: 0}` is mandatory. The content script runs in ALL
+    // frames, so an unaddressed sendMessage reaches every iframe on the page
+    // and each one builds its own full-viewport capture-phase overlay. `keydown`
+    // does not cross frame boundaries, so ESC dismisses only the focused frame's
+    // and the rest persist for the life of the page, swallowing every click in
+    // their region. The picker belongs to the top frame only.
+    chrome.tabs.sendMessage(tab.id, { type: 'ACTIVATE_PICKER' }, { frameId: 0 }).catch(() => {
       // Tab might not have content script loaded yet
     });
   }
@@ -2699,7 +2782,7 @@ function appendUserFilterLine(line) {
     const next = current
       ? (current.endsWith('\n') ? current + trimmedLine : `${current}\n${trimmedLine}`)
       : trimmedLine;
-    if (next.length > MAX_USER_FILTERS_BYTES) {
+    if (utf8ByteLength(next) > MAX_USER_FILTERS_BYTES) {
       return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
     }
     await setStorage(StorageKeys.USER_FILTERS, next);
@@ -2707,7 +2790,45 @@ function appendUserFilterLine(line) {
   });
 }
 
-/** Parse a simple ABP-style network rule into a DNR rule object. */
+// §5.6 — the ONLY `$options` this parser can express in DNR. Anything absent
+// from this map makes the whole line unrepresentable, and the line is dropped.
+const SIMPLE_RULE_RESOURCE_TYPES = {
+  script: 'script', image: 'image', stylesheet: 'stylesheet',
+  xmlhttprequest: 'xmlhttprequest', document: 'main_frame',
+  subdocument: 'sub_frame', font: 'font', media: 'media',
+  websocket: 'websocket', ping: 'ping', other: 'other',
+};
+
+// §5.6 — options that scope *cosmetic* filtering. An `@@…$ghide` line is a
+// generic-hide exception, not a network allow; emitting `{action: allow}` for
+// it switched off network blocking for the whole domain (§3.3's blanket-allow
+// shape, verbatim). Recognised here purely so the line can be refused.
+//
+// TODO: this duplicates `COSMETIC_SCOPE_OPTIONS` in src/shared/filter-parser.js,
+// which is still module-private there. When that map is exported, import it
+// and delete this copy (REVIEW-2026-08 §5.6 cross-file follow-up).
+const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = new Set([
+  'generichide', 'ghide',
+  'elemhide', 'ehide',
+  'specifichide', 'shide',
+  'genericblock',
+]);
+
+/**
+ * Parse a simple ABP-style network rule into a DNR rule object.
+ *
+ * ONLY used on the WASM-down path for user filters; `compile_user_filters` is
+ * the real parser. Sprint 3 unified three parsers behind fail-closed unknown-
+ * modifier handling and left this one out, so `$badfilter` became an active
+ * block, `$removeparam` became a plain domain block, `@@…$ghide` became a
+ * blanket network allow and `$important` was silently downgraded — i.e. a
+ * user's filters meant different things depending on whether WASM had
+ * initialized. It now refuses anything it cannot represent exactly (§5.6).
+ *
+ * Fail-closed is the recoverable direction here: a dropped rule under-blocks
+ * and is visible to the user, where a mis-parsed one silently over-blocks or
+ * (worse, for an `@@` line) silently disables blocking.
+ */
 function parseSimpleNetworkRule(line, id) {
   const isException = line.startsWith('@@');
   const pattern = isException ? line.slice(2) : line;
@@ -2721,14 +2842,32 @@ function parseSimpleNetworkRule(line, id) {
 
   if (dollarPos > 0) {
     urlFilter = pattern.slice(0, dollarPos);
-    const opts = pattern.slice(dollarPos + 1).split(',');
-    const typeMap = {
-      script: 'script', image: 'image', stylesheet: 'stylesheet',
-      xmlhttprequest: 'xmlhttprequest', document: 'main_frame',
-      subdocument: 'sub_frame', font: 'font', media: 'media',
-      websocket: 'websocket', ping: 'ping', other: 'other',
-    };
-    const types = opts.map(o => typeMap[o]).filter(Boolean);
+    const types = [];
+
+    for (const raw of pattern.slice(dollarPos + 1).split(',')) {
+      const option = raw.trim().toLowerCase();
+
+      // A cosmetic-scope option means the line is not a network rule at all.
+      // Never translate it into an `allow`.
+      if (SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS.has(option)) return null;
+
+      const resourceType = SIMPLE_RULE_RESOURCE_TYPES[option];
+      if (resourceType) {
+        types.push(resourceType);
+        continue;
+      }
+
+      // Everything else — `$important`, `$badfilter`, `$removeparam`, `$csp`,
+      // `$redirect`, `$domain=`, `$third-party`, `~`-negated types, an empty
+      // token from a trailing comma, or a bare `$` that was really part of the
+      // URL pattern — changes the rule's meaning in a way this parser does not
+      // implement. Drop the line rather than emit a rule that means something
+      // else. `$domain=`/`$third-party` in particular NARROW a filter, so
+      // ignoring them broadens a block (over-blocks) or an allow (silently
+      // stops blocking).
+      return null;
+    }
+
     if (types.length > 0) resourceTypes = types;
   }
 
@@ -2795,17 +2934,6 @@ async function allowSite(domain) {
     await _rebuildAllowlistStateNow(newAllowlist);
     return newAllowlist;
   });
-}
-
-/**
- * Replace the entire allowlist and synchronize all dependent runtime state.
- * Returns `{allowlist, rejected}` — rejected entries (§4.8) are reported so
- * the UI can surface invalid import lines instead of silently dropping them.
- */
-async function setAllowlistDomains(domains) {
-  const { valid, rejected } = partitionAllowlistInput(domains);
-  await rebuildAllowlistState(valid);
-  return { allowlist: valid, rejected };
 }
 
 /**
@@ -3233,15 +3361,125 @@ const SCRIPTLET_REGISTRY_KEY = (() => {
   return '__n_' + Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 })();
 
-// Produce a 64-bit integer seed from the CSPRNG for WASM noise generators.
-// `Date.now() * Math.random()` is predictable, low-entropy, and callable in
-// a timing attack — `crypto.getRandomValues` is both faster and unbiased.
-function cryptoSeed64() {
-  const buf = new Uint32Array(2);
-  crypto.getRandomValues(buf);
-  // JS numbers are float64 (53-bit mantissa); combining two u32s saturates
-  // below 2^53 which fits the `seed as u64` cast on the Rust side.
-  return buf[0] * 0x1_0000 + buf[1];
+// ---------------------------------------------------------------------------
+// §5.25 — the trust boundary for privileged scriptlets
+// ---------------------------------------------------------------------------
+//
+// uBO marks a handful of scriptlets `requiresTrust` and refuses any filter that
+// names one unless the filter came from a trusted source. Nothing enforced that
+// here, so `trusted-set-constant` (which `JSON.parse`s a value and installs the
+// result at an arbitrary `window` path) and `trusted-replace-fetch-response`
+// (which rewrites arbitrary response bodies) were reachable from ANY filter the
+// user could be induced to add — including, critically, through
+// `APPEND_USER_FILTER`, which is SENDER_ANY. That made it a privilege
+// escalation from a compromised renderer: append one line, get arbitrary code
+// semantics injected into the MAIN world of the next page load.
+//
+// The gate lives here, at spec-build time, because this is the only layer that
+// knows where a spec came from. Filtering in the page would be too late (the
+// spec has already crossed into the renderer) and filtering at ingest would
+// lose the distinction between a subscribed list and the user's own filters.
+//
+// The name set MIRRORS `TRUSTED_SCRIPTLETS` in src/scriptlets/index.js
+// (registry keys, aliases included) rather than importing it: that module
+// eagerly imports every scriptlet implementation and installs a MAIN-world
+// global at load, so importing it would pull the entire scriptlet corpus into
+// the service-worker bundle. tests/sw-harness/sw-scriptlet-trust.test.mjs pins
+// the two lists against each other so they cannot drift.
+const TRUSTED_ONLY_SCRIPTLETS = new Set([
+  'trusted-set-constant', 'tsc', 'trusted-set',
+  'trusted-click-element', 'tce',
+  'trusted-replace-fetch-response', 'trfr',
+  'trusted-replace-xhr-response', 'trxr',
+  'trusted-set-cookie', 'trusted-set-cookie-reload',
+  'trusted-set-local-storage-item', 'trusted-set-session-storage-item',
+  // uBO's `replace-node-text`/`rpnt` are aliases of the *trusted* scriptlet:
+  // the replacement text is written straight into a <script> node.
+  'trusted-replace-node-text', 'trusted-rpnt', 'replace-node-text', 'rpnt',
+]);
+
+/**
+ * Filter-list sources whose rules may invoke a `requiresTrust` scriptlet.
+ *
+ * Today that is every list this extension ships or subscribes to — all curated
+ * (uAssets, EasyList, malware-filter) — plus the built-in `system-unbreak`.
+ * The set exists so that adding a custom-list subscription later is a
+ * *deliberate* trust decision rather than an accidental one.
+ */
+const TRUSTED_FILTER_LIST_IDS = new Set(ALL_KNOWN_LIST_IDS);
+
+/**
+ * Scriptlet-dispatch diagnostics (§5.22, §5.25).
+ *
+ * `unknown` is the miss counter the page bundle keeps — 20.4% of the shipped
+ * corpus names scriptlets with no implementation, and until now nothing in the
+ * worker, popup, options page or build read `getUnknownScriptlets()`, so a
+ * coverage regression was invisible in production. `refusedUntrusted` counts
+ * specs this gate dropped. Both surface through GET_ERROR_REPORT.
+ *
+ * Bounded: a hostile page cannot make either map grow without limit.
+ */
+const MAX_SCRIPTLET_DIAGNOSTIC_KEYS = 200;
+const scriptletDiagnostics = {
+  unknown: new Map(),           // name -> misses observed in pages
+  refusedUntrusted: new Map(),  // name -> specs refused by the trust gate
+};
+
+function bumpScriptletDiagnostic(map, name, count) {
+  const key = typeof name === 'string' ? name.slice(0, 100) : String(name).slice(0, 100);
+  const increment = Number.isFinite(count) && count > 0 ? Math.min(Math.floor(count), 1e6) : 1;
+  if (!map.has(key) && map.size >= MAX_SCRIPTLET_DIAGNOSTIC_KEYS) return;
+  map.set(key, (map.get(key) || 0) + increment);
+}
+
+function scriptletDiagnosticsSnapshot() {
+  const toObject = (map) => Object.fromEntries(map);
+  const total = (map) => [...map.values()].reduce((sum, n) => sum + n, 0);
+  return {
+    unknown: toObject(scriptletDiagnostics.unknown),
+    unknownTotal: total(scriptletDiagnostics.unknown),
+    refusedUntrusted: toObject(scriptletDiagnostics.refusedUntrusted),
+    refusedUntrustedTotal: total(scriptletDiagnostics.refusedUntrusted),
+  };
+}
+
+/**
+ * May a rule from `origin` invoke a trust-gated scriptlet?
+ *
+ * `origin` is `'user'` for the user's own filter text (SET_USER_FILTERS and the
+ * renderer-reachable APPEND_USER_FILTER) and `'list'` for the compiled index
+ * built from subscribed filter lists.
+ *
+ * FOLLOW-UP (cross-file): the index stores scriptlet rules merged across lists
+ * with no per-rule provenance — `mergeFilterSources` and wasm-core's
+ * `compile_active_filter_index` both flatten them — so `rule.listId` is absent
+ * today and a list rule is trusted by virtue of being in the curated index. The
+ * `listId` branch is live for the moment ingestion starts tagging rules, and
+ * fails closed for any id not in TRUSTED_FILTER_LIST_IDS. Tagging requires
+ * changes in src/shared/db.js and wasm-core, which are outside this pass.
+ */
+function isTrustedScriptletSource(rule, origin) {
+  if (origin !== 'list') return false;
+  const listId = rule?.listId;
+  if (listId === undefined || listId === null) return true;
+  return TRUSTED_FILTER_LIST_IDS.has(listId);
+}
+
+/** Drop specs naming a trust-gated scriptlet that `origin` may not invoke. */
+function filterTrustedScriptlets(rules, origin) {
+  const allowed = [];
+  for (const rule of rules) {
+    if (!TRUSTED_ONLY_SCRIPTLETS.has(rule?.name)) {
+      allowed.push(rule);
+      continue;
+    }
+    if (isTrustedScriptletSource(rule, origin)) {
+      allowed.push(rule);
+      continue;
+    }
+    bumpScriptletDiagnostic(scriptletDiagnostics.refusedUntrusted, rule?.name, 1);
+  }
+  return allowed;
 }
 
 /**
@@ -3255,16 +3493,34 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
     const registryReady = await ensureScriptletRegistry(tabId, frameId);
     if (!registryReady) return;
 
-    await chrome.scripting.executeScript({
+    const [{ result: diagnostics = null } = {}] = await chrome.scripting.executeScript({
       target: { tabId, frameIds: [frameId] },
       world: 'MAIN',
       func: executeScriptlets,
       args: [SCRIPTLET_REGISTRY_KEY, scriptletRules],
     });
+
+    // §5.22 — pull the page bundle's unknown-name counters back across the
+    // injection boundary. This is the only channel that exists: the bundle
+    // runs in the page's MAIN world and cannot message the worker.
+    recordUnknownScriptletsFromPage(diagnostics);
   } catch (err) {
     if (!err.message?.includes('No frame with id')) {
       reportError('scriptlet:inject', err);
     }
+  }
+}
+
+/**
+ * Fold a page's `{name: missCount}` report into the worker's counters.
+ * Everything here is renderer-supplied, so shapes are validated, not trusted.
+ */
+function recordUnknownScriptletsFromPage(report) {
+  const unknown = report?.unknown;
+  if (!unknown || typeof unknown !== 'object' || Array.isArray(unknown)) return;
+  for (const [name, count] of Object.entries(unknown)) {
+    if (typeof count !== 'number') continue;
+    bumpScriptletDiagnostic(scriptletDiagnostics.unknown, name, count);
   }
 }
 
@@ -3286,7 +3542,15 @@ async function injectScriptlets(tabId, frameId, scriptletRules) {
  * 'function'` check happily handed such a spy the full per-site scriptlet
  * spec list. Require the exact descriptor + object shape the bundle produces:
  * non-configurable/non-enumerable/non-writable data property (no accessor
- * spies) whose value is a frozen object with exactly one own key, `run`.
+ * spies) whose value is a frozen object whose own keys are drawn from a fixed
+ * allowlist and always include `run`.
+ *
+ * §5.22 — that allowlist gained one optional member, `getUnknownScriptlets`,
+ * so the bundle can hand its miss counters back through `executeScriptlets`.
+ * This does not weaken the check: a forged registry could always satisfy the
+ * one-key shape, so admitting a second *named, function-typed* key grants an
+ * attacker nothing new. The substance of the gate — frozen, non-configurable,
+ * non-writable, no accessors, no unexpected keys — is unchanged.
  */
 function verifyScriptletRegistry(key) {
   try {
@@ -3298,8 +3562,10 @@ function verifyScriptletRegistry(key) {
     const reg = desc.value;
     if (!reg || typeof reg.run !== 'function') return false;
     if (!Object.isFrozen(reg)) return false;
+    const allowedKeys = ['run', 'getUnknownScriptlets'];
     const ownKeys = Reflect.ownKeys(reg);
-    return ownKeys.length === 1 && ownKeys[0] === 'run';
+    if (!ownKeys.includes('run')) return false;
+    return ownKeys.every((k) => allowedKeys.includes(k) && typeof reg[k] === 'function');
   } catch {
     return false;
   }
@@ -3388,13 +3654,26 @@ async function ensureScriptletRegistry(tabId, frameId) {
  */
 function executeScriptlets(key, specs) {
   const registry = window[key];
-  if (!registry || typeof registry.run !== 'function') return;
+  if (!registry || typeof registry.run !== 'function') return null;
 
   for (const spec of specs) {
     try {
       registry.run(spec.name, spec.args);
     } catch { }
   }
+
+  // §5.22 — hand the bundle's unknown-name counters back to the worker as this
+  // injection's result. The bundle counts every dispatch that resolved to no
+  // implementation; without this readback a 20% miss rate is invisible outside
+  // a debugger. Optional and best-effort: a bundle without the accessor (or a
+  // page that broke it) simply reports nothing.
+  try {
+    if (typeof registry.getUnknownScriptlets === 'function') {
+      const unknown = registry.getUnknownScriptlets();
+      if (unknown && typeof unknown === 'object') return { unknown };
+    }
+  } catch { }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -3406,6 +3685,22 @@ function executeScriptlets(key, specs) {
 // or malformed traffic from compromised renderers).
 const MAX_USER_FILTERS_BYTES = 2 * 1024 * 1024;   // 2 MB text cap
 const MAX_USER_FILTERS_DNR_RULES = 10_000;        // dynamic DNR budget guard
+
+/**
+ * §5.5 — the cap is a BYTE budget and must be measured in bytes.
+ *
+ * This worker compared `raw.length`, i.e. UTF-16 code units, while
+ * `src/options/messaging.js` and `wasm-core/src/lib.rs` both count UTF-8
+ * bytes. A large non-ASCII list (Cyrillic, CJK — every one of those is 2-3
+ * UTF-8 bytes per code unit) therefore passed this check and threw inside
+ * Rust. `compileUserFiltersViaWasm` catches that throw and returns `null`,
+ * which is indistinguishable from "WASM unavailable" — so the naive JS
+ * fallback ran over the whole blob with none of the critical-path guards the
+ * Rust compiler applies. Counting bytes here makes the three enforcers agree.
+ */
+function utf8ByteLength(text) {
+  return new TextEncoder().encode(text ?? '').length;
+}
 // §5.2 — upper bound on one CONTENT_BLOCKED report. The cosmetic engine sends
 // a count per observer batch; anything past this is a compromised renderer
 // inflating the badge, not a page with a million ad slots.
@@ -3428,35 +3723,39 @@ const MAX_CONTENT_BLOCKED_COUNT = 1_000;
 const SENDER_ANY = 'any';                         // content scripts + extension pages (payload still validated)
 const SENDER_EXTENSION_PAGE = 'extension-page';   // extension pages only
 
+// §5.33 — six handlers were removed in this pass because nothing in
+// src/content, src/popup or src/options called them (re-verified by grep at
+// HEAD, not taken from the review): SET_SETTINGS, SET_ALLOWLIST,
+// GET_COSMETIC_RULES, GET_NOISE, GET_ANONYMIZED_STATS and
+// FORCE_CLEAN_ALL_DYNAMIC_RULES. Two of them (GET_COSMETIC_RULES, GET_NOISE)
+// were SENDER_ANY, i.e. renderer-reachable attack surface maintained for no
+// consumer; GET_COSMETIC_RULES additionally leaked the user's own per-site
+// cosmetic filters for any claimed hostname (§4.19). The remaining four were
+// whole-object writers and destructive operations with live, narrower
+// replacements (UPDATE_SETTINGS, ADD_ALLOWLIST_DOMAINS).
 const MESSAGE_SENDER_POLICY = {
   // Content-script critical path + picker/stats reporting.
-  GET_INIT_DATA: SENDER_ANY,
-  GET_COSMETIC_RULES: SENDER_ANY,
+  GET_INIT_DATA: SENDER_ANY,          // §4.19: hostname derived from sender.url
   IS_SITE_ALLOWED: SENDER_ANY,
   GET_TAB_STATS: SENDER_ANY,          // §5.4: payload.tabId honored only for extension pages
   CONTENT_BLOCKED: SENDER_ANY,        // §4.13: payload validated in the handler
   APPEND_USER_FILTER: SENDER_ANY,     // element picker; single validated line
   REPORT_CONTENT_ERROR: SENDER_ANY,
   CHECK_SEMANTIC_AD: SENDER_ANY,
-  GET_NOISE: SENDER_ANY,
 
   // Extension pages only — settings/allowlist/filter/ruleset writers, bulk
   // readers of user data, diagnostics, and destructive operations.
   GET_SETTINGS: SENDER_EXTENSION_PAGE,
-  SET_SETTINGS: SENDER_EXTENSION_PAGE,
   UPDATE_SETTINGS: SENDER_EXTENSION_PAGE,
   GET_ALLOWLIST: SENDER_EXTENSION_PAGE,
   ALLOW_SITE: SENDER_EXTENSION_PAGE,
   DISALLOW_SITE: SENDER_EXTENSION_PAGE,
-  SET_ALLOWLIST: SENDER_EXTENSION_PAGE,
   ADD_ALLOWLIST_DOMAINS: SENDER_EXTENSION_PAGE,
   GET_USER_FILTERS: SENDER_EXTENSION_PAGE,
   SET_USER_FILTERS: SENDER_EXTENSION_PAGE,
   SET_RULESET_ENABLED: SENDER_EXTENSION_PAGE,
   GET_ENABLED_RULESETS: SENDER_EXTENSION_PAGE,
   GET_DAILY_BLOCKED_TOTAL: SENDER_EXTENSION_PAGE,
-  GET_ANONYMIZED_STATS: SENDER_EXTENSION_PAGE,
-  FORCE_CLEAN_ALL_DYNAMIC_RULES: SENDER_EXTENSION_PAGE,
   CHECK_FILTER_UPDATES: SENDER_EXTENSION_PAGE,
   GET_ERROR_REPORT: SENDER_EXTENSION_PAGE,
   CLEAR_ERROR_REPORT: SENDER_EXTENSION_PAGE,
@@ -3468,12 +3767,10 @@ const MESSAGE_SENDER_POLICY = {
  * populate in stage 2 of `_criticalPromise` (§3.1).
  */
 const NEEDS_CRITICAL_CACHE = new Set([
-  'GET_COSMETIC_RULES',
   'IS_SITE_ALLOWED',
   'GET_ALLOWLIST',
   'ALLOW_SITE',
   'DISALLOW_SITE',
-  'SET_ALLOWLIST',
   'ADD_ALLOWLIST_DOMAINS',
   'GET_TAB_STATS',
   'GET_DAILY_BLOCKED_TOTAL',
@@ -3484,6 +3781,48 @@ const NEEDS_CRITICAL_CACHE = new Set([
 function isExtensionPageSender(sender) {
   return typeof sender?.url === 'string' &&
     sender.url.startsWith(chrome.runtime.getURL(''));
+}
+
+/**
+ * §4.19 — the hostname a content-script message is answered for must be
+ * derived from the sender, never taken from the payload.
+ *
+ * `GET_INIT_DATA` is SENDER_ANY and used to trust `payload.hostname`
+ * verbatim. Two consequences, both reachable from any compromised renderer:
+ *
+ *   - Disclosure. The reply folds in the user's OWN per-site cosmetic filters
+ *     (`USER_COSMETIC_RULES`, keyed by domain). Claiming hostnames one at a
+ *     time enumerated the user's private filter list for sites they never
+ *     opened in that renderer.
+ *   - Allowlist bypass. `isAllowed` was computed from the CLAIM, while
+ *     `injectScriptlets` targets the real `sender.tab.id`/`frameId`. A page on
+ *     an allowlisted host could claim an unlisted hostname and have scriptlets
+ *     injected into itself — and vice versa, claim an allowlisted hostname to
+ *     get `isAllowed: true` and suppress its own cosmetic filtering.
+ *
+ * §5.4 applied exactly this fix to `GET_TAB_STATS` (payload.tabId honored only
+ * for extension pages) and stopped there.
+ *
+ * Extension pages have no `sender.tab`; they are trusted and keep the payload.
+ * `about:blank` / `about:srcdoc` / `data:` frames yield no usable hostname
+ * from `sender.url` — they inherit their parent's origin, and the content
+ * script sends the hostname it computed from that parent — so those fall back
+ * to the payload. That fallback grants nothing: such a frame's `sender.url`
+ * is unforgeable-but-useless, and the claim is all that exists.
+ */
+function hostnameFromSenderUrl(url) {
+  if (typeof url !== 'string' || !url) return '';
+  try {
+    return normalizeHostname(new URL(url).hostname);
+  } catch {
+    return '';
+  }
+}
+
+function resolveRequestHostname(sender, claimed) {
+  const claimedHostname = normalizeHostname(claimed);
+  if (!sender?.tab) return claimedHostname;
+  return hostnameFromSenderUrl(sender.url) || claimedHostname;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -3514,7 +3853,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     ? _criticalPromise.then(() => handleMessage(message, sender))
     : handleMessage(message, sender);
 
-  run.then(sendResponse).catch((err) => sendResponse({ error: err.message }));
+  run.then(sendResponse).catch((err) => {
+    // §4.11 — the catch-all used to answer `{error}` and log nothing, so a
+    // handler that threw (a rejected `getCosmeticBundleForPage`, say) left
+    // GET_ERROR_REPORT describing a perfectly healthy extension while every
+    // page got zero cosmetic rules. The response shape is the caller's
+    // problem; the failure being *invisible* was ours.
+    reportError(`message:${message.type}`, err);
+    sendResponse({ error: err.message });
+  });
   return true;
 });
 
@@ -3523,7 +3870,13 @@ async function handleMessage(message, sender) {
 
   switch (type) {
     case 'GET_INIT_DATA': {
-      const { hostname } = payload;
+      // §4.19 — resolved from `sender.url` for content scripts. Deliberately
+      // the FIRST thing this handler does: every read below (allowlist check,
+      // cosmetic bundle, scriptlet specs) and the injection target must all
+      // agree on one hostname, and `getCosmeticBundleForPage` snapshots the
+      // rebuild generation on entry, so the hostname has to be settled before
+      // it is called.
+      const hostname = resolveRequestHostname(sender, payload?.hostname);
       const [isAllowed, settings, cosmeticBundle, scriptletRules] = await Promise.all([
         isHostnameAllowedCached(hostname),
         (await getStorage(StorageKeys.SETTINGS)) || {},
@@ -3604,17 +3957,13 @@ async function handleMessage(message, sender) {
     }
     case 'GET_SETTINGS':
       return (await getStorage(StorageKeys.SETTINGS)) || {};
-    case 'SET_SETTINGS': {
-      await setStorage(StorageKeys.SETTINGS, payload);
-      cachedSettings = payload;
-      await applyPrivacySettings();
-      await refreshAllBadges();
-      return { ok: true };
-    }
     case 'UPDATE_SETTINGS': {
       // Partial merge — safe when multiple UI surfaces (popup + options)
-      // may be editing settings concurrently. SET_SETTINGS is read-modify-
-      // write from the caller's perspective and can drop sibling changes.
+      // may be editing settings concurrently. §5.33: the whole-object
+      // SET_SETTINGS writer is gone. It had no caller (options.js carries a
+      // comment explaining that it deliberately does not use it), and a
+      // replace composed from one tab's possibly-stale DOM silently clobbers
+      // concurrent edits made in the other surface.
       const current = (await getStorage(StorageKeys.SETTINGS)) || {};
       const merged = { ...current, ...(payload || {}) };
       await setStorage(StorageKeys.SETTINGS, merged);
@@ -3647,12 +3996,12 @@ async function handleMessage(message, sender) {
       const allowlist = await disallowSite(domain);
       return { ok: true, allowlist };
     }
-    case 'SET_ALLOWLIST': {
-      // §4.8 — response stays `{ok, allowlist}` for existing consumers, with
-      // an additive `rejected` array reporting entries that failed validation.
-      const { allowlist, rejected } = await setAllowlistDomains(payload?.domains);
-      return { ok: true, allowlist, rejected };
-    }
+    // §5.33 — SET_ALLOWLIST (replace the entire allowlist) is deleted. No
+    // caller: the options page's import path uses ADD_ALLOWLIST_DOMAINS
+    // precisely because a replace composed from a stale read can wipe entries
+    // added elsewhere (§3.1's failure mode). Both share
+    // `partitionAllowlistInput`, so the §4.8 public-suffix rejection is
+    // unchanged and still reported through the `rejected` array.
     case 'ADD_ALLOWLIST_DOMAINS': {
       if (!Array.isArray(payload?.domains) ||
           payload.domains.some((domain) => typeof domain !== 'string')) {
@@ -3674,7 +4023,8 @@ async function handleMessage(message, sender) {
       const raw = typeof payload?.filters === 'string' ? payload.filters : '';
       // Cap raw text at 2 MB so a pasted/imported blob cannot exhaust the
       // service worker's heap or block the filter compiler indefinitely.
-      if (raw.length > MAX_USER_FILTERS_BYTES) {
+      // §5.5 — bytes, not UTF-16 code units: see utf8ByteLength.
+      if (utf8ByteLength(raw) > MAX_USER_FILTERS_BYTES) {
         return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
       }
       const counts = await setAndApplyUserFilters(raw);
@@ -3698,22 +4048,25 @@ async function handleMessage(message, sender) {
       if (line.includes('\n') || line.includes('\r')) {
         return { error: 'APPEND_USER_FILTER accepts a single line' };
       }
-      if (line.length > MAX_USER_FILTERS_BYTES) {
+      if (utf8ByteLength(line) > MAX_USER_FILTERS_BYTES) {
         return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
       }
       const result = await appendUserFilterLine(line);
       if (result?.error) return { error: result.error };
       return { ok: true, counts: result };
     }
-    case 'GET_COSMETIC_RULES': {
-      const bundle = await getCosmeticBundleForPage(payload.hostname);
-      return bundle.rules;
-    }
     // §5.5 — RUN_SCRIPTLETS and GET_SCRIPTLET_RULES are deliberately gone:
     // they had no caller anywhere in src/content, src/popup or src/options,
     // ignored the allowlist, and accepted arbitrary scriptlet names/args from
     // any renderer. Scriptlet injection happens exclusively through
     // GET_INIT_DATA, which gates on the allowlist.
+    //
+    // §5.33/§4.19 — GET_COSMETIC_RULES joins them. Same story: no caller
+    // anywhere, SENDER_ANY, and it answered for a caller-supplied hostname,
+    // so any renderer could read the user's own per-site cosmetic filters for
+    // every site they had ever written one for. The content script gets its
+    // bundle from GET_INIT_DATA, which now derives the hostname from the
+    // sender and gates on the allowlist.
     case 'SET_RULESET_ENABLED': {
       const enabledMap = await setRulesetEnabled(payload.rulesetId, payload.enabled);
       return { ok: true, enabledMap };
@@ -3721,23 +4074,13 @@ async function handleMessage(message, sender) {
     case 'GET_ENABLED_RULESETS':
       return await getEffectiveEnabledRulesetsMap();
 
-    case 'GET_NOISE': {
-      const { mean = 0, stdDev = 1 } = payload || {};
-      if (wasmReady) {
-        return { noise: generate_gaussian_noise(mean, stdDev, cryptoSeed64()) };
-      }
-      return { noise: (Math.random() - 0.5) * 2 * stdDev + mean }; // JS fallback
-    }
-
-    case 'GET_ANONYMIZED_STATS': {
-      const stats = await getStorage(StorageKeys.TAB_STATS) || {};
-      if (!wasmReady) return { stats };
-
-      const json = JSON.stringify(stats);
-      const noiseScale = payload?.noiseScale || 2.0;
-      const anonymizedJson = anonymize_stats_json(json, noiseScale, cryptoSeed64());
-      return { stats: JSON.parse(anonymizedJson) };
-    }
+    // §5.33 — GET_NOISE and GET_ANONYMIZED_STATS are deleted. Neither had a
+    // caller. GET_NOISE was SENDER_ANY and handed any renderer an oracle over
+    // the worker's CSPRNG-seeded Gaussian generator; the fingerprint-noise
+    // scriptlet generates its own noise in-page. GET_ANONYMIZED_STATS returned
+    // the entire cross-tab stats store (every tab's URL) with differential-
+    // privacy noise applied to the counters only — the URLs were never
+    // anonymized, and no surface displayed either.
 
     case 'CHECK_SEMANTIC_AD': {
       const { text } = payload;
@@ -3745,20 +4088,14 @@ async function handleMessage(message, sender) {
       return { isAd: wasmReady ? is_semantic_ad(text) : false };
     }
 
-    case 'FORCE_CLEAN_ALL_DYNAMIC_RULES': {
-      const existing = await chrome.declarativeNetRequest.getDynamicRules();
-      const ids = existing.map(r => r.id);
-      if (ids.length > 0) {
-        await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ids });
-      }
-      // §5.1 — the user-filter DNR rules were just deleted, so the "already
-      // applied" marker is now a lie. Left in place, the startup short-circuit
-      // (`userFilters === appliedUserFilters`) means they never come back.
-      await setStorage(StorageKeys.USER_FILTERS_APPLIED, '');
-      domainRulesCache.clear();
-      _inFlightRules.clear();
-      return { cleared: ids.length, rules: existing };
-    }
+    // §5.33 — FORCE_CLEAN_ALL_DYNAMIC_RULES is deleted. It deleted every
+    // dynamic rule the worker owns (the whole allowlist and every user filter)
+    // and had no caller in any surface. §5.1 had to repair it in the previous
+    // pass precisely because nothing exercised it: it wiped the user-filter
+    // rules and left USER_FILTERS_APPLIED set, so the startup short-circuit
+    // meant they never came back. Unreachable destructive code that silently
+    // rots is worse than no recovery hatch; the allowlist and user filters are
+    // both rebuilt from storage on the paths that actually run.
 
     case 'CHECK_FILTER_UPDATES': {
       // §5.3 — report what actually happened. `{ok:true}` on a total fetch
@@ -3783,12 +4120,18 @@ async function handleMessage(message, sender) {
         warningCount: errorReport.warnings.length,
         critical: errorReport.critical.slice(-20),
         warnings: errorReport.warnings.slice(-20),
+        // §5.22/§5.25 — scriptlet dispatch health. `unknown` is the page
+        // bundle's own miss counter, which had no consumer anywhere until now;
+        // `refusedUntrusted` is what the trust gate dropped.
+        scriptlets: scriptletDiagnosticsSnapshot(),
       };
     }
     case 'CLEAR_ERROR_REPORT': {
       errorReport.critical = [];
       errorReport.warnings = [];
       errorReport.lastError = null;
+      scriptletDiagnostics.unknown.clear();
+      scriptletDiagnostics.refusedUntrusted.clear();
       return { ok: true };
     }
     case 'CONTENT_BLOCKED': {
@@ -3983,11 +4326,15 @@ function isScriptletExcludedForHostname(rule, hostname) {
 
 async function getScriptletRulesForPage(hostname) {
   const userScriptlets = (await getStorage(StorageKeys.USER_SCRIPTLET_RULES)) || [];
-  const activeUserScriptlets = userScriptlets.filter(r => {
+  // §5.25 — the trust gate runs here, before a single spec can be handed to
+  // `injectScriptlets`. User filters can never invoke a trust-gated scriptlet,
+  // whichever path wrote them (the options textarea or the element picker's
+  // renderer-reachable APPEND_USER_FILTER).
+  const activeUserScriptlets = filterTrustedScriptlets(userScriptlets.filter(r => {
     if (isScriptletExcludedForHostname(r, hostname)) return false;
     if (r.domains.length === 0) return true;
     return r.domains.some(d => domainCoversHostname(d, hostname));
-  });
+  }), 'user');
 
   if (!bloom) return activeUserScriptlets;
 
@@ -4005,8 +4352,11 @@ async function getScriptletRulesForPage(hostname) {
       })());
 
   if (!mightHaveRules) return activeUserScriptlets;
-  const dbRules = (await db.getScriptletRules(hostname))
-    .filter((rule) => !isScriptletExcludedForHostname(rule, hostname));
+  const dbRules = filterTrustedScriptlets(
+    (await db.getScriptletRules(hostname))
+      .filter((rule) => !isScriptletExcludedForHostname(rule, hostname)),
+    'list'
+  );
   return [...dbRules, ...activeUserScriptlets];
 }
 /**
@@ -4169,6 +4519,17 @@ export const __testHooks = {
   // Scriptlet boot-key hardening (§4.24)
   seedBootKey,
   verifyScriptletRegistry,
+  // Scriptlet trust gate (§5.25) + dispatch diagnostics (§5.22)
+  injectScriptlets,
+  getScriptletRulesForPage,
+  filterTrustedScriptlets,
+  TRUSTED_ONLY_SCRIPTLETS,
+  TRUSTED_FILTER_LIST_IDS,
+  SCRIPTLET_REGISTRY_KEY,
+  scriptletDiagnosticsSnapshot,
+  // Bloom health (§3.2, second door)
+  isBloomEmpty,
+  loadBloomFilter,
   // Stats
   restorePersistedStats,
   resetTabStats,

@@ -62,8 +62,11 @@ test('5.8: fallback allowlist walk stops at public suffixes like the WASM matche
   // §4.8 (fixed): server-side validation now rejects the bare public suffix
   // at write time, so it never reaches the cached set — the matcher-side
   // PSL stop below stays as defense in depth.
+  // §5.33 — SET_ALLOWLIST is deleted (no caller anywhere); ADD_ALLOWLIST_DOMAINS
+  // is the live writer and shares `partitionAllowlistInput`, so it exercises the
+  // same validation on an empty starting allowlist.
   const res = await chrome.runtime.sendMessage({
-    type: 'SET_ALLOWLIST',
+    type: 'ADD_ALLOWLIST_DOMAINS',
     payload: { domains: ['co.uk', 'example.com'] },
   });
   assert.equal(res.ok, true);
@@ -125,11 +128,11 @@ test('ADD_ALLOWLIST_DOMAINS: rejects malformed payloads with {error}', async () 
 // "Protected" (the matchers refuse to match at a public suffix).
 // ---------------------------------------------------------------------------
 
-test('4.8: SET_ALLOWLIST rejects public suffixes server-side and reports them', async () => {
+test('4.8: the allowlist writer rejects public suffixes server-side and reports them', async () => {
   const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
 
   const res = await chrome.runtime.sendMessage({
-    type: 'SET_ALLOWLIST',
+    type: 'ADD_ALLOWLIST_DOMAINS',
     payload: { domains: ['com', 'co.uk', 'example.com', 'foo bar'] },
   });
 

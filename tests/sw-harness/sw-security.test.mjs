@@ -26,31 +26,39 @@ function contentScriptSender(tabId = 7, url = 'https://evil.example/page') {
 // §2.3 — privileged-message gate
 // ---------------------------------------------------------------------------
 
-test('2.3: FORCE_CLEAN_ALL_DYNAMIC_RULES is refused for a content-script sender', async () => {
+const DNR_ALLOWLIST_START = 990_000;
+
+function allowlistRules(chrome) {
+  return [...chrome.declarativeNetRequest._dynamic.values()]
+    .filter((r) => r.id >= DNR_ALLOWLIST_START);
+}
+
+test('2.3: a destructive DNR mutation is refused for a content-script sender', async () => {
   const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
 
-  // Put a dynamic rule in place so a successful clean would be observable.
+  // Put a dynamic rule in place so a successful removal would be observable.
   const seedRes = await chrome.runtime.sendMessage({
     type: 'ALLOW_SITE',
     payload: { domain: 'example.com' },
   });
   assert.equal(seedRes.ok, true);
-  const before = chrome.declarativeNetRequest._dynamic.size;
-  assert.ok(before >= 1, 'at least the allowlist rule must be live');
+  assert.equal(allowlistRules(chrome).length, 1, 'the allowlist rule must be live');
 
   const res = await chrome.runtime.sendMessage(
-    { type: 'FORCE_CLEAN_ALL_DYNAMIC_RULES' },
+    { type: 'DISALLOW_SITE', payload: { domain: 'example.com' } },
     contentScriptSender()
   );
 
   assert.ok(res.error, 'content-script sender must be refused');
-  assert.equal(chrome.declarativeNetRequest._dynamic.size, before,
-    'no dynamic rule may be wiped by a renderer-reachable message');
+  assert.equal(allowlistRules(chrome).length, 1,
+    'no dynamic rule may be removed by a renderer-reachable message');
+  assert.deepEqual(chrome.storage.local._data().allowlist, ['example.com']);
 
   // Extension pages (popup/options) still can.
-  const ok = await chrome.runtime.sendMessage({ type: 'FORCE_CLEAN_ALL_DYNAMIC_RULES' });
-  assert.equal(ok.cleared, before);
-  assert.equal(chrome.declarativeNetRequest._dynamic.size, 0);
+  const ok = await chrome.runtime.sendMessage(
+    { type: 'DISALLOW_SITE', payload: { domain: 'example.com' } });
+  assert.equal(ok.ok, true);
+  assert.equal(allowlistRules(chrome).length, 0);
 
   hooks.cancelPendingStatsPersistForTest();
 });
@@ -59,10 +67,8 @@ test('2.3: every settings/allowlist/filter writer requires an extension-page sen
   const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
 
   const privileged = [
-    { type: 'SET_SETTINGS', payload: { enabled: false } },
     { type: 'UPDATE_SETTINGS', payload: { enabled: false } },
     { type: 'GET_SETTINGS' },
-    { type: 'SET_ALLOWLIST', payload: { domains: ['example.com'] } },
     { type: 'ADD_ALLOWLIST_DOMAINS', payload: { domains: ['example.com'] } },
     { type: 'ALLOW_SITE', payload: { domain: 'example.com' } },
     { type: 'DISALLOW_SITE', payload: { domain: 'example.com' } },
@@ -71,7 +77,6 @@ test('2.3: every settings/allowlist/filter writer requires an extension-page sen
     { type: 'SET_USER_FILTERS', payload: { filters: '||x.example^' } },
     { type: 'SET_RULESET_ENABLED', payload: { rulesetId: 'easylist', enabled: false } },
     { type: 'GET_ENABLED_RULESETS' },
-    { type: 'GET_ANONYMIZED_STATS' },
     { type: 'GET_DAILY_BLOCKED_TOTAL' },
     { type: 'CHECK_FILTER_UPDATES' },
     { type: 'GET_ERROR_REPORT' },
@@ -267,6 +272,56 @@ test('5.5: RUN_SCRIPTLETS and GET_SCRIPTLET_RULES no longer exist', async () => 
     const res = await chrome.runtime.sendMessage({ type, payload: { hostname: 'x.example' } });
     assert.match(res.error, /Unknown message type/);
   }
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// §5.33 — dead handlers removed
+// ---------------------------------------------------------------------------
+
+test('5.33: the six caller-less handlers are gone from the bus and the sender policy', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const seedRes = await chrome.runtime.sendMessage({
+    type: 'ALLOW_SITE', payload: { domain: 'example.com' } });
+  assert.equal(seedRes.ok, true);
+  const dynamicBefore = chrome.declarativeNetRequest._dynamic.size;
+  await chrome.runtime.sendMessage({
+    type: 'SET_USER_FILTERS', payload: { filters: 'evil.example##.ad' } });
+  const settingsBefore = JSON.stringify(chrome.storage.local._data().settings);
+  const allowlistBefore = [...(chrome.storage.local._data().allowlist || [])];
+
+  const deleted = [
+    { type: 'SET_SETTINGS', payload: { enabled: false } },
+    { type: 'SET_ALLOWLIST', payload: { domains: ['takeover.example'] } },
+    { type: 'GET_COSMETIC_RULES', payload: { hostname: 'evil.example' } },
+    { type: 'GET_NOISE', payload: { mean: 0, stdDev: 1 } },
+    { type: 'GET_ANONYMIZED_STATS' },
+    { type: 'FORCE_CLEAN_ALL_DYNAMIC_RULES' },
+  ];
+
+  // The two SENDER_ANY ones (GET_COSMETIC_RULES, GET_NOISE) must now fail
+  // closed at the privilege gate, i.e. they are no longer renderer-reachable
+  // surface at all…
+  for (const message of deleted) {
+    const res = await chrome.runtime.sendMessage(message, contentScriptSender());
+    assert.match(res.error, /extension-page sender required/,
+      `${message.type} must fail closed for a content-script sender`);
+  }
+
+  // …and even from an extension page there is no handler left.
+  for (const message of deleted) {
+    const res = await chrome.runtime.sendMessage(message);
+    assert.match(res.error, /Unknown message type/,
+      `${message.type} must no longer be handled`);
+  }
+
+  // Nothing they used to do may have happened.
+  assert.equal(chrome.declarativeNetRequest._dynamic.size, dynamicBefore,
+    'FORCE_CLEAN_ALL_DYNAMIC_RULES must not have wiped the dynamic ruleset');
+  assert.equal(JSON.stringify(chrome.storage.local._data().settings), settingsBefore);
+  assert.deepEqual([...(chrome.storage.local._data().allowlist || [])], allowlistBefore);
 
   hooks.cancelPendingStatsPersistForTest();
 });

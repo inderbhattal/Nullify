@@ -131,6 +131,169 @@ test('3.2 (didn\'t re-break): a clean boot on a healthy index does not rebuild',
 });
 
 // ---------------------------------------------------------------------------
+// §3.2, second door — a stored bloom that DESERIALIZES to nothing
+//
+// Both deserializers now degrade to an empty filter rather than throwing on a
+// payload they cannot validate: `BloomFilter.deserialize` on an unknown
+// `format` tag, and `deserialize_from_json` (wasm-core) on a payload with no
+// format tag at all — which is exactly the shape every wasm-produced legacy
+// blob has. `ensureRuleDataReady` decides from what is IN storage (a bloom key
+// exists, the version matches, no interrupt marker), so it never rebuilds; and
+// `checkBloomFillRatio` only fires above the saturation threshold, while an
+// empty filter's ratio is 0. Result: `bloom.has(d)` is false for every domain
+// and all domain cosmetics plus every scriptlet are dead — §3.2's silent
+// death, reached through a different door.
+// ---------------------------------------------------------------------------
+
+test('3.2: a bloom that loads empty while sources are populated forces a rebuild', async () => {
+  const first = await bootWithIndex();
+  first.hooks.cancelPendingStatsPersistForTest();
+  assert.deepEqual(await first.hooks.db.getCosmeticRules('example.com'), ['.site-ad']);
+
+  // Replace the stored bloom with a structurally valid payload carrying an
+  // unrecognised format tag — what a cross-version or wasm-produced legacy
+  // blob looks like. Everything else (sources, version, marker) stays healthy,
+  // so nothing in `ensureRuleDataReady` has any reason to rebuild.
+  const stored = first.chrome.storage.local._data().bloomFilter;
+  assert.ok(stored && typeof stored === 'object', 'baseline: a bloom really was stored');
+  await first.chrome.storage.local.set({ bloomFilter: { ...stored, format: 99 } });
+
+  const second = await loadServiceWorker({
+    stub: first.chrome,
+    idb: first.idb,
+    packagedSources: samplePackagedSources(),
+  });
+  let rebuilds = 0;
+  const origClear = second.hooks.db.clearActiveRules.bind(second.hooks.db);
+  second.hooks.db.clearActiveRules = async () => { rebuilds++; return origClear(); };
+  await second.hooks.whenCriticalReady();
+  await second.hooks.whenBackgroundSetupDone();
+  second.hooks.cancelPendingStatsPersistForTest();
+
+  assert.equal(rebuilds, 1,
+    'an empty bloom with populated sources must trigger exactly one rebuild');
+  assert.ok(
+    second.hooks.errorReport.critical.concat(second.hooks.errorReport.warnings)
+      .some((e) => String(e.context).includes('bloom:emptyWithSources')),
+    'the dead bloom must reach GET_ERROR_REPORT, not just die quietly',
+  );
+
+  // The user-visible symptom is gone: domain cosmetics resolve again.
+  const bundle = await second.hooks.getCosmeticBundleForPage('example.com');
+  assert.ok(
+    JSON.stringify(bundle).includes('.site-ad'),
+    'domain-specific cosmetics must work after the repair',
+  );
+});
+
+test('3.2 (didn\'t re-break): an empty bloom with NO sources is not a fault', async () => {
+  // A first-ever boot with nothing indexed legitimately has an empty filter.
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+  hooks.cancelPendingStatsPersistForTest();
+
+  assert.equal(await hooks.db.hasFilterSources(), false);
+  assert.ok(
+    !hooks.errorReport.critical.concat(hooks.errorReport.warnings)
+      .some((e) => String(e.context).includes('bloom:emptyWithSources')),
+    'no sources means nothing to rebuild from — this must not be reported as a fault',
+  );
+});
+
+test('3.2: isBloomEmpty distinguishes a populated filter from a degraded one', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+  const { BloomFilter } = await import('../../src/shared/bloom.js');
+
+  assert.equal(hooks.isBloomEmpty(null), true);
+  assert.equal(hooks.isBloomEmpty(new BloomFilter(1024, 4)), true);
+
+  const populated = new BloomFilter(1024, 4);
+  populated.add('example.com');
+  assert.equal(hooks.isBloomEmpty(populated), false);
+
+  // An unknown format tag degrades to empty rather than throwing — the exact
+  // shape that used to sail through unnoticed.
+  assert.equal(
+    hooks.isBloomEmpty(BloomFilter.deserialize({ ...populated.serialize(), format: 99 })),
+    true);
+  assert.equal(hooks.isBloomEmpty(BloomFilter.deserialize(populated.serialize())), false);
+
+  // A WASM-style filter is measured through fill_ratio().
+  assert.equal(hooks.isBloomEmpty({ fill_ratio: () => 0 }), true);
+  assert.equal(hooks.isBloomEmpty({ fill_ratio: () => 0.01 }), false);
+  assert.equal(hooks.isBloomEmpty({ fill_ratio: () => { throw new Error('x'); } }), false,
+    'an unreadable ratio must not force a rebuild on a guess');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// §3.2, second door — a bloom that DESERIALIZES to nothing
+//
+// Both deserializers degrade to an empty filter rather than throwing when the
+// stored payload fails validation (an unknown `format` tag in the JS one; a
+// missing tag in the Rust one, which is every wasm-produced legacy blob).
+// `ensureRuleDataReady` decides whether to rebuild from what is in *storage* —
+// a bloom key exists, the version matches, no interrupt marker — so it sails
+// straight through, and `checkBloomFillRatio` only fires ABOVE the saturation
+// threshold while an empty filter's ratio is 0. Result: `bloom.has(d)` is false
+// for every domain, so every domain cosmetic and every scriptlet is dead, and
+// nothing anywhere notices.
+// ---------------------------------------------------------------------------
+
+test('3.2: a bloom that deserializes to an empty filter forces a rebuild', async () => {
+  const first = await bootWithIndex();
+  first.hooks.cancelPendingStatsPersistForTest();
+  assert.deepEqual(await first.hooks.db.getCosmeticRules('example.com'), ['.site-ad']);
+
+  // Corrupt the STORED payload the way a format change does: structurally
+  // valid, so nothing throws, but tagged with a format this build refuses.
+  const stored = first.chrome.storage.local._data().bloomFilter;
+  assert.ok(stored && typeof stored === 'object', 'baseline must store an object payload');
+  await first.chrome.storage.local.set({ bloomFilter: { ...stored, format: 99 } });
+
+  // Boot on the same disk. Nothing else changed: sources present, version
+  // unchanged, no interrupt marker — so no existing signal asks for a rebuild.
+  const second = await loadServiceWorker({
+    stub: first.chrome,
+    idb: first.idb,
+    awaitReady: true,
+    packagedSources: samplePackagedSources(),
+  });
+  second.hooks.cancelPendingStatsPersistForTest();
+
+  // The user-visible symptom is the assertion: domain cosmetics must resolve.
+  const bundle = await second.hooks.getCosmeticBundleForPage('example.com');
+  assert.ok(
+    JSON.stringify(bundle).includes('.site-ad'),
+    'an empty bloom silently kills every domain cosmetic and scriptlet lookup',
+  );
+  assert.ok(
+    (await second.hooks.getScriptletRulesForPage('example.com')).some((r) => r.name === 'noeval'),
+    'scriptlets go dead through the same gate',
+  );
+  assert.ok(
+    second.hooks.errorReport.critical.concat(second.hooks.errorReport.warnings)
+      .some((e) => String(e.context).includes('bloom:emptyWithSources')),
+    'the dead index must reach GET_ERROR_REPORT, not just be repaired silently',
+  );
+  assert.equal(second.hooks.isBloomEmpty(null), true);
+});
+
+test('3.2 (didn\'t re-break): an empty bloom with no indexed sources is not a fault', async () => {
+  // A first-ever boot with no filter sources legitimately has an empty filter.
+  // Rebuilding there would be a pointless loop, so the check must stay quiet.
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+  hooks.cancelPendingStatsPersistForTest();
+
+  assert.equal(await hooks.db.hasFilterSources(), false);
+  assert.ok(
+    !hooks.errorReport.critical.concat(hooks.errorReport.warnings)
+      .some((e) => String(e.context).includes('bloom:emptyWithSources')),
+    'no sources indexed yet is not a dead index',
+  );
+});
+
+// ---------------------------------------------------------------------------
 // §5.4 — generation compare + stall release
 // ---------------------------------------------------------------------------
 

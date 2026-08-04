@@ -317,9 +317,22 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
       calls.push({ api: 'scripting.unregisterContentScripts', ids });
       for (const id of ids) scripting._registered.delete(id);
     },
+    // Opt-in MAIN-world evaluation. OFF by default: most tests rely on
+    // `executeScript` being inert, and the boot-key/registry helpers are
+    // exercised directly through the test hooks instead.
+    //
+    // Set `stub.scripting._evaluateInjectedFuncs = true` when the *return
+    // value* of an injected func is the thing under test — §5.22's
+    // unknown-scriptlet readback is carried by nothing else. The func then runs
+    // in this process against `globalThis`, so the test must provide whatever
+    // MAIN-world globals it touches (`globalThis.window`, the registry key).
+    _evaluateInjectedFuncs: false,
     async executeScript(injection) {
       calls.push({ api: 'scripting.executeScript', target: injection.target, world: injection.world, files: injection.files, hasFunc: typeof injection.func === 'function' });
       scripting._execLog.push(injection);
+      if (scripting._evaluateInjectedFuncs && typeof injection.func === 'function') {
+        return [{ result: await injection.func(...(injection.args || [])), frameId: 0 }];
+      }
       return [{ result: undefined, frameId: 0 }];
     },
     async insertCSS(injection) {
@@ -348,6 +361,13 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     async get(id) {
       calls.push({ api: 'tabs.get', id });
       return tabs._tabs.get(id) || null;
+    },
+    // §4.24 — records the `options` argument, because the whole defect is an
+    // omitted `{frameId: 0}`: without it Chrome broadcasts to every frame the
+    // content script runs in, and the picker overlay is built once per iframe.
+    async sendMessage(tabId, message, options = undefined) {
+      calls.push({ api: 'tabs.sendMessage', tabId, message, options });
+      return undefined;
     },
     onUpdated: makeListenerEvent(),
     onRemoved: makeListenerEvent(),

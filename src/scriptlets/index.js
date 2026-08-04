@@ -12,7 +12,7 @@ import { abortOnPropertyRead } from './abort-on-property-read.js';
 import { abortOnPropertyWrite } from './abort-on-property-write.js';
 import { setConstant } from './set-constant.js';
 import { abortCurrentInlineScript } from './abort-current-inline-script.js';
-import { jsonPrune } from './json-prune.js';
+import { jsonPrune, jsonPruneFetchResponse, jsonPruneXhrResponse } from './json-prune.js';
 import { preventFetch } from './prevent-fetch.js';
 import { preventXhr } from './prevent-xhr.js';
 import { removeAttr } from './remove-attr.js';
@@ -23,15 +23,19 @@ import { noSetTimeout } from './no-set-timeout-if.js';
 import { noSetInterval } from './no-set-interval-if.js';
 import { preventAddEventListener } from './prevent-add-event-listener.js';
 import { setCookie } from './set-cookie.js';
+import { trustedSetCookie, trustedSetCookieReload } from './trusted-set-cookie.js';
 import { setCookiePath } from './set-cookie-reload.js';
 import { removeCookie } from './remove-cookie.js';
+import { removeNodeText, replaceNodeText } from './replace-node-text.js';
 import { disableNewtabLinks } from './disable-newtab-links.js';
 import { adjustSetTimeout } from './adjust-set-timeout.js';
 import { adjustSetInterval } from './adjust-set-interval.js';
 import { noWindowOpenIf } from './no-window-open-if.js';
 import { preventWindowOpen } from './prevent-window-open.js';
-import { setLocalStorageItem } from './set-local-storage-item.js';
-import { setSessionStorageItem } from './set-session-storage-item.js';
+import {
+  setLocalStorageItem, trustedSetLocalStorageItem,
+  setSessionStorageItem, trustedSetSessionStorageItem,
+} from './set-local-storage-item.js';
 import { abortOnStackTrace } from './abort-on-stack-trace.js';
 import { noXhrIf } from './no-xhr-if.js';
 import { noFetchIf } from './no-fetch-if.js';
@@ -67,8 +71,12 @@ const REGISTRY = new Map([
   ['aost', abortOnStackTrace],
 
   // JSON/Object manipulation
+  // §4.21: the three uBO scriptlets hook one surface each. Aliasing them all
+  // to `jsonPrune` made `json-prune-fetch-response` also hook JSON.parse, so
+  // a rule scoped to one endpoint pruned every parsed JSON on the site.
   ['json-prune', jsonPrune],
-  ['json-prune-fetch-response', jsonPrune],
+  ['json-prune-fetch-response', jsonPruneFetchResponse],
+  ['json-prune-xhr-response', jsonPruneXhrResponse],
   ['object-prune', objectPrune],
 
   // Network interception
@@ -85,6 +93,11 @@ const REGISTRY = new Map([
   ['ac', addClass],
   ['remove-class', removeClass],
   ['rc', removeClass],
+  // §5.22: 1,111 corpus rules named these and resolved to nothing.
+  ['remove-node-text', removeNodeText],
+  ['rmnt', removeNodeText],
+  ['replace-node-text', replaceNodeText],
+  ['rpnt', replaceNodeText],
 
   // Timer/Event manipulation
   ['noeval', noeval],
@@ -117,6 +130,16 @@ const REGISTRY = new Map([
   ['set-session-storage-item', setSessionStorageItem],
   ['set-ssi', setSessionStorageItem],
 
+  // Trusted storage/cookie variants. Deliberately NOT aliases of the
+  // untrusted ones: the value gate in `set-cookie` /
+  // `set-local-storage-item` is precisely what distinguishes them (§5.22).
+  ['trusted-set-cookie', trustedSetCookie],
+  ['trusted-set-cookie-reload', trustedSetCookieReload],
+  ['trusted-set-local-storage-item', trustedSetLocalStorageItem],
+  ['trusted-set-session-storage-item', trustedSetSessionStorageItem],
+  ['trusted-replace-node-text', replaceNodeText],
+  ['trusted-rpnt', replaceNodeText],
+
   // Popup/window blocking
   ['no-window-open-if', noWindowOpenIf],
   ['nowoif', noWindowOpenIf],
@@ -148,6 +171,43 @@ const REGISTRY = new Map([
   ['stealth', botStealth],
   ['persona-spoof', personaSpoof],
 ]);
+
+// ---------------------------------------------------------------------------
+// Trust metadata (§5.25)
+// ---------------------------------------------------------------------------
+//
+// uBO marks privileged scriptlets `requiresTrust: true` and drops any filter
+// using one that did not come from a trusted list (its own lists, or the
+// user's own "My filters"). Nothing here carried that flag, so a third-party
+// list — or the picker's APPEND_USER_FILTER path — reached
+// `trusted-set-constant` (which `JSON.parse`s a value and installs it on an
+// arbitrary window path) and `trusted-replace-fetch-response` (which rewrites
+// arbitrary response bodies).
+//
+// This module is the registry, so it owns the flag; enforcement belongs to the
+// service worker at spec-build time, which is the only place that knows a
+// filter's source list. Names below are exactly the registry keys, aliases
+// included, so a caller can test the name it is about to dispatch.
+const TRUSTED_SCRIPTLETS = new Set([
+  'trusted-set-constant', 'tsc', 'trusted-set',
+  'trusted-click-element', 'tce',
+  'trusted-replace-fetch-response', 'trfr',
+  'trusted-replace-xhr-response', 'trxr',
+  'trusted-set-cookie', 'trusted-set-cookie-reload',
+  'trusted-set-local-storage-item', 'trusted-set-session-storage-item',
+  // uBO's `replace-node-text`/`rpnt` are aliases of the *trusted* scriptlet:
+  // the replacement text is written straight into a <script> node.
+  'trusted-replace-node-text', 'trusted-rpnt', 'replace-node-text', 'rpnt',
+]);
+
+/**
+ * Whether `name` may only be used by a filter from a trusted source.
+ * @param {string} name Registry key (canonical name or alias).
+ * @returns {boolean}
+ */
+function getScriptletTrustRequirement(name) {
+  return TRUSTED_SCRIPTLETS.has(name);
+}
 
 // ---------------------------------------------------------------------------
 // Executor
@@ -265,4 +325,10 @@ if (typeof bootKey === 'string' && BOOT_KEY_SHAPE.test(bootKey)) {
   // random string left on the global is harmless.
 }
 
-export { run, getUnknownScriptlets, REGISTRY };
+export {
+  run,
+  getUnknownScriptlets,
+  REGISTRY,
+  TRUSTED_SCRIPTLETS,
+  getScriptletTrustRequirement,
+};

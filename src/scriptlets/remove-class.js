@@ -4,7 +4,11 @@ export function removeClass(classNames, selector, behavior) {
   // uBO separates multiple class tokens with `|`, not whitespace.
   const classes = String(classNames).split(/\s*\|\s*/).filter(Boolean);
   if (!classes.length) return;
-  const sel = selector || '.' + classes[0];
+  // §5.26: the default selector used only the first token, so
+  // `rc, ad-shown|ad-active` never touched an element carrying only the
+  // second class. uBO builds one selector per token, prefixed by the
+  // (possibly empty) explicit selector, and joins them with a comma.
+  const sel = classes.map((c) => `${selector || ''}.${cssEscape(c)}`).join(',');
   let rafId = null;
   const apply = () => {
     if (rafId) return;
@@ -26,4 +30,10 @@ export function removeClass(classNames, selector, behavior) {
       observer.disconnect();
     }, { once: true });
   }
+}
+
+/** `CSS.escape` where available; the identifier grammar otherwise. */
+function cssEscape(token) {
+  if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(token);
+  return token.replace(/[^\w-]/g, (c) => `\\${c}`);
 }

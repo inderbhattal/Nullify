@@ -1,4 +1,4 @@
-import { toMatcher, toRegex } from './shared-utils.js';
+import { proxyApply, toMatcher, toRegex, wrapInstanceGetter } from './shared-utils.js';
 
 /**
  * trusted-replace-fetch-response.js
@@ -33,14 +33,10 @@ export function trustedReplaceFetchResponse(pattern, replacement = '', propsToMa
 
   // An empty propsToMatch means every fetch is a candidate (uBO parity).
   const matchUrl = propsToMatch ? toMatcher(propsToMatch) : () => true;
-  const origFetch = window.fetch;
 
-  window.fetch = async function (input, init) {
-    const url = typeof input === 'string' ? input : input?.url || '';
-    if (!matchUrl(url)) return origFetch.call(this, input, init);
-
+  const replace = async (context) => {
     try {
-      const response = await origFetch.call(this, input, init);
+      const response = await context.reflect();
       if (!response.ok) return response;
       if (!isTextLikeResponse(response)) return response;
 
@@ -64,9 +60,16 @@ export function trustedReplaceFetchResponse(pattern, replacement = '', propsToMa
         headers
       });
     } catch {
-      return origFetch.call(this, input, init);
+      return context.reflect();
     }
   };
+
+  proxyApply(window, 'fetch', (context) => {
+    const input = context.callArgs[0];
+    const url = typeof input === 'string' ? input : input?.url || '';
+    if (!matchUrl(url)) return context.reflect();
+    return replace(context);
+  });
 }
 
 export function trustedReplaceXhrResponse(pattern, replacement = '', propsToMatch = '') {
@@ -75,38 +78,28 @@ export function trustedReplaceXhrResponse(pattern, replacement = '', propsToMatc
   // An empty propsToMatch means every request is a candidate (uBO parity).
   const matchUrl = propsToMatch ? toMatcher(propsToMatch) : () => true;
   const findRe = toRegex(pattern);
-  const OrigXHR = window.XMLHttpRequest;
-  const interceptedMap = new WeakMap();
+  const XHR = window.XMLHttpRequest;
+  if (typeof XHR !== 'function') return;
+  const intercepted = new WeakMap();
 
-  const origOpen = OrigXHR.prototype.open;
-  OrigXHR.prototype.open = function (method, url, ...args) {
-    if (matchUrl(url)) interceptedMap.set(this, true);
-    else interceptedMap.delete(this);
-    return origOpen.call(this, method, url, ...args);
-  };
-
-  // Proxy preserves identity (`x instanceof XMLHttpRequest`, prototype chain).
-  window.XMLHttpRequest = new Proxy(OrigXHR, {
-    construct(target, args) {
-      const xhr = Reflect.construct(target, args);
-      const textDesc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText');
-      const respDesc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'response');
-
-      const wrap = (desc) => ({
-        configurable: true,
-        get() {
-          const val = desc.get.call(this);
-          if (interceptedMap.get(this) && typeof val === 'string') {
-            return val.replace(findRe, replacement);
-          }
-          return val;
-        },
-      });
-
-      if (textDesc?.get) Object.defineProperty(xhr, 'responseText', wrap(textDesc));
-      if (respDesc?.get) Object.defineProperty(xhr, 'response', wrap(respDesc));
-
-      return xhr;
-    },
+  // §4.22: interception lives entirely on the prototype now. The previous
+  // `construct` trap assigned own `response`/`responseText` accessors to every
+  // instance, and `Object.getOwnPropertyNames(new XMLHttpRequest())` is `[]`
+  // on a real browser — a one-line detector. It also dropped `newTarget`, so
+  // `class PageXHR extends XMLHttpRequest {}` produced instances that were not
+  // `instanceof PageXHR`.
+  proxyApply(XHR.prototype, 'open', (context) => {
+    const { thisArg, callArgs } = context;
+    if (matchUrl(String(callArgs[1] ?? ''))) intercepted.set(thisArg, true);
+    else intercepted.delete(thisArg);
+    return context.reflect();
   });
+
+  const transform = (value, xhr) => {
+    if (intercepted.get(xhr) !== true) return value;
+    if (typeof value !== 'string') return value;
+    return value.replace(findRe, replacement);
+  };
+  wrapInstanceGetter(XHR.prototype, 'responseText', transform);
+  wrapInstanceGetter(XHR.prototype, 'response', transform);
 }

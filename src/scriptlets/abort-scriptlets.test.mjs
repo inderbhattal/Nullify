@@ -113,7 +113,9 @@ test('aost: aborts silently — nothing written to console', () => {
   const logged = [];
   console.log = (...args) => { logged.push(args); };
   try {
-    assert.equal(globalThis.__aostTarget.fire(), undefined, 'matching stack must abort the call');
+    // §5.26: a match must *throw* — the old wrapper returned undefined, which
+    // is not an abort: the calling script carried on with a bad value.
+    assert.throws(() => globalThis.__aostTarget.fire(), ReferenceError);
   } finally {
     console.log = origLog;
   }

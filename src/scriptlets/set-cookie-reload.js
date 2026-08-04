@@ -1,8 +1,14 @@
+import { isSafeCookieValue } from './set-cookie.js';
+
 /** set-cookie-reload.js — Set cookie and reload the page if cookie wasn't already set. */
 export function setCookiePath(name, value, path) {
   if (!name) return;
-  const encName = encodeURIComponent(name);
-  const encValue = encodeURIComponent(value || '');
+  // §5.23: uBO's `set-cookie-reload` is `set-cookie` with `reload, 1`, so it
+  // carries the same trust boundary. Without this gate it would be a way for
+  // an untrusted list to write the arbitrary values `set-cookie` now refuses.
+  if (isSafeCookieValue(value ?? '') === false) return;
+  const encName = encodeCookiePart(name);
+  const encValue = encodeCookiePart(value || '');
   const existing = document.cookie.split(';').find((c) => c.trim().startsWith(encName + '='));
   if (existing) return;
 
@@ -28,4 +34,13 @@ export function setCookiePath(name, value, path) {
     return; // cannot arm the loop guard — reloading would risk a reload loop
   }
   window.location.reload();
+}
+
+/**
+ * §5.23: encode only when the value contains a character the cookie grammar
+ * disallows. Unconditional `encodeURIComponent` mangled already-encoded values
+ * (`%5B%22required%22%5D` -> `%255B%2522required%2522%255D`).
+ */
+function encodeCookiePart(s) {
+  return /[^ -:<-[\]-~]/.test(s) ? encodeURIComponent(s) : s;
 }

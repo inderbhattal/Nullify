@@ -35,6 +35,11 @@ globalThis.document = {
   querySelectorAll: () => [],
 };
 
+/** Route a selector string to a fixed element list, uBO-style. */
+function stubQuery(map) {
+  document.querySelectorAll = (sel) => map[sel] ?? [];
+}
+
 const { removeAttr } = await import('./remove-attr.js');
 const { addClass } = await import('./add-class.js');
 const { removeClass } = await import('./remove-class.js');
@@ -124,55 +129,162 @@ test('add-class/remove-class: observer disconnects at load unless "stay"', () =>
 
 // §4.34 — trusted-click-element read uBO's 3-argument form (selectors,
 // extraMatch, delay) as (selector, delay, interval): the click fired
-// immediately instead of after the delay, and a missing element rescheduled a
-// timer forever. It is now MutationObserver-driven with a hard deadline.
+// immediately instead of after the delay.
+//
+// §4.26 — the step grammar was invented: it split on `!!`, which appears twice
+// in 13,765 corpus rules and never as a separator, while uBO splits on `,`
+// (or on `;`/`|` when the argument starts with one) and treats an all-digits
+// step as a delay. Every multi-step rule went into querySelector whole and
+// threw. It also gated every click on `offsetParent !== null`, which is null
+// for any `position: fixed` element.
 
-test('tce: uBO 3-arg form — delay is honored, then observer/timers stop', async () => {
+const settle = (ms = 5) => new Promise((r) => setTimeout(r, ms));
+
+test('tce: uBO 3-arg form — delay is honored before the click', async () => {
   const el = makeElement();
-  document.querySelector = (sel) => (sel === '#accept-ads' ? el : null);
+  stubQuery({ '#accept-ads': [el] });
 
   trustedClickElement('#accept-ads', '', '40');
 
-  await new Promise((r) => setTimeout(r, 15));
+  await settle(15);
   assert.equal(el.clicks, 0, 'prior code clicked immediately, treating "" as delay 0');
 
-  await new Promise((r) => setTimeout(r, 60));
+  await settle(60);
   assert.equal(el.clicks, 1, 'click must land once the delay has elapsed');
-
-  const mo = FakeMutationObserver.instances.at(-1);
-  assert.equal(mo.disconnected, true, 'observer must disconnect after a successful click');
 });
 
-test('tce: waits for the element via MutationObserver, no polling timer', async () => {
-  let el = null;
-  document.querySelector = () => el;
+// §4.26: 6 corpus rules ship a comma list with integer delay steps, e.g.
+// `1000, #next-timer-btn > .btn-success, 600, #final-nextbutton`. The prior
+// grammar handed the whole string to querySelector, which throws.
+test('tce: comma-separated steps click in order, integer steps are delays', async () => {
+  const first = makeElement();
+  const second = makeElement();
+  stubQuery({ '#step-one': [first], '#step-two': [second] });
 
-  trustedClickElement('#late-banner', '', '');
-  const mo = FakeMutationObserver.instances.at(-1);
-  assert.equal(mo.disconnected, false, 'must keep watching while the element is missing');
+  trustedClickElement('5, #step-one, 5, #step-two', '', '');
 
-  el = makeElement();
-  mo.cb([]); // simulate the banner being inserted
-  assert.equal(el.clicks, 1);
-  assert.equal(mo.disconnected, true);
+  await settle(60);
+  assert.equal(first.clicks, 1, 'first selector step must be clicked');
+  assert.equal(second.clicks, 1, 'a multi-step rule must not die in querySelector');
 });
 
-test('tce: extraMatch gates clicking', () => {
+test('tce: a leading ; or | overrides the separator so selectors may hold commas', async () => {
   const el = makeElement();
-  document.querySelector = () => el;
-  document.cookie = 'consent=1';
+  stubQuery({ 'div[a="x,y"]': [el] });
+
+  trustedClickElement(';div[a="x,y"]', '', '');
+
+  await settle(20);
+  assert.equal(el.clicks, 1, 'the alternate separator must not split inside the selector');
+});
+
+// §4.26: `el.offsetParent === null` is true for every position:fixed element
+// per spec, so the old visibility gate never clicked a fixed consent button —
+// which is what essentially every cookie banner uses.
+test('tce: a position:fixed button (offsetParent === null) is still clicked', async () => {
+  const el = makeElement();
+  el.offsetParent = null;
+  el.getBoundingClientRect = () => ({ width: 0, height: 0 });
+  stubQuery({ '#fixed-consent': [el] });
+
+  trustedClickElement('#fixed-consent', '', '');
+
+  await settle(20);
+  assert.equal(el.clicks, 1, 'uBO clicks unconditionally; visibility is opt-in');
+});
+
+// §4.26: 25 rules use ` >>> ` to reach into a shadow root — the Usercentrics
+// CMP rules, ~105 domains across the corpus.
+test('tce: >>> pierces shadow roots', async () => {
+  const inner = makeElement();
+  const host = { ...makeElement(), shadowRoot: { querySelectorAll: (s) => (s === '#deny' ? [inner] : []) } };
+  stubQuery({ '#usercentrics-root': [host] });
+
+  trustedClickElement('#usercentrics-root >>> #deny', '', '');
+
+  await settle(20);
+  assert.equal(inner.clicks, 1, 'shadow-piercing selector must resolve');
+});
+
+test('tce: xpath: and when-visible: directives resolve', async () => {
+  const byXpath = makeElement();
+  document.evaluate = () => ({
+    resultType: 7,
+    snapshotLength: 1,
+    snapshotItem: () => byXpath,
+  });
+
+  trustedClickElement('xpath://button[@id="ok"]', '', '');
+  await settle(20);
+  assert.equal(byXpath.clicks, 1, 'xpath: must not go through querySelectorAll');
+
+  const hidden = makeElement();
+  hidden.checkVisibility = () => false;
+  stubQuery({ '#maybe': [hidden] });
+  // The trailing integer step is uBO's per-step lookup timeout; a short one
+  // keeps the never-resolving case from holding the event loop for 11 s.
+  trustedClickElement('when-visible:#maybe, 20', '', '5');
+  await settle(60);
+  assert.equal(hidden.clicks, 0, 'when-visible: must filter out invisible elements');
+});
+
+// §4.26: `cookie:` used to substring-match the whole document.cookie string
+// and `localStorage:key=value` looked up a literal key named "key=value".
+// uBO anchors `^key=value` against each enumerated entry.
+test('tce: extraMatch anchors ^key=value over enumerated cookies', async () => {
+  const el = makeElement();
+  stubQuery({ '#a': [el] });
+  document.cookie = 'other=nope; consent=1';
 
   trustedClickElement('#a', 'cookie:missing=1', '');
+  await settle(20);
   assert.equal(el.clicks, 0, 'failed cookie condition must not click');
 
+  // A substring match over the raw cookie string would fire on this: the
+  // value `nope` contains no `consent=1`, but `onsent=1` is a substring of
+  // the joined string. Anchoring per entry is what makes it exact.
+  trustedClickElement('#a', 'cookie:onsent=1', '');
+  await settle(20);
+  assert.equal(el.clicks, 0, 'the needle must be anchored at the start of a key');
+
   trustedClickElement('#a', 'cookie:consent=1', '');
+  await settle(20);
   assert.equal(el.clicks, 1, 'satisfied cookie condition must click');
 });
 
-test('tce: malformed selector stops cleanly instead of retrying forever', () => {
-  document.querySelector = () => { throw new SyntaxError('bad selector'); };
+test('tce: extraMatch negation with ! inverts the assertion', async () => {
+  const el = makeElement();
+  stubQuery({ '#b': [el] });
+  document.cookie = 'consent=1';
 
-  assert.doesNotThrow(() => trustedClickElement('#a[', '', ''));
+  trustedClickElement('#b', '!cookie:consent=1', '');
+  await settle(20);
+  assert.equal(el.clicks, 0, 'a present cookie must fail a negated assertion');
+
+  trustedClickElement('#b', '!cookie:absent=1', '');
+  await settle(20);
+  assert.equal(el.clicks, 1, 'an absent cookie must satisfy a negated assertion');
+});
+
+test('tce: waits for a late element via MutationObserver', async () => {
+  let els = [];
+  document.querySelectorAll = () => els;
+
+  trustedClickElement('#late-banner', '', '');
+  await settle(5);
   const mo = FakeMutationObserver.instances.at(-1);
-  assert.equal(mo.disconnected, true, 'retrying a selector that throws cannot help');
+  assert.equal(mo.disconnected, false, 'must keep watching while the element is missing');
+
+  const el = makeElement();
+  els = [el];
+  mo.cb([]); // simulate the banner being inserted
+  await settle(5);
+  assert.equal(el.clicks, 1);
+  assert.equal(mo.disconnected, true, 'observer must stop once the step resolves');
+});
+
+test('tce: malformed selector does not throw out of the scriptlet', async () => {
+  document.querySelectorAll = () => { throw new SyntaxError('bad selector'); };
+  assert.doesNotThrow(() => trustedClickElement('#a[, 20', '', ''));
+  await settle(60);
 });

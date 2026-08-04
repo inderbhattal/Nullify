@@ -47,6 +47,10 @@ globalThis.localStorage = {
   getItem: (k) => (localStore.has(k) ? localStore.get(k) : null),
   setItem: (k, v) => localStore.set(k, String(v)),
   removeItem: (k) => localStore.delete(k),
+  // uBO's `$remove$` enumerates the store to find every key matching the
+  // (verbatim) pattern, so the stub needs the index API.
+  get length() { return localStore.size; },
+  key: (i) => [...localStore.keys()][i] ?? null,
 };
 
 let reloads = 0;

@@ -1,4 +1,4 @@
-import { ABORT_MESSAGE } from './shared-utils.js';
+import { ABORT_MESSAGE, patternToRegex } from './shared-utils.js';
 
 /**
  * abort-current-inline-script.js
@@ -14,15 +14,31 @@ import { ABORT_MESSAGE } from './shared-utils.js';
 export function abortCurrentInlineScript(prop, search) {
   if (!prop) return;
 
-  const re = search ? new RegExp(search) : null;
+  // §4.9: this used to be `new RegExp(search)`. uBO escapes a plain-string
+  // needle and treats only `/…/flags` as a regex. Raw construction killed 28
+  // corpus rules outright — `l.parentNode.insertBefore(s` is not a valid
+  // regex, so the SyntaxError propagated out and the trap was never installed
+  // — and silently widened 115 more, where `.` in a literal needle became
+  // "any character" and aborted page scripts the filter never targeted.
+  const re = search ? patternToRegex(search) : null;
 
   const parts = prop.split('.');
   const lastProp = parts[parts.length - 1];
 
   let obj = window;
   for (let i = 0; i < parts.length - 1; i++) {
-    obj = obj[parts[i]];
-    if (!obj) return;
+    const p = parts[i];
+    const parent = obj[p];
+    if (parent === undefined || parent === null) {
+      // §4.9: `if (!obj) return` gave up on any chain whose parent had not
+      // loaded yet (`Swal.fire`, `ips.controller.register`), so every rule
+      // aimed at a late-loading library was a no-op. Defer exactly as
+      // abort-on-property-read.js and set-constant.js do: trap the parent and
+      // re-arm once the page assigns it.
+      deferUntilParentExists(obj, p, () => abortCurrentInlineScript(prop, search));
+      return;
+    }
+    obj = parent;
   }
 
   // Bind once, outside the descriptor. Binding inside the getter returned a
@@ -55,4 +71,30 @@ export function abortCurrentInlineScript(prop, search) {
       Object.defineProperty(obj, lastProp, { configurable: true, writable: true, value: v });
     },
   });
+}
+
+/**
+ * Trap a not-yet-existing link in a property chain and run `rearm` once the
+ * page assigns it. The incoming value is always stored, including for the bare
+ * `var lib;` shape that produces a data descriptor with no setter.
+ */
+function deferUntilParentExists(obj, p, rearm) {
+  let settled = false;
+  const originalDescriptor = Object.getOwnPropertyDescriptor(obj, p);
+  try {
+    Object.defineProperty(obj, p, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        return originalDescriptor?.get?.() ?? originalDescriptor?.value;
+      },
+      set(value) {
+        if (originalDescriptor?.set) originalDescriptor.set(value);
+        Object.defineProperty(obj, p, { configurable: true, writable: true, value });
+        if (settled) return;
+        settled = true;
+        rearm();
+      },
+    });
+  } catch { /* non-configurable — nothing to defer on */ }
 }

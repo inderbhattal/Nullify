@@ -1,4 +1,4 @@
-import { toMatcher } from './shared-utils.js';
+import { proxyApply, toMatcher, wrapInstanceGetter } from './shared-utils.js';
 
 /**
  * m3u-prune.js
@@ -17,12 +17,8 @@ export function m3uPrune(m3uPattern, urlPattern) {
   const matchUrl = urlPattern ? toMatcher(urlPattern) : () => true;
   const matchPrune = toMatcher(m3uPattern);
 
-  const origFetch = window.fetch;
-  window.fetch = async function (input, init) {
-    const url = typeof input === 'string' ? input : input?.url || '';
-    if (!matchUrl(url)) return origFetch.call(this, input, init);
-
-    const response = await origFetch.call(this, input, init);
+  const pruneResponse = async (context) => {
+    const response = await context.reflect();
     if (!response.ok) return response;
 
     try {
@@ -42,40 +38,33 @@ export function m3uPrune(m3uPattern, urlPattern) {
     return response;
   };
 
+  proxyApply(window, 'fetch', (context) => {
+    const input = context.callArgs[0];
+    const url = typeof input === 'string' ? input : input?.url || '';
+    if (!matchUrl(url)) return context.reflect();
+    return pruneResponse(context);
+  });
+
   // Also patch XHR as many players use it for playlists.
-  // Proxy preserves identity: static constants (XMLHttpRequest.DONE), the
-  // prototype chain and `instanceof` keep working — a bare replacement
-  // function dropped the statics and broke `readyState === XMLHttpRequest.DONE`
-  // comparisons on every page.
-  const OrigXHR = window.XMLHttpRequest;
-  window.XMLHttpRequest = new Proxy(OrigXHR, {
-    construct(target, args) {
-      const xhr = Reflect.construct(target, args);
-      const origOpen = xhr.open.bind(xhr);
-      let isTarget = false;
+  //
+  // §4.22: this used to be a `construct` trap that assigned own `open` and
+  // `responseText` properties to every instance — a real XHR has no own
+  // properties at all, so that was a one-line detector — and dropped
+  // `newTarget`, breaking `class Player extends XMLHttpRequest {}`. Everything
+  // now lives on the prototype, with per-instance state in a WeakMap.
+  const XHR = window.XMLHttpRequest;
+  if (typeof XHR !== 'function') return;
+  const targets = new WeakMap();
 
-      xhr.open = function (method, url, ...rest) {
-        isTarget = matchUrl(url);
-        return origOpen(method, url, ...rest);
-      };
+  proxyApply(XHR.prototype, 'open', (context) => {
+    const { thisArg, callArgs } = context;
+    if (matchUrl(String(callArgs[1] ?? ''))) targets.set(thisArg, true);
+    else targets.delete(thisArg);
+    return context.reflect();
+  });
 
-      const textDesc = Object.getOwnPropertyDescriptor(OrigXHR.prototype, 'responseText');
-      if (textDesc?.get) {
-        Object.defineProperty(xhr, 'responseText', {
-          get() {
-            const text = textDesc.get.call(this);
-            if (isTarget && text) {
-              const lines = text.split('\n');
-              const filtered = lines.filter(line => !matchPrune(line));
-              return filtered.join('\n');
-            }
-            return text;
-          },
-          configurable: true,
-        });
-      }
-
-      return xhr;
-    },
+  wrapInstanceGetter(XHR.prototype, 'responseText', (text, xhr) => {
+    if (targets.get(xhr) !== true || !text) return text;
+    return text.split('\n').filter((line) => !matchPrune(line)).join('\n');
   });
 }

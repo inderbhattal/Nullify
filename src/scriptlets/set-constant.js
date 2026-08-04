@@ -1,3 +1,5 @@
+import { getExtraArgs } from './shared-utils.js';
+
 /**
  * set-constant.js
  *
@@ -19,7 +21,7 @@ function isProtoPollutionKey(key) {
  *  resolved `undefined`, which is a legitimate value (`set, foo, undefined`). */
 const ABORT = Symbol('nullify:set-constant:abort');
 
-export function setConstant(prop, value) {
+export function setConstant(prop, value, ...args) {
   if (!prop) return;
 
   const parts = prop.split('.');
@@ -27,6 +29,25 @@ export function setConstant(prop, value) {
 
   const resolvedValue = resolveValue(value);
   if (resolvedValue === ABORT) return;
+
+  // §5.26: 10 corpus rules pass a third argument that used to be dropped.
+  // uBO reads it as varargs; the shipped values are `runAt, <state>` (defer
+  // installing the trap until the document reaches that readyState) and a bare
+  // `3`, which is uBO's numeric spelling of readyState `complete`.
+  // A recursive re-arm (deferred parent, below) never passes varargs, so this
+  // branch is evaluated exactly once per rule.
+  const extraArgs = getExtraArgs(args, 0);
+  const runAtWhen = extraArgs.runAt !== undefined ? extraArgs.runAt : args[0];
+  const target = readyStateRank(runAtWhen);
+  if (target !== 0 && readyStateRank(document.readyState) < target) {
+    const onStateChange = () => {
+      if (readyStateRank(document.readyState) < target) return;
+      document.removeEventListener('readystatechange', onStateChange, true);
+      setConstant(prop, value);
+    };
+    document.addEventListener('readystatechange', onStateChange, true);
+    return;
+  }
 
   const lastProp = parts[parts.length - 1];
 
@@ -63,6 +84,16 @@ export function setConstant(prop, value) {
     });
   } catch {
     // Existing non-configurable descriptor — best effort, skip.
+  }
+}
+
+/** uBO's `intFromReadyState`: 0 means "no deferral requested". */
+function readyStateRank(state) {
+  switch (`${state}`) {
+    case 'loading': case 'asap': case '1': return 1;
+    case 'interactive': case 'end': case '2': return 2;
+    case 'complete': case 'idle': case '3': return 3;
+    default: return 0;
   }
 }
 

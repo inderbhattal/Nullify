@@ -1,17 +1,29 @@
-import { patternToRegex } from './shared-utils.js';
+import {
+  functionToString, parseTimerBoost, parseTimerDelay, patternToRegex, proxyApply,
+} from './shared-utils.js';
 
-/** adjust-set-timeout.js — Adjust or multiply the delay of matching setTimeout calls. */
-export function adjustSetTimeout(pattern, delay, multiplier) {
-  const re = pattern ? patternToRegex(pattern) : null;
-  const targetDelay = delay !== undefined ? Number(delay) : undefined;
-  const mult = multiplier !== undefined ? Number(multiplier) : 0.001;
-  const origSetTimeout = window.setTimeout;
+/**
+ * adjust-set-timeout.js — Speed up (or slow down) matching setTimeout calls.
+ * uBO: `adjust-setTimeout` / `nano-setTimeout-booster` / `nano-stb` / `ast`.
+ *
+ * @param {string} needle - Matched against the stringified callback.
+ * @param {string} delay  - Delay to match. `*` means any delay; an absent or
+ *                          unparseable argument means **1000**, not "any".
+ * @param {string} boost  - Delay multiplier, clamped to [0.001, 50]. Default
+ *                          0.05 (20x faster).
+ */
+export function adjustSetTimeout(needle, delay, boost) {
+  const re = patternToRegex(needle === undefined ? '' : needle);
+  if (re === null) return;
+  const targetDelay = parseTimerDelay(delay);
+  const mult = parseTimerBoost(boost);
 
-  window.setTimeout = function (fn, ms, ...rest) {
-    const src = typeof fn === 'function' ? fn.toString() : String(fn);
-    if ((!re || re.test(src)) && (targetDelay === undefined || targetDelay === ms)) {
-      ms = Math.floor(ms * mult);
+  proxyApply(window, 'setTimeout', (context) => {
+    const { callArgs } = context;
+    const ms = callArgs[1];
+    if ((targetDelay === -1 || ms === targetDelay) && re.test(functionToString(callArgs[0]))) {
+      callArgs[1] = ms * mult;
     }
-    return origSetTimeout.call(this, fn, ms, ...rest);
-  };
+    return context.reflect();
+  });
 }

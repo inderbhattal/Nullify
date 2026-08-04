@@ -767,6 +767,14 @@ fn apply_scriptlet_exceptions(scriptlets: &mut Vec<ParsedRule>, exceptions: &[Pa
     }
 }
 
+/// The user allowlist outranks every shipped rule, static or dynamic (§4.5).
+/// It sits far above the static bands (1-6) and above the privacy band (100)
+/// because "trust this site" has to beat the hand-maintained system-unbreak
+/// blocks, which ship at 1100 and used to win. Must stay equal to
+/// `DNR_ALLOWLIST_PRIORITY` in src/background/service-worker.js — the worker
+/// re-stamps the band on rules from either builder, so a drift here is silent.
+const DNR_ALLOWLIST_PRIORITY: u32 = 100_000;
+
 fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<DnrRule> {
     let mut seen = HashSet::new();
     let mut rules = Vec::new();
@@ -780,7 +788,7 @@ fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<
     {
         rules.push(DnrRule {
             id: start_id + index as u32,
-            priority: 500,
+            priority: DNR_ALLOWLIST_PRIORITY,
             action: DnrAction {
                 action_type: "allowAllRequests".to_string(),
                 redirect: None,
@@ -1044,7 +1052,7 @@ fn parse_scriptlet_args(s: &str) -> Vec<String> {
 #[derive(Serialize, Deserialize)]
 pub struct DnrRule {
     id: u32,
-    priority: u16,
+    priority: u32,
     action: DnrAction,
     condition: DnrCondition,
 }
@@ -1312,10 +1320,10 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
     // (5), exactly as the static scheme intends. Runtime rules still sit far
     // above at 500 (allowlist) and 1000 (system-unbreak).
     let priority = match (is_exception, is_important) {
-        (true, true) => 6u16,   // @@...$important  -> IMPORTANT_ALLOW
-        (true, false) => 3u16,  // @@...            -> ALLOW
-        (false, true) => 4u16,  // ...$important    -> IMPORTANT_BLOCK
-        (false, false) => 1u16, // plain block      -> BLOCK
+        (true, true) => 6u32,   // @@...$important  -> IMPORTANT_ALLOW
+        (true, false) => 3u32,  // @@...            -> ALLOW
+        (false, true) => 4u32,  // ...$important    -> IMPORTANT_BLOCK
+        (false, false) => 1u32, // plain block      -> BLOCK
     };
 
     Some(DnrRule {
@@ -2960,12 +2968,12 @@ mod tests {
     fn user_filter_priority_bands_match_the_static_scale_exactly() {
         // scripts/build-rules.mjs DNR_PRIORITY, duplicated as the assertion's
         // subject. Six bands; user filters can only reach four of them.
-        const BLOCK: u16 = 1;
-        const REDIRECT: u16 = 2;
-        const ALLOW: u16 = 3;
-        const IMPORTANT_BLOCK: u16 = 4;
-        const IMPORTANT_REDIRECT: u16 = 5;
-        const IMPORTANT_ALLOW: u16 = 6;
+        const BLOCK: u32 = 1;
+        const REDIRECT: u32 = 2;
+        const ALLOW: u32 = 3;
+        const IMPORTANT_BLOCK: u32 = 4;
+        const IMPORTANT_REDIRECT: u32 = 5;
+        const IMPORTANT_ALLOW: u32 = 6;
 
         let priority_of = |filter: &str| {
             compile_user_filters_internal(filter, 1)
@@ -3000,7 +3008,7 @@ mod tests {
 
         // Runtime bands still sit far above every static band.
         let allowlist = build_allowlist_rules_internal(vec!["example.com".into()], 1);
-        assert_eq!(allowlist[0].priority, 500);
+        assert_eq!(allowlist[0].priority, DNR_ALLOWLIST_PRIORITY);
         assert!(allowlist[0].priority > IMPORTANT_ALLOW);
     }
 
@@ -3273,7 +3281,7 @@ mod tests {
 
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].id, 990000);
-        assert_eq!(rules[0].priority, 500);
+        assert_eq!(rules[0].priority, DNR_ALLOWLIST_PRIORITY);
         assert_eq!(
             rules[0].condition.url_filter.as_deref(),
             Some("||example.com^")

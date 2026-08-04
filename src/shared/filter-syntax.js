@@ -177,12 +177,21 @@ export function applyScriptletExceptions(scriptletRules, scriptletExceptions) {
   return out;
 }
 
+/**
+ * Split a cosmetic rule's domain prefix into included and excluded lists.
+ *
+ * Tokens are case-folded (§5.14b): hostnames are case-insensitive, lookups key
+ * on a lowercased hostname, and the Rust engine already folds. Keeping the
+ * author's case here meant `EXAMPLE.com##.Ad` was stored under a key no
+ * hostname can equal — dead in the JS engines, live in Rust, for the same
+ * line.
+ */
 export function splitDomainList(raw) {
   const domains = [];
   const excludedDomains = [];
 
   for (const part of String(raw || '').split(',')) {
-    const token = part.trim();
+    const token = part.trim().toLowerCase();
     if (!token) continue;
 
     if (token.startsWith('~')) {

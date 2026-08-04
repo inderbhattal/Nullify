@@ -281,20 +281,17 @@ export const FILTER_VECTORS = [
   },
 
   // --- domain case (§5.14b) -----------------------------------------------
-  // parseLine preserves the domain text as written; the engines diverge one
-  // step later, at KEYING. Rust lowercases the key (push_unique_domain_selector),
-  // so the rule lands in the bucket the lookup walk — which lowercases the
-  // hostname — actually asks for. The JS ingestion path keys the raw token, so
-  // the same filter is dead there. Rust's behaviour is the correct one;
-  // `splitDomainList` in src/shared/filter-syntax.js needs the same fold, at
-  // which point this vector's `domains` becomes ['example.com'].
-  // tests/wasm-parity.test.mjs asserts the lowercased key against the real
-  // WASM bundle. The selector's own case is data and must survive untouched.
+  // All three engines case-fold the domain key, because the lookup walk folds
+  // the hostname. Rust always did (push_unique_domain_selector); the JS engines
+  // kept the author's case and so keyed `EXAMPLE.com##.Ad` under a bucket no
+  // hostname can equal — dead in JS, live in Rust, from one line.
+  // tests/wasm-parity.test.mjs asserts the same key against the real WASM
+  // bundle. The selector's own case is data and must survive untouched.
   {
     line: 'EXAMPLE.com##.Ad',
     expect: {
       kind: 'cosmetic',
-      domains: ['EXAMPLE.com'],
+      domains: ['example.com'],
       excludedDomains: [],
       selector: '.Ad',
       exception: false,

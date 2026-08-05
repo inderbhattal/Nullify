@@ -1,5 +1,6 @@
 const sharedGlobals = {
   AbortController: 'readonly',
+  AbortSignal: 'readonly',
   ArrayBuffer: 'readonly',
   Blob: 'readonly',
   Buffer: 'readonly',
@@ -69,6 +70,7 @@ const nodeGlobals = {
   ...sharedGlobals,
   __dirname: 'readonly',
   process: 'readonly',
+  setImmediate: 'readonly',
 };
 
 const commonRules = {
@@ -105,6 +107,20 @@ export default [
       ecmaVersion: 'latest',
       sourceType: 'module',
       globals: nodeGlobals,
+    },
+    rules: commonRules,
+  },
+  {
+    // Test files run on Node but exercise browser-facing modules, so they
+    // stub DOM globals freely and need both sets. Without this block the
+    // `--ext .mjs` in `npm run lint` still handed eslint every
+    // `src/**/*.test.mjs`, but no block matched them — so they were parsed
+    // and then checked against zero rules, which reads exactly like passing.
+    files: ['**/*.test.mjs', 'tests/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      globals: { ...browserGlobals, ...nodeGlobals },
     },
     rules: commonRules,
   },

@@ -12,7 +12,7 @@ import { abortOnPropertyRead } from './abort-on-property-read.js';
 import { abortOnPropertyWrite } from './abort-on-property-write.js';
 import { setConstant } from './set-constant.js';
 import { abortCurrentInlineScript } from './abort-current-inline-script.js';
-import { jsonPrune } from './json-prune.js';
+import { jsonPrune, jsonPruneFetchResponse, jsonPruneXhrResponse } from './json-prune.js';
 import { preventFetch } from './prevent-fetch.js';
 import { preventXhr } from './prevent-xhr.js';
 import { removeAttr } from './remove-attr.js';
@@ -23,15 +23,19 @@ import { noSetTimeout } from './no-set-timeout-if.js';
 import { noSetInterval } from './no-set-interval-if.js';
 import { preventAddEventListener } from './prevent-add-event-listener.js';
 import { setCookie } from './set-cookie.js';
+import { trustedSetCookie, trustedSetCookieReload } from './trusted-set-cookie.js';
 import { setCookiePath } from './set-cookie-reload.js';
 import { removeCookie } from './remove-cookie.js';
+import { removeNodeText, replaceNodeText } from './replace-node-text.js';
 import { disableNewtabLinks } from './disable-newtab-links.js';
 import { adjustSetTimeout } from './adjust-set-timeout.js';
 import { adjustSetInterval } from './adjust-set-interval.js';
 import { noWindowOpenIf } from './no-window-open-if.js';
 import { preventWindowOpen } from './prevent-window-open.js';
-import { setLocalStorageItem } from './set-local-storage-item.js';
-import { setSessionStorageItem } from './set-session-storage-item.js';
+import {
+  setLocalStorageItem, trustedSetLocalStorageItem,
+  setSessionStorageItem, trustedSetSessionStorageItem,
+} from './set-local-storage-item.js';
 import { abortOnStackTrace } from './abort-on-stack-trace.js';
 import { noXhrIf } from './no-xhr-if.js';
 import { noFetchIf } from './no-fetch-if.js';
@@ -67,8 +71,12 @@ const REGISTRY = new Map([
   ['aost', abortOnStackTrace],
 
   // JSON/Object manipulation
+  // §4.21: the three uBO scriptlets hook one surface each. Aliasing them all
+  // to `jsonPrune` made `json-prune-fetch-response` also hook JSON.parse, so
+  // a rule scoped to one endpoint pruned every parsed JSON on the site.
   ['json-prune', jsonPrune],
-  ['json-prune-fetch-response', jsonPrune],
+  ['json-prune-fetch-response', jsonPruneFetchResponse],
+  ['json-prune-xhr-response', jsonPruneXhrResponse],
   ['object-prune', objectPrune],
 
   // Network interception
@@ -85,6 +93,11 @@ const REGISTRY = new Map([
   ['ac', addClass],
   ['remove-class', removeClass],
   ['rc', removeClass],
+  // §5.22: 1,111 corpus rules named these and resolved to nothing.
+  ['remove-node-text', removeNodeText],
+  ['rmnt', removeNodeText],
+  ['replace-node-text', replaceNodeText],
+  ['rpnt', replaceNodeText],
 
   // Timer/Event manipulation
   ['noeval', noeval],
@@ -117,6 +130,16 @@ const REGISTRY = new Map([
   ['set-session-storage-item', setSessionStorageItem],
   ['set-ssi', setSessionStorageItem],
 
+  // Trusted storage/cookie variants. Deliberately NOT aliases of the
+  // untrusted ones: the value gate in `set-cookie` /
+  // `set-local-storage-item` is precisely what distinguishes them (§5.22).
+  ['trusted-set-cookie', trustedSetCookie],
+  ['trusted-set-cookie-reload', trustedSetCookieReload],
+  ['trusted-set-local-storage-item', trustedSetLocalStorageItem],
+  ['trusted-set-session-storage-item', trustedSetSessionStorageItem],
+  ['trusted-replace-node-text', replaceNodeText],
+  ['trusted-rpnt', replaceNodeText],
+
   // Popup/window blocking
   ['no-window-open-if', noWindowOpenIf],
   ['nowoif', noWindowOpenIf],
@@ -148,6 +171,43 @@ const REGISTRY = new Map([
   ['stealth', botStealth],
   ['persona-spoof', personaSpoof],
 ]);
+
+// ---------------------------------------------------------------------------
+// Trust metadata (§5.25)
+// ---------------------------------------------------------------------------
+//
+// uBO marks privileged scriptlets `requiresTrust: true` and drops any filter
+// using one that did not come from a trusted list (its own lists, or the
+// user's own "My filters"). Nothing here carried that flag, so a third-party
+// list — or the picker's APPEND_USER_FILTER path — reached
+// `trusted-set-constant` (which `JSON.parse`s a value and installs it on an
+// arbitrary window path) and `trusted-replace-fetch-response` (which rewrites
+// arbitrary response bodies).
+//
+// This module is the registry, so it owns the flag; enforcement belongs to the
+// service worker at spec-build time, which is the only place that knows a
+// filter's source list. Names below are exactly the registry keys, aliases
+// included, so a caller can test the name it is about to dispatch.
+const TRUSTED_SCRIPTLETS = new Set([
+  'trusted-set-constant', 'tsc', 'trusted-set',
+  'trusted-click-element', 'tce',
+  'trusted-replace-fetch-response', 'trfr',
+  'trusted-replace-xhr-response', 'trxr',
+  'trusted-set-cookie', 'trusted-set-cookie-reload',
+  'trusted-set-local-storage-item', 'trusted-set-session-storage-item',
+  // uBO's `replace-node-text`/`rpnt` are aliases of the *trusted* scriptlet:
+  // the replacement text is written straight into a <script> node.
+  'trusted-replace-node-text', 'trusted-rpnt', 'replace-node-text', 'rpnt',
+]);
+
+/**
+ * Whether `name` may only be used by a filter from a trusted source.
+ * @param {string} name Registry key (canonical name or alias).
+ * @returns {boolean}
+ */
+function getScriptletTrustRequirement(name) {
+  return TRUSTED_SCRIPTLETS.has(name);
+}
 
 // ---------------------------------------------------------------------------
 // Executor
@@ -230,29 +290,52 @@ function run(name, args = []) {
 // ---------------------------------------------------------------------------
 // Public API — capability token handed to the bundle by the service worker.
 // ---------------------------------------------------------------------------
-// The SW injects a one-shot global `__nullifyBootKey` before loading this
+// The SW injects a global `__nullifyBootKey` (non-writable, non-configurable,
+// non-enumerable — see seedBootKey in the service worker) before loading this
 // bundle. We register the dispatcher under that key (non-enumerable +
-// non-configurable so page scripts can't enumerate or replace it), then
-// delete the temporary boot key.
+// non-configurable so page scripts can't enumerate or replace it).
 //
 // No fixed sentinel. No randomized `__nu*` prefix exposed via Object.keys.
 // If the boot key is missing (e.g. direct <script> load) we refuse to
 // register — the SW is the only legitimate caller.
+//
+// §4.24 (REVIEW-2026-07): the key must match the SW generator's exact shape.
+// A page that raced the seed→load gap and redefined the boot property to an
+// arbitrary string must not get the dispatcher registered under a name it
+// chose. `__n_` + 32 lowercase hex chars is the only shape the SW ever seeds.
+const BOOT_KEY_SHAPE = /^__n_[0-9a-f]{32}$/;
 const bootKey = globalThis.__nullifyBootKey;
-if (typeof bootKey === 'string' && bootKey.length > 0) {
+if (typeof bootKey === 'string' && BOOT_KEY_SHAPE.test(bootKey)) {
   try {
+    // `getUnknownScriptlets` rides along so the SW can read back which
+    // scriptlet names this page failed to resolve (§5.22). Without it the
+    // registry-miss counter has no consumer and a coverage regression is
+    // invisible in production, which is how the rate reached 20%. The SW's
+    // `verifyScriptletRegistry` admits exactly these two keys, both callable;
+    // widening the shape costs nothing against a forger, who could always
+    // satisfy the one-key form.
     Object.defineProperty(window, bootKey, {
-      value: Object.freeze({ run }),
+      value: Object.freeze({ run, getUnknownScriptlets }),
       writable: false,
       configurable: false,
       enumerable: false,
     });
   } catch {
-    // Attacker pre-claimed the key with a non-configurable descriptor — refuse.
+    // Attacker pre-claimed the key with a non-configurable descriptor — refuse
+    // to register. We cannot remove the page's object, so the SW re-verifies
+    // the registry's descriptor shape after this bundle loads and refuses to
+    // hand it any scriptlet specs (§4.24 layered fix 2).
   }
-  try {
-    delete globalThis.__nullifyBootKey;
-  } catch { /* ignore */ }
+  // NOTE (§4.24): the boot key is deliberately NOT deleted anymore. The SW
+  // seeds it configurable:false (so a polling page can't redefine it in the
+  // seed→load gap), which also makes it undeletable. A frozen, non-enumerable
+  // random string left on the global is harmless.
 }
 
-export { run, getUnknownScriptlets, REGISTRY };
+export {
+  run,
+  getUnknownScriptlets,
+  REGISTRY,
+  TRUSTED_SCRIPTLETS,
+  getScriptletTrustRequirement,
+};

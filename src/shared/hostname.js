@@ -51,6 +51,39 @@ export function normalizeHostname(input, { stripWww = true } = {}) {
 }
 
 /**
+ * Server-side validation for a single (already-normalized) allowlist entry
+ * (REVIEW-2026-07 §4.8). `normalizeHostname` is a canonicalizer, not a
+ * validator: it happily returns `com`, `co.uk`, or `foo bar`. A bare public
+ * suffix that reaches the DNR builder becomes `||co.uk^` + allowAllRequests —
+ * a TLD-wide blocking bypass that the matchers (which stop at public
+ * suffixes) never report, so the UI keeps saying "Protected".
+ *
+ * Rules, per the review's prescription:
+ *  - charset `/^[a-z0-9.-]+$/`, length ≤ 253, non-empty labels;
+ *  - at least one dot (dotted-quad IPv4 literals therefore pass; IPv6
+ *    literals contain ':' and fail the charset check — DNR `||<domain>^`
+ *    anchors don't support them meaningfully anyway);
+ *  - never a public suffix (`com`, `co.uk`, `netlify.app`, …).
+ *
+ * Callers should pass the output of `normalizeHostname`; raw user input is
+ * accepted but not canonicalized here.
+ *
+ * @param {unknown} domain
+ * @returns {boolean}
+ */
+export function isValidAllowlistDomain(domain) {
+  if (typeof domain !== 'string' || !domain) return false;
+  if (domain.length > 253) return false;
+  if (!/^[a-z0-9.-]+$/.test(domain)) return false;
+  // No empty labels ("a..b", ".a", "a.") and no oversized labels.
+  const labels = domain.split('.');
+  if (labels.some((label) => label.length === 0 || label.length > 63)) return false;
+  if (!domain.includes('.')) return false;
+  if (isPublicSuffix(domain)) return false;
+  return true;
+}
+
+/**
  * Normalize and dedupe an allowlist array while preserving insertion order.
  *
  * @param {unknown} domains

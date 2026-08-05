@@ -58,10 +58,18 @@ export default {
   },
 
   optimization: {
-    // Keep service worker as a single chunk — Chrome requires it
+    // Keep the service worker and every content-script entry as single
+    // chunks. Content scripts (`content`, `youtube-shield`) have no chunk-
+    // loading runtime: the first time src/shared/ crosses the 20KB minSize,
+    // webpack would emit a common chunk they cannot load and content
+    // filtering would die at page load. Only the extension-page bundles
+    // (popup, options) may share chunks.
     splitChunks: {
       chunks(chunk) {
-        return chunk.name !== 'service-worker' && chunk.name !== 'scriptlets-world';
+        return chunk.name !== 'service-worker'
+          && chunk.name !== 'scriptlets-world'
+          && chunk.name !== 'content'
+          && chunk.name !== 'youtube-shield';
       },
     },
   },

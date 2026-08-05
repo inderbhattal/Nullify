@@ -42,12 +42,16 @@ function defineNavigatorValue(key, value) {
   defineGetter(navigator, key, () => value);
 }
 
+// Module-scope guard. A global flag was page-writable — one inline script
+// setting it disabled the scriptlet — and enumerable via Object.keys(window).
+let appliedPersona = null;
+
 export function personaSpoof(personaId = 'default') {
   const persona = PERSONAS[personaId];
   if (!persona) return;
 
-  if (globalThis.__nullifyPersonaSpoof === personaId) return;
-  globalThis.__nullifyPersonaSpoof = personaId;
+  if (appliedPersona === personaId) return;
+  appliedPersona = personaId;
 
   defineNavigatorValue('userAgent', persona.userAgent);
   defineNavigatorValue('appVersion', persona.userAgent.replace(/^Mozilla\/5\.0\s*/, ''));

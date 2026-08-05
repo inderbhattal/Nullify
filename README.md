@@ -37,7 +37,7 @@
 | HTTP → HTTPS upgrade | ✅ | DNR `upgradeScheme` action |
 | WebRTC IP leak blocking | ✅ | `chrome.privacy` API |
 | Hyperlink auditing blocking | ✅ | `chrome.privacy` API |
-| Redirect rules ($redirect=) | ✅ | DNR redirect action |
+| Redirect rules ($redirect=) | ✅ | DNR redirect action (`$redirect-rule=` is dropped: uBO applies it only when another filter blocks, which DNR cannot express) |
 | removeparam ($removeparam=) | ✅ | DNR queryTransform |
 | Blocked count badge | ✅ | Per-tab stats |
 | Dashboard UI | ✅ | Filter lists, My Filters, Allowlist, Settings |
@@ -87,7 +87,7 @@ nullify/
 ## How It Works
 
 ### Network Blocking (declarativeNetRequest)
-Filter lists are pre-compiled at build time into Chrome's `declarativeNetRequest` format. Each list becomes an enabled static ruleset. The extension ships with 6 rulesets (30,000+ rules).
+Filter lists are pre-compiled at build time into Chrome's `declarativeNetRequest` format. Large lists are sharded across several ruleset files. The manifest declares 16 static rulesets, 7 of which are enabled by default; the service worker enables further shards at runtime as the global rule budget allows.
 
 ### Cosmetic Filtering (Content Scripts)
 The content script loads cosmetic rules from `rules/cosmetic-rules.json` and injects a `<style>` element at `document_start`, hiding ad elements before they render. A `MutationObserver` handles dynamically injected content.
@@ -98,8 +98,8 @@ The `scriptlets-world.js` bundle is injected into the page's MAIN JavaScript con
 ### MV3 Rule Limits
 | Type | Limit | Our Usage |
 |---|---|---|
-| Static rulesets | 50 enabled max | 6 |
-| Static rules | 30,000 guaranteed | ~41 (sample), ~150K+ (full) |
+| Static rulesets | 50 enabled max | 16 declared / 7 enabled by default |
+| Static rules | 30,000 guaranteed | ~22 (sample), ~65K+ compiled (full; enabled-by-default sum draws on the shared global pool) |
 | Dynamic rules | 30,000 (Chrome 121+) | User rules + allowlist |
 | Regex rules | 1,000 per type | Minimal |
 
@@ -125,15 +125,96 @@ npm run build:ext
 npm run dev
 ```
 
-### Full Build (downloads filter lists from internet)
+### Full Build (compiles the vendored filter lists)
+
+`npm run build:rules` does **not** touch the network. It compiles the
+fully-expanded list snapshots committed under `scripts/filter-lists/`, after
+verifying each one against `scripts/filter-lists.lock.json`.
 
 ```bash
-# Download EasyList, EasyPrivacy, uBO filters and compile to DNR
+# Compile EasyList, EasyPrivacy, uBO filters, … to DNR rulesets. Offline.
+# Output is staged and only swapped into rules/ on success — as one directory
+# rename — so a failed build never destroys or half-replaces the previous
+# good rulesets.
 npm run build:rules
 
 # Then build extension
 npm run build:ext
 ```
+
+#### Refreshing the upstream lists
+
+Upstream rotates constantly: measured, **6 of 8 lists changed within ~48 h** of
+a lock refresh (that was before `ubo-quick-fixes`; there are nine lists now).
+When the build fetched at build time, any list rotating between `git tag` and
+the CI build failed SRI and killed the release — a success window of minutes.
+Fetching is now a separate, deliberate step whose output is reviewed and
+committed:
+
+```bash
+# 1. Fetch upstream, expand every !#include, and write BOTH the snapshots and
+#    the SRI lock from the same bytes (they can never disagree).
+npm run refresh:lists
+
+# 2. Review what actually changed. This is the one moment upstream content
+#    enters the repo, and it is a plain text diff.
+git diff --stat scripts/filter-lists/
+git diff scripts/filter-lists/ubo-unbreak.txt
+
+# 3. Recompile and run the gates.
+npm run build:rules && npm test
+
+# 4. Commit the snapshots and the lock together.
+git add scripts/filter-lists scripts/filter-lists.lock.json
+```
+
+A missing snapshot, or a snapshot whose hash does not match the lock, fails the
+build with the command to run. Nothing falls back to the network.
+
+Cosmetic filters and scriptlets still refresh for users on the runtime's own
+24 h update alarm; the snapshots pin what the *static DNR rulesets* are
+compiled from.
+
+#### `ubo-quick-fixes` is the volatile one — a deliberate trade-off
+
+`scripts/filter-lists/ubo-quick-fixes.txt` is a snapshot of uAssets'
+[`quick-fixes.txt`](https://github.com/uBlockOrigin/uAssets/blob/master/filters/quick-fixes.txt),
+which declares:
+
+```
+! Expires: 8 hours
+```
+
+That is **by far the shortest expiry of anything we carry** — the other eight
+lists declare 12 h to 4 days. quick-fixes.txt is where uBO lands its *same-day*
+counter-moves, and it is the only place uBO's modern YouTube machinery lives
+(`json-prune-fetch-response` / `json-prune-xhr-response` on `/youtubei/v1/player`,
+`trusted-json-edit-xhr-request` request shaping, `trusted-prevent-dom-bypass`);
+none of it is in `filters.txt`, which we ingest as `ubo-filters`.
+
+The consequence of vendoring it is real and is stated here rather than left
+implicit: **a snapshot of this list goes stale within a working day, and its
+static DNR rules only reach users on a release.** We accept that because:
+
+- The alternative — fetching at build time — did not merely go stale, it broke
+  releases outright (see above). Staleness degrades; a failed SRI check ships
+  nothing at all.
+- Its DNR rules are a small minority of the list (28 of ~460 lines at the last
+  refresh). Almost everything that matters is cosmetic/scriptlet, and **those
+  are re-fetched by the service worker on its own 24 h alarm** — `ubo-quick-fixes`
+  is registered in `REMOTE_FILTER_LISTS`, so a fresh YouTube counter-move does
+  reach installed users without a release.
+- `npm run refresh:lists` immediately before tagging keeps the snapshot within
+  hours of upstream, and the diff is small enough to actually read.
+
+If YouTube breaks and the fix is known to be in quick-fixes.txt, the response is
+`npm run refresh:lists && npm run build:rules` and a release — not a build-time
+fetch.
+
+The list is treated as **trusted** (`TRUSTED_FILTER_LIST_IDS` in the service
+worker): it is a `ublock-*` list, matching uBO's own `trustedListPrefixes:
+'ublock-'` gate, and its YouTube rules depend on `trusted-replace-*`,
+`trusted-json-edit-*` and `trusted-rpnt`, which are trust-gated.
 
 ### Load in Chrome
 
@@ -164,8 +245,9 @@ git push origin main --follow-tags
 
 | Script | Description |
 |---|---|
-| `npm run build` | Full build (download rules + webpack) |
-| `npm run build:rules` | Download and compile filter lists only |
+| `npm run build` | Full build (compile rules + webpack) |
+| `npm run build:rules` | Compile the vendored lists to DNR rulesets (offline, SRI-verified) |
+| `npm run refresh:lists` | Fetch upstream and rewrite `scripts/filter-lists/` + the SRI lock (review and commit the diff) |
 | `npm run build:sample-rules` | Generate minimal rules for local testing |
 | `npm run build:ext` | Webpack bundle only |
 | `npm run dev` | Webpack watch mode |

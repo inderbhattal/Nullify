@@ -5,6 +5,13 @@
 import './options.css';
 
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
+import { call, MAX_USER_FILTERS_BYTES, utf8ByteLength } from './messaging.js';
+import {
+  describeAllowlistImport,
+  describeFilterApply,
+  describeFilterImport,
+  describeUpdateResult,
+} from './status-format.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -17,6 +24,7 @@ const FILTER_LISTS = [
   { id: 'ubo-filters',  name: 'uBO Filters',       desc: 'uBlock Origin default filter list' },
   { id: 'ubo-unbreak',  name: 'uBO Unbreak',       desc: 'Fixes over-blocking by other lists' },
   { id: 'anti-adblock', name: 'Anti-Adblock',      desc: 'Anti-adblock and badware fixes from uBO' },
+  { id: 'ubo-quick-fixes', name: 'uBO Quick Fixes', desc: 'Same-day countermeasures, including the current YouTube ad bypass' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -32,14 +40,28 @@ function initNav() {
   if (sidebarVersionEl) sidebarVersionEl.textContent = `v${manifest.version}`;
 
   document.querySelectorAll('.nav-item').forEach((item) => {
-    item.addEventListener('click', () => {
+    const activate = () => {
       const tabId = item.dataset.tab;
 
-      document.querySelectorAll('.nav-item').forEach((n) => n.classList.remove('active'));
+      document.querySelectorAll('.nav-item').forEach((n) => {
+        n.classList.remove('active');
+        n.setAttribute('aria-selected', 'false');
+      });
       document.querySelectorAll('.tab-content').forEach((t) => t.classList.remove('active'));
 
       item.classList.add('active');
+      item.setAttribute('aria-selected', 'true');
       $(`tab-${tabId}`)?.classList.add('active');
+    };
+
+    item.addEventListener('click', activate);
+    // The nav items are <li> elements, not buttons — without this they are
+    // keyboard-unreachable dead ends even with tabindex.
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        activate();
+      }
     });
   });
 }
@@ -47,6 +69,13 @@ function initNav() {
 // ---------------------------------------------------------------------------
 // Filter Lists
 // ---------------------------------------------------------------------------
+function showListsStatus(msg, type, detail) {
+  showStatus('listsStatus', msg, type, detail);
+}
+
+/** Display name for a ruleset id, falling back to the id itself. */
+const listNameFor = (id) => FILTER_LISTS.find((list) => list.id === id)?.name || id;
+
 async function initFilterLists() {
   const getStatusText = (state) => state === false ? 'Disabled' : state === 'partial' ? 'Partial' : 'Active';
   const isEffectivelyEnabled = (state) => state !== false;
@@ -54,12 +83,12 @@ async function initFilterLists() {
   let enabled = {};
   let lastUpdate = 0;
   try {
-    const res = await Promise.all([
-      chrome.runtime.sendMessage({ type: 'GET_ENABLED_RULESETS' }),
-      chrome.storage.local.get('lastUpdateCheck')
-    ]);
-    enabled = res[0] || {};
-    lastUpdate = res[1]?.lastUpdateCheck || 0;
+    enabled = (await call('GET_ENABLED_RULESETS')) || {};
+  } catch (err) {
+    showListsStatus('✗ Failed to load filter list state: ' + err.message, 'error');
+  }
+  try {
+    lastUpdate = (await chrome.storage.local.get('lastUpdateCheck'))?.lastUpdateCheck || 0;
   } catch {}
 
   const updateStatusText = () => {
@@ -79,14 +108,14 @@ async function initFilterLists() {
   grid.innerHTML = '';
 
   for (const list of FILTER_LISTS) {
-    const initialState = enabled[list.id];
-    const isEnabled = isEffectivelyEnabled(initialState);
+    let currentState = enabled[list.id];
+    const isEnabled = isEffectivelyEnabled(currentState);
 
     const card = document.createElement('div');
     card.className = 'list-card' + (isEnabled ? '' : ' disabled');
     card.innerHTML = `
       <label class="list-toggle">
-        <input type="checkbox" ${isEnabled ? 'checked' : ''} data-listid="${list.id}">
+        <input type="checkbox" ${isEnabled ? 'checked' : ''} data-listid="${list.id}" aria-label="Enable ${list.name}">
         <span class="list-toggle-track"></span>
       </label>
       <div class="list-info">
@@ -94,17 +123,19 @@ async function initFilterLists() {
         <div class="list-desc">${list.desc}</div>
       </div>
       <div class="list-meta" id="meta-${list.id}">
-        ${getStatusText(initialState)}
+        ${getStatusText(currentState)}
       </div>
     `;
 
     const checkbox = card.querySelector('input[type="checkbox"]');
-    checkbox.indeterminate = initialState === 'partial';
+    checkbox.indeterminate = currentState === 'partial';
     checkbox.addEventListener('change', async () => {
       const nowEnabled = checkbox.checked;
+      const prevState = currentState;
       const applyState = (enabledMap) => {
         const actualState = enabledMap?.[list.id];
         const actualEnabled = isEffectivelyEnabled(actualState);
+        currentState = actualState;
         checkbox.checked = actualEnabled;
         checkbox.indeterminate = actualState === 'partial';
         card.className = 'list-card' + (actualEnabled ? '' : ' disabled');
@@ -113,11 +144,17 @@ async function initFilterLists() {
 
       applyState({ [list.id]: nowEnabled });
 
-      const res = await chrome.runtime.sendMessage({
-        type: 'SET_RULESET_ENABLED',
-        payload: { rulesetId: list.id, enabled: nowEnabled },
-      });
-      applyState(res?.enabledMap || {});
+      try {
+        const res = await call('SET_RULESET_ENABLED', {
+          rulesetId: list.id,
+          enabled: nowEnabled,
+        });
+        applyState(res?.enabledMap || {});
+      } catch (err) {
+        // Revert the optimistic flip — the SW is authoritative.
+        applyState({ [list.id]: prevState });
+        showListsStatus(`✗ ${list.name}: ${err.message}`, 'error');
+      }
     });
 
     grid.appendChild(card);
@@ -126,17 +163,23 @@ async function initFilterLists() {
   $('btnUpdateAll').addEventListener('click', async () => {
     $('btnUpdateAll').textContent = 'Updating...';
     $('btnUpdateAll').disabled = true;
-    
+
     try {
-      // Trigger background update check
-      await chrome.runtime.sendMessage({ type: 'CHECK_FILTER_UPDATES' });
-      
-      // Refresh last update time
-      const res = await chrome.storage.local.get('lastUpdateCheck');
-      lastUpdate = res.lastUpdateCheck || Date.now();
+      // Trigger background update check. §5.3 — a total fetch failure comes
+      // back as `{ok:false, error}`, which `call()` turns into a rejection, so
+      // "Update All" while offline reports instead of silently no-opping.
+      const res = await call('CHECK_FILTER_UPDATES');
+      const outcome = describeUpdateResult(res, listNameFor);
+      showListsStatus(outcome.message, outcome.type, outcome.detail);
+
+      // Refresh last update time from what the SW actually wrote. Falling back
+      // to `Date.now()` here would render a "Last check" the SW never
+      // recorded — the §5.3 lie one layer up.
+      const stored = await chrome.storage.local.get('lastUpdateCheck');
+      lastUpdate = Number(stored?.lastUpdateCheck) || lastUpdate;
       updateStatusText();
     } catch (err) {
-      console.error('Update failed:', err);
+      showListsStatus('✗ Update failed: ' + err.message, 'error');
     }
 
     setTimeout(() => {
@@ -151,23 +194,34 @@ async function initFilterLists() {
 // ---------------------------------------------------------------------------
 async function initMyFilters() {
   try {
-    const res = await chrome.runtime.sendMessage({ type: 'GET_USER_FILTERS' });
+    const res = await call('GET_USER_FILTERS');
     $('userFiltersArea').value = res?.filters || '';
-  } catch {}
+  } catch (err) {
+    showFilterStatus('✗ Failed to load filters: ' + err.message, 'error');
+  }
 
+  // Resolves with the applied-status descriptor (see status-format.js) when
+  // the SW accepted the filters, or `null` when it did not.
   const saveFilters = async () => {
     const filters = $('userFiltersArea').value;
+    // The UI budget is UTF-8 bytes and the SW's is UTF-16 code units, which is
+    // never larger — so an over-cap paste fails here, with a clear message,
+    // before the SW can reject it (see messaging.js).
+    if (utf8ByteLength(filters) > MAX_USER_FILTERS_BYTES) {
+      showFilterStatus(`✗ Filters exceed the ${MAX_USER_FILTERS_BYTES / (1024 * 1024)} MB limit`, 'error');
+      return null;
+    }
     try {
-      const counts = await chrome.runtime.sendMessage({
-        type: 'SET_USER_FILTERS',
-        payload: { filters },
-      });
-      const msg = counts 
-        ? `✓ Applied ${counts.network} network and ${counts.cosmetic} cosmetic rules`
-        : '✓ Filters applied successfully';
-      showFilterStatus(msg, 'success');
+      // §5.32 — `counts.skippedNetwork` / `counts.skippedRules` report the
+      // lines Chrome refused. Reporting only `network`/`cosmetic` claimed
+      // success over every dropped rule.
+      const counts = await call('SET_USER_FILTERS', { filters });
+      const applied = describeFilterApply(counts);
+      showFilterStatus(applied.message, applied.type, applied.detail);
+      return applied;
     } catch (err) {
       showFilterStatus('✗ Error: ' + err.message, 'error');
+      return null;
     }
   };
 
@@ -209,14 +263,13 @@ async function initMyFilters() {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = '.txt,.text,text/plain';
-    const MAX_IMPORT_BYTES = 5 * 1024 * 1024; // 5 MB
     input.addEventListener('change', async () => {
       const file = input.files?.[0];
       if (!file) return;
       // Reject oversized files before calling `.text()` so a huge upload
-      // cannot pin the UI thread on decoding.
-      if (file.size > MAX_IMPORT_BYTES) {
-        showFilterStatus(`✗ File too large (>${MAX_IMPORT_BYTES / (1024 * 1024)} MB)`, 'error');
+      // cannot pin the UI thread on decoding. Same 2 MB budget as the SW.
+      if (file.size > MAX_USER_FILTERS_BYTES) {
+        showFilterStatus(`✗ File too large (>${MAX_USER_FILTERS_BYTES / (1024 * 1024)} MB)`, 'error');
         return;
       }
       try {
@@ -237,14 +290,19 @@ async function initMyFilters() {
         const existing = area.value.trim();
         const newRules = filtered.split('\n').map(r => r.trim()).filter(Boolean);
         const existingRules = existing.split('\n').map(r => r.trim()).filter(Boolean);
-        
+
         // Merge and deduplicate
         const merged = [...new Set([...existingRules, ...newRules])].join('\n');
         area.value = merged;
-        
-        // Auto-apply for better UX
-        await saveFilters();
-        showFilterStatus(`✓ Imported ${file.name} (${newRules.length} rules added)`, 'success');
+
+        // Auto-apply for better UX. Only report the import as done when the
+        // SW actually accepted the merged filters — and carry the skip report
+        // into the import message, since it replaces the save status.
+        const applied = await saveFilters();
+        if (applied) {
+          const outcome = describeFilterImport(file.name, newRules.length, applied);
+          showFilterStatus(outcome.message, outcome.type, outcome.detail);
+        }
       } catch (err) {
         showFilterStatus('✗ Import failed: ' + err.message, 'error');
       }
@@ -253,25 +311,66 @@ async function initMyFilters() {
   });
 }
 
-function showFilterStatus(msg, type) {
-  showStatus('filterStatus', msg, type);
+function showFilterStatus(msg, type, detail) {
+  showStatus('filterStatus', msg, type, detail);
 }
 
-function showAllowlistStatus(msg, type) {
-  showStatus('allowlistStatus', msg, type);
+function showAllowlistStatus(msg, type, detail) {
+  showStatus('allowlistStatus', msg, type, detail);
 }
 
-function showStatus(id, msg, type) {
+function showSettingsStatus(msg, type) {
+  showStatus('settingsStatus', msg, type);
+}
+
+/**
+ * Render a status line. `detail` (optional array of strings) becomes a
+ * collapsed <details> disclosure beneath it — that is how the §5.32 honesty
+ * fields (per-rule skip reasons, rejected allowlist entries) reach the user
+ * without turning the one-line status into a wall of text.
+ *
+ * A status carrying detail is *not* auto-cleared: the 3 s timer would delete
+ * the disclosure before it could be opened. It stays until the next status
+ * replaces it.
+ */
+function showStatus(id, msg, type, detail) {
   const el = $(id);
   if (!el) return;
-  el.textContent = msg;
+  el.textContent = '';
   el.style.color = type === 'error'
     ? 'var(--red)'
     : type === 'warning'
       ? 'var(--yellow)'
       : 'var(--accent2)';
+
+  const line = document.createElement('span');
+  line.textContent = msg;
+  el.appendChild(line);
+
+  const lines = (Array.isArray(detail) ? detail : []).filter(Boolean);
+  if (lines.length > 0) {
+    const details = document.createElement('details');
+    details.className = 'status-detail';
+    const summary = document.createElement('summary');
+    summary.textContent = `Show details (${lines.length})`;
+    details.appendChild(summary);
+
+    const ul = document.createElement('ul');
+    for (const text of lines) {
+      const li = document.createElement('li');
+      // textContent, not innerHTML — reasons come from Chrome's DNR errors and
+      // domains from the imported file; neither is trusted markup.
+      li.textContent = text;
+      ul.appendChild(li);
+    }
+    details.appendChild(ul);
+    el.appendChild(details);
+  }
+
   if (el._clearTimer) clearTimeout(el._clearTimer);
-  el._clearTimer = setTimeout(() => { el.textContent = ''; }, 3000);
+  el._clearTimer = lines.length > 0
+    ? null
+    : setTimeout(() => { el.textContent = ''; }, 3000);
 }
 
 // ---------------------------------------------------------------------------
@@ -288,21 +387,26 @@ async function initAllowlist() {
       return;
     }
 
-    const res = await chrome.runtime.sendMessage({
-      type: 'ALLOW_SITE',
-      payload: { domain },
-    });
-    if (res?.ok === false) {
-      showAllowlistStatus('Enter a valid hostname or URL', 'error');
-      return;
+    try {
+      const res = await call('ALLOW_SITE', { domain });
+      $('allowlistInput').value = '';
+      await renderAllowlist(res?.allowlist);
+    } catch (err) {
+      // §5.32 — the SW rejects public suffixes and bare TLDs with an error
+      // naming the domain (and a `rejected` array). Show its reason rather
+      // than a generic "invalid" that hides which entry was refused.
+      showAllowlistStatus('✗ ' + (err?.message || 'Enter a valid hostname or URL'), 'error');
     }
-
-    $('allowlistInput').value = '';
-    await renderAllowlist(res?.allowlist);
   });
 
   $('btnExportAllowlist').addEventListener('click', async () => {
-    const allowlist = await fetchAllowlist();
+    let allowlist;
+    try {
+      allowlist = await fetchAllowlist();
+    } catch (err) {
+      showAllowlistStatus('✗ Export failed: ' + err.message, 'error');
+      return;
+    }
     if (allowlist.length === 0) {
       showAllowlistStatus('Nothing to export — allowlist is empty', 'error');
       return;
@@ -344,24 +448,28 @@ async function initAllowlist() {
           return;
         }
 
-        const current = await fetchAllowlist();
-        const merged = normalizeAllowlist(current.concat(imported));
-        const addedCount = merged.length - current.length;
-        if (addedCount === 0) {
-          showAllowlistStatus('No new sites to import', 'warning');
+        // Read the current list only to report an accurate "added" count.
+        // If this read fails, abort — never fall back to an empty list.
+        let current;
+        try {
+          current = await fetchAllowlist();
+        } catch (err) {
+          showAllowlistStatus('✗ Import aborted — could not read current allowlist: ' + err.message, 'error');
           return;
         }
 
-        const res = await chrome.runtime.sendMessage({
-          type: 'SET_ALLOWLIST',
-          payload: { domains: merged },
-        });
-        if (res?.ok === false) {
-          throw new Error(res.error || 'Allowlist import failed');
-        }
+        // The SW merges against its authoritative state; a read-then-replace
+        // here could wipe the allowlist if the read raced a SW restart.
+        const res = await call('ADD_ALLOWLIST_DOMAINS', { domains: imported });
+        const merged = normalizeAllowlist(res?.allowlist || []);
+        const addedCount = Math.max(0, merged.length - current.length);
 
-        await renderAllowlist(res?.allowlist || merged);
-        showAllowlistStatus(`✓ Imported ${file.name} (${addedCount} sites added)`, 'success');
+        await renderAllowlist(merged);
+        // §5.32 — `res.rejected` lists the entries the SW's validator refused
+        // (public suffixes, bare TLDs). Reporting only the added count made
+        // those disappear behind a success message.
+        const outcome = describeAllowlistImport(file.name, addedCount, res?.rejected);
+        showAllowlistStatus(outcome.message, outcome.type, outcome.detail);
       } catch (err) {
         showAllowlistStatus('✗ Import failed: ' + err.message, 'error');
       }
@@ -389,18 +497,23 @@ function parseAllowlistText(text) {
   );
 }
 
+// Throws on failure — callers must not treat "could not read" as "empty".
 async function fetchAllowlist() {
-  try {
-    return normalizeAllowlist(await chrome.runtime.sendMessage({ type: 'GET_ALLOWLIST' }) || []);
-  } catch {
-    return [];
-  }
+  const resp = await call('GET_ALLOWLIST');
+  return normalizeAllowlist(Array.isArray(resp) ? resp : []);
 }
 
 async function renderAllowlist(allowlistOverride) {
-  const allowlist = Array.isArray(allowlistOverride)
-    ? normalizeAllowlist(allowlistOverride)
-    : await fetchAllowlist();
+  let allowlist;
+  try {
+    allowlist = Array.isArray(allowlistOverride)
+      ? normalizeAllowlist(allowlistOverride)
+      : await fetchAllowlist();
+  } catch (err) {
+    // Keep whatever is currently rendered rather than showing a false empty.
+    showAllowlistStatus('✗ Failed to load allowlist: ' + err.message, 'error');
+    return;
+  }
 
   const ul = $('allowlistItems');
   ul.innerHTML = '';
@@ -421,15 +534,17 @@ async function renderAllowlist(allowlistOverride) {
       <button class="allowlist-remove" title="Remove">×</button>
     `;
     li.querySelector('.allowlist-item-domain').textContent = domain;
-    
+
     const removeBtn = li.querySelector('.allowlist-remove');
     removeBtn.dataset.domain = domain;
+    removeBtn.setAttribute('aria-label', `Remove ${domain} from allowlist`);
     removeBtn.addEventListener('click', async () => {
-      const res = await chrome.runtime.sendMessage({
-        type: 'DISALLOW_SITE',
-        payload: { domain },
-      });
-      await renderAllowlist(res?.allowlist);
+      try {
+        const res = await call('DISALLOW_SITE', { domain });
+        await renderAllowlist(res?.allowlist);
+      } catch (err) {
+        showAllowlistStatus(`✗ Could not remove ${domain}: ${err.message}`, 'error');
+      }
     });
     ul.appendChild(li);
   }
@@ -438,45 +553,69 @@ async function renderAllowlist(allowlistOverride) {
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
+const SETTING_BINDINGS = [
+  { id: 'settingWebRTC',      key: 'blockWebRTC',            fromSettings: (s) => s.blockWebRTC !== false },
+  { id: 'settingPing',        key: 'blockHyperlinkAuditing', fromSettings: (s) => s.blockHyperlinkAuditing !== false },
+  { id: 'settingHTTPS',       key: 'upgradeInsecureRequests', fromSettings: (s) => s.upgradeInsecureRequests !== false },
+  { id: 'settingBadge',       key: 'showBadge',              fromSettings: (s) => s.showBadge !== false },
+  { id: 'settingCookies',     key: 'blockThirdPartyCookies', fromSettings: (s) => s.blockThirdPartyCookies === true },
+  { id: 'settingFingerprint', key: 'fingerprintProtection',  fromSettings: (s) => s.fingerprintProtection === true },
+  { id: 'settingHeaders',     key: 'stripTrackingHeaders',   fromSettings: (s) => s.stripTrackingHeaders !== false },
+  { id: 'settingStealth',     key: 'enhancedStealth',        fromSettings: (s) => s.enhancedStealth === true },
+  { id: 'settingPersona',     key: 'stealthPersona',         fromSettings: (s) => s.stealthPersona || 'default' },
+  { id: 'settingCache',       key: 'cacheProtection',        fromSettings: (s) => s.cacheProtection !== false },
+  { id: 'settingReferrer',    key: 'referrerControl',        fromSettings: (s) => s.referrerControl !== false },
+];
+
+function applySettingsToDom(settings) {
+  const s = settings || {};
+  for (const binding of SETTING_BINDINGS) {
+    const el = $(binding.id);
+    if (!el) continue;
+    const value = binding.fromSettings(s);
+    if (el.type === 'checkbox') {
+      el.checked = value;
+    } else {
+      el.value = value;
+    }
+  }
+}
+
 async function initSettings() {
   let settings = {};
   try {
-    settings = await chrome.runtime.sendMessage({ type: 'GET_SETTINGS' }) || {};
-  } catch {}
+    settings = (await call('GET_SETTINGS')) || {};
+  } catch (err) {
+    showSettingsStatus('✗ Failed to load settings: ' + err.message, 'error');
+  }
+  applySettingsToDom(settings);
 
-  $('settingWebRTC').checked = settings.blockWebRTC !== false;
-  $('settingPing').checked = settings.blockHyperlinkAuditing !== false;
-  $('settingHTTPS').checked = settings.upgradeInsecureRequests !== false;
-  $('settingBadge').checked = settings.showBadge !== false;
-  $('settingCookies').checked = settings.blockThirdPartyCookies === true;
-  $('settingFingerprint').checked = settings.fingerprintProtection === true;
-  $('settingHeaders').checked = settings.stripTrackingHeaders !== false;
-  $('settingStealth').checked = settings.enhancedStealth === true;
-  $('settingPersona').value = settings.stealthPersona || 'default';
-  $('settingCache').checked = settings.cacheProtection !== false;
-  $('settingReferrer').checked = settings.referrerControl !== false;
-
-  const saveSettings = async () => {
-    await chrome.runtime.sendMessage({
-      type: 'SET_SETTINGS',
-      payload: {
-        blockWebRTC: $('settingWebRTC').checked,
-        blockHyperlinkAuditing: $('settingPing').checked,
-        upgradeInsecureRequests: $('settingHTTPS').checked,
-        showBadge: $('settingBadge').checked,
-        blockThirdPartyCookies: $('settingCookies').checked,
-        fingerprintProtection: $('settingFingerprint').checked,
-        stripTrackingHeaders: $('settingHeaders').checked,
-        enhancedStealth: $('settingStealth').checked,
-        stealthPersona: $('settingPersona').value,
-        cacheProtection: $('settingCache').checked,
-        referrerControl: $('settingReferrer').checked,
-      },
+  for (const binding of SETTING_BINDINGS) {
+    const el = $(binding.id);
+    if (!el) continue;
+    el.addEventListener('change', async () => {
+      // Send only the changed key; the SW merges it atomically. A full
+      // SET_SETTINGS replace from this tab's (possibly stale) DOM would
+      // clobber concurrent popup edits (§4.18).
+      const value = el.type === 'checkbox' ? el.checked : el.value;
+      try {
+        const res = await call('UPDATE_SETTINGS', { [binding.key]: value });
+        if (res?.settings) applySettingsToDom(res.settings);
+      } catch (err) {
+        showSettingsStatus('✗ Failed to save setting: ' + err.message, 'error');
+        // Re-sync the control with the SW's authoritative state.
+        try {
+          applySettingsToDom((await call('GET_SETTINGS')) || {});
+        } catch {}
+      }
     });
-  };
+  }
 
-  ['settingWebRTC', 'settingPing', 'settingHTTPS', 'settingBadge', 'settingCookies', 'settingFingerprint', 'settingHeaders', 'settingStealth', 'settingPersona', 'settingCache', 'settingReferrer'].forEach((id) => {
-    $(id).addEventListener('change', saveSettings);
+  // Keep this tab's DOM in sync with edits made elsewhere (e.g. the popup's
+  // persona selector) so a later change here can't revert them.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== 'local' || !changes.settings) return;
+    applySettingsToDom(changes.settings.newValue || {});
   });
 }
 
@@ -490,7 +629,7 @@ class LiveLogger {
     this.filter = 'all';
     this.searchQuery = '';
     this.container = $('loggerItems');
-    
+
     if (!this.container) return;
 
     this.bindEvents();
@@ -517,12 +656,12 @@ class LiveLogger {
     if (filtered.length === 0) return;
 
     let csvContent = 'Time,Type,Action,Info,Extra\n';
-    
+
     for (const e of filtered) {
       const time = new Date(e.timestamp).toISOString();
       let info = '';
       let extra = '';
-      
+
       if (e.type === 'network') {
         info = e.url;
         extra = `${e.method} | ${e.resourceType} | ${e.rulesetId}${e.isTracker ? ' | tracker' : ''}`;
@@ -534,7 +673,7 @@ class LiveLogger {
       // Escape quotes for CSV
       const safeInfo = `"${info.replace(/"/g, '""')}"`;
       const safeExtra = `"${extra.replace(/"/g, '""')}"`;
-      
+
       csvContent += `${time},${e.type},${e.action},${safeInfo},${safeExtra}\n`;
     }
 
@@ -573,12 +712,12 @@ class LiveLogger {
     if (this.events.length > this.maxEvents) {
       this.events.pop();
     }
-    
+
     // Only render immediately if it matches current filters
     if (this.matchesFilter(event)) {
       const row = this.createLogRow(event);
       this.container.prepend(row);
-      
+
       // Limit DOM size too
       if (this.container.children.length > this.maxEvents) {
         this.container.lastElementChild.remove();
@@ -604,7 +743,7 @@ class LiveLogger {
     this.container.innerHTML = '';
     const filtered = this.events.filter(e => this.matchesFilter(e));
     const fragment = document.createDocumentFragment();
-    
+
     for (const event of filtered) {
       fragment.appendChild(this.createLogRow(event));
     }
@@ -614,9 +753,9 @@ class LiveLogger {
   createLogRow(e) {
     const row = document.createElement('div');
     row.className = 'log-entry';
-    
+
     const time = new Date(e.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    
+
     const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
     const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : e.action === 'modify' ? 'badge-modify' : e.action === 'remove' ? 'badge-remove' : 'badge-hide';
     const trackerBadge = e.isTracker ? '<span class="log-badge" style="background:rgba(255,121,198,0.15);color:#ff79c6;margin-left:4px">tracker</span>' : '';
@@ -632,12 +771,17 @@ class LiveLogger {
                   <span class="log-extra" title="${this.esc(e.hostname)}">${this.esc(e.hostname)}</span>`;
     }
 
+    // `type`/`action` originate from content-script payloads (the SW passes
+    // `payload.action` through unvalidated), so they must be escaped like
+    // every other field before entering this privileged page's DOM (§4.13).
     row.innerHTML = `
-      <div class="log-col-time">${time}</div>
-      <div class="log-col-type"><span class="log-badge ${typeBadge}">${e.type}</span></div>
-      <div class="log-col-action"><span class="log-badge ${actionBadge}">${e.action}</span></div>
+      <div class="log-col-time">${this.esc(time)}</div>
+      <div class="log-col-type"><span class="log-badge ${typeBadge}"></span></div>
+      <div class="log-col-action"><span class="log-badge ${actionBadge}"></span></div>
       <div class="log-col-info">${infoHtml}</div>
     `;
+    row.querySelector('.log-col-type .log-badge').textContent = e.type ?? '';
+    row.querySelector('.log-col-action .log-badge').textContent = e.action ?? '';
 
     // Add click-to-copy handler
     const copyTarget = row.querySelector('[data-copy]');
@@ -646,7 +790,7 @@ class LiveLogger {
         try {
           const textToCopy = ev.target.getAttribute('data-copy');
           await navigator.clipboard.writeText(textToCopy);
-          
+
           // Brief visual feedback
           const originalTitle = ev.target.title;
           ev.target.title = "Copied!";
@@ -660,7 +804,7 @@ class LiveLogger {
         }
       });
     }
-    
+
     return row;
   }
 
@@ -688,7 +832,7 @@ async function main() {
     initAllowlist(),
     initSettings(),
   ]);
-  
+
   // Initialize Logger
   new LiveLogger();
 }

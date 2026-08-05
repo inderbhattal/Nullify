@@ -51,6 +51,31 @@ pub struct BloomFilter {
 /// on wasm32 no matter what a stored payload declares.
 const MAX_BLOOM_BITS: usize = 1 << 27;
 
+/// Serialization format tag written by both the JS and Rust serializers.
+///
+/// Format 1 means "bit indices come from the 32-bit FNV-1a variant in
+/// src/shared/bloom.js". Anything else — including a payload with *no* format
+/// field — is refused here (safe empty fallback) so a format change degrades
+/// to a rebuild instead of silently cross-loading incompatible bits.
+///
+/// An untagged payload is deliberately NOT treated as compatible legacy data
+/// on this side (§5.12). The earlier rationale — "legacy payloads used the
+/// same hash" — held only for legacy *JS* payloads. Untagged payloads reaching
+/// this deserializer are overwhelmingly ones this very struct wrote before the
+/// tag existed, back when `calculate_hash` was the 64-bit FNV-multiply variant
+/// whose bit indices have nothing to do with format 1. That was the primary
+/// storage path (the service worker prefers WASM whenever it initialized), so
+/// "no tag" here is precisely the incompatible case, not the compatible one.
+/// Loading it would answer `has()` from a foreign bit pattern: false negatives
+/// for real domains, false positives for others, with no error anywhere.
+///
+/// The JS deserializer in src/shared/bloom.js may keep accepting untagged
+/// payloads — the legacy blobs *it* can encounter genuinely do use the same
+/// 32-bit hash — so the two sides are asymmetric on purpose.
+///
+/// Keep the value in sync with `BLOOM_FORMAT` in src/shared/bloom.js.
+const BLOOM_FORMAT: u32 = 1;
+
 #[wasm_bindgen]
 impl BloomFilter {
     #[wasm_bindgen(constructor)]
@@ -91,17 +116,34 @@ impl BloomFilter {
         true
     }
 
-    fn calculate_hash(&self, key: &str, seed: u8) -> u64 {
-        let mut h = 0x811c9dc5u64 ^ (seed as u64);
-        for b in key.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+    /// Bit-identical port of `BloomFilter._hash` in src/shared/bloom.js.
+    ///
+    /// The two engines cross-load each other's serialized filters, so the two
+    /// hashes must agree bit for bit or every non-empty key maps to different
+    /// bits and `has()` returns false for ~99% of domains (§4.1). JS iterates
+    /// UTF-16 code units (`charCodeAt`), so we do too — for the ASCII
+    /// hostnames actually stored the units equal the UTF-8 bytes, and for
+    /// anything else `encode_utf16` still matches JS exactly. All arithmetic
+    /// is wrapping u32, which is congruent mod 2^32 with JS's int32 shifts
+    /// followed by the final `>>> 0`.
+    fn calculate_hash(&self, key: &str, seed: u8) -> u32 {
+        let mut h: u32 = 0x811c9dc5 ^ (seed as u32);
+        for unit in key.encode_utf16() {
+            h ^= unit as u32;
+            h = h.wrapping_add(
+                (h << 1)
+                    .wrapping_add(h << 4)
+                    .wrapping_add(h << 7)
+                    .wrapping_add(h << 8)
+                    .wrapping_add(h << 24),
+            );
         }
         h
     }
 
     pub fn serialize_to_json(&self) -> Result<String, JsValue> {
         let s = SerializedBloom {
+            format: Some(BLOOM_FORMAT),
             size: self.size,
             hashes: self.hashes,
             data: self.bitset.clone(),
@@ -119,9 +161,16 @@ impl BloomFilter {
         // declared size. Otherwise `add`/`has` panic (divide-by-zero on
         // `size == 0`, out-of-bounds on a short `data`), poisoning the whole
         // WASM instance. Degrade to a safe empty filter instead.
+        //
+        // The format tag must be present and equal to BLOOM_FORMAT. An absent
+        // tag is *unknown*, not *legacy-compatible*: see BLOOM_FORMAT for why
+        // an untagged payload arriving here is the incompatible 64-bit-hash
+        // case (§5.12). An empty filter under-blocks and is rebuilt; a
+        // wrong-hash filter answers confidently and wrongly forever.
         match serde_json::from_str::<SerializedBloom>(json) {
             Ok(s)
-                if s.size > 0
+                if s.format == Some(BLOOM_FORMAT)
+                    && s.size > 0
                     && s.size <= MAX_BLOOM_BITS
                     && s.hashes > 0
                     && s.data.len() == s.size.div_ceil(32) =>
@@ -177,6 +226,12 @@ impl BloomFilter {
 
 #[derive(Serialize, Deserialize)]
 struct SerializedBloom {
+    /// Hash/format version tag. `Option` so an untagged payload deserializes
+    /// far enough to be *recognised and refused* rather than failing as
+    /// malformed JSON; absence means "unknown format", not "legacy
+    /// compatible". See BLOOM_FORMAT (§5.12).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format: Option<u32>,
     size: usize,
     hashes: u8,
     data: Vec<u32>,
@@ -217,7 +272,12 @@ struct MergedFilterData {
     scriptlet_rules: Vec<ParsedRule>,
 }
 
+// `#[serde(default)]` on the structs that cross the JS boundary via
+// `from_js_value` (§5.21): a stored bundle missing one field must degrade to
+// the field's default instead of hard-failing the whole compile and silently
+// reverting to the slower JS merge path.
 #[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 struct FilterSourceCosmetic {
     generic: Vec<String>,
     #[serde(rename = "domainSpecific")]
@@ -226,6 +286,7 @@ struct FilterSourceCosmetic {
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 struct FilterSourceBundle {
     cosmetic: FilterSourceCosmetic,
     scriptlets: Vec<ParsedRule>,
@@ -246,6 +307,34 @@ where
     value
         .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
         .unwrap_or(JsValue::NULL)
+}
+
+// ---------------------------------------------------------------------------
+// Input-size caps (§5.20). WASM linear memory never shrinks, so a single
+// oversized call permanently balloons the instance; unbounded text inputs are
+// also a trivial DoS through a hostile filter list. Each cap is far above the
+// largest legitimate payload seen in practice.
+// ---------------------------------------------------------------------------
+
+/// My-Filters text typed/pasted by the user (real lists are a few KB).
+const MAX_USER_FILTER_BYTES: usize = 2 * 1024 * 1024;
+/// A fetched filter list (EasyList raw is ~2.5 MB).
+const MAX_FILTER_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+/// A YouTube player JSON response (typically well under 4 MB).
+const MAX_YT_PLAYER_BYTES: usize = 32 * 1024 * 1024;
+/// Total selector/scriptlet entries across all sources fed to the index
+/// compiler (the shipped corpus is ~45k selectors).
+const MAX_INDEX_INPUT_ENTRIES: usize = 1_000_000;
+
+/// Refuse an oversized input with a structured, machine-readable error.
+fn check_input_size(function: &str, unit: &str, actual: usize, max: usize) -> Result<(), String> {
+    if actual > max {
+        Err(format!(
+            "{{\"error\":\"input_too_large\",\"function\":\"{function}\",\"{unit}\":{actual},\"max\":{max}}}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn should_skip_filter_line(line: &str) -> bool {
@@ -391,9 +480,21 @@ fn compile_user_filters_internal(text: &str, start_id: u32) -> CompiledUserFilte
     compiled
 }
 
+fn compile_user_filters_checked(text: &str, start_id: u32) -> Result<CompiledUserFilters, String> {
+    check_input_size(
+        "compile_user_filters",
+        "bytes",
+        text.len(),
+        MAX_USER_FILTER_BYTES,
+    )?;
+    Ok(compile_user_filters_internal(text, start_id))
+}
+
 #[wasm_bindgen]
-pub fn compile_user_filters(text: &str, start_id: u32) -> JsValue {
-    to_js_value(&compile_user_filters_internal(text, start_id))
+pub fn compile_user_filters(text: &str, start_id: u32) -> Result<JsValue, JsValue> {
+    let compiled =
+        compile_user_filters_checked(text, start_id).map_err(|e| JsValue::from_str(&e))?;
+    Ok(to_js_value(&compiled))
 }
 
 #[cfg(test)]
@@ -507,9 +608,20 @@ fn merge_filter_sources_internal(
     merged
 }
 
+fn parse_filter_source_checked(text: &str) -> Result<FilterSourceBundle, String> {
+    check_input_size(
+        "parse_filter_source",
+        "bytes",
+        text.len(),
+        MAX_FILTER_SOURCE_BYTES,
+    )?;
+    Ok(parse_filter_source_internal(text))
+}
+
 #[wasm_bindgen]
-pub fn parse_filter_source(text: &str) -> JsValue {
-    to_js_value(&parse_filter_source_internal(text))
+pub fn parse_filter_source(text: &str) -> Result<JsValue, JsValue> {
+    let bundle = parse_filter_source_checked(text).map_err(|e| JsValue::from_str(&e))?;
+    Ok(to_js_value(&bundle))
 }
 
 fn parse_filter_source_internal(text: &str) -> FilterSourceBundle {
@@ -655,6 +767,14 @@ fn apply_scriptlet_exceptions(scriptlets: &mut Vec<ParsedRule>, exceptions: &[Pa
     }
 }
 
+/// The user allowlist outranks every shipped rule, static or dynamic (§4.5).
+/// It sits far above the static bands (1-6) and above the privacy band (100)
+/// because "trust this site" has to beat the hand-maintained system-unbreak
+/// blocks, which ship at 1100 and used to win. Must stay equal to
+/// `DNR_ALLOWLIST_PRIORITY` in src/background/service-worker.js — the worker
+/// re-stamps the band on rules from either builder, so a drift here is silent.
+const DNR_ALLOWLIST_PRIORITY: u32 = 100_000;
+
 fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<DnrRule> {
     let mut seen = HashSet::new();
     let mut rules = Vec::new();
@@ -668,7 +788,7 @@ fn build_allowlist_rules_internal(allowlist: Vec<String>, start_id: u32) -> Vec<
     {
         rules.push(DnrRule {
             id: start_id + index as u32,
-            priority: 500,
+            priority: DNR_ALLOWLIST_PRIORITY,
             action: DnrAction {
                 action_type: "allowAllRequests".to_string(),
                 redirect: None,
@@ -692,7 +812,8 @@ pub fn build_allowlist_rules(allowlist: JsValue, start_id: u32) -> Result<JsValu
     )))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+#[serde(default)]
 pub struct ParsedRule {
     #[serde(rename = "type")]
     rule_type: String,
@@ -717,30 +838,35 @@ pub struct ParsedRule {
 }
 
 fn parse_line(line: &str) -> Option<ParsedRule> {
+    // Both callers already trim, but `parseLine` in the JS engines trims
+    // internally and the `+js(...)` anchors below are end-of-line sensitive —
+    // so trim here too and the three implementations cannot diverge on a
+    // caller's whitespace handling.
+    let line = line.trim();
     // `#@#+js(` must be recognised before any `+js(` test: it *contains*
     // `#+js(`, so the scriptlet branch claimed it first and produced an active
     // scriptlet under the garbage domain prefix "example.com#@" — the opposite
     // of disabling it.
-    if let Some(idx) = line.find("#@#+js(") {
-        let (domains, excluded_domains) = parse_domains(&line[..idx]);
-        let close = line.rfind(')')?;
-        let open = idx + "#@#+js(".len();
-        if close < open {
-            return None;
+    //
+    // Both `+js(` branches *fall through* when the line is not a well-formed
+    // scriptlet, rather than rejecting the line outright (§5.14). The JS
+    // parsers match `/^([^#]*)#(?:#\+js\(|\+js\()(.+)\)$/` and, on failure,
+    // carry on to the plain `##`/`#@#` branches — so `example.com##+js(foo)
+    // extra` is a cosmetic rule whose selector is the literal text
+    // `+js(foo) extra` (inert; the CSS gate drops it). Rust used to accept the
+    // same line as a LIVE scriptlet, because it took `rfind(')')` from
+    // anywhere in the line. Which behaviour a user got depended on whether
+    // WASM initialized; the JS reading is the safer one, so it is the one all
+    // three engines now implement.
+    if line.contains("#@#+js(") {
+        if let Some(rule) = parse_scriptlet_exception(line) {
+            return Some(rule);
         }
-        let name = parse_scriptlet_args(&line[open..close]).into_iter().next()?;
-        return Some(ParsedRule {
-            rule_type: "scriptlet-exception".into(),
-            domains,
-            excluded_domains,
-            selector: None,
-            exception: Some(true),
-            name: Some(name),
-            args: None,
-        });
     }
     if line.contains("##+js(") || line.contains("#+js(") {
-        return parse_scriptlet(line);
+        if let Some(rule) = parse_scriptlet(line) {
+            return Some(rule);
+        }
     }
     if let Some(idx) = line.find("#@#") {
         let (domains, excluded_domains) = parse_domains(&line[..idx]);
@@ -808,21 +934,56 @@ fn parse_domains(domains: &str) -> (Vec<String>, Vec<String>) {
     (included, excluded)
 }
 
+/// Byte offset of the argument-list terminator for a `+js(...)` line, or
+/// `None` when the line is not a well-formed scriptlet.
+///
+/// Enforces the JS parsers' anchors (§5.14): the `)` must END the line, the
+/// argument text must be non-empty, and the domain prefix must contain no `#`
+/// (the regexes' `^([^#]*)` group). `rfind(')')` accepted a `)` anywhere,
+/// which promoted `example.com##+js(foo) extra` — a cosmetic selector in JS —
+/// to a live scriptlet in Rust. Callers fall through to the cosmetic branches
+/// on `None`, exactly as the JS regexes do.
+fn scriptlet_arg_end(line: &str, domains: &str, open: usize) -> Option<usize> {
+    if domains.contains('#') || !line.ends_with(')') {
+        return None;
+    }
+    // `ends_with(')')` guarantees the last byte is an ASCII `)`, so `len - 1`
+    // is a char boundary — blindly slicing it off would otherwise panic on a
+    // trailing multi-byte char, reachable from untrusted filter text.
+    let close = line.len() - 1;
+    // The JS `(.+)` group requires at least one character of arguments.
+    if close <= open {
+        return None;
+    }
+    Some(close)
+}
+
+fn parse_scriptlet_exception(line: &str) -> Option<ParsedRule> {
+    let idx = line.find("#@#+js(")?;
+    let domains = &line[..idx];
+    let open = idx + "#@#+js(".len();
+    let close = scriptlet_arg_end(line, domains, open)?;
+    let name = parse_scriptlet_args(&line[open..close]).into_iter().next()?;
+    let (domains, excluded_domains) = parse_domains(domains);
+    Some(ParsedRule {
+        rule_type: "scriptlet-exception".into(),
+        domains,
+        excluded_domains,
+        selector: None,
+        exception: Some(true),
+        name: Some(name),
+        args: None,
+    })
+}
+
 fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
     let (domains, open) = if let Some(idx) = line.find("##+js(") {
         (&line[..idx], idx + 6)
-    } else if let Some(idx) = line.find("#+js(") {
-        (&line[..idx], idx + 5)
     } else {
-        return None;
+        let idx = line.find("#+js(")?;
+        (&line[..idx], idx + 5)
     };
-    // Require a real closing paren after the opener. Blindly slicing off the
-    // last byte panics on a missing ')' (start > end) or a trailing multi-byte
-    // char (non-char-boundary) — both reachable from untrusted filter text.
-    let close = line.rfind(')')?;
-    if close < open {
-        return None;
-    }
+    let close = scriptlet_arg_end(line, domains, open)?;
     let rest = &line[open..close];
     let args = parse_scriptlet_args(rest);
     let mut args_iter = args.into_iter();
@@ -839,34 +1000,81 @@ fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
     })
 }
 
+/// Finalize one raw argument: trim whitespace, then strip a *matched*
+/// surrounding quote pair (`'x'` or `"x"`). Interior quotes are preserved.
+///
+/// §5.38: this used to strip a leading and a trailing quote independently,
+/// mirroring `replace(/^['"]|['"]$/g, '')` in the JS parsers. That mangles any
+/// argument that merely ends in a quote — uBO ships
+/// `##+js(trusted-set, document.visibilityState, json:"visible")`, and the
+/// unpaired-strip turned the value into `json:"visible`, which no JSON parser
+/// accepts.
+fn finalize_scriptlet_arg(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let mut chars = trimmed.chars();
+    if let (Some(first), Some(last)) = (chars.next(), chars.next_back()) {
+        if (first == '\'' || first == '"') && first == last {
+            return chars.as_str().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+/// Split a scriptlet argument list on commas, respecting quoted commas.
+///
+/// Quote characters are kept in the argument text — `div[id='ad']` stays
+/// intact — and only a matched surrounding quote pair is stripped per
+/// argument.
+///
+/// Divergences from the JS parsers (filter-parser.js / build-rules.mjs), both
+/// deliberate, both cases where the JS side is wrong:
+///  * Unpaired quotes: the JS parsers leave the quote state open so every
+///    later comma stops splitting and arguments merge (§5.17); here a quote
+///    only opens quoted mode when a matching close quote exists later in the
+///    string, so `aopr, don't, x` still splits into three arguments.
+///  * `\,` (§5.38): uBO's escaped comma. The JS parsers split on it and strip
+///    a trailing quote that has no partner; both are fixed here.
+///
+/// Paired-quote, escape-free inputs behave identically in all three engines.
 fn parse_scriptlet_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    for ch in s.chars() {
+    let mut quote: Option<char> = None;
+    let mut chars = s.char_indices().peekable();
+
+    while let Some((idx, ch)) = chars.next() {
         match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            ',' if !in_single && !in_double => {
-                args.push(
-                    current
-                        .trim()
-                        .trim_matches(|c| c == '\'' || c == '"')
-                        .to_string(),
-                );
-                current = String::new();
+            // §5.38: `\,` is an escaped comma, not a separator. uBO unescapes
+            // it to a plain comma; splitting on it shredded the shipped
+            // `www.youtube.com##+js(trusted-replace-xhr-response, /"adPlacements…{2\,4}…/, , /…/)`
+            // rule into five arguments, leaving `propsToMatch` as `/` — which
+            // matches every YouTube XHR. Any other backslash escape is data:
+            // both characters survive so regex arguments stay intact.
+            '\\' => {
+                if matches!(chars.peek(), Some(&(_, ','))) {
+                    chars.next();
+                    current.push(',');
+                    continue;
+                }
+                current.push('\\');
+            }
+            '\'' | '"' => {
+                match quote {
+                    Some(open) if open == ch => quote = None,
+                    None if s[idx + ch.len_utf8()..].contains(ch) => quote = Some(ch),
+                    _ => {}
+                }
+                current.push(ch);
+            }
+            ',' if quote.is_none() => {
+                args.push(finalize_scriptlet_arg(&current));
+                current.clear();
             }
             _ => current.push(ch),
         }
     }
     if !current.trim().is_empty() {
-        args.push(
-            current
-                .trim()
-                .trim_matches(|c| c == '\'' || c == '"')
-                .to_string(),
-        );
+        args.push(finalize_scriptlet_arg(&current));
     }
     args
 }
@@ -874,7 +1082,7 @@ fn parse_scriptlet_args(s: &str) -> Vec<String> {
 #[derive(Serialize, Deserialize)]
 pub struct DnrRule {
     id: u32,
-    priority: u16,
+    priority: u32,
     action: DnrAction,
     condition: DnrCondition,
 }
@@ -1060,6 +1268,16 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
 
             match opt_name {
                 "important" => is_important = true,
+                // Cosmetic-scope modifiers (§4.36). `@@||example.com^$generichide`
+                // means "don't apply generic element hiding here". The user-filter
+                // pipeline has no cosmetic-scope channel, and stripping the option
+                // would degrade the line into a bare network allow — disabling ALL
+                // blocking on the domain instead of only element hiding. Drop the
+                // rule and count it; never emit a network allow.
+                "elemhide" | "ehide" | "generichide" | "ghide" | "specifichide" | "shide" => {
+                    UNSUPPORTED_OPT_DROPS.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
                 "badfilter" => {
                     // uBO: $badfilter invalidates a matching non-badfilter rule
                     // elsewhere. We don't model cross-rule invalidation, so
@@ -1110,14 +1328,32 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
     // block beats that exception — overriding exceptions is the whole purpose
     // of $important, and the anti-circumvention lists depend on it. The old
     // scheme put every exception (10) above every important block (5), so the
-    // modifier was inert. Matches DNR_PRIORITY in scripts/build-rules.mjs;
-    // runtime rules still sit far above at 500 (allowlist) and 1000
-    // (system-unbreak).
+    // modifier was inert.
+    //
+    // These are the SAME numbers the static compiler emits, and that is not
+    // cosmetic: dynamic (user) rules and static (list) rules compete on one
+    // numeric scale, with ties broken by DNR action precedence (allow > block
+    // > redirect), not by ruleset. A locally-consistent-but-different scale
+    // therefore re-opens the very inversion it fixed *across the seam* — the
+    // previous 1/2/3/4 numbering tied a user's `||x^$important` (3) with a
+    // list's plain `@@||x^` (ALLOW = 3), and the allow won on action
+    // precedence. Keep in exact lockstep with DNR_PRIORITY in
+    // scripts/build-rules.mjs (§4.2):
+    //
+    //     BLOCK 1 · REDIRECT 2 · ALLOW 3 ·
+    //     IMPORTANT_BLOCK 4 · IMPORTANT_REDIRECT 5 · IMPORTANT_ALLOW 6
+    //
+    // The redirect bands (2, 5) are deliberately unused here: user filters
+    // never compile to a redirect action, and leaving the numbers reserved is
+    // what lets an $important user block (4) outrank a list's plain
+    // `$redirect` (2) while still losing to a list's `$important,redirect=`
+    // (5), exactly as the static scheme intends. Runtime rules still sit far
+    // above at 500 (allowlist) and 1000 (system-unbreak).
     let priority = match (is_exception, is_important) {
-        (true, true) => 4u16,   // @@...$important
-        (true, false) => 2u16,  // @@...
-        (false, true) => 3u16,  // ...$important
-        (false, false) => 1u16, // plain block
+        (true, true) => 6u32,   // @@...$important  -> IMPORTANT_ALLOW
+        (true, false) => 3u32,  // @@...            -> ALLOW
+        (false, true) => 4u32,  // ...$important    -> IMPORTANT_BLOCK
+        (false, false) => 1u32, // plain block      -> BLOCK
     };
 
     Some(DnrRule {
@@ -1188,20 +1424,29 @@ impl AllowlistMatcher {
     /// Returns true if `hostname` or any of its parent domains (up to but
     /// excluding the first public suffix) is in the allowlist. Without the
     /// public-suffix guard a rule at e.g. `co.uk` would match every site on
-    /// that TLD.
+    /// that TLD. Exact membership is honoured before the suffix stop: a
+    /// curated public suffix (`netlify.app`) can itself be a browsable site
+    /// the user deliberately allowlisted, and must match its own entry —
+    /// mirrors `allowlistCoversHostname` on the JS side (§4.8).
     pub fn check(&self, hostname: &str) -> bool {
         let lower = hostname.to_lowercase();
+        if self.domains.contains(lower.as_str()) {
+            return true;
+        }
         let mut h: &str = &lower;
+        if is_public_suffix(h) {
+            return false;
+        }
         loop {
+            match h.find('.') {
+                Some(idx) => h = &h[idx + 1..],
+                None => return false,
+            }
             if is_public_suffix(h) {
                 return false;
             }
             if self.domains.contains(h) {
                 return true;
-            }
-            match h.find('.') {
-                Some(idx) => h = &h[idx + 1..],
-                None => return false,
             }
         }
     }
@@ -1221,46 +1466,59 @@ impl AllowlistMatcher {
 }
 
 // ---------------------------------------------------------------------------
-// UrlSanitizer — stateful, AhoCorasick built once for tracking-param stripping
+// UrlSanitizer — stateful, tracking-param set built once for query stripping
 // ---------------------------------------------------------------------------
 
-/// Pre-compiles tracking parameter keywords into an AhoCorasick automaton once.
-/// Call `.sanitize(url)` on every request instead of rebuilding the automaton.
+/// Pre-compiles tracking parameter names into a set once. Call
+/// `.sanitize(url)` on every request instead of re-parsing the list.
+///
+/// Keys are matched *exactly*: substring matching stripped `referral_code`
+/// because `ref` was on the list (§5.23). The URL fragment is preserved —
+/// it was previously folded into the last query pair and dropped.
 #[wasm_bindgen]
 pub struct UrlSanitizer {
-    ac: AhoCorasick,
+    params: HashSet<String>,
 }
 
 #[wasm_bindgen]
 impl UrlSanitizer {
     #[wasm_bindgen(constructor)]
     pub fn new(patterns_csv: &str) -> Self {
-        let patterns: Vec<&str> = patterns_csv
+        let params = patterns_csv
             .split(',')
-            .map(|s| s.trim())
+            .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
-        let ac = AhoCorasick::new(&patterns)
-            .unwrap_or_else(|_| AhoCorasick::new::<[&str; 0], &str>([]).unwrap());
-        Self { ac }
+        Self { params }
     }
 
     pub fn sanitize(&self, url: &str) -> String {
-        let Some((base, query)) = url.split_once('?') else {
+        // Split the fragment off first: it is not part of the query and must
+        // survive sanitization verbatim.
+        let (without_fragment, fragment) = match url.split_once('#') {
+            Some((head, frag)) => (head, Some(frag)),
+            None => (url, None),
+        };
+        let Some((base, query)) = without_fragment.split_once('?') else {
             return url.to_string();
         };
         let clean: Vec<&str> = query
             .split('&')
             .filter(|pair| {
                 let key = pair.split('=').next().unwrap_or("");
-                !self.ac.is_match(key)
+                !self.params.contains(key)
             })
             .collect();
-        if clean.is_empty() {
+        let mut out = if clean.is_empty() {
             base.to_string()
         } else {
             format!("{}?{}", base, clean.join("&"))
+        };
+        if let Some(frag) = fragment {
+            out.push('#');
+            out.push_str(frag);
         }
+        out
     }
 }
 
@@ -1306,18 +1564,43 @@ struct ProceduralPlanStep {
     arg: Option<String>,
 }
 
+/// Version of the procedural-plan JSON format (§5.21), written into every
+/// planned bundle and every serialized rule so future consumers can detect a
+/// format change instead of misreading stored payloads. Payloads written
+/// before versioning carry no field and deserialize as version 1 — the format
+/// itself is unchanged, so legacy bundles remain fully compatible.
+const PLAN_FORMAT_VERSION: u32 = 1;
+
+fn plan_format_version() -> u32 {
+    PLAN_FORMAT_VERSION
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct PlannedSelectorRule {
     selector: String,
     plan: Vec<ProceduralPlanStep>,
+    #[serde(rename = "planVersion", default = "plan_format_version")]
+    plan_version: u32,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct PlannedSelectorBundle {
+    #[serde(default = "plan_format_version")]
+    version: u32,
     #[serde(rename = "cssSelectors")]
     css_selectors: Vec<String>,
     #[serde(rename = "proceduralRules")]
     procedural_rules: Vec<PlannedSelectorRule>,
+}
+
+impl Default for PlannedSelectorBundle {
+    fn default() -> Self {
+        Self {
+            version: PLAN_FORMAT_VERSION,
+            css_selectors: Vec::new(),
+            procedural_rules: Vec::new(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1492,10 +1775,56 @@ fn parse_procedural_plan(selector: &str) -> Vec<ProceduralPlanStep> {
 
 fn is_valid_selector(selector: &str) -> bool {
     let trimmed = selector.trim();
-    !trimmed.is_empty()
-        && !trimmed.contains('{')
-        && !trimmed.contains('}')
-        && !trimmed.contains(';')
+    if trimmed.is_empty() || trimmed.contains('{') || trimmed.contains('}') {
+        return false;
+    }
+    // NUL would desync the NUL-terminated binary rule framing in
+    // `serialize_rules_to_binary_lists`, shifting every subsequent entry
+    // (§5.19). No real selector contains one; reject at ingestion.
+    if trimmed.contains('\0') {
+        return false;
+    }
+    // `;` is CSS-injection material everywhere except inside a procedural
+    // operator's argument, which is never emitted as CSS: `:style(...)` carries
+    // multiple declarations by design (§4.35), and `:has-text(/ad;box/)`,
+    // `:xpath(...)`, `:matches-attr(...)` and friends carry regex/XPath/text
+    // needles in which `;` is an ordinary character (§5.14). Both JS engines
+    // ingest those lines; refusing them here made a filter mean one thing at
+    // build time and another at runtime, with the WASM path silently losing
+    // rules the JS path kept.
+    !trimmed.contains(';') || semicolons_confined_to_proc_op_args(trimmed)
+}
+
+/// True when every `;` in `selector` sits inside the argument of a procedural
+/// operator (paren-aware, so nested parens in the argument are handled). Any
+/// `;` outside such an argument — the actual CSS-injection shape — stays
+/// rejected.
+///
+/// The operator set is `proc_op_ac()`, the same Aho-Corasick automaton the
+/// planner uses to decide a selector is procedural, so the carve-out cannot
+/// drift from the set of operators whose arguments are not CSS. Nested cases
+/// (`div:has(span:has-text(/ad;box/))`) work because the scan finds the
+/// innermost operator opener first and the `;` lives inside its argument.
+fn semicolons_confined_to_proc_op_args(selector: &str) -> bool {
+    let mut idx = 0;
+    while idx < selector.len() {
+        // Earliest operator opener at or after `idx`, longest-match-aware.
+        let Some(m) = proc_op_ac().find(&selector[idx..]) else {
+            return !selector[idx..].contains(';');
+        };
+        if selector[idx..idx + m.start()].contains(';') {
+            return false;
+        }
+        // Patterns are `:name(`, so the argument starts just past the match.
+        let arg_start = idx + m.end();
+        match find_matching_paren(selector, arg_start) {
+            Some(close) => idx = close + 1,
+            // Unbalanced operator — malformed; a stray `;` past this point has
+            // no closed argument to live in.
+            None => return false,
+        }
+    }
+    true
 }
 
 fn has_balanced_selector_delimiters(selector: &str) -> bool {
@@ -1554,94 +1883,120 @@ fn has_balanced_selector_delimiters(selector: &str) -> bool {
     quoted.is_none() && bracket_depth == 0 && paren_depth == 0
 }
 
+/// True when `rest` begins with a character that can continue a CSS
+/// identifier, i.e. one that would make a preceding pseudo-element name a
+/// *different*, unknown name. Mirrors the CSS ident grammar closely enough for
+/// a safety gate: ASCII alphanumerics, `-`, `_`, an escape, and any non-ASCII
+/// character (CSS idents admit U+0080 and above).
+fn starts_with_ident_char(rest: &str) -> bool {
+    rest.chars().next().is_some_and(|c| {
+        c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '\\' || !c.is_ascii()
+    })
+}
+
+/// True when the selector *starts* with a combinator or a selector-list
+/// comma — `> .ad`, `+ .promo`, `~ div`, `, .ad`, and the `+js(...)` shape a
+/// mis-split scriptlet line leaves behind (§5.13).
+///
+/// A relative selector is only legal inside `:has()`/`:is()` and friends;
+/// standalone it is a parse error, and because up to 100 selectors are joined
+/// into one declaration, a single such entry takes the other 99 down with it.
+/// The universal-selector scan already refuses combinators in the *middle* of
+/// a malformed selector; nothing looked at position zero.
+fn has_leading_combinator(selector: &str) -> bool {
+    matches!(
+        selector.trim_start().chars().next(),
+        Some('>') | Some('+') | Some('~') | Some(',')
+    )
+}
+
 fn has_invalid_universal_usage(selector: &str) -> bool {
-    let chars: Vec<char> = selector.chars().collect();
-    let len = chars.len();
+    // Byte-index walk over the original &str: no per-selector Vec<char> and no
+    // per-`::` tail String — this runs across ~45k selectors on every index
+    // rebuild (§5.22).
     let mut bracket_depth = 0i32;
     let mut paren_depth = 0i32;
     let mut quoted: Option<char> = None;
     let mut escaped = false;
+    // The character immediately preceding the current one, unfiltered.
+    // Whitespace before `*` is a descendant combinator (`div *` is valid);
+    // only a directly glued identifier char (`div*`) is the bypass shape.
+    let mut prev: Option<char> = None;
 
-    for (idx, ch) in chars.iter().enumerate() {
+    for (idx, ch) in selector.char_indices() {
+        let prev_char = prev;
+        prev = Some(ch);
+
         if escaped {
             escaped = false;
             continue;
         }
 
-        if *ch == '\\' {
+        if ch == '\\' {
             escaped = true;
             continue;
         }
 
         if let Some(quote) = quoted {
-            if *ch == quote {
+            if ch == quote {
                 quoted = None;
             }
             continue;
         }
 
-        match *ch {
-            '"' | '\'' => {
-                quoted = Some(*ch);
-                continue;
-            }
-            '[' => {
-                bracket_depth += 1;
-                continue;
-            }
+        match ch {
+            '"' | '\'' => quoted = Some(ch),
+            '[' => bracket_depth += 1,
             ']' => {
                 bracket_depth -= 1;
                 if bracket_depth < 0 {
                     return true;
                 }
-                continue;
             }
-            '(' => {
-                paren_depth += 1;
-                continue;
-            }
+            '(' => paren_depth += 1,
             ')' => {
                 paren_depth -= 1;
                 if paren_depth < 0 {
                     return true;
                 }
-                continue;
             }
             '*' if bracket_depth == 0 && paren_depth == 0 => {
-                // Universal selector (*) is invalid when preceded by alphanumeric/identifier chars
-                // This catches bypasses like `div*` or `.class*`
-                let prev = chars[..idx].iter().rev().find(|c| !c.is_whitespace());
-                if prev.is_some_and(|c| {
-                    c.is_ascii_alphanumeric() || *c == '_' || *c == '-' || *c == ')' || *c == ']'
+                // Universal selector (*) is invalid when glued to an
+                // identifier or a closing bracket/paren: `div*`, `.class*`,
+                // `[a]*`. Inspect the *immediate* predecessor — skipping
+                // whitespace here conflated `div *` (valid descendant
+                // combinator) with `div*` (invalid) and silently dropped
+                // shipped selectors (§4.35).
+                if prev_char.is_some_and(|c| {
+                    c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ')' || c == ']'
                 }) {
                     return true;
                 }
-                // Universal selector at start is valid only if followed by valid combinator or element
-                // Reject `*` followed by invalid characters (bypass via malformed selector)
-                if idx + 1 < len {
-                    let next = chars[idx + 1..].iter().find(|c| !c.is_whitespace());
-                    if let Some(n) = next {
-                        // After * we allow: combinator (>, +, ~, space), pseudo (:), or end
-                        if !n.is_ascii_alphanumeric()
-                            && *n != '#'
-                            && *n != '.'
-                            && *n != '['
-                            && *n != ':'
-                            && *n != '>'
-                            && *n != '+'
-                            && *n != '~'
-                            && *n != ','
-                        {
-                            return true;
-                        }
+                // After `*` allow: element/ident, #, ., [, pseudo (:), a
+                // combinator (>, +, ~, whitespace), a selector-list comma,
+                // or end of input. Anything else is a malformed-selector
+                // bypass shape.
+                let next = selector[idx + 1..].chars().find(|c| !c.is_whitespace());
+                if let Some(n) = next {
+                    if !n.is_ascii_alphanumeric()
+                        && n != '#'
+                        && n != '.'
+                        && n != '['
+                        && n != ':'
+                        && n != '>'
+                        && n != '+'
+                        && n != '~'
+                        && n != ','
+                    {
+                        return true;
                     }
                 }
             }
-            // Pseudo-element safety: reject double-colon followed by unknown pseudo-element
-            ':' if idx + 1 < len && chars[idx + 1] == ':' => {
-                // Allow known pseudo-elements only
-                let pseudo_rest: String = chars[idx..].iter().collect();
-                let known_pseudo_elements = [
+            // Pseudo-element safety: reject double-colon followed by an
+            // unknown pseudo-element. `starts_with` on the original slice —
+            // no allocation.
+            ':' if selector[idx + 1..].starts_with(':') => {
+                const KNOWN_PSEUDO_ELEMENTS: [&str; 12] = [
                     "::before",
                     "::after",
                     "::first-line",
@@ -1655,10 +2010,21 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
                     "::part",
                     "::file-selector-button",
                 ];
-                if !known_pseudo_elements
-                    .iter()
-                    .any(|p| pseudo_rest.starts_with(p))
-                {
+                let rest = &selector[idx..];
+                // A bare prefix match is not a match: `::before2` and
+                // `::first-line-x` both start with a known name yet name a
+                // pseudo-element that does not exist, so the browser discards
+                // the whole comma-joined declaration — up to 100 selectors,
+                // 99 of them legitimate, failing open together (§5.13).
+                // Require the character after the name to be one that cannot
+                // continue an identifier: `(` for the functional forms
+                // (`::part(x)`, `::slotted(x)`), a combinator, a selector-list
+                // comma, an attribute/pseudo continuation, or end of input.
+                let known = KNOWN_PSEUDO_ELEMENTS.iter().any(|p| {
+                    rest.strip_prefix(p)
+                        .is_some_and(|after| !starts_with_ident_char(after))
+                });
+                if !known {
                     // Unknown pseudo-element — could be bypass attempt
                     return true;
                 }
@@ -1676,6 +2042,7 @@ fn is_css_safe_selector(selector: &str) -> bool {
         && !contains_proc_op(trimmed)
         && has_balanced_selector_delimiters(trimmed)
         && !has_invalid_universal_usage(trimmed)
+        && !has_leading_combinator(trimmed)
 }
 
 fn build_css_from_selector_list(selectors: &[String], chunk_size: usize) -> String {
@@ -1750,10 +2117,24 @@ fn build_page_bundle_internal(
     exceptions_in: Vec<String>,
     css_chunk_size: usize,
 ) -> BuiltPageBundle {
+    // Two views of the exception list (§5.18):
+    // - `exceptions`: CSS-safe selectors only — these become the `revert` CSS
+    //   and travel to the content script.
+    // - `suppression_set`: every valid exception selector, *including
+    //   procedural ones*. A `#@#` exception for `div:has-text(Ad)` is not CSS
+    //   and cannot be reverted by a stylesheet, but it must still cancel the
+    //   matching procedural rule below. Filtering it through
+    //   `is_css_safe_selector` first discarded it before the suppression
+    //   check ever ran.
     let mut exceptions = Vec::new();
     let mut exception_seen = HashSet::new();
+    let mut suppression_set: HashSet<String> = HashSet::new();
     for selector in exceptions_in {
         let selector = selector.trim();
+        if !is_valid_selector(selector) {
+            continue;
+        }
+        suppression_set.insert(selector.to_string());
         if !is_css_safe_selector(selector) {
             continue;
         }
@@ -1762,13 +2143,12 @@ fn build_page_bundle_internal(
         }
     }
 
-    let exception_set: HashSet<&str> = exceptions.iter().map(String::as_str).collect();
     let mut css_selectors = Vec::new();
     let mut procedural_rules = Vec::new();
 
-    for selector in generic_in.into_iter().chain(domain_specific_in.into_iter()) {
+    for selector in generic_in.into_iter().chain(domain_specific_in) {
         let selector = selector.trim();
-        if !is_valid_selector(selector) || exception_set.contains(selector) {
+        if !is_valid_selector(selector) || suppression_set.contains(selector) {
             continue;
         }
 
@@ -1776,6 +2156,7 @@ fn build_page_bundle_internal(
             procedural_rules.push(PlannedSelectorRule {
                 selector: selector.to_string(),
                 plan: parse_procedural_plan(selector),
+                plan_version: PLAN_FORMAT_VERSION,
             });
         } else if is_css_safe_selector(selector) {
             css_selectors.push(selector.to_string());
@@ -1821,14 +2202,16 @@ pub fn plan_selector_rules_json(selectors_json: &str) -> String {
             bundle.procedural_rules.push(PlannedSelectorRule {
                 selector: selector.to_string(),
                 plan: parse_procedural_plan(selector),
+                plan_version: PLAN_FORMAT_VERSION,
             });
         } else if is_css_safe_selector(selector) {
             bundle.css_selectors.push(selector.to_string());
         }
     }
 
-    serde_json::to_string(&bundle)
-        .unwrap_or_else(|_| "{\"cssSelectors\":[],\"proceduralRules\":[]}".to_string())
+    serde_json::to_string(&bundle).unwrap_or_else(|_| {
+        "{\"version\":1,\"cssSelectors\":[],\"proceduralRules\":[]}".to_string()
+    })
 }
 
 /// Build the per-page cosmetic bundle in one Rust pass:
@@ -1904,6 +2287,16 @@ pub fn build_page_bundle(
 /// filtering out exceptions and deduplicating. Chunks are capped at `chunk_size`
 /// selectors to avoid hitting browser CSS parser limits.
 ///
+/// Gated by `is_css_safe_selector`, the same predicate
+/// `build_css_from_selector_list` uses. This function joins up to `chunk_size`
+/// selectors into ONE declaration, so it has the identical failure mode
+/// (§5.13): a single malformed selector — `div::before2`, a leading `> `, the
+/// `+js(...)` text a mis-split scriptlet line leaves behind — makes the
+/// browser discard the whole chunk, taking up to 149 legitimate hide rules
+/// with it. It used to reject only `{`, `}` and `;`, i.e. it trusted its
+/// caller to have gated the input; the two CSS joiners in this file now apply
+/// the same rule.
+///
 /// Returns newline-separated CSS rules, one rule per chunk.
 #[wasm_bindgen]
 pub fn build_css_from_selectors(selectors: &str, exceptions: &str, chunk_size: usize) -> String {
@@ -1920,12 +2313,7 @@ pub fn build_css_from_selectors(selectors: &str, exceptions: &str, chunk_size: u
         .split('\n')
         .map(|s| s.trim())
         .filter(|s| {
-            !s.is_empty()
-                && !s.contains('{')
-                && !s.contains('}')
-                && !s.contains(';')
-                && !exc.contains(*s)
-                && seen.insert(*s)
+            !s.is_empty() && is_css_safe_selector(s) && !exc.contains(*s) && seen.insert(*s)
         })
         .collect();
 
@@ -2016,11 +2404,41 @@ fn reduce_cosmetic_rules_internal(
     }
 }
 
+/// Total selector/scriptlet entries a source contributes, for the §5.20 cap.
+fn filter_source_entry_count(source: &FilterSourceBundle) -> usize {
+    source.cosmetic.generic.len()
+        + source
+            .cosmetic
+            .domain_specific
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+        + source
+            .cosmetic
+            .exceptions
+            .values()
+            .map(Vec::len)
+            .sum::<usize>()
+        + source.scriptlets.len()
+}
+
 fn compile_active_filter_index_internal(
     core_source: FilterSourceBundle,
     list_sources: Vec<FilterSourceBundle>,
     css_chunk_size: usize,
-) -> ActiveFilterIndex {
+) -> Result<ActiveFilterIndex, String> {
+    let total_entries = filter_source_entry_count(&core_source)
+        + list_sources
+            .iter()
+            .map(filter_source_entry_count)
+            .sum::<usize>();
+    check_input_size(
+        "compile_active_filter_index",
+        "entries",
+        total_entries,
+        MAX_INDEX_INPUT_ENTRIES,
+    )?;
+
     let mut merged_generic = Vec::new();
     let mut generic_seen = HashSet::new();
     let mut merged_domains: HashMap<String, Vec<String>> = HashMap::new();
@@ -2102,12 +2520,12 @@ fn compile_active_filter_index_internal(
     )
     .css_text;
 
-    ActiveFilterIndex {
+    Ok(ActiveFilterIndex {
         cosmetic,
         scriptlets: merged_scriptlets,
         generic_css,
         bloom_hosts,
-    }
+    })
 }
 
 #[wasm_bindgen]
@@ -2118,11 +2536,9 @@ pub fn compile_active_filter_index(
 ) -> Result<JsValue, JsValue> {
     let core_source: FilterSourceBundle = from_js_value(core_source)?;
     let list_sources: Vec<FilterSourceBundle> = from_js_value(list_sources)?;
-    Ok(to_js_value(&compile_active_filter_index_internal(
-        core_source,
-        list_sources,
-        css_chunk_size,
-    )))
+    let index = compile_active_filter_index_internal(core_source, list_sources, css_chunk_size)
+        .map_err(|e| JsValue::from_str(&e))?;
+    Ok(to_js_value(&index))
 }
 
 // ---------------------------------------------------------------------------
@@ -2333,7 +2749,23 @@ fn yt_exp_ac() -> &'static AhoCorasick {
 /// the original payload behind a `disabled_` prefix. This preserves the schema
 /// YouTube expects without leaving active ad data in place.
 #[wasm_bindgen]
-pub fn process_youtube_player(text: &str) -> String {
+pub fn process_youtube_player(text: &str) -> Result<String, JsValue> {
+    process_youtube_player_checked(text).map_err(|e| JsValue::from_str(&e))
+}
+
+// §5.20: an oversized payload is refused with a structured error; the
+// caller's try/catch falls back to using the original response text.
+fn process_youtube_player_checked(text: &str) -> Result<String, String> {
+    check_input_size(
+        "process_youtube_player",
+        "bytes",
+        text.len(),
+        MAX_YT_PLAYER_BYTES,
+    )?;
+    Ok(process_youtube_player_internal(text))
+}
+
+fn process_youtube_player_internal(text: &str) -> String {
     // Single combined pre-check: one O(n) scan over all 14 patterns.
     // Returns "" → JS keeps its own copy of the text, no copy-out needed.
     if !yt_combined_ac().is_match(text) {
@@ -2363,6 +2795,22 @@ pub fn sanitize_youtube_experiments(json_text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // §4.8 related: a curated public suffix (netlify.app, github.io) can be a
+    // browsable site in its own right. Exact allowlist membership must match
+    // before the public-suffix stop, while ancestor walks still refuse to
+    // blanket a TLD from a `co.uk`-style entry. Mirrors the JS
+    // `allowlistCoversHostname` semantics.
+    #[test]
+    fn allowlist_matcher_honours_exact_membership_at_a_public_suffix() {
+        let m = AllowlistMatcher::new("netlify.app,example.com");
+        assert!(m.check("netlify.app")); // exact hit at a curated suffix
+        assert!(m.check("sub.example.com")); // ancestor walk still works
+        assert!(!m.check("someuser.netlify.app")); // suffix stops the walk
+        let tld = AllowlistMatcher::new("co.uk");
+        assert!(tld.check("co.uk")); // exact only
+        assert!(!tld.check("bbc.co.uk")); // never blankets the TLD
+    }
 
     #[test]
     fn bloom_deserialize_rejects_corrupt_payloads_without_panicking() {
@@ -2529,6 +2977,71 @@ mod tests {
         );
     }
 
+    // §4.2 — the user-filter compiler's bands are pinned to their ABSOLUTE
+    // values, not merely to their relative order.
+    //
+    // A relative-order check passes for any internally consistent scale, and
+    // that is exactly how the bug survived: the compiler emitted 1/2/3/4 while
+    // the static compiler in scripts/build-rules.mjs emitted 1/2/3/4/5/6.
+    // Dynamic and static rules compete on ONE numeric scale — ties are broken
+    // by DNR action precedence (allow > block > redirect), not by which
+    // ruleset a rule came from — so a user's `||x^$important` (old 3) tied a
+    // list's plain `@@||x^` (ALLOW 3) and lost, resurrecting the §4.10 defect
+    // across the seam, and a user's `@@||x^$important` (old 4) lost to a
+    // list's `$important,redirect=` (IMPORTANT_REDIRECT 5).
+    //
+    // Any renumbering on either side must therefore fail a test rather than
+    // pass a self-consistent one. The mirror assertion lives in
+    // tests/wasm-parity.test.mjs, which reads DNR_PRIORITY out of
+    // scripts/build-rules.mjs and compares it to these same numbers.
+    #[test]
+    fn user_filter_priority_bands_match_the_static_scale_exactly() {
+        // scripts/build-rules.mjs DNR_PRIORITY, duplicated as the assertion's
+        // subject. Six bands; user filters can only reach four of them.
+        const BLOCK: u32 = 1;
+        const REDIRECT: u32 = 2;
+        const ALLOW: u32 = 3;
+        const IMPORTANT_BLOCK: u32 = 4;
+        const IMPORTANT_REDIRECT: u32 = 5;
+        const IMPORTANT_ALLOW: u32 = 6;
+
+        let priority_of = |filter: &str| {
+            compile_user_filters_internal(filter, 1)
+                .dnr_rules
+                .first()
+                .map(|r| r.priority)
+                .unwrap_or_else(|| panic!("no rule emitted for {filter}"))
+        };
+
+        assert_eq!(priority_of("||ads.example.com^"), BLOCK);
+        assert_eq!(priority_of("@@||ads.example.com^"), ALLOW);
+        assert_eq!(priority_of("||ads.example.com^$important"), IMPORTANT_BLOCK);
+        assert_eq!(
+            priority_of("@@||ads.example.com^$important"),
+            IMPORTANT_ALLOW
+        );
+
+        // The two cross-seam inversions the old numbering produced, stated as
+        // the comparisons the browser actually performs.
+        assert!(
+            priority_of("||ads.example.com^$important") > ALLOW,
+            "a user $important block must outrank a LIST's plain exception",
+        );
+        assert!(
+            priority_of("@@||ads.example.com^$important") > IMPORTANT_REDIRECT,
+            "a user $important exception must outrank a LIST's $important redirect",
+        );
+        assert!(
+            priority_of("||ads.example.com^$important") > REDIRECT,
+            "a user $important block must outrank a LIST's plain redirect",
+        );
+
+        // Runtime bands still sit far above every static band.
+        let allowlist = build_allowlist_rules_internal(vec!["example.com".into()], 1);
+        assert_eq!(allowlist[0].priority, DNR_ALLOWLIST_PRIORITY);
+        assert!(allowlist[0].priority > IMPORTANT_ALLOW);
+    }
+
     #[test]
     fn bloom_size_is_bounded_rather_than_allocated() {
         // An absurd declared size must be clamped, not honoured. Unclamped,
@@ -2620,7 +3133,7 @@ mod tests {
             "\"web_enable_ad_break_heartbeat\":true}"
         );
 
-        let output = process_youtube_player(input);
+        let output = process_youtube_player_internal(input);
 
         assert!(output.contains("\"adPlacements\":false,\"disabled_adPlacements\":["));
         assert!(output.contains("\"playerAds\":false,\"disabled_playerAds\":{"));
@@ -2630,7 +3143,7 @@ mod tests {
 
     #[test]
     fn process_youtube_player_skips_clean_payloads() {
-        assert_eq!(process_youtube_player("{\"streamingData\":{}}"), "");
+        assert_eq!(process_youtube_player_internal("{\"streamingData\":{}}"), "");
     }
 
     #[test]
@@ -2798,7 +3311,7 @@ mod tests {
 
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].id, 990000);
-        assert_eq!(rules[0].priority, 500);
+        assert_eq!(rules[0].priority, DNR_ALLOWLIST_PRIORITY);
         assert_eq!(
             rules[0].condition.url_filter.as_deref(),
             Some("||example.com^")
@@ -2826,7 +3339,8 @@ mod tests {
             },
             Vec::new(),
             100,
-        );
+        )
+        .expect("under the input cap");
 
         assert!(compiled.generic_css.contains(".ad"));
         assert!(!compiled.generic_css.contains("#google_ads_iframe_*"));
@@ -2860,7 +3374,8 @@ mod tests {
                 scriptlets: Vec::new(),
             }],
             100,
-        );
+        )
+        .expect("under the input cap");
 
         let domain_specific = compiled.cosmetic.domain_specific["mail.google.com"].clone();
         let exceptions = Vec::new();
@@ -2875,6 +3390,616 @@ mod tests {
             .css_text
             .contains(".aeF > .nH > .nH[role=\"main\"] > .aKB"));
         assert!(bundle.exception_css.is_empty());
+    }
+
+    // §4.1 — the Rust hash must be bit-identical to the JS one. Golden
+    // vectors computed by src/shared/bloom.js (`_hash(key, seed) % size`,
+    // size = 256 * 1024, seeds 0..4). The same values are asserted on the JS
+    // side in src/shared/bloom.test.mjs — if either engine drifts, its half
+    // of the pair fails.
+    #[test]
+    fn bloom_hash_matches_js_bit_indices() {
+        let size = 256 * 1024;
+        let filter = BloomFilter::new(size, 4);
+        let indices = |key: &str| -> Vec<usize> {
+            (0..4u8)
+                .map(|seed| (filter.calculate_hash(key, seed) as usize) % size)
+                .collect()
+        };
+
+        assert_eq!(
+            filter.calculate_hash("example.com", 0),
+            1_125_968_678,
+            "raw 32-bit hash must match bloom.js"
+        );
+        assert_eq!(indices("example.com"), vec![60198, 41457, 105056, 128235]);
+        assert_eq!(
+            indices("ads.example.com"),
+            vec![65278, 200453, 245808, 110063]
+        );
+        assert_eq!(
+            indices("tracker.evil.example"),
+            vec![46029, 30112, 29635, 78086]
+        );
+        assert_eq!(indices(""), vec![40389, 40388, 40391, 40390]);
+    }
+
+    // §4.1 / §5.12 — serialized payloads carry a format tag, and anything
+    // without the current tag degrades to the safe empty filter instead of
+    // cross-loading foreign bits.
+    //
+    // An *untagged* payload is the point of this test. The previous rule
+    // accepted it on the rationale that "legacy payloads used the same hash",
+    // which is only true of legacy payloads written by src/shared/bloom.js.
+    // Untagged payloads reaching THIS deserializer were written by this struct
+    // before the tag existed — when calculate_hash was the 64-bit FNV-multiply
+    // variant — and that was the primary storage path. Accepting them answers
+    // `has()` from a bit pattern computed by a different hash: silent false
+    // negatives for the domains that matter, with no error anywhere.
+    #[test]
+    fn bloom_deserialize_refuses_untagged_and_unknown_formats() {
+        let mut original = BloomFilter::new(1024, 4);
+        original.add("example.com");
+        let json = original.serialize_to_json().unwrap();
+        assert!(json.contains("\"format\":1"), "serializer must tag: {json}");
+
+        // Tagged round-trip still loads.
+        assert!(BloomFilter::deserialize_from_json(&json).has("example.com"));
+
+        let mut untagged: serde_json::Value = serde_json::from_str(&json).unwrap();
+        untagged.as_object_mut().unwrap().remove("format");
+        let refused_untagged = BloomFilter::deserialize_from_json(&untagged.to_string());
+        assert!(
+            !refused_untagged.has("example.com"),
+            "an untagged payload is an UNKNOWN format here, not a compatible \
+             legacy one, and must degrade to the empty filter"
+        );
+
+        let mut future: serde_json::Value = serde_json::from_str(&json).unwrap();
+        future["format"] = serde_json::json!(999);
+        let refused = BloomFilter::deserialize_from_json(&future.to_string());
+        assert!(
+            !refused.has("example.com"),
+            "unknown format must fall back to the empty filter"
+        );
+
+        // The refusal is a safe *empty* filter, not a poisoned one: it must
+        // still answer queries and accept new keys without panicking.
+        let mut recovered = BloomFilter::deserialize_from_json(&untagged.to_string());
+        recovered.add("example.com");
+        assert!(recovered.has("example.com"));
+    }
+
+    // §4.35 — `;` is legal inside a `:style(...)` argument (uBO ships
+    // multi-declaration style rules); everywhere else it stays rejected, as
+    // do braces and NULs.
+    #[test]
+    fn style_operator_arguments_may_contain_semicolons() {
+        assert!(is_valid_selector(
+            ".widget:style(-webkit-user-select: text !important; user-select: text !important)"
+        ));
+        assert!(is_valid_selector(
+            "div:style(a: 1; b: 2):style(c: 3; d: 4)"
+        ));
+
+        assert!(!is_valid_selector("div; body"));
+        assert!(!is_valid_selector(".x:style(a: 1) ; div"));
+        assert!(!is_valid_selector(".x:style(a: 1;"), "unbalanced :style(");
+        assert!(!is_valid_selector(".x:style(a{b})"), "braces stay rejected");
+
+        let compiled = compile_user_filters_internal(
+            "example.com##.hero:style(position: absolute !important; top: -9999px)",
+            1,
+        );
+        assert_eq!(
+            compiled.cosmetic_rules.domain_specific["example.com"].len(),
+            1,
+            "the :style rule must survive ingestion"
+        );
+    }
+
+    // §4.35 — the ingested `:style` rule must reach the procedural planner
+    // with its full multi-declaration argument intact.
+    #[test]
+    fn style_rules_with_semicolons_reach_the_procedural_plan() {
+        let bundle = build_page_bundle_internal(
+            Vec::new(),
+            vec![".hero:style(a: 1 !important; b: 2)".into()],
+            Vec::new(),
+            100,
+        );
+
+        assert_eq!(bundle.rules.domain_specific.len(), 1);
+        let plan = &bundle.rules.domain_specific[0].plan;
+        assert!(
+            plan.iter().any(|step| step.op.as_deref() == Some("style")
+                && step.arg.as_deref() == Some("a: 1 !important; b: 2")),
+            "plan must contain the style op with the ;-bearing argument"
+        );
+    }
+
+    // §4.35 — `div *` is a valid descendant-universal selector; only a `*`
+    // glued to the preceding token (`div*`) is the bypass shape. The old scan
+    // skipped whitespace and conflated the two, silently dropping shipped
+    // selectors.
+    #[test]
+    fn descendant_universal_selectors_are_valid_but_glued_ones_are_not() {
+        assert!(is_css_safe_selector("div *"));
+        assert!(is_css_safe_selector(".ad-container > *"));
+        assert!(!has_invalid_universal_usage("div *"));
+        assert!(!has_invalid_universal_usage("li > div *"));
+
+        assert!(has_invalid_universal_usage("div*"));
+        assert!(has_invalid_universal_usage(".class*"));
+        assert!(has_invalid_universal_usage("[data-ad]*"));
+        assert!(!is_css_safe_selector("div*"));
+    }
+
+    // §5.22 — behavior pinned across the allocation-free rewrite.
+    #[test]
+    fn universal_usage_scan_keeps_pseudo_element_and_quote_semantics() {
+        assert!(!has_invalid_universal_usage("div::before"));
+        assert!(!has_invalid_universal_usage("input::placeholder"));
+        assert!(has_invalid_universal_usage("div::malicious"));
+        // `*` inside brackets/quotes is not a universal selector
+        assert!(!has_invalid_universal_usage("a[href*=\"ads\"]"));
+        assert!(!has_invalid_universal_usage("a[title=\"x*y\"]"));
+    }
+
+    // §4.36 — `@@…$generichide`-family user filters must never degrade into
+    // blanket network allows; the pipeline has no cosmetic-scope channel for
+    // user filters, so they are dropped and counted.
+    #[test]
+    fn elemhide_family_exceptions_never_become_network_allows() {
+        for opt in [
+            "elemhide",
+            "ehide",
+            "generichide",
+            "ghide",
+            "specifichide",
+            "shide",
+        ] {
+            let line = format!("@@||example.com^${opt}");
+            let compiled = compile_user_filters_internal(&line, 1);
+            assert!(
+                compiled.dnr_rules.is_empty(),
+                "@@…${opt} must not emit a network rule"
+            );
+        }
+
+        let combined =
+            compile_user_filters_internal("@@||example.com^$generichide,domain=example.com", 1);
+        assert!(combined.dnr_rules.is_empty());
+
+        // A plain exception still compiles to a network allow.
+        let plain = compile_user_filters_internal("@@||example.com^", 1);
+        assert_eq!(plain.dnr_rules.len(), 1);
+        assert_eq!(plain.dnr_rules[0].action.action_type, "allow");
+    }
+
+    // §5.17 — argument interiors keep their quote characters, matching the
+    // JS parsers; only one surrounding quote pair is stripped.
+    #[test]
+    fn scriptlet_args_preserve_interior_quotes() {
+        assert_eq!(
+            parse_scriptlet_args("set, div[id='ad'], x"),
+            vec![
+                "set".to_string(),
+                "div[id='ad']".to_string(),
+                "x".to_string()
+            ]
+        );
+        assert_eq!(
+            parse_scriptlet_args("foo, 'a, b', c"),
+            vec!["foo".to_string(), "a, b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            parse_scriptlet_args("foo, \"x, y\", 'z'"),
+            vec!["foo".to_string(), "x, y".to_string(), "z".to_string()]
+        );
+    }
+
+    // §5.38 — `\,` is an escaped comma, not a separator. This is uBO's shipped
+    // YouTube rule, verbatim: it carries `{2\,4}` inside the regex and a
+    // trailing `\,`, and must parse as exactly three arguments (pattern, empty
+    // replacement, propsToMatch). Splitting on the escapes produced five, and
+    // `propsToMatch` came out as `/` — a substring of every YouTube XHR URL.
+    #[test]
+    fn scriptlet_args_keep_escaped_commas() {
+        let rule = "www.youtube.com##+js(trusted-replace-xhr-response, \
+                    /\"adPlacements.*?([A-Z]\"\\}|\"\\}{2\\,4})\\}\\]\\,/, , \
+                    /playlist\\?list=|\\/player(?:\\?.+)?$|watch\\?[tv]=/)";
+        let parsed = parse_scriptlet(rule).expect("rule must parse as a scriptlet");
+        assert_eq!(parsed.name.as_deref(), Some("trusted-replace-xhr-response"));
+        let args = parsed.args.expect("args");
+        assert_eq!(
+            args,
+            vec![
+                "/\"adPlacements.*?([A-Z]\"\\}|\"\\}{2,4})\\}\\],/".to_string(),
+                String::new(),
+                "/playlist\\?list=|\\/player(?:\\?.+)?$|watch\\?[tv]=/".to_string(),
+            ],
+            "escaped commas must stay inside their argument"
+        );
+    }
+
+    // §5.38 — only a *matched* surrounding quote pair is stripped. uBO ships
+    // `trusted-set, document.visibilityState, json:"visible"`; stripping the
+    // unpaired trailing quote left `json:"visible`, which no JSON parser takes.
+    #[test]
+    fn scriptlet_args_keep_an_unpaired_trailing_quote() {
+        assert_eq!(
+            parse_scriptlet_args("trusted-set, document.visibilityState, json:\"visible\""),
+            vec![
+                "trusted-set".to_string(),
+                "document.visibilityState".to_string(),
+                "json:\"visible\"".to_string()
+            ]
+        );
+        // A leading-only quote is equally untouched.
+        assert_eq!(
+            parse_scriptlet_args("foo, \"bar"),
+            vec!["foo".to_string(), "\"bar".to_string()]
+        );
+    }
+
+    // §5.17 — an unpaired quote must not leave the quote state open and
+    // swallow every subsequent comma.
+    #[test]
+    fn scriptlet_args_with_unpaired_quote_do_not_merge() {
+        assert_eq!(
+            parse_scriptlet_args("aopr, don't, x"),
+            vec!["aopr".to_string(), "don't".to_string(), "x".to_string()]
+        );
+    }
+
+    // §5.18 — a `#@#` exception carrying a procedural selector is not CSS,
+    // but it must still suppress the matching procedural rule.
+    #[test]
+    fn procedural_exceptions_suppress_procedural_rules() {
+        let bundle = build_page_bundle_internal(
+            Vec::new(),
+            vec![
+                "div:has-text(Ad):upward(1)".into(),
+                ".plain-ad".into(),
+            ],
+            vec!["div:has-text(Ad):upward(1)".into()],
+            100,
+        );
+
+        assert!(
+            bundle.rules.domain_specific.is_empty(),
+            "the excepted procedural rule must be suppressed"
+        );
+        assert!(bundle.css_text.contains(".plain-ad"));
+        // Procedural exceptions are not stylesheet material: they must not
+        // leak into the revert CSS or the transported exception list.
+        assert!(bundle.exception_css.is_empty());
+        assert!(bundle.rules.exceptions.is_empty());
+    }
+
+    // §5.19 — a NUL would desync the NUL-terminated binary rule framing and
+    // shift every subsequent entry; it is rejected at ingestion.
+    #[test]
+    fn nul_bytes_are_rejected_before_binary_framing() {
+        assert!(!is_valid_selector("div\0.ad"));
+        let compiled = compile_user_filters_internal("example.com##div\0.ad", 1);
+        assert!(compiled.cosmetic_rules.domain_specific.is_empty());
+    }
+
+    // §5.20 — oversized inputs are refused with a structured error instead
+    // of being processed (WASM linear memory never shrinks).
+    #[test]
+    fn oversized_inputs_are_refused_with_a_structured_error() {
+        let big = "x".repeat(MAX_USER_FILTER_BYTES + 1);
+        let err = match compile_user_filters_checked(&big, 1) {
+            Err(err) => err,
+            Ok(_) => panic!("oversized input must be refused"),
+        };
+        assert!(err.contains("\"error\":\"input_too_large\""), "{err}");
+        assert!(err.contains("\"function\":\"compile_user_filters\""));
+        assert!(err.contains(&format!("\"max\":{MAX_USER_FILTER_BYTES}")));
+
+        let big_source = "y".repeat(MAX_FILTER_SOURCE_BYTES + 1);
+        assert!(parse_filter_source_checked(&big_source).is_err());
+
+        let big_player = "z".repeat(MAX_YT_PLAYER_BYTES + 1);
+        assert!(process_youtube_player_checked(&big_player).is_err());
+
+        let oversized_index = FilterSourceBundle {
+            cosmetic: FilterSourceCosmetic {
+                generic: vec![".x".to_string(); MAX_INDEX_INPUT_ENTRIES + 1],
+                ..Default::default()
+            },
+            scriptlets: Vec::new(),
+        };
+        assert!(compile_active_filter_index_internal(oversized_index, Vec::new(), 100).is_err());
+
+        // Sanity: ordinary inputs still pass every guard.
+        assert!(compile_user_filters_checked("##.ad", 1).is_ok());
+        assert!(parse_filter_source_checked("##.ad").is_ok());
+        assert!(process_youtube_player_checked("{}").is_ok());
+    }
+
+    // §5.20 — the entry counter behind the index cap counts every class of
+    // entry a source contributes.
+    #[test]
+    fn filter_source_entry_count_covers_all_entry_classes() {
+        let source = FilterSourceBundle {
+            cosmetic: FilterSourceCosmetic {
+                generic: vec![".a".into()],
+                domain_specific: HashMap::from([(
+                    "d.com".to_string(),
+                    vec![".b".to_string(), ".c".to_string()],
+                )]),
+                exceptions: HashMap::from([("d.com".to_string(), vec![".d".to_string()])]),
+            },
+            scriptlets: vec![ParsedRule::default()],
+        };
+        assert_eq!(filter_source_entry_count(&source), 5);
+    }
+
+    // §5.21 — the procedural-plan JSON carries a version field, and legacy
+    // payloads (no version, missing bundle fields) deserialize instead of
+    // hard-failing the compile.
+    #[test]
+    fn plan_json_is_versioned_and_legacy_payloads_deserialize() {
+        let planned = plan_selector_rules_json("[\"div:has-text(Ad)\"]");
+        let parsed: serde_json::Value = serde_json::from_str(&planned).unwrap();
+        assert_eq!(parsed["version"], 1);
+        assert_eq!(parsed["proceduralRules"][0]["planVersion"], 1);
+
+        let legacy_rule: PlannedSelectorRule =
+            serde_json::from_str("{\"selector\":\".x\",\"plan\":[]}").unwrap();
+        assert_eq!(legacy_rule.plan_version, PLAN_FORMAT_VERSION);
+
+        let empty: FilterSourceBundle = serde_json::from_str("{}").unwrap();
+        assert!(empty.cosmetic.generic.is_empty());
+        assert!(empty.scriptlets.is_empty());
+
+        let partial: FilterSourceBundle =
+            serde_json::from_str("{\"cosmetic\":{\"generic\":[\".ad\"]}}").unwrap();
+        assert_eq!(partial.cosmetic.generic, vec![".ad".to_string()]);
+
+        let sparse_rule: ParsedRule = serde_json::from_str("{\"type\":\"scriptlet\"}").unwrap();
+        assert_eq!(sparse_rule.rule_type, "scriptlet");
+        assert!(sparse_rule.domains.is_empty());
+    }
+
+    // §5.13 — the CSS-safety gate is a *joining* gate: up to 100 selectors are
+    // comma-joined into one declaration, and one invalid selector makes the
+    // browser discard the entire declaration. So a shape that merely "looks
+    // close enough" is not a near miss, it is 99 legitimate hide rules failing
+    // open. Two families slipped through:
+    //   - `rest.starts_with(p)` matched a known pseudo-element as a mere
+    //     PREFIX, so `::before2` and `::first-line-x` — names that do not
+    //     exist — were accepted.
+    //   - nothing looked at position zero, so a leading combinator (`> .ad`)
+    //     or the `+js(...)` text a mis-split scriptlet line leaves behind was
+    //     accepted as a selector.
+    #[test]
+    fn css_safety_gate_rejects_prefix_pseudo_elements_and_leading_combinators() {
+        // Real pseudo-elements still pass, in every legal continuation.
+        for ok in [
+            "div::before",
+            "div::after",
+            "p::first-line",
+            "p::first-letter",
+            "input::placeholder",
+            "li::marker",
+            "x::part(label)",
+            "x::slotted(.ad)",
+            "div::before:hover",
+            "div::before, .ad",
+            "div::before .child",
+            "div::file-selector-button",
+        ] {
+            assert!(is_css_safe_selector(ok), "{ok} must stay CSS-safe");
+        }
+
+        // Prefix matches of a known name are different, non-existent names.
+        for bad in [
+            "div::before2",
+            "div::first-line-x",
+            "div::afterward",
+            "div::markers",
+            "div::before-x",
+            "div::part2(label)",
+        ] {
+            assert!(!is_css_safe_selector(bad), "{bad} must be refused");
+            assert!(has_invalid_universal_usage(bad), "{bad} must be flagged");
+        }
+
+        // Leading combinators and the mis-split-scriptlet shape.
+        for bad in ["> .ad", "+js()", "+js(foo) extra", "~ div", ", .ad", "  > .ad"] {
+            assert!(has_leading_combinator(bad), "{bad} leads with a combinator");
+            assert!(!is_css_safe_selector(bad), "{bad} must be refused");
+        }
+        for ok in [".a > .b", ".a + .b", ".a ~ .b", ".a, .b", "*"] {
+            assert!(!has_leading_combinator(ok), "{ok} does not lead with one");
+            assert!(is_css_safe_selector(ok), "{ok} must stay CSS-safe");
+        }
+
+        // The joining consequence, end to end: one bad selector must not take
+        // its neighbours' declaration down with it. Both joiners in this file
+        // apply the gate — `build_css_from_selectors` used to check only
+        // `{`/`}`/`;` and trust its caller.
+        let css = build_css_from_selector_list(
+            &[".good-one".into(), "div::before2".into(), ".good-two".into()],
+            100,
+        );
+        assert!(css.contains(".good-one"), "{css}");
+        assert!(css.contains(".good-two"), "{css}");
+        assert!(!css.contains("::before2"), "{css}");
+
+        let joined = build_css_from_selectors(".good-one\ndiv::before2\n> .ad\n.good-two", "", 100);
+        assert!(joined.contains(".good-one"), "{joined}");
+        assert!(joined.contains(".good-two"), "{joined}");
+        assert!(!joined.contains("::before2"), "{joined}");
+        assert!(!joined.contains("> .ad"), "{joined}");
+        // Its exception filtering and dedup are unchanged.
+        assert!(!build_css_from_selectors(".a\n.b", ".b", 100).contains(".b"));
+        assert_eq!(
+            build_css_from_selectors(".a\n.a", "", 100),
+            ".a { display: none !important; visibility: hidden !important; }"
+        );
+    }
+
+    // §5.14(a) — a `+js(...)` line is a scriptlet only when the `)` ENDS the
+    // line, matching `/^([^#]*)#(?:#\+js\(|\+js\()(.+)\)$/` in both JS
+    // parsers. `rfind(')')` took a `)` from anywhere, so
+    // `example.com##+js(foo) extra` — a cosmetic selector in JS — executed a
+    // scriptlet in Rust. On failure the line falls through to the cosmetic
+    // branches, as the JS regexes do, rather than being dropped.
+    #[test]
+    fn scriptlet_requires_the_closing_paren_to_end_the_line() {
+        let trailing = parse_line("example.com##+js(foo) extra").expect("must not be dropped");
+        assert_eq!(trailing.rule_type, "cosmetic");
+        assert_eq!(trailing.selector.as_deref(), Some("+js(foo) extra"));
+        assert_eq!(trailing.domains, vec!["example.com".to_string()]);
+
+        // …and the inert cosmetic never reaches a stylesheet.
+        let bundle = parse_filter_source_internal("example.com##+js(foo) extra");
+        assert!(bundle.scriptlets.is_empty(), "must not run a scriptlet");
+        assert!(build_css_from_selector_list(&["+js(foo) extra".into()], 100).is_empty());
+
+        // The exception form is anchored identically.
+        let exception_trailing =
+            parse_line("example.com#@#+js(foo) extra").expect("must not be dropped");
+        assert_eq!(exception_trailing.rule_type, "cosmetic");
+        assert_eq!(exception_trailing.exception, Some(true));
+        assert_eq!(
+            exception_trailing.selector.as_deref(),
+            Some("+js(foo) extra")
+        );
+
+        // An empty argument list fails `(.+)` and falls through too.
+        let empty = parse_line("example.com##+js()").expect("must not be dropped");
+        assert_eq!(empty.rule_type, "cosmetic");
+        assert_eq!(empty.selector.as_deref(), Some("+js()"));
+
+        // A `#` in the domain prefix fails `^([^#]*)`; the line is the
+        // cosmetic rule the JS engines produce.
+        let hashed = parse_line("a#b##+js(foo)").expect("must not be dropped");
+        assert_eq!(hashed.rule_type, "cosmetic");
+        assert_eq!(hashed.domains, vec!["a#b".to_string()]);
+
+        // Well-formed scriptlets are untouched, including a `)` inside an
+        // argument as long as one also ends the line.
+        let ok = parse_line("example.com##+js(set, adsEnabled, false)").unwrap();
+        assert_eq!(ok.rule_type, "scriptlet");
+        assert_eq!(ok.name.as_deref(), Some("set"));
+        let nested = parse_line("example.com##+js(rmnt, script, /foo)bar/)").unwrap();
+        assert_eq!(nested.rule_type, "scriptlet");
+        assert_eq!(
+            nested.args.as_deref(),
+            Some(&["script".to_string(), "/foo)bar/".to_string()][..])
+        );
+        let exception = parse_line("example.com#@#+js(nowebrtc)").unwrap();
+        assert_eq!(exception.rule_type, "scriptlet-exception");
+        assert_eq!(exception.name.as_deref(), Some("nowebrtc"));
+    }
+
+    // §5.14(b) — domain keys are lowercased at ingestion, so `EXAMPLE.com`
+    // reaches the same bucket the lookup walk (which lowercases the hostname)
+    // asks for. This is the Rust behaviour the JS side must adopt in
+    // `splitDomainList`; the selector's own case is data and must survive.
+    #[test]
+    fn domain_keys_are_case_folded_but_selectors_are_not() {
+        let bundle = parse_filter_source_internal("EXAMPLE.com##.Ad");
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.domain_specific, "example.com"),
+            Some(&vec![".Ad".to_string()]),
+        );
+        assert!(!bundle.cosmetic.domain_specific.contains_key("EXAMPLE.com"));
+    }
+
+    // §5.14(c) — `;` is CSS-injection material only where the text is CSS. A
+    // procedural operator's argument is a regex/XPath/text needle, never a
+    // declaration list, so `div:has-text(/ad;box/)` is a legitimate rule that
+    // both JS engines ingest. The carve-out used to name `:style(` alone, so
+    // the WASM path silently dropped rules the JS path kept.
+    #[test]
+    fn semicolons_are_allowed_inside_any_procedural_operator_argument() {
+        for ok in [
+            "div:has-text(/ad;box/)",
+            "div:xpath(//div[contains(@style,\"a;b\")])",
+            "div:matches-css(background: url(a;b))",
+            "div:matches-attr(data-x=/a;b/)",
+            "div:has(span:has-text(/ad;box/))",
+            "div:has-text(a;b):upward(2)",
+            ".widget:style(color: red; display: block)",
+        ] {
+            assert!(is_valid_selector(ok), "{ok} must survive ingestion");
+        }
+
+        // A `;` outside every operator argument is still refused — before,
+        // between and after the operators.
+        for bad in [
+            "div;evil:has-text(x)",
+            "div:has-text(x);evil",
+            "div:has-text(a):style(b: 1);evil",
+            "div:has-text(x) ; .other",
+            // Unbalanced operator: the `;` has no closed argument to live in.
+            "div:has-text(a;b",
+            "div;.ad",
+        ] {
+            assert!(!is_valid_selector(bad), "{bad} must be refused");
+        }
+
+        // The safety invariant the carve-out rests on, stated directly: a
+        // selector whose `;` was excused is BY CONSTRUCTION procedural (the
+        // excuse requires an operator match from the same automaton
+        // `contains_proc_op` uses), so no `;` can ever reach the CSS joiner.
+        for excused in [
+            "div:has-text(/ad;box/)",
+            ".widget:style(color: red; display: block)",
+            "div:has(span:has-text(/ad;box/))",
+        ] {
+            assert!(is_valid_selector(excused));
+            assert!(contains_proc_op(excused), "{excused}");
+            assert!(!is_css_safe_selector(excused), "{excused} is not CSS");
+        }
+        assert!(!build_css_from_selectors("div:has-text(/ad;box/)", "", 100).contains(';'));
+
+        // End to end: the rule reaches the bundle and plans as procedural.
+        let bundle = parse_filter_source_internal("example.com#?#div:has-text(/ad;box/)");
+        assert_eq!(
+            selectors_for(&bundle.cosmetic.domain_specific, "example.com"),
+            Some(&vec!["div:has-text(/ad;box/)".to_string()]),
+        );
+        let planned = plan_selector_rules_json("[\"div:has-text(/ad;box/)\"]");
+        let parsed: serde_json::Value = serde_json::from_str(&planned).unwrap();
+        assert_eq!(parsed["proceduralRules"][0]["plan"][1]["op"], "has-text");
+        assert_eq!(parsed["proceduralRules"][0]["plan"][1]["arg"], "/ad;box/");
+    }
+
+    // §5.23 — the fragment survives sanitization and keys are matched
+    // exactly: `ref` on the strip list must not take `referral_code` with it.
+    #[test]
+    fn url_sanitizer_preserves_fragment_and_matches_keys_exactly() {
+        let sanitizer = UrlSanitizer::new("ref,utm_source");
+
+        assert_eq!(
+            sanitizer.sanitize("https://x.example/p?ref=1&referral_code=abc&utm_source=nl#frag"),
+            "https://x.example/p?referral_code=abc#frag"
+        );
+        assert_eq!(
+            sanitizer.sanitize("https://x.example/p?ref=1#frag"),
+            "https://x.example/p#frag"
+        );
+        assert_eq!(
+            sanitizer.sanitize("https://x.example/p#frag"),
+            "https://x.example/p#frag"
+        );
+        assert_eq!(
+            sanitizer.sanitize("https://x.example/p?a=1&utm_source=x"),
+            "https://x.example/p?a=1"
+        );
+        assert_eq!(
+            sanitizer.sanitize("https://x.example/p"),
+            "https://x.example/p"
+        );
     }
 }
 

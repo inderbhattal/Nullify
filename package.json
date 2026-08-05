@@ -1,6 +1,6 @@
 {
   "name": "nullify",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "description": "A powerful MV3 Chrome ad blocker with uBlock Origin-level features",
   "type": "module",
   "engines": {
@@ -11,29 +11,32 @@
     "setup:prod": "npm install && npm run build:wasm && npm run build:rules && npm run build:ext",
     "build": "npm run build:wasm && npm run build:rules && npm run build:ext",
     "build:rules": "node scripts/build-rules.mjs --verbose",
+    "refresh:lists": "node scripts/generate-sri-hashes.mjs",
     "build:wasm": "cd wasm-core && wasm-pack build --target web --out-dir ../src/shared/wasm",
     "build:ext": "webpack --mode production",
     "build:sample-rules": "node scripts/build-rules.mjs --sample",
     "dev": "npm run build:wasm && npm run build:sample-rules && webpack --mode development --watch",
-    "lint": "eslint src/ scripts/ --ext .js,.mjs",
+    "lint": "eslint src/ scripts/ tests/ --ext .js,.mjs",
     "test": "node --test",
     "clean": "rm -rf dist/ && find rules/ -name '*.json' ! -name 'system-unbreak.json' -delete && rm -rf _metadata && rm -rf rules/skipped",
     "clean:all": "npm run clean && rm -rf node_modules/",
     "version:sync": "node scripts/version.mjs",
     "version:bump": "f() { new_ver=$(npm version --no-git-tag-version \"$1\") && npm run version:sync -- \"${new_ver#v}\" && git add package.json package-lock.json manifest.json && git commit -m \"Chore: bump version to ${new_ver#v}\"; }; f",
     "version:tag": "f() { git tag -a \"$1\" -m \"Nullify $1\" && echo \"Tag $1 created on $(git rev-parse HEAD)\"; }; f",
-    "push": "git push origin main --tags"
+    "push": "git push origin main --tags",
+    "pretest": "node scripts/check-test-prereqs.mjs",
+    "check": "npm run lint && npm test && cargo test --manifest-path wasm-core/Cargo.toml && npm run build:sample-rules && npm run build:ext"
   },
   "devDependencies": {
-    "@types/chrome": "^0.0.268",
-    "ajv": "^8.18.0",
-    "copy-webpack-plugin": "^12.0.2",
+    "@types/chrome": "^0.2.5",
+    "ajv": "^8.20.0",
+    "copy-webpack-plugin": "^14.0.0",
     "css-loader": "^7.1.2",
-    "eslint": "^9.15.0",
-    "html-webpack-plugin": "^5.6.3",
-    "mini-css-extract-plugin": "^2.9.2",
+    "eslint": "^10.8.0",
+    "html-webpack-plugin": "^5.6.8",
+    "mini-css-extract-plugin": "^2.10.2",
     "style-loader": "^4.0.0",
-    "webpack": "^5.96.1",
-    "webpack-cli": "^5.1.4"
+    "webpack": "^5.109.2",
+    "webpack-cli": "^7.2.2"
   }
 }

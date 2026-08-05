@@ -2,98 +2,89 @@
 /**
  * generate-sri-hashes.mjs
  *
- * Generates Subresource Integrity (SRI) hashes for remote filter lists.
- * These hashes are used by build-rules.mjs to verify fetched content hasn't been tampered with.
+ * Refreshes the vendored filter-list snapshots AND the committed SRI lock they
+ * are verified against. This is the ONLY script in the repo that fetches
+ * upstream lists — `build:rules` compiles from what this writes.
  *
- * Usage:
- *   node scripts/generate-sri-hashes.mjs
+ * Both artifacts are written in the same pass, from the same bytes, so the
+ * snapshot and its hash can never disagree:
  *
- * Output: rules/filter-list-hashes.json
+ *   scripts/filter-lists/<id>.txt      fully-expanded list text (committed)
+ *   scripts/filter-lists.lock.json     sha384 of each snapshot   (committed)
+ *
+ * The hash covers the FULLY-EXPANDED list text — the same fetchAndExpand()
+ * output the build compiles — so !#include sub-files (where uBO lists carry
+ * most of their content) are covered, and redirects are required to stay on
+ * https. Hashing only the top-level file, as an earlier version of this script
+ * did, verified almost nothing.
+ *
+ * Workflow:
+ *   1. npm run refresh:lists
+ *   2. Review `git diff scripts/filter-lists/` — this is the one moment
+ *      upstream content enters the repo. The lock diff alone tells you
+ *      nothing; the text diff tells you what changed.
+ *   3. npm run build:rules   (offline — compiles the reviewed snapshots)
+ *   4. Commit the snapshots and the lock together.
+ *
+ * Why snapshots: builds used to verify the lock against a LIVE fetch, so a
+ * release raced upstream rotation (measured: 6 of 8 lists rotated within ~48 h
+ * of a lock refresh). Any list rotating between tag and build failed SRI and
+ * killed the release. Rotation now only matters here, at review time (§4.6).
  */
 
 import fs from 'fs';
 import path from 'path';
-import https from 'https';
 import { createHash } from 'crypto';
 import { fileURLToPath } from 'url';
+import { fetchAndExpand, FILTER_LISTS, VENDORED_LISTS_DIR, vendoredListPath } from './build-rules.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RULES_DIR = path.resolve(__dirname, '../rules');
-const HASHES_FILE = path.join(RULES_DIR, 'filter-list-hashes.json');
-
-const FILTER_LISTS = [
-  { id: 'easylist', url: 'https://easylist.to/easylist/easylist.txt' },
-  { id: 'easyprivacy', url: 'https://easylist.to/easylist/easyprivacy.txt' },
-  { id: 'annoyances', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances.txt' },
-  { id: 'malware', url: 'https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt' },
-  { id: 'ubo-filters', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/filters.txt' },
-  { id: 'ubo-unbreak', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/unbreak.txt' },
-  { id: 'anti-adblock', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt' },
-  { id: 'ubo-cookie-annoyances', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances-cookies.txt' },
-];
-
-function fetchText(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'adblock-sri-generator/1.0' } }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        return fetchText(res.headers.location).then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) {
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
-      }
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
-      res.on('error', reject);
-    }).on('error', reject);
-  });
-}
-
-async function computeSha384(url) {
-  const buffer = await fetchText(url);
-  const hash = createHash('sha384').update(buffer).digest('base64');
-  return `sha384-${hash}`;
-}
+const LOCK_FILE = path.join(__dirname, 'filter-lists.lock.json');
 
 async function main() {
-  console.log('[SRI] Generating Subresource Integrity hashes for filter lists...\n');
+  console.log('[lists] Fetching upstream filter lists (fully-expanded text)...\n');
 
   const hashes = {};
-  let successCount = 0;
+  const snapshots = new Map();
   let failCount = 0;
 
   for (const list of FILTER_LISTS) {
     try {
-      const hash = await computeSha384(list.url);
+      const expanded = await fetchAndExpand(list.url);
+      const hash = `sha384-${createHash('sha384').update(expanded, 'utf8').digest('base64')}`;
       hashes[list.id] = {
         url: list.url,
         sha384: hash,
         generatedAt: new Date().toISOString(),
       };
-      console.log(`✓ ${list.id}: ${hash.slice(0, 24)}...`);
-      successCount++;
+      snapshots.set(list.id, expanded);
+      console.log(`✓ ${list.id}: ${(expanded.length / 1024).toFixed(0)} KiB  ${hash.slice(0, 24)}...`);
     } catch (err) {
       console.error(`✗ ${list.id}: ${err.message}`);
       failCount++;
     }
   }
 
-  // Ensure rules directory exists
-  if (!fs.existsSync(RULES_DIR)) {
-    fs.mkdirSync(RULES_DIR, { recursive: true });
-  }
-
-  // Write hashes to file
-  fs.writeFileSync(HASHES_FILE, JSON.stringify(hashes, null, 2));
-  console.log(`\n[SRI] Hashes written to ${HASHES_FILE}`);
-  console.log(`[SRI] Complete: ${successCount} succeeded, ${failCount} failed`);
-
   if (failCount > 0) {
+    // Fail closed without touching the existing snapshots or lock: a partial
+    // refresh would leave the repo compiling a mix of generations, and
+    // silently replacing reviewed content on a flaky network helps no one.
+    console.error(`\n[lists] ${failCount} list(s) failed — nothing written`);
     process.exit(1);
   }
+
+  fs.mkdirSync(VENDORED_LISTS_DIR, { recursive: true });
+  for (const [id, text] of snapshots) {
+    fs.writeFileSync(vendoredListPath(id), text);
+  }
+  fs.writeFileSync(LOCK_FILE, JSON.stringify(hashes, null, 2) + '\n');
+
+  console.log(`\n[lists] ${snapshots.size} snapshots written to ${VENDORED_LISTS_DIR}`);
+  console.log(`[lists] Lock file written to ${LOCK_FILE}`);
+  console.log('[lists] Review `git diff scripts/filter-lists/`, then run `npm run build:rules`.');
 }
 
 main().catch((err) => {
-  console.error('[SRI] Fatal error:', err);
+  console.error('[lists] Fatal error:', err);
   process.exit(1);
 });

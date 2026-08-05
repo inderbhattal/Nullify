@@ -11,18 +11,45 @@ import init, {
 import { initWasmFromUrl } from '../shared/wasm-loader.js';
 
 (function() {
-  const SHIELD_STATE_KEY = '__nullifyYoutubeShield';
-  const SHIELD_VERSION = 2;
-  const shieldState = globalThis[SHIELD_STATE_KEY] || {};
-  const installedVersions = Array.isArray(shieldState.versions) ? shieldState.versions : [];
-  if (installedVersions.includes(SHIELD_VERSION)) return;
-  globalThis[SHIELD_STATE_KEY] = {
-    loaded: true,
-    version: SHIELD_VERSION,
-    versions: installedVersions.concat(SHIELD_VERSION),
-    startedAt: shieldState.startedAt || Date.now(),
-    updatedAt: Date.now(),
+  const SHIELD_VERSION = 3;
+
+  // ---- Idempotency guard (REVIEW-2026-08 §4.12) ----
+  //
+  // This bundle is evaluated more than once per frame: registerContentScripts
+  // runs it at document_start, and injectIntoOpenTabs re-injects it into
+  // already-loaded tabs on install, update, allowlist change and settings
+  // change. Each injection is a *separate* script evaluation in the page
+  // realm, so the "already installed" marker cannot live in module scope —
+  // but it must not live in a fixed-name writable global either: that made
+  // `window.__nullifyYoutubeShield = { versions: [0,1,2,3,4,5] }` a one-line
+  // page kill switch for every layer below, and published a
+  // `{version, startedAt, updatedAt}` fingerprint on every load.
+  //
+  // Instead the marker is a symbol-keyed, non-enumerable, non-writable,
+  // non-configurable brand on the JSON.parse wrapper this shield installs,
+  // and it is honoured only when that wrapper still *behaves* like ours.
+  // Page script can plant the brand, but planting it without also rewriting
+  // ad payload keys to false no longer disables anything — the probe fails
+  // and the shield installs over the top.
+  const INSTALL_BRAND = Symbol.for('$$jsonParseHookVersion');
+  const isShieldInstalled = () => {
+    try {
+      // Behavioural probe. The randomized payload stops a page from
+      // special-casing one fixed probe string: to pass, JSON.parse has to
+      // actually neutralize ad payload keys the way the hook below does.
+      const probe = JSON.parse(`{"adPlacements":[${Math.random()}]}`);
+      if (!probe || probe.adPlacements !== false) return false;
+      const installed = JSON.parse[INSTALL_BRAND];
+      // A hook that behaves but carries an older brand is a previous shield
+      // generation, so let this one install over it. An unbranded hook is
+      // treated as installed rather than stacking a second copy of every
+      // interceptor on top of it.
+      return !(typeof installed === 'number' && installed < SHIELD_VERSION);
+    } catch {
+      return false;
+    }
   };
+  if (isShieldInstalled()) return;
 
   let wasmReady = false;
   let wasmInitStarted = false;
@@ -60,11 +87,22 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       return [];
     }
   };
+  // Endpoints whose bodies get the deep/scrubbed treatment.
+  //
+  // `/reel_watch_sequence` is the Shorts feed endpoint. uBO gates its Shorts
+  // json-prune rule on exactly this URL (`propsToMatch, url:/reel_watch_sequence?`),
+  // and its payload is where the `entries.[-]...adClientParams.isAd` ad reels
+  // live — without it those responses only ever got the shallow parse path.
+  //
+  // `/get_video_info` is deliberately *not* in this list any more. YouTube
+  // retired that endpoint in 2020 (it has 410'd ever since and no current
+  // client calls it), so the check could never match; it is called out here
+  // rather than silently dropped so nobody "restores" it later.
   const isYoutubePlayerLikeUrl = (url = '') =>
     url.includes('/v1/player') ||
     url.includes('/v1/next') ||
     url.includes('/get_watch') ||
-    url.includes('/get_video_info');
+    url.includes('/reel_watch_sequence');
   const PLAYER_POLL_DELAYS = [50, 100, 200, 400, 800, 1600, 3000];
   const PRUNE_NODE_LIMIT = 10000;
 
@@ -84,14 +122,17 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     ['"web_player_api_v2_ads_metadata":true', '"web_player_api_v2_ads_metadata":false'],
     ['"web_enable_ad_break_heartbeat":true', '"web_enable_ad_break_heartbeat":false'],
   ];
-  const WASM_STATE_KEY = '__nullifyYoutubeWasm';
+  // WASM bootstrap diagnostics. This used to be published on
+  // `globalThis.__nullifyYoutubeWasm`, which announced the extension —
+  // status, readiness, error text and asset path — to every page on every
+  // load (§4.12). Nothing outside this file ever read it, so the state now
+  // stays in the closure.
+  const wasmState = { status: 'waiting', ready: false, error: null, source: null };
   const updateWasmState = (status) => {
-    globalThis[WASM_STATE_KEY] = {
-      status,
-      ready: status === 'ready',
-      error: wasmInitError,
-      source: wasmSource,
-    };
+    wasmState.status = status;
+    wasmState.ready = status === 'ready';
+    wasmState.error = wasmInitError;
+    wasmState.source = wasmSource;
   };
   const shouldBlockRequestUrl = (url) =>
     url.includes('/ad_break') ||
@@ -142,24 +183,189 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     return false;
   }
 
-  function shouldPruneParsedResult(result) {
-    if (!result || typeof result !== 'object' || Array.isArray(result)) return false;
-    if (hasAdPayload(result)) return true;
+  // How hard to prune a parsed value. Splitting "shallow" from "deep" matters:
+  // the JSON.parse hook is page-global, so an unconditional deep walk would
+  // traverse every object youtube.com ever parses. Deep is only licensed once
+  // the value has been positively identified as a player envelope.
+  const PRUNE_NONE = 0;
+  const PRUNE_SHALLOW = 1;
+  const PRUNE_DEEP = 2;
+
+  function parsedPruneMode(result) {
+    if (!result || typeof result !== 'object' || Array.isArray(result)) return PRUNE_NONE;
 
     const nested = result.playerResponse;
-    if (!nested || typeof nested !== 'object' || Array.isArray(nested)) return false;
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+      // Narrow the page-global JSON.parse hook to known YouTube player-ish
+      // shapes — but once one matches, walk the whole envelope. The old code
+      // let this gate pass and then ran the *shallow* prune, so a payload like
+      // `{playerResponse:{streamingData:{}, <container>:{adPlacements:[…]}}}`
+      // was recognised as a player response and then left untouched: the
+      // shallow walk only looks at `result` and `result.playerResponse`.
+      if (
+        hasAdPayload(nested) ||
+        nested.playabilityStatus ||
+        nested.streamingData ||
+        nested.videoDetails ||
+        nested.microformat ||
+        nested.responseContext
+      ) {
+        return PRUNE_DEEP;
+      }
+    }
 
-    if (hasAdPayload(nested)) return true;
-
-    // Narrow the page-global JSON.parse hook to known YouTube player-ish shapes.
-    return !!(
-      nested.playabilityStatus ||
-      nested.streamingData ||
-      nested.videoDetails ||
-      nested.microformat ||
-      nested.responseContext
-    );
+    // Bare ad keys on some other page JSON: neutralize them in place, but do
+    // not let that license a deep walk of an arbitrary object.
+    return hasAdPayload(result) ? PRUNE_SHALLOW : PRUNE_NONE;
   }
+
+  // ---- Path-targeted pruning (uBO parity) ----
+  //
+  // pruneAdKeys() only knows key *names*, so an entire ad surface that hides
+  // behind a nested renderer chain walks straight past it: a Shorts ad reel is
+  // an `entries[]` element, a feed ad is a `richItemRenderer` wrapping an
+  // `adSlotRenderer`, and neither carries any AD_KEYS name at a level the
+  // shallow walk visits. uBO handles these by explicit path, so we ship the
+  // same paths, verbatim from its rules.
+  //
+  // Segment grammar (uBO's json-prune):
+  //   `[]`  — recurse into every array element, leaving the array intact
+  //   `[-]` — recurse into every array element and SPLICE OUT the elements for
+  //           which the remainder of the path resolves
+  //   anything else — a literal own key
+  const AD_PATHS = [
+    // Shorts ad reels. uBO:
+    //   ##+js(json-prune, entries.[-].command.reelWatchEndpoint.adClientParams.isAd)
+    //   ##+js(json-prune-fetch-response,
+    //         reelWatchSequenceResponse.entries.[-].command.reelWatchEndpoint.adClientParams.isAd
+    //         entries.[-].command.reelWatchEndpoint.adClientParams.isAd, ,
+    //         propsToMatch, url:/reel_watch_sequence?)
+    'entries.[-].command.reelWatchEndpoint.adClientParams.isAd',
+    'reelWatchSequenceResponse.entries.[-].command.reelWatchEndpoint.adClientParams.isAd',
+    // Homepage feed ad slots, inside the browse response's rich grid.
+    'contents.twoColumnBrowseResultsRenderer.tabs.[].tabRenderer.content.richGridRenderer.contents.[-].richItemRenderer.content.adSlotRenderer',
+    // Premium upsell nag. uBO:
+    //   ##+js(json-prune, auxiliaryUi.messageRenderers.upsellDialogRenderer)
+    'auxiliaryUi.messageRenderers.upsellDialogRenderer',
+    // Array-wrapped player responses (batched innertube payloads), which the
+    // `result.playerResponse` gate above cannot see because the root is an array.
+    '[].playerResponse.adPlacements',
+    '[].playerResponse.adSlots',
+  ].map((path) => path.split('.'));
+
+  const isUnsafePathKey = (key) =>
+    key === '__proto__' || key === 'constructor' || key === 'prototype';
+
+  // Existence probe for the tail of a `[-]` path — uBO's objectFindOwnerFn with
+  // pruning off. Recursion depth is bounded by the (fixed, hand-written) path
+  // length, so a cyclic object cannot run away here the way it could in the
+  // key-based walk; breadth is what needs a ceiling, hence the shared budget.
+  function pathResolves(target, parts, index, state) {
+    let current = target;
+    let at = index;
+    for (;;) {
+      if (!current || typeof current !== 'object') return false;
+      if (state.nodes >= PRUNE_NODE_LIMIT) return false;
+      state.nodes++;
+
+      const part = parts[at];
+      if (isUnsafePathKey(part)) return false;
+      const isLast = at === parts.length - 1;
+
+      if (part === '[]' || part === '[-]') {
+        if (!Array.isArray(current)) return false;
+        if (isLast) return current.length > 0;
+        for (let i = 0; i < current.length; i++) {
+          if (pathResolves(current[i], parts, at + 1, state)) return true;
+        }
+        return false;
+      }
+
+      if (isLast) return Object.prototype.hasOwnProperty.call(current, part);
+      current = current[part];
+      at++;
+    }
+  }
+
+  function pruneAdPath(target, parts, index, state) {
+    if (!target || typeof target !== 'object') return false;
+    if (state.nodes >= PRUNE_NODE_LIMIT) return false;
+    state.nodes++;
+
+    const part = parts[index];
+    if (isUnsafePathKey(part)) return false;
+    const isLast = index === parts.length - 1;
+
+    if (part === '[-]') {
+      if (!Array.isArray(target)) return false;
+      // uBO's `[-]` semantics are element *removal*, not key neutralization,
+      // and we match uBO here rather than following our usual "set to false"
+      // convention: a Shorts entry whose reelWatchEndpoint is flagged `isAd`,
+      // or a rich-grid item whose content is an adSlotRenderer, is an ad and
+      // nothing else — neutering one key would leave an empty husk occupying a
+      // slot in the sequence/feed, which is exactly the artefact uBO avoids by
+      // splicing. Iterate backwards so splicing does not skip elements.
+      let removed = false;
+      for (let i = target.length - 1; i >= 0; i--) {
+        if (isLast || pathResolves(target[i], parts, index + 1, state)) {
+          target.splice(i, 1);
+          removed = true;
+        }
+      }
+      return removed;
+    }
+
+    if (part === '[]') {
+      if (!Array.isArray(target)) return false;
+      let pruned = false;
+      for (let i = 0; i < target.length; i++) {
+        if (isLast) {
+          target[i] = false;
+          pruned = true;
+        } else if (pruneAdPath(target[i], parts, index + 1, state)) {
+          pruned = true;
+        }
+      }
+      return pruned;
+    }
+
+    if (isLast) {
+      if (!Object.prototype.hasOwnProperty.call(target, part)) return false;
+      // Ordinary leaves keep our convention: neutralize in place so YouTube's
+      // player still finds the schema it expects.
+      target[part] = false;
+      return true;
+    }
+    return pruneAdPath(target[part], parts, index + 1, state);
+  }
+
+  // Cheap root gate: every path starts with either a literal key or an array
+  // wildcard, so one hasOwnProperty (or Array.isArray) test per path keeps the
+  // page-global JSON.parse hook off the hot path for the overwhelming majority
+  // of payloads, which carry none of these surfaces.
+  function pruneAdPaths(result) {
+    if (!result || typeof result !== 'object') return;
+    const rootIsArray = Array.isArray(result);
+    let state = null;
+    for (let i = 0; i < AD_PATHS.length; i++) {
+      const parts = AD_PATHS[i];
+      const root = parts[0];
+      if (root === '[]' || root === '[-]') {
+        if (!rootIsArray) continue;
+      } else if (rootIsArray || !Object.prototype.hasOwnProperty.call(result, root)) {
+        continue;
+      }
+      if (state === null) state = { nodes: 0 };
+      pruneAdPath(result, parts, 0, state);
+    }
+  }
+
+  const prunePayload = (result) => {
+    const mode = parsedPruneMode(result);
+    if (mode !== PRUNE_NONE) pruneAdKeys(result, mode === PRUNE_DEEP);
+    pruneAdPaths(result);
+    return result;
+  };
 
   // 1a. JSON.parse hook — THE critical interception layer.
   //
@@ -175,11 +381,22 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   const _origJSONParse = JSON.parse;
   JSON.parse = function(text, ...rest) {
     const result = _origJSONParse.call(this, text, ...rest);
-    if (shouldPruneParsedResult(result)) {
-      pruneAdKeys(result);
-    }
-    return result;
+    return prunePayload(result);
   };
+  // Locked idempotency brand — see isShieldInstalled() above. Non-enumerable
+  // so it stays out of Object.keys/JSON output, non-writable and
+  // non-configurable so a later page script cannot forge a newer generation
+  // onto our own wrapper.
+  try {
+    Object.defineProperty(JSON.parse, INSTALL_BRAND, {
+      value: SHIELD_VERSION,
+      writable: false,
+      enumerable: false,
+      configurable: false,
+    });
+  } catch {
+    // Branding is best effort; the behavioural probe still detects the hook.
+  }
 
   // 1b. Response.json hook — keep the scope narrow and let JSON.parse handle
   // text-backed consumers. The broader text()/arrayBuffer() hooks were touching
@@ -190,10 +407,10 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       const result = await _origResponseJson.apply(this, args);
       if (isYoutubePlayerLikeUrl(this.url)) {
         pruneAdKeys(result, true);
-      } else if (shouldPruneParsedResult(result)) {
-        pruneAdKeys(result);
+        pruneAdPaths(result);
+        return result;
       }
-      return result;
+      return prunePayload(result);
     };
   }
 
@@ -226,7 +443,10 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       updateWasmState('ready');
       console.info(`[Nullify] YouTube WASM ready (${wasmSource || 'unknown'})`);
       try {
-        if (window.ytcfg?.config_) poison(window.ytcfg.config_);
+        // Same store resolution as the synchronous belt layer (§4.25) — the
+        // old `window.ytcfg?.config_` check never matched a real page, so the
+        // extra flags WASM covers were never applied to the live config.
+        poisonCfgStores(window.ytcfg);
       } catch {
         // Ignore late config poisoning failures.
       }
@@ -255,10 +475,16 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   }
 
   // 3. Response Scrubber
-  // String scrubbers are kept for XHR/JSON-backed fallback paths. For fetch, we
-  // avoid replaying `/v1/player` bodies because YouTube appears to retry when
-  // the transport payload is modified, even though parse-time hooks are enough
-  // to neutralize ad fields after the response is consumed by the page.
+  // String scrubbers run on every player-like body we can materialize — the
+  // XHR responseText path and (see 3b) the fetch path.
+  //
+  // The previous note here argued that fetch bodies must be left alone because
+  // YouTube retries when "the transport payload is modified". That rationale is
+  // about *replaying a request* — re-issuing it so the response can be read
+  // twice — not about rewriting a response body we are already holding. With
+  // fetch left out entirely, `scrub()` had exactly one call site (the XHR text
+  // path) while modern YouTube fetches `/youtubei/v1/player`, so on a real page
+  // the WASM string neutralizer effectively never ran.
   //
   // JS string pre-check is still useful for XHR/responseText paths, where the
   // browser has already materialized a string.
@@ -310,6 +536,95 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     } catch { return data; }
   };
 
+  // 3b. Fetch body scrubber
+  //
+  // `Response.prototype.json` (1b) already deep-prunes the parsed object, so
+  // the remaining hole is a player fetch whose body is read via `.text()` or
+  // `.arrayBuffer()` — those never touch our parse hooks at all. Close it by
+  // handing back a Response whose body is the scrubbed string.
+  //
+  // Deliberately narrow, so nothing outside the player path is reconstructed:
+  //   • player-like URLs only,
+  //   • text-like content types only, with a size ceiling,
+  //   • the body is read from a `clone()`, so an unchanged payload is returned
+  //     as the *original* Response with its stream still unread,
+  //   • `ok`/`status`/`statusText`/`redirected`/`type`/`url` are carried over so
+  //     page code branching on them cannot tell the difference.
+  const PLAYER_BODY_LIMIT = 8 * 1024 * 1024;
+  const TEXT_LIKE_CONTENT_TYPES = [
+    'application/json', 'text/', 'application/javascript', 'application/xml',
+  ];
+  const isTextLikeResponse = (response) => {
+    try {
+      const contentType = response.headers?.get?.('content-type') || '';
+      for (let i = 0; i < TEXT_LIKE_CONTENT_TYPES.length; i++) {
+        if (contentType.includes(TEXT_LIKE_CONTENT_TYPES[i])) return true;
+      }
+    } catch {
+      // An exotic/throwing headers object is treated as "not text".
+    }
+    return false;
+  };
+
+  const rebuildResponse = (response, body) => {
+    // The rebuilt body is raw text, so the byte-level headers describing the
+    // original (likely compressed) stream no longer apply to it.
+    let headers = response.headers;
+    try {
+      headers = new Headers(response.headers);
+      headers.delete('content-encoding');
+      headers.delete('content-length');
+    } catch {
+      // Fall back to the original header set.
+    }
+
+    const rebuilt = new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+    try {
+      // `new Response` always reports ok/redirected/type/url for a synthetic
+      // response; carry the real ones over so the page sees no difference.
+      Object.defineProperties(rebuilt, {
+        ok: { value: response.ok },
+        redirected: { value: response.redirected },
+        type: { value: response.type },
+        url: { value: response.url },
+      });
+    } catch {
+      // Best effort — the scrubbed body is what actually matters.
+    }
+    return rebuilt;
+  };
+
+  const scrubPlayerResponse = async (response) => {
+    try {
+      if (!response || typeof response.text !== 'function') return response;
+      // Opaque and body-less responses carry nothing to scrub, and the Response
+      // constructor rejects a status outside 200-599 or a body on 204/205/304.
+      const status = response.status;
+      if (!(status >= 200 && status <= 599)) return response;
+      if (status === 204 || status === 205 || status === 304) return response;
+      if (response.type === 'opaque' || response.type === 'opaqueredirect') return response;
+      if (response.bodyUsed) return response;
+      if (!isTextLikeResponse(response)) return response;
+      const declaredLength = Number.parseInt(response.headers?.get?.('content-length') || '0', 10);
+      if (declaredLength > PLAYER_BODY_LIMIT) return response;
+      if (typeof response.clone !== 'function') return response;
+
+      const text = await response.clone().text();
+      if (typeof text !== 'string' || text.length > PLAYER_BODY_LIMIT) return response;
+      const cleaned = scrub(text);
+      // Nothing changed: hand back the untouched original, stream still unread.
+      if (cleaned === text) return response;
+      return rebuildResponse(response, cleaned);
+    } catch {
+      // Any failure leaves the original response exactly as the network gave it.
+      return response;
+    }
+  };
+
   // 4. Identity Trap-Defuser
   const ok = () => Promise.resolve({ state: 'granted' });
   if (document.requestStorageAccess) document.requestStorageAccess = ok;
@@ -332,7 +647,13 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       });
     }
 
-    return origFetch.call(this, input, init);
+    const response = await origFetch.call(this, input, init);
+    // The request URL can be relative and the response URL is post-redirect, so
+    // check both before spending a clone on the body.
+    if (isYoutubePlayerLikeUrl(url) || isYoutubePlayerLikeUrl(response?.url || '')) {
+      return scrubPlayerResponse(response);
+    }
+    return response;
   };
 
   // 5b. Network Interceptor — XMLHttpRequest
@@ -413,6 +734,7 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       const r = super.response;
       if (this._isPlayerJson()) {
         pruneAdKeys(r, true);
+        pruneAdPaths(r);
         return r;
       }
       return (this._isPlayerText() && typeof r === 'string') ? this._scrubbed() : r;
@@ -491,15 +813,125 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
     } catch {}
   };
 
-  if (window.ytcfg?.set) {
-    const origSet = window.ytcfg.set;
-    window.ytcfg.set = function(cfg, ...args) {
-      if (cfg) poison(cfg);
-      return origSet.apply(this, [cfg, ...args]);
+  // Where the flags actually live (REVIEW-2026-08 §4.25). Real YouTube never
+  // keeps the store on `ytcfg.config_`: `ytcfg.d()` returns `window.yt.config_`
+  // and older/alternate builds back it with `ytcfg.data_`. Poisoning only
+  // `cfg.config_` made the whole belt layer — and the WASM-ready re-poison —
+  // a no-op against the real page. Collect every store shape we can see and
+  // poison all of them; they are usually the same object anyway.
+  const collectCfgStores = (cfg) => {
+    const stores = [];
+    const add = (store) => {
+      if (store && typeof store === 'object' && !stores.includes(store)) stores.push(store);
     };
-    if (window.ytcfg.config_) poison(window.ytcfg.config_);
-  } else if (window.ytcfg?.config_) {
-    poison(window.ytcfg.config_);
+    try {
+      if (cfg && typeof cfg === 'object') {
+        add(cfg.config_);
+        add(cfg.data_);
+      }
+    } catch {
+      // A throwing accessor on the page's ytcfg must not break the hook.
+    }
+    try {
+      add(globalThis.yt?.config_);
+    } catch {
+      // Same for window.yt.
+    }
+    return stores;
+  };
+  const poisonCfgStores = (cfg) => {
+    const stores = collectCfgStores(cfg);
+    for (let i = 0; i < stores.length; i++) poison(stores[i]);
+  };
+
+  const wrappedYtcfgSetters = new WeakSet();
+  const hookYtcfg = (cfg) => {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (typeof cfg.set === 'function' && !wrappedYtcfgSetters.has(cfg.set)) {
+      const origSet = cfg.set;
+      const wrappedSet = function(config, ...args) {
+        if (config) poison(config);
+        return origSet.apply(this, [config, ...args]);
+      };
+      wrappedYtcfgSetters.add(wrappedSet);
+      cfg.set = wrappedSet;
+    }
+    poisonCfgStores(cfg);
+  };
+
+  // `window.yt.config_` is the store `ytcfg.d()` reads on the real page, and
+  // the page can seed it by direct assignment without ever calling
+  // `ytcfg.set` — the case the .set wrapper cannot see. Trap it the same way
+  // shield() traps the player-response globals: once at the `window.yt`
+  // assignment, and again at the `config_` assignment on whatever object the
+  // page installs there.
+  const hookYt = (yt) => {
+    try {
+      if (!yt || typeof yt !== 'object') return;
+      let store = yt.config_;
+      // Whatever is already there gets poisoned now; the trap below then
+      // catches both the first seeding and any later wholesale replacement.
+      if (store && typeof store === 'object') poison(store);
+      const existing = Object.getOwnPropertyDescriptor(yt, 'config_');
+      if (existing && !existing.configurable) return;
+      Object.defineProperty(yt, 'config_', {
+        get: () => store,
+        set: (v) => {
+          store = v;
+          try {
+            poison(v);
+          } catch {
+            // Never let poisoning failures break the page's assignment.
+          }
+        },
+        enumerable: true,
+        configurable: true,
+      });
+    } catch {
+      // A sealed or exotic `yt` object is left alone.
+    }
+  };
+
+  if (globalThis.yt) {
+    hookYt(globalThis.yt);
+  } else {
+    let _ytValue;
+    try {
+      Object.defineProperty(window, 'yt', {
+        get: () => _ytValue,
+        set: (v) => {
+          _ytValue = v;
+          hookYt(v);
+        },
+        configurable: true,
+      });
+    } catch {
+      // Leave a non-configurable page-owned `yt` in place.
+    }
+  }
+
+  if (window.ytcfg) {
+    // Late-injection path (already-loaded tab): ytcfg exists — hook it now.
+    hookYtcfg(window.ytcfg);
+  } else {
+    // Fresh navigation: this script runs at document_start, before any page
+    // script has defined ytcfg, so checking window.ytcfg once here can never
+    // fire. Trap the assignment instead (same technique as shield() above):
+    // the moment YouTube's inline script assigns ytcfg we wrap .set and
+    // poison whatever config it already carries.
+    let _ytcfgValue;
+    Object.defineProperty(window, 'ytcfg', {
+      get: () => _ytcfgValue,
+      set: (v) => {
+        _ytcfgValue = v;
+        try {
+          hookYtcfg(v);
+        } catch {
+          // Never let poisoning failures break the page's ytcfg assignment.
+        }
+      },
+      configurable: true,
+    });
   }
 
   // 8. Zero-Latency Ad Skipper — MutationObserver reacts immediately when
@@ -731,4 +1163,15 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   schedulePlayerPoll(true);
   window.addEventListener('yt-navigate-finish', () => schedulePlayerPoll(true));
   window.addEventListener('yt-page-data-updated', () => schedulePlayerPoll(true));
+
+  // Background tabs: the bounded chain above (~6.15 s total) can expire before
+  // a hidden tab ever constructs its player, and re-arming depended only on
+  // yt-navigate events — which focusing a tab does not fire. Re-arm the poll
+  // when the tab becomes visible and no player is hooked yet, so the DOM
+  // ad-skipper recovers instead of staying dead for the tab's lifetime.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && !_observedPlayer) {
+      schedulePlayerPoll(true);
+    }
+  });
 })();

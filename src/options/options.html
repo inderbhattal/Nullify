@@ -18,8 +18,8 @@
         </div>
       </div>
 
-      <ul class="nav-list">
-        <li class="nav-item active" data-tab="filter-lists">
+      <ul class="nav-list" role="tablist" aria-orientation="vertical" aria-label="Dashboard sections">
+        <li class="nav-item active" data-tab="filter-lists" role="tab" tabindex="0" aria-selected="true" aria-controls="tab-filter-lists">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/>
             <line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/>
@@ -27,26 +27,26 @@
           </svg>
           Filter Lists
         </li>
-        <li class="nav-item" data-tab="my-filters">
+        <li class="nav-item" data-tab="my-filters" role="tab" tabindex="0" aria-selected="false" aria-controls="tab-my-filters">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
             <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
           </svg>
           My Filters
         </li>
-        <li class="nav-item" data-tab="allowlist">
+        <li class="nav-item" data-tab="allowlist" role="tab" tabindex="0" aria-selected="false" aria-controls="tab-allowlist">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
           </svg>
           Allowlist
         </li>
-        <li class="nav-item" data-tab="logger">
+        <li class="nav-item" data-tab="logger" role="tab" tabindex="0" aria-selected="false" aria-controls="tab-logger">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
           </svg>
           Live Logger
         </li>
-        <li class="nav-item" data-tab="settings">
+        <li class="nav-item" data-tab="settings" role="tab" tabindex="0" aria-selected="false" aria-controls="tab-settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="3"/>
             <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -60,7 +60,7 @@
     <main class="main-content">
 
       <!-- ---- Filter Lists ---- -->
-      <section id="tab-filter-lists" class="tab-content active">
+      <section id="tab-filter-lists" class="tab-content active" role="tabpanel">
         <div class="section-header">
           <h2>Filter Lists</h2>
           <div style="display:flex;align-items:center;gap:12px">
@@ -70,13 +70,15 @@
         </div>
         <p class="section-desc">Enable or disable individual filter lists. Changes take effect immediately.</p>
 
+        <div class="filter-status" id="listsStatus" role="status"></div>
+
         <div class="list-grid" id="filterListGrid">
           <!-- Populated by JS -->
         </div>
       </section>
 
       <!-- ---- My Filters ---- -->
-      <section id="tab-my-filters" class="tab-content">
+      <section id="tab-my-filters" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>My Filters</h2>
           <div style="display:flex;gap:8px">
@@ -105,7 +107,7 @@
       </section>
 
       <!-- ---- Allowlist ---- -->
-      <section id="tab-allowlist" class="tab-content">
+      <section id="tab-allowlist" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>Allowlist</h2>
           <div style="display:flex;gap:8px">
@@ -116,7 +118,7 @@
         <p class="section-desc">Sites on this list will have all blocking disabled.</p>
 
         <div class="add-site-row">
-          <input type="text" id="allowlistInput" class="text-input" placeholder="example.com">
+          <input type="text" id="allowlistInput" class="text-input" placeholder="example.com" aria-label="Site to allow">
           <button class="btn btn-primary" id="btnAddAllowlist">Add site</button>
         </div>
 
@@ -128,12 +130,12 @@
       </section>
 
       <!-- ---- Live Logger ---- -->
-      <section id="tab-logger" class="tab-content">
+      <section id="tab-logger" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>Live Logger</h2>
           <div style="display:flex;gap:8px">
-            <input type="text" id="loggerSearch" class="text-input" style="padding: 4px 10px; width: 180px;" placeholder="Search logs...">
-            <select id="loggerFilter" class="text-input" style="padding: 4px 8px; width: auto; flex: none;">
+            <input type="text" id="loggerSearch" class="text-input" style="padding: 4px 10px; width: 180px;" placeholder="Search logs..." aria-label="Search logs">
+            <select id="loggerFilter" class="text-input" style="padding: 4px 8px; width: auto; flex: none;" aria-label="Filter log entries by type">
               <option value="all">All Types</option>
               <option value="network">Network</option>
               <option value="cosmetic">Cosmetic</option>
@@ -158,10 +160,12 @@
       </section>
 
       <!-- ---- Settings ---- -->
-      <section id="tab-settings" class="tab-content">
+      <section id="tab-settings" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>Settings</h2>
         </div>
+
+        <div class="filter-status" id="settingsStatus" role="status"></div>
 
         <div class="settings-group">
           <h3>Privacy</h3>

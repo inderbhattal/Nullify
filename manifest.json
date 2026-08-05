@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nullify",
-  "version": "4.3.0",
+  "version": "4.4.0",
   "minimum_chrome_version": "120",
   "description": "Nullify — reduce ads to nothing. A powerful, privacy-focused ad blocker built on Manifest V3.",
   "author": "Nullify",
@@ -113,6 +113,11 @@
         "id": "ubo-cookie-annoyances",
         "enabled": true,
         "path": "rules/ubo-cookie-annoyances.json"
+      },
+      {
+        "id": "ubo-quick-fixes",
+        "enabled": true,
+        "path": "rules/ubo-quick-fixes.json"
       }
     ]
   },
@@ -137,15 +142,23 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "dist/scriptlets-world.js",
-        "dist/nullify_core_bg.wasm"
+        "dist/scriptlets-world.js"
       ],
       "matches": [
         "<all_urls>"
       ]
+    },
+    {
+      "resources": [
+        "dist/nullify_core_bg.wasm"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "use_dynamic_url": true
     }
   ],
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   }
 }

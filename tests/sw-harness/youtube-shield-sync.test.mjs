@@ -145,7 +145,7 @@ test('4. two YT tabs, allowlist toggle on one — both must reflect the new excl
 });
 
 test('5. music.youtube.com allowlist isolates: www.youtube.com still receives shield', async () => {
-  const { stub, sync, allowlist } = setupHarness({
+  const { stub, sync } = setupHarness({
     allowlist: ['music.youtube.com'],
     tabs: [
       { id: 1, url: 'https://www.youtube.com/' },

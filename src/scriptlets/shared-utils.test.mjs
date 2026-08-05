@@ -43,9 +43,48 @@ test('patternToRegex: /regex/flags syntax still parsed, and a global one is rese
   }
 });
 
-test('patternToRegex: invalid regex returns null rather than throwing', () => {
-  assert.equal(patternToRegex('/[/'), null);
+test('patternToRegex: non-string input returns null rather than throwing', () => {
   assert.equal(patternToRegex(undefined), null);
+  assert.equal(patternToRegex(42), null);
+});
+
+// Regression (§4.31): "starts with / and contains a second /" treated every
+// path-like argument as /regex/flags. `/gampad/ads?` parsed as body "gampad"
+// with flags "ads?" -> SyntaxError -> null -> the whole rule silently died.
+// Only a pattern matching /^\/(.*)\/([dgimsuvy]*)$/ is a regex literal.
+
+test('patternToRegex: path-like pattern is a literal, not /regex/flags', () => {
+  const re = patternToRegex('/gampad/ads?');
+  assert.notEqual(re, null, 'path-like pattern must not be dropped');
+  assert.equal(re.test('https://pubads.g.doubleclick.net/gampad/ads?x=1'), true);
+  assert.equal(re.test('https://example.com/gampadXads'), false, '? must be literal');
+});
+
+test('patternToRegex: regex literal requires valid flags only', () => {
+  const re = patternToRegex('/showAds/i');
+  assert.equal(re.test('window.showads()'), true, 'i flag must be honored');
+  assert.equal(patternToRegex('/a/x').test('/a/x'), true, 'invalid flag char means literal');
+});
+
+test('patternToRegex: malformed regex literal falls back to literal matching, not null', () => {
+  const re = patternToRegex('/[/');
+  assert.notEqual(re, null, 'silent total failure is worse than a literal match');
+  assert.equal(re.test('path/[/x'), true);
+});
+
+test('toMatcher: path-like pattern matches by substring, not as regex', () => {
+  const match = toMatcher('/gampad/ads?');
+  assert.equal(match('https://pubads.g.doubleclick.net/gampad/ads?x=1'), true);
+  assert.equal(match('https://example.com/other'), false);
+});
+
+test('toMatcher: malformed regex literal falls back to substring, not never-match', () => {
+  const match = toMatcher('/[/');
+  assert.equal(match('path/[/x'), true);
+});
+
+test('toRegex: path-like pattern is a literal find pattern', () => {
+  assert.equal('x /a/b y'.replace(toRegex('/a/b'), ''), 'x  y');
 });
 
 test('toMatcher: repeated calls on a /regex/ pattern are stable', () => {

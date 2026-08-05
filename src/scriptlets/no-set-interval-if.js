@@ -1,32 +1,33 @@
-/** no-set-interval-if.js — Suppress setInterval calls matching a pattern. */
-export function noSetInterval(pattern, delay) {
-  const re = pattern ? patternToRegex(pattern) : null;
-  const targetDelay = delay !== undefined ? Number(delay) : undefined;
+import { RangeParser, functionToString, patternToRegex } from './shared-utils.js';
+
+/**
+ * no-set-interval-if.js — Suppress setInterval calls matching a pattern.
+ * uBO: `prevent-setInterval` / `nosiif`. Argument semantics match
+ * no-set-timeout-if: `!needle` inverts, and the delay accepts uBO ranges.
+ */
+export function noSetInterval(pattern = '', delay = '') {
+  const needleNot = String(pattern).charAt(0) === '!';
+  const re = patternToRegex(needleNot ? String(pattern).slice(1) : pattern);
+  if (re === null) return;
+  const range = new RangeParser(delay);
+  const logOnly = pattern === '' && range.unbound();
   const origSetInterval = window.setInterval;
   const origClearInterval = window.clearInterval;
-  const noopTokens = new Set();
   let tokenCounter = 0;
 
   window.setInterval = function (fn, ms, ...rest) {
-    const src = typeof fn === 'function' ? fn.toString() : String(fn);
-    if ((!re || re.test(src)) && (targetDelay === undefined || targetDelay === ms)) {
-      const token = `__n_siif_${++tokenCounter}`;
-      noopTokens.add(token);
-      return token;
+    const src = functionToString(fn);
+    if (!logOnly && re.test(src) !== needleNot && range.test(ms)) {
+      // A unique string token: never a real timer id, so clearInterval can
+      // recognize and swallow it. No bookkeeping — a Set of every suppressed
+      // token grew forever on pages that poll.
+      return `__n_siif_${++tokenCounter}`;
     }
     return origSetInterval.call(this, fn, ms, ...rest);
   };
 
   window.clearInterval = function (id) {
-    if (typeof id === 'string' && id.startsWith('__n_siif_')) {
-      noopTokens.delete(id);
-      return;
-    }
+    if (typeof id === 'string' && id.startsWith('__n_siif_')) return;
     return origClearInterval.call(this, id);
   };
-}
-
-function patternToRegex(p) {
-  if (p.startsWith('/') && p.endsWith('/')) return new RegExp(p.slice(1, -1));
-  return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
 }

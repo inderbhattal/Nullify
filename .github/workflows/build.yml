@@ -18,12 +18,15 @@ jobs:
   # ship — so a tag on a red commit shipped, and a v4.2.0 tag could publish a
   # ZIP whose manifest read 4.1.0. Chrome shows the manifest version, so that
   # mismatch reaches users rather than us.
+  # All actions are pinned to full commit SHAs: a mutable tag (or the fully
+  # mutable dtolnay/rust-toolchain@stable branch ref) lets third-party code
+  # holding a write-scoped token be swapped out from under us.
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -37,9 +40,16 @@ jobs:
       - name: Unit + harness tests
         run: npm test
 
+      # `${{ github.ref_name }}` interpolated straight into a `run:` block is
+      # shell-injectable: `git check-ref-format 'refs/tags/v4.3.0$(id)'` exits
+      # 0, so `$(…)` and `${IFS}` are legal in a tag name and would execute
+      # inside the job. Pass it through the environment and quote it, so the
+      # value is data the shell never parses.
       - name: Assert tag matches shipped version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: node scripts/assert-release-version.mjs "${{ github.ref_name }}"
+        env:
+          TAG: ${{ github.ref_name }}
+        run: node scripts/assert-release-version.mjs "$TAG"
 
   build:
     needs: verify
@@ -47,9 +57,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -58,26 +68,38 @@ jobs:
         run: npm ci
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        # When pinned to a SHA the action cannot infer the toolchain from the
+        # ref name, so it must be given explicitly.
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07
+        with:
+          toolchain: stable
 
       - name: Setup wasm-pack
-        uses: jetli/wasm-pack-action@v0.4.0
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
         with:
-          version: 'latest'
+          # 'latest' pulled a mutable binary at run time — pin it.
+          version: 'v0.13.1'
 
       - name: Build WASM Core
         run: npm run build:wasm
 
-      - name: Build filter rules
+      # Compiles the committed snapshots under scripts/filter-lists/ and
+      # verifies them against scripts/filter-lists.lock.json. No network: a
+      # release can no longer lose a race with upstream list rotation, which
+      # used to reduce the window between tag and build to minutes (§4.6).
+      # Refresh upstream content with `npm run refresh:lists` on a branch.
+      - name: Build filter rules (offline, from vendored snapshots)
         run: npm run build:rules
 
       - name: Build extension
         run: npm run build:ext
 
       - name: Package extension ZIP
+        env:
+          TAG: ${{ github.ref_name || 'dev' }}
         run: |
           mkdir -p release
-          zip -r release/nullify-${{ github.ref_name || 'dev' }}.zip \
+          zip -r "release/nullify-$TAG.zip" \
             manifest.json \
             assets/ \
             rules/ \
@@ -89,24 +111,43 @@ jobs:
             src/options/options.css \
             -x "*.map" "rules/skipped/*"
 
+      - name: Generate SHA-256 checksums
+        run: |
+          cd release
+          sha256sum *.zip > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: nullify-extension
-          path: release/*.zip
+          path: |
+            release/*.zip
+            release/SHA256SUMS
 
+      # `env.TAG` is the same value as github.ref_name, but routing every
+      # reference through one place means a future `run:` step cannot pick up
+      # the raw expression by copy-paste. Action inputs are not shell, so this
+      # is consistency rather than a second injection sink.
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        env:
+          TAG: ${{ github.ref_name }}
         with:
-          files: release/*.zip
+          files: |
+            release/*.zip
+            release/SHA256SUMS
           generate_release_notes: true
           body: |
-            ## Nullify ${{ github.ref_name }}
+            ## Nullify ${{ env.TAG }}
 
             ### Install
-            1. Download `nullify-${{ github.ref_name }}.zip` below
+            1. Download `nullify-${{ env.TAG }}.zip` below
             2. Unzip to a folder
             3. Open `chrome://extensions` → enable **Developer mode**
             4. Click **Load unpacked** → select the unzipped folder
             5. Done! Nullify is active.
+
+            ### Verify
+            Compare `sha256sum nullify-${{ env.TAG }}.zip` against the `SHA256SUMS` asset.

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { normalizeHostname, normalizeAllowlist } from './hostname.js';
+import { normalizeHostname, normalizeAllowlist, isValidAllowlistDomain } from './hostname.js';
 
 test('lowercases and trims plain hostnames', () => {
   assert.equal(normalizeHostname('  EXAMPLE.com  '), 'example.com');
@@ -93,4 +93,40 @@ test('allowlist normalisation: returns empty array for non-array input', () => {
   assert.deepEqual(normalizeAllowlist(null), []);
   assert.deepEqual(normalizeAllowlist(undefined), []);
   assert.deepEqual(normalizeAllowlist('example.com'), []);
+});
+
+// ---------------------------------------------------------------------------
+// isValidAllowlistDomain (REVIEW-2026-07 §4.8) — write-side validation.
+// ---------------------------------------------------------------------------
+
+test('4.8: rejects bare TLDs and multi-label public suffixes', () => {
+  assert.equal(isValidAllowlistDomain('com'), false);
+  assert.equal(isValidAllowlistDomain('uk'), false);
+  assert.equal(isValidAllowlistDomain('co.uk'), false);
+  assert.equal(isValidAllowlistDomain('github.io'), false);
+  assert.equal(isValidAllowlistDomain('netlify.app'), false);
+});
+
+test('4.8: rejects dotless labels, bad charset, empty labels, oversized input', () => {
+  assert.equal(isValidAllowlistDomain('localhost'), false);
+  assert.equal(isValidAllowlistDomain('foo bar'), false);
+  assert.equal(isValidAllowlistDomain('exa_mple.com'), false);
+  assert.equal(isValidAllowlistDomain('Example.com'), false, 'expects normalized (lowercase) input');
+  assert.equal(isValidAllowlistDomain('a..b'), false);
+  assert.equal(isValidAllowlistDomain('.example.com'), false);
+  assert.equal(isValidAllowlistDomain('example.com.'), false);
+  assert.equal(isValidAllowlistDomain(`${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(63)}.example.com`), false);
+  assert.equal(isValidAllowlistDomain(`${'a'.repeat(64)}.com`), false);
+  assert.equal(isValidAllowlistDomain(''), false);
+  assert.equal(isValidAllowlistDomain(null), false);
+  assert.equal(isValidAllowlistDomain(42), false);
+});
+
+test('4.8: accepts registrable domains, subdomains, and IPv4 literals', () => {
+  assert.equal(isValidAllowlistDomain('example.com'), true);
+  assert.equal(isValidAllowlistDomain('bbc.co.uk'), true);
+  assert.equal(isValidAllowlistDomain('news.bbc.co.uk'), true);
+  assert.equal(isValidAllowlistDomain('mysite.netlify.app'), true);
+  assert.equal(isValidAllowlistDomain('192.168.1.1'), true);
+  assert.equal(isValidAllowlistDomain('xn--bcher-kva.example'), true);
 });

@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { parseLine, networkFilterToDNR } from './build-rules.mjs';
+import {
+  parseLine,
+  networkFilterToDNR,
+  parseFilterList,
+  applyBadfilterSuppression,
+  buildDNRRules,
+  splitPatternAndOptions,
+  estimateRegexNfaCost,
+  MAX_REGEX_NFA_COST,
+} from './build-rules.mjs';
 
 /**
  * Golden-file suite for ABP filter line -> DNR rule conversion.
@@ -30,7 +39,14 @@ function convert(line) {
   return rest;
 }
 
-const block = (condition, priority = 1) => ({ priority, condition, action: { type: 'block' } });
+// ABP filters are case-insensitive unless $match-case, and the emitted rule
+// states that explicitly rather than relying on Chrome's version-dependent
+// default (§5.46) — hence the field on every expected condition.
+const block = (condition, priority = 1) => ({
+  priority,
+  condition: { isUrlFilterCaseSensitive: false, ...condition },
+  action: { type: 'block' },
+});
 
 test('pattern anchors survive conversion unchanged', () => {
   assert.deepEqual(convert('||ads.example.com^'), block({ urlFilter: '||ads.example.com^' }));
@@ -83,7 +99,7 @@ test('$domain= splits into initiator includes and excludes', () => {
 test('$removeparam with a value becomes a queryTransform, not a block', () => {
   assert.deepEqual(convert('||example.com^$removeparam=utm_source'), {
     priority: 1,
-    condition: { urlFilter: '||example.com^' },
+    condition: { urlFilter: '||example.com^', isUrlFilterCaseSensitive: false },
     action: {
       type: 'redirect',
       redirect: { transform: { queryTransform: { removeParams: ['utm_source'] } } },
@@ -260,10 +276,6 @@ test('cosmetic-scope aliases normalise to their canonical scope name', () => {
 // below was a live block rule before this suite.
 test('semantic modifiers we do not implement drop the whole rule', () => {
   const cases = [
-    // Cancels a filter elsewhere in the corpus. Ignoring it instates the very
-    // rule it was written to remove.
-    '||example.com^$badfilter',
-    '@@||example.com^$badfilter',
     // Bare $removeparam strips every query parameter. Ignoring it turned a
     // parameter-hygiene rule into a hard block of the domain.
     '||example.com^$removeparam',
@@ -297,9 +309,14 @@ test('benign no-op options are still ignorable, keeping the rest of the rule', (
     convert('||ads.example.com^$script,inline-script'),
     block({ urlFilter: '||ads.example.com^', resourceTypes: ['script'] }),
   );
+  // $match-case is no longer merely ignorable — it is honoured (§5.46).
   assert.deepEqual(
     convert('||ads.example.com^$image,match-case'),
-    block({ urlFilter: '||ads.example.com^', resourceTypes: ['image'] }),
+    block({
+      urlFilter: '||ads.example.com^',
+      resourceTypes: ['image'],
+      isUrlFilterCaseSensitive: true,
+    }),
   );
 });
 
@@ -358,4 +375,496 @@ test('$csp exceptions are skipped, not converted to a network allow', () => {
     const parsed = parseLine(line);
     assert.equal(parsed.skip, true, `${line} must be skipped`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// $badfilter two-pass suppression (prior review 4.1)
+// ---------------------------------------------------------------------------
+
+test('$badfilter cancels its base rule instead of being dropped as unsupported', () => {
+  const text = [
+    '||ads.example.com^$script',
+    '||ads.example.com^$script,badfilter',
+    '||keep.example.com^',
+  ].join('\n');
+
+  const parsed = parseFilterList(text);
+  const patterns = parsed.networkRules.map((r) => r.pattern);
+  assert.deepEqual(patterns, ['||keep.example.com^'], 'the badfiltered base rule must be suppressed');
+
+  const suppressed = parsed.skippedRecords.filter((r) => r.reason.startsWith('badfilter-suppressed'));
+  assert.equal(suppressed.length, 1, 'the suppression must be recorded in the skip log');
+});
+
+test('$badfilter matching is canonical: option order and domain order do not matter', () => {
+  const text = [
+    '||a.example^$script,domain=b.com|c.com',
+    '||a.example^$domain=c.com|b.com,script,badfilter',
+  ].join('\n');
+
+  const parsed = parseFilterList(text);
+  assert.deepEqual(parsed.networkRules, [], 'reordered options must still match');
+});
+
+test('$badfilter does not cancel rules whose options differ', () => {
+  const text = [
+    '||a.example^$script',
+    '||a.example^$image,badfilter',
+  ].join('\n');
+
+  const parsed = parseFilterList(text);
+  assert.equal(parsed.networkRules.length, 1, 'a badfilter for a different form must not match');
+  assert.equal(parsed.networkRules[0].pattern, '||a.example^');
+});
+
+test('a $badfilter rule itself never converts to a DNR rule', () => {
+  const parsed = parseLine('||example.com^$badfilter');
+  assert.equal(parsed.type, 'network', 'badfilter parses as a network directive');
+  assert.equal(networkFilterToDNR(parsed), null, 'but must never ship');
+});
+
+// ---------------------------------------------------------------------------
+// $popup (§4.22)
+// ---------------------------------------------------------------------------
+
+test('$popup converts only for ||domain^-anchored patterns', () => {
+  assert.deepEqual(
+    convert('||popupads.example^$popup'),
+    block({ urlFilter: '||popupads.example^', resourceTypes: ['main_frame'] }),
+  );
+
+  // Broad patterns would block ordinary navigations (a full-page
+  // ERR_BLOCKED_BY_CLIENT on a legitimate link click), where ABP $popup
+  // matches only script-opened popup windows.
+  for (const line of ['/r.php?u=https$popup', '.com/smartpop/$popup', '/?usid=*&utid=$popup']) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be skipped`);
+    assert.match(parsed.reason || '', /popup/, `${line} must say why`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// redirect= / redirect-rule= (§5.42)
+// ---------------------------------------------------------------------------
+
+test('redirect-rule= is skipped — uBO applies it only when another filter blocks', () => {
+  const parsed = parseLine('||ads.example.com^$image,redirect-rule=1x1.gif');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /redirect-rule/);
+});
+
+test('$redirect= outranks a co-matching plain block but not an allow', () => {
+  const redirect = convert('||ads.example.com^$image,redirect=1x1.gif');
+  const plainBlock = convert('||ads.example.com^');
+  const allow = convert('@@||ads.example.com^');
+
+  assert.equal(redirect.action.type, 'redirect');
+  // At EQUAL priority DNR resolves allow > block > redirect, so a co-matching
+  // EasyList block would defeat the stub and hard-block where uBO serves a
+  // working placeholder.
+  assert.ok(redirect.priority > plainBlock.priority, 'redirect must beat a plain block');
+  assert.ok(allow.priority > redirect.priority, 'an exception must still beat the redirect');
+});
+
+test('$removeparam stays in the block band so a co-matching block wins the tie', () => {
+  const removeparam = convert('||example.com^$removeparam=utm_source');
+  const plainBlock = convert('||example.com^');
+  assert.equal(removeparam.priority, plainBlock.priority);
+});
+
+// ---------------------------------------------------------------------------
+// Case sensitivity (§5.46)
+// ---------------------------------------------------------------------------
+
+test('rules are case-insensitive by default, case-sensitive only with $match-case', () => {
+  assert.equal(
+    convert('||example.com/adframe.$script').condition.isUrlFilterCaseSensitive,
+    false,
+    'ABP filters are case-insensitive absent $match-case',
+  );
+  assert.equal(
+    convert('||example.com/AdFrame.$script,match-case').condition.isUrlFilterCaseSensitive,
+    true,
+    '$match-case must be honoured',
+  );
+  assert.equal(
+    convert('/banner[0-9]+\\.gif/').condition.isUrlFilterCaseSensitive,
+    false,
+    'regex rules get the explicit flag too',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Regex filters ending in `$/` (§5.45)
+// ---------------------------------------------------------------------------
+
+test('a regex filter ending in an anchor keeps its $ — not split as options', () => {
+  assert.deepEqual(
+    convert('/banner[0-9]+\\.gif$/'),
+    block({ regexFilter: 'banner[0-9]+\\.gif$' }),
+  );
+});
+
+test('options after a regex literal are still recognised', () => {
+  assert.deepEqual(
+    convert('/banner[0-9]+/$script'),
+    block({ regexFilter: 'banner[0-9]+', resourceTypes: ['script'] }),
+  );
+});
+
+test('a path-anchored (non-regex) pattern still splits options at $', () => {
+  assert.deepEqual(
+    convert('/banner-$image'),
+    block({ urlFilter: '/banner-', resourceTypes: ['image'] }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// RE2 cost estimator (§5.44)
+// ---------------------------------------------------------------------------
+
+test('patterns containing .* survive the RE2 cost estimate', () => {
+  // RE2 compiles `.` to one byte-range instruction and never backtracks; the
+  // old estimator costed it at 256 alternatives ×10 for the star, so any
+  // pattern containing `.*` blew the budget and ~100 valid rules were dropped.
+  assert.notEqual(convert('/^https?:.*\\/adframe\\/banner/'), null);
+  assert.notEqual(convert('/ads[0-9a-z]+\\.example\\.com/'), null);
+});
+
+test('regex source length is bounded by the compiled budget, not by 256 chars', () => {
+  // Prior review 4.4 asked for the source-length cap to be raised to 256 on
+  // the theory that 256 characters fit Chrome's 2KB RE2 budget. Chrome
+  // disagrees: it refused an 79-character pattern at ruleset load, because the
+  // budget is spent on compiled instructions across BOTH the forward and
+  // reverse programs, and a literal character costs one instruction each.
+  // The source-length cap is now a backstop; the instruction budget is the
+  // limit that actually decides, and it binds first.
+  assert.notEqual(convert(`/${'a'.repeat(60)}/`), null, 'a short literal regex still fits');
+  assert.equal(convert(`/${'a'.repeat(200)}/`), null, 'a 200-char literal exceeds the compiled budget');
+  assert.equal(convert(`/${'a'.repeat(300)}/`), null, 'and so does anything past the source cap');
+});
+
+test('bounded quantifier unrolling is still costed', () => {
+  // RE2 really does unroll bounded repetition, so this guard must survive
+  // the recalibration.
+  assert.equal(convert(`/[0-9a-z]{100}[0-9a-z]{100}[0-9a-z]{100}/`), null);
+});
+
+// ---------------------------------------------------------------------------
+// Wildcard $domain= entries (§5.43)
+// ---------------------------------------------------------------------------
+
+test('wildcard-only $domain= drops the rule — gmx.* is invalid DNR', () => {
+  assert.equal(convert('||ads.example^$domain=gmx.*'), null);
+});
+
+test('wildcard $domain= entries are pruned when concrete domains remain', () => {
+  assert.deepEqual(
+    convert('||ads.example^$domain=gmx.*|real.example'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['real.example'] }),
+  );
+});
+
+test('a wildcard $domain= EXCLUSION drops the rule rather than over-applying it', () => {
+  assert.equal(convert('||ads.example^$domain=~gmx.*'), null);
+});
+
+// ---------------------------------------------------------------------------
+// Dedup key (§5.41)
+// ---------------------------------------------------------------------------
+
+test('dedup keeps rules that differ only in action payload or priority', () => {
+  const rules = [
+    parseLine('||y.example^$removeparam=utm_source'),
+    parseLine('||y.example^$removeparam=utm_medium'),
+    parseLine('||z.example^'),
+    parseLine('||z.example^$important'),
+    parseLine('||z.example^'), // true duplicate — must still dedup
+  ];
+  const { dnrRules, droppedRecords } = buildDNRRules(rules);
+
+  assert.equal(dnrRules.length, 4, 'both removeparams and both priorities must survive');
+  assert.equal(
+    droppedRecords.filter((r) => r.reason.startsWith('dedup')).length,
+    1,
+    'the true duplicate is still removed',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// TLD guard operates on the whole host, not the first label (§4.3)
+// ---------------------------------------------------------------------------
+
+test('the bare-TLD guard rejects a TLD-only host, not a subdomain that shares a TLD name', () => {
+  // The guard captured only up to the first dot, so every pattern whose first
+  // SUBDOMAIN label collided with a TLD name was dropped as "anchors on TLD":
+  // 1,907 valid filters on a live corpus, 35 of them `@@` exceptions (16 in
+  // unbreak.txt, so EasyPrivacy's block shipped while its escape was deleted).
+  for (const line of [
+    '||app.adjust.com^',
+    '||app.link/_r?',
+    '||app.clickfunnels.com/cf.js',
+    '||cc.naver.com/cc',
+    '||tv.example.org^',
+    '||dev.example.co.uk^',
+    '||in.com/common/script_catch.js',
+  ]) {
+    assert.ok(convert(line), `${line} must survive the TLD guard`);
+  }
+
+  const exception = convert('@@||dev.visualwebsiteoptimizer.com^');
+  assert.deepEqual(exception, {
+    priority: 3,
+    condition: { urlFilter: '||dev.visualwebsiteoptimizer.com^', isUrlFilterCaseSensitive: false },
+    action: { type: 'allow' },
+  });
+});
+
+test('a genuinely bare TLD anchor is still rejected', () => {
+  // The guard exists because ||com^ matches every .com host.
+  for (const line of ['||com^', '||xyz^', '||co.', '||tv^', '||com/path/ads.js']) {
+    assert.equal(convert(line), null, `${line} must still be dropped`);
+  }
+});
+
+test('an unscoped multi-label public suffix is rejected, a $domain=-scoped one is kept', () => {
+  // ||co.uk^ is as broad as ||com^ — but the corpus ships several deliberate
+  // narrow rules on public suffixes (||cloudfront.net^$domain=…,
+  // ||pages.dev^$script,domain=…), and dropping those costs real coverage.
+  assert.equal(convert('||co.uk^'), null);
+  assert.equal(convert('||com.br^'), null);
+  assert.deepEqual(
+    convert('||cloudfront.net^$domain=a.example|b.example'),
+    block({ urlFilter: '||cloudfront.net^', initiatorDomains: ['a.example', 'b.example'] }),
+  );
+  assert.ok(convert('||cloudfront.net/ads/banner.js'), 'a path-scoped rule is not a suffix anchor');
+});
+
+// ---------------------------------------------------------------------------
+// $badfilter is resolved corpus-wide, not per list (§4.4)
+// ---------------------------------------------------------------------------
+
+test('parseFilterList reports the list\'s own $badfilter keys for a corpus-wide pass', () => {
+  const unbreak = parseFilterList('||sumo.com^$third-party,badfilter\n||keep.example^\n');
+  assert.equal(unbreak.badfilterKeys.size, 1);
+  assert.equal(unbreak.networkRules.length, 1, 'the badfilter directive itself never ships');
+});
+
+test('a $badfilter in one list cancels a matching rule in another list', () => {
+  // unbreak.txt ships 204 badfilters, NONE of which match a rule in
+  // unbreak.txt itself while 34 exactly match live EasyList/EasyPrivacy rules.
+  // Per-list scope therefore delivered ~0% of the feature to its only real
+  // consumer, and `||sumo.com^` kept breaking sites.
+  const unbreak = parseFilterList('||sumo.com^$third-party,badfilter\n');
+  const privacy = parseFilterList('||sumo.com^$third-party\n||other.example^\n');
+
+  // Phase 1 leaves the victim alive — its own list carries no badfilter.
+  assert.equal(privacy.networkRules.length, 2);
+
+  const corpusKeys = new Set([...unbreak.badfilterKeys]);
+  const { rules, suppressed } = applyBadfilterSuppression(privacy.networkRules, corpusKeys);
+  assert.equal(suppressed.length, 1);
+  assert.equal(suppressed[0].pattern, '||sumo.com^');
+  assert.deepEqual(rules.map((r) => r.pattern), ['||other.example^']);
+});
+
+test('per-list $badfilter suppression still applies with no corpus keys supplied', () => {
+  const parsed = parseFilterList('||ads.example^\n||ads.example^$badfilter\n||keep.example^\n');
+  assert.deepEqual(parsed.networkRules.map((r) => r.pattern), ['||keep.example^']);
+  assert.equal(
+    parsed.skippedRecords.filter((r) => r.reason.startsWith('badfilter-suppressed')).length,
+    1,
+  );
+});
+
+test('a corpus-wide badfilter still requires an exact canonical match', () => {
+  // uBO's subset-$domain= narrowing cannot be expressed by exact matching, and
+  // guessing would cancel rules the author never targeted.
+  const bad = parseFilterList('||ads.example^$third-party,badfilter\n');
+  const victim = parseFilterList('||ads.example^\n');
+  const { suppressed } = applyBadfilterSuppression(
+    victim.networkRules,
+    new Set([...bad.badfilterKeys]),
+  );
+  assert.equal(suppressed.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// $domain= values are validated against the DNR schema (§5.29)
+// ---------------------------------------------------------------------------
+
+test('$domain= entries are lowercased, punycoded, and empty entries dropped', () => {
+  // Chrome rejects the whole rule at ruleset indexing if any entry is
+  // uppercase, non-ASCII or empty — `$domain=foo.com|` used to emit
+  // ["foo.com", ""] and cost the entire filter.
+  assert.deepEqual(
+    convert('||ads.example^$domain=foo.com|'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['foo.com'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example^$domain=Example.COM'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['example.com'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example^$domain=bücher.de'),
+    block({ urlFilter: '||ads.example^', initiatorDomains: ['xn--bcher-kva.de'] }),
+  );
+  assert.deepEqual(
+    convert('||ads.example^$domain=~Example.COM'),
+    block({ urlFilter: '||ads.example^', excludedInitiatorDomains: ['example.com'] }),
+  );
+});
+
+test('a $domain= list that normalises to nothing drops the rule instead of shipping it unscoped', () => {
+  // Mirrors the wildcard-domain handling: losing every positive entry would
+  // widen the rule from "on these sites" to "everywhere".
+  assert.equal(convert('||ads.example^$domain=|'), null);
+  assert.equal(convert('||ads.example^$domain=ex ample.com'), null);
+});
+
+test('an unencodable ~exclusion drops the rule rather than over-applying it', () => {
+  assert.equal(convert('||ads.example^$domain=~ex ample.com'), null);
+});
+
+// ---------------------------------------------------------------------------
+// $removeparam forms we cannot express (§5.30)
+// ---------------------------------------------------------------------------
+
+test('$removeparam=~keep is skipped, not shipped stripping a param called "~keep"', () => {
+  const parsed = parseLine('||ads.example^$removeparam=~keep');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /removeparam-negation/);
+});
+
+test('$removeparam=/regex/ is skipped, not shipped stripping a param called "/regex/"', () => {
+  const parsed = parseLine('||content.example/api*&ad=$xhr,removeparam=/^ad/,domain=a.example');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /removeparam-regex/);
+});
+
+test('$removeparam with no value is skipped rather than falling through to a hard block', () => {
+  const parsed = parseLine('||ads.example^$removeparam=');
+  assert.equal(parsed.skip, true);
+  assert.match(parsed.reason || '', /removeparam-all/);
+});
+
+test('a literal $removeparam=name still becomes a queryTransform', () => {
+  assert.deepEqual(convert('||ads.example^$removeparam=utm_source'), {
+    priority: 1,
+    condition: { urlFilter: '||ads.example^', isUrlFilterCaseSensitive: false },
+    action: {
+      type: 'redirect',
+      redirect: { transform: { queryTransform: { removeParams: ['utm_source'] } } },
+    },
+  });
+});
+
+
+// ---------------------------------------------------------------------------
+// Chrome refuses a regexFilter whose compiled RE2 program exceeds 2KB, and
+// says so only in chrome://extensions. Both defects below shipped rules that
+// were silently dropped at ruleset load.
+// ---------------------------------------------------------------------------
+
+test('the options separator is found before the regex delimiter, not after', () => {
+  // A plain path pattern that both starts and ends with `/`, because its
+  // `replace=` value is slash-delimited. Treating it as a regex literal put
+  // the whole option string into regexFilter.
+  assert.deepEqual(
+    splitPatternAndOptions(String.raw`/theme/002/js/application.js?2.0|$script,1p,replace=/video\.maxPop/0/`),
+    ['/theme/002/js/application.js?2.0|', String.raw`script,1p,replace=/video\.maxPop/0/`],
+  );
+
+  // `$` inside the pattern is an anchor; the separator is the later one whose
+  // tail actually parses as an option list.
+  assert.deepEqual(
+    splitPatternAndOptions(String.raw`/\/_static\/[a-z0-9]{12}\.js\?nonce=\d+$/$script,1p,match-case`),
+    [String.raw`/\/_static\/[a-z0-9]{12}\.js\?nonce=\d+$/`, 'script,1p,match-case'],
+  );
+
+  // A bare regex literal ending in an anchor has no options at all: the only
+  // `$` present is followed by `/`, which is not an option name.
+  assert.deepEqual(
+    splitPatternAndOptions(String.raw`/banner[0-9]+\.gif$/`),
+    [String.raw`/banner[0-9]+\.gif$/`, ''],
+  );
+
+  assert.deepEqual(splitPatternAndOptions('||example.com^$third-party'), ['||example.com^', 'third-party']);
+  assert.deepEqual(splitPatternAndOptions('||example.com^'), ['||example.com^', '']);
+});
+
+test('a rule whose options are slash-delimited never lands in regexFilter', () => {
+  for (const line of [
+    String.raw`/theme/002/js/application.js?2.0|$script,1p,replace=/video\.maxPop/0/`,
+    String.raw`/_static/delivery.js?nonce=$script,1p,header=server:/^openresty\//`,
+  ]) {
+    const parsed = parseLine(line);
+    if (parsed?.skip || parsed === null) continue; // dropped for an unsupported modifier is fine
+    const rule = networkFilterToDNR(parsed);
+    if (!rule) continue;
+    const rf = rule.condition.regexFilter ?? '';
+    for (const marker of ['$script,', ',replace=', ',header=']) {
+      assert.ok(!rf.includes(marker), `option text leaked into regexFilter: ${rf}`);
+    }
+  }
+});
+
+test('the RE2 budget straddles the boundary Chrome demonstrated', () => {
+  // Bisected over three load cycles against real chrome://extensions output.
+  // These two were refused; the third loaded. The budget must sit between
+  // them, and the gap is only three instructions wide -- so a recalibration
+  // that moves it up has to justify itself against this evidence.
+  const refused = [
+    String.raw`nyaa\.land\/static\/[a-z0-9]{32}\.jpg$`,          // scored 86
+    String.raw`\bgamatotv\.info\/[a-z0-9]{32}\.js\b`,            // scored 85
+  ];
+  for (const pattern of refused) {
+    assert.ok(
+      estimateRegexNfaCost(pattern) > MAX_REGEX_NFA_COST,
+      `Chrome refused this, we must too: ${pattern} scored ${estimateRegexNfaCost(pattern)}`,
+    );
+  }
+  // 38 characters is not a lot; `{32}` of a two-range class is what costs.
+  assert.ok(refused.every((p) => p.length < 40), 'these are short patterns, not obvious monsters');
+});
+
+test('the RE2 budget rejects the patterns Chrome rejected', () => {
+  // Every one of these was refused at ruleset load with "exceeded the 2KB
+  // memory limit". The cheapest scored 104, which is why the budget sits below
+  // that. Cost is dominated by bounded repeats of a class, and by `.` — which
+  // under UTF-8 is a multi-byte alternation, not one byte range.
+  const refusedByChrome = [
+    String.raw`(https?:\/\/)104\.154\..{100,}`,
+    String.raw`^https?:\/\/[0-9a-f]{50,}\.s3\.amazonaws\.com\/[0-9a-f]{10}$`,
+    String.raw`^https:\/\/st\.pussyspace\.(?:com|net)\/upload\/cat\.image\/[_3a-z]{2,16}\.jpg$`,
+    String.raw`^https:\/\/cdn\.jsdelivr\.net\/npm\/[-a-z_]{4,22}@latest\/dist\/script\.min\.js$`,
+    String.raw`(https?:\/\/)\w{30,}\.me\/\w{30,}\.`,
+  ];
+  for (const pattern of refusedByChrome) {
+    assert.ok(
+      estimateRegexNfaCost(pattern) > MAX_REGEX_NFA_COST,
+      `should be over budget: ${pattern} scored ${estimateRegexNfaCost(pattern)}`,
+    );
+  }
+});
+
+test('ordinary regex filters stay within the RE2 budget', () => {
+  for (const pattern of [
+    String.raw`^https?:\/\/ads\.example\.com\/banner\.gif$`,
+    String.raw`\/pagead\/[0-9]{3}\.js`,
+    String.raw`^https:\/\/cdn\.example\.net\/[a-f0-9]{8}\.js$`,
+  ]) {
+    assert.ok(
+      estimateRegexNfaCost(pattern) <= MAX_REGEX_NFA_COST,
+      `should fit: ${pattern} scored ${estimateRegexNfaCost(pattern)}`,
+    );
+  }
+});
+
+test('a bounded repeat of a class is costed by its upper bound', () => {
+  // `{n,}` unrolls n times in RE2; costing it as 1 is what admitted `.{100,}`.
+  const one = estimateRegexNfaCost(String.raw`[0-9a-f]`);
+  const fifty = estimateRegexNfaCost(String.raw`[0-9a-f]{50,}`);
+  assert.ok(fifty >= one * 40, `expected ~50x growth, got ${one} -> ${fifty}`);
+  assert.ok(estimateRegexNfaCost('.') > 1, 'dot spans multi-byte sequences under UTF-8');
 });

@@ -147,7 +147,14 @@ export const CORE_FILTER_SOURCE = {
         '[data-mol-fe-page-type="ad"]',
       ],
     },
-    exceptions: {},
+    exceptions: {
+      // `#player-ads` is bait: YouTube renders it and then checks whether
+      // anything hid it, treating a hidden one as a blocker signal. uBO ships
+      // `youtube.com#@##player-ads` for exactly this reason. Nothing we ship
+      // hides it today, but a remote list revision could, so carve it out
+      // here rather than relying on that staying true.
+      'youtube.com': ['#player-ads'],
+    },
   },
   scriptlets: [
     { type: 'scriptlet', domains: ['example.com'], name: 'abort-on-property-read', args: ['_sp_'] },

@@ -9,30 +9,76 @@
 import { splitDomainList, evaluatePreprocessorCondition } from './filter-syntax.js';
 
 /**
- * Parse scriptlet argument string, respecting quoted commas.
+ * Trim one argument and strip a *matched* surrounding quote pair.
+ *
+ * Stripping the first and last quote independently mangles any argument that
+ * legitimately ends in a quote — uBO ships
+ * `trusted-set, document.visibilityState, json:"visible"`, which became
+ * `json:"visible` and then failed to JSON.parse.
+ */
+function finalizeScriptletArg(raw) {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    if ((first === "'" || first === '"') && trimmed[trimmed.length - 1] === first) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+/**
+ * Parse scriptlet argument string, respecting quoted and escaped commas.
  * e.g. "set-constant, ads.enabled, false" → ['set-constant', 'ads.enabled', 'false']
+ *
+ * Must stay behaviourally identical to `parse_scriptlet_args` in
+ * wasm-core/src/lib.rs and to the copy in scripts/build-rules.mjs; the parity
+ * suite asserts it. Two rules that are easy to get wrong, both of which we did:
+ *
+ *  - `\,` is an escaped comma, not a separator, and uBO unescapes it. Splitting
+ *    on it shredded the shipped `trusted-replace-xhr-response` rule carrying
+ *    `{2\,4}` into five arguments.
+ *  - A quote only opens quoted mode when a matching close exists later.
+ *    Otherwise an unpaired quote leaves the state open and every subsequent
+ *    comma stops splitting, merging the rest of the line into one argument.
  */
 function parseScriptletArgs(str) {
   const args = [];
   let current = '';
-  let inSingle = false, inDouble = false;
+  let quote = null;
 
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-      current += ch;
-    } else if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-      current += ch;
-    } else if (ch === ',' && !inSingle && !inDouble) {
-      args.push(current.trim().replace(/^['"]|['"]$/g, ''));
-      current = '';
-    } else {
-      current += ch;
+
+    if (ch === '\\') {
+      if (str[i + 1] === ',') {
+        current += ',';
+        i++;
+        continue;
+      }
+      // Any other escape is data: both characters survive so regex
+      // arguments stay intact.
+      current += '\\';
+      continue;
     }
+
+    if (ch === "'" || ch === '"') {
+      if (quote === ch) quote = null;
+      else if (quote === null && str.indexOf(ch, i + 1) !== -1) quote = ch;
+      current += ch;
+      continue;
+    }
+
+    if (ch === ',' && quote === null) {
+      args.push(finalizeScriptletArg(current));
+      current = '';
+      continue;
+    }
+
+    current += ch;
   }
-  if (current.trim()) args.push(current.trim().replace(/^['"]|['"]$/g, ''));
+
+  if (current.trim()) args.push(finalizeScriptletArg(current));
   return args;
 }
 
@@ -76,6 +122,32 @@ function dedupeDomains(domains) {
   return [...new Set((domains || []).map(normalizeCosmeticScopeDomain).filter(Boolean))];
 }
 
+/**
+ * Options that scope *cosmetic* filtering, mapped to their canonical name.
+ *
+ * §4.7 — this is the same table as `COSMETIC_SCOPE_OPTIONS` in
+ * scripts/build-rules.mjs and must stay identical to it; the parity suite in
+ * tests/parser-parity.test.mjs asserts that. uBO accepts a short spelling for
+ * each and the lists this project fetches use them heavily — unbreak.txt ships
+ * a whole `$ghide` section. Recognising only the long forms made every
+ * short-alias line parse to `null` at runtime, so the domains uBO explicitly
+ * excepts from generic hiding kept getting generic cosmetics applied. The
+ * build script learned this and the runtime did not, which is precisely the
+ * build-vs-runtime divergence the parity suite exists to catch.
+ *
+ * Downstream matching is by canonical name, so aliases normalise rather than
+ * pass through.
+ */
+export const COSMETIC_SCOPE_OPTIONS = new Map([
+  ['generichide', 'generichide'],
+  ['ghide', 'generichide'],
+  ['elemhide', 'elemhide'],
+  ['ehide', 'elemhide'],
+  ['specifichide', 'specifichide'],
+  ['shide', 'specifichide'],
+  ['genericblock', 'genericblock'],
+]);
+
 function parseCosmeticScopeException(line) {
   if (!line.startsWith('@@')) return null;
   const rawRule = line.slice(2);
@@ -86,7 +158,14 @@ function parseCosmeticScopeException(line) {
   const optionTokens = rawRule.slice(dollarPos + 1)
     .split(',')
     .map((option) => option.trim());
-  const scopes = optionTokens.filter((option) => option === 'generichide' || option === 'elemhide');
+  const scopes = [];
+  for (const option of optionTokens) {
+    // A negated scope (`~generichide`) asks for the opposite and is not a
+    // scope exception; the build parser skips it the same way.
+    if (option.startsWith('~')) continue;
+    const canonical = COSMETIC_SCOPE_OPTIONS.get(option);
+    if (canonical) scopes.push(canonical);
+  }
 
   if (scopes.length === 0) return null;
   const optionDomains = optionTokens
@@ -236,15 +315,120 @@ export function parseFilterList(text) {
   };
 }
 
+// A hung or hostile CDN must not stall the service worker or OOM its small
+// heap: bound every list fetch in time and bytes (§5.10 / prior 2.6).
+const LIST_FETCH_TIMEOUT_MS = 30_000;
+
+/**
+ * Aggregate byte ceiling for one `fetchAndExpand` call — the list itself plus
+ * every `!#include` it pulls in, at every depth, combined.
+ *
+ * §5.9 — this used to be a *per-request* 25 MB cap while `!#include` sub-fetches
+ * ran in parallel to depth 5, so a hostile list could hold N x 25 MB in the
+ * service worker at once and still pass every individual check. It also sat
+ * above `MAX_FILTER_SOURCE_BYTES` in wasm-core/src/lib.rs (16 MB), so a list
+ * between the two caps downloaded fine and was then rejected wholesale at
+ * ingestion with a single console line — the worst of both. One shared budget,
+ * aligned to the Rust ingestion cap, fixes both: text that survives this
+ * function is text the core will actually accept.
+ *
+ * The budget bounds *fetched* bytes, which bounds the joined result too: the
+ * expansion only ever drops lines (preprocessor branches, include directives)
+ * and substitutes already-budgeted text for them, so the return value can
+ * never be larger than the bytes paid for. Keep in sync with
+ * `MAX_FILTER_SOURCE_BYTES`.
+ */
+export const LIST_FETCH_MAX_BYTES = 16 * 1024 * 1024;
+
+/** A mutable byte budget shared by one expansion tree. */
+function createFetchBudget(limit = LIST_FETCH_MAX_BYTES) {
+  return { limit, used: 0 };
+}
+
+function spendBudget(budget, bytes, url) {
+  budget.used += bytes;
+  if (budget.used > budget.limit) {
+    throw new Error(`Filter list exceeds the ${budget.limit} byte budget at ${url}`);
+  }
+}
+
+async function fetchTextBounded(url, budget) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LIST_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {cache: 'no-store', signal: controller.signal});
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    if (url.startsWith('https:') && res.url && !res.url.startsWith('https:')) {
+      throw new Error(`Insecure redirect for ${url} -> ${res.url}`);
+    }
+    if (!res.body?.getReader) {
+      // Environments without streaming (tests): cap after the fact.
+      const text = await res.text();
+      spendBudget(budget, text.length, url);
+      return text;
+    }
+    const reader = res.body.getReader();
+    const chunks = [];
+    let received = 0;
+    for (;;) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      // Charge the shared budget as bytes arrive, not at the end: concurrent
+      // sub-fetches must contend for the same ceiling while they are still
+      // streaming, or the cap is only enforced after the memory is committed.
+      try {
+        spendBudget(budget, value.byteLength, url);
+      } catch (err) {
+        controller.abort();
+        throw err;
+      }
+      chunks.push(value);
+    }
+    const merged = new Uint8Array(received);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return new TextDecoder().decode(merged);
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error(`Timeout after ${LIST_FETCH_TIMEOUT_MS}ms fetching ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Resolve an `!#include` target against the list that declared it.
+ *
+ * Returns null when the include must not be fetched. §5.9: the old test was
+ * `includePath.startsWith('http')`, which accepted a plaintext `http://`
+ * sub-file inside an HTTPS list. That walks straight past the redirect guard
+ * in `fetchTextBounded` — no redirect is involved — and hands an on-path
+ * attacker edit rights over part of a corpus the user believes is fetched
+ * securely. An include may never be less secure than the list that names it.
+ */
+function resolveIncludeUrl(includePath, parentUrl, baseUrl) {
+  const isAbsolute = /^[a-z][a-z0-9+.-]*:/i.test(includePath);
+  const includeUrl = isAbsolute ? includePath : baseUrl + includePath;
+  if (parentUrl.toLowerCase().startsWith('https:') &&
+      !includeUrl.toLowerCase().startsWith('https:')) {
+    return null;
+  }
+  return includeUrl;
+}
+
 /**
  * Fetch a filter list URL and expand any !#include directives.
  * Uses the browser fetch() API (available in service workers).
  */
-export async function fetchAndExpand(url, depth = 0) {
+export async function fetchAndExpand(url, depth = 0, budget = createFetchBudget()) {
   if (depth > 5) return '';
-  const res = await fetch(url, {cache: 'no-store'});
-  if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
-  const text = await res.text();
+  const text = await fetchTextBounded(url, budget);
 
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
   const lines = [];
@@ -285,9 +469,13 @@ export async function fetchAndExpand(url, depth = 0) {
     const m = line.trim().match(/^!#include\s+(.+)$/);
     if (m) {
       const includePath = m[1].trim();
-      const includeUrl = includePath.startsWith('http') ? includePath : baseUrl + includePath;
+      const includeUrl = resolveIncludeUrl(includePath, url, baseUrl);
+      if (includeUrl === null) {
+        console.warn('[AdBlock] Refusing insecure include:', includePath, 'in', url);
+        return '';
+      }
       try {
-        return await fetchAndExpand(includeUrl, depth + 1);
+        return await fetchAndExpand(includeUrl, depth + 1, budget);
       } catch (e) {
         console.warn('[AdBlock] Skipping include:', includeUrl, e.message);
         return '';

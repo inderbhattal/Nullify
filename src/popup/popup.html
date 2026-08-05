@@ -15,7 +15,7 @@
         <span class="logo-text">Nullify</span>
       </div>
       <div class="power-btn-wrap">
-        <button id="toggleSite" class="power-btn" title="Enable/disable on this site">
+        <button id="toggleSite" class="power-btn" title="Enable/disable on this site" aria-label="Enable or disable blocking on this site">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
             <path d="M12 2v4M12 18v4M7.05 4.93 9.88 7.76M14.12 16.24l2.83 2.83M2 12h4M18 12h4M4.93 7.05l2.83 2.83M16.24 14.12l2.83 2.83"/>
           </svg>
@@ -29,12 +29,15 @@
       <span class="site-status" id="siteStatus">Protected</span>
     </div>
 
+    <!-- Transient error status -->
+    <div class="popup-status" id="popupStatus" role="status" aria-live="polite"></div>
+
     <!-- Persona Selector -->
     <div class="persona-bar">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="persona-icon">
         <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
       </svg>
-      <select id="selectPersona" class="persona-select">
+      <select id="selectPersona" class="persona-select" aria-label="Browser persona">
         <option value="default">Default Persona</option>
         <option value="windows">Windows / Chrome</option>
         <option value="mac">macOS / Chrome</option>

@@ -163,6 +163,86 @@ test('system-unbreak priorities stay inside the documented band', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Any job that runs the JS suite must build the WASM artifact first.
+// src/shared/wasm/ is gitignored and service-worker.js imports its glue
+// statically, so without it the whole sw-harness suite dies at pretest. This
+// was fixed in test.yml and missed in build.yml's verify job, which failed the
+// same way on the next release run — artifacts do not carry between jobs, so
+// every such job needs its own build step, in the right order.
+test('every workflow job that runs the tests builds the WASM artifact first', () => {
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+  let jobsChecked = 0;
+
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const text = fs.readFileSync(path.join(workflowDir, file), 'utf8');
+
+    // Split on two-space-indented job keys; enough structure for this check
+    // without taking on a YAML parser.
+    for (const job of text.split(/\n {2}(?=[A-Za-z0-9_-]+:\n)/)) {
+      const name = (job.match(/^\s*([A-Za-z0-9_-]+):/) || [])[1] ?? '?';
+      const testIdx = job.search(/run:\s*npm (?:test|run check)\b/);
+      if (testIdx === -1) continue;
+
+      jobsChecked++;
+      const wasmIdx = job.search(/run:\s*npm run build:wasm\b/);
+      assert.notEqual(wasmIdx, -1,
+        `${file} job "${name}" runs the tests without building the WASM artifact`);
+      assert.ok(wasmIdx < testIdx,
+        `${file} job "${name}" builds the WASM artifact after running the tests`);
+    }
+  }
+
+  assert.ok(jobsChecked >= 2, `expected to find the test jobs, checked ${jobsChecked}`);
+});
+
+// The workflow header states that only the publishing job gets a write token.
+// That is a real constraint, not a comment: `build` runs on every push to main
+// now, so if it still carried `contents: write`, every merge would run a
+// release-capable token through the whole packaging pipeline.
+test('only a tag-gated job may hold a write token', () => {
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const text = fs.readFileSync(path.join(workflowDir, file), 'utf8');
+
+    for (const job of text.split(/\n {2}(?=[A-Za-z0-9_-]+:\n)/)) {
+      const name = (job.match(/^\s*([A-Za-z0-9_-]+):/) || [])[1] ?? '?';
+      const header = job.split('steps:')[0] ?? '';
+      if (!/permissions:\s*\n\s*contents:\s*write/.test(header)) continue;
+
+      assert.match(header, /if:\s*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
+        `${file} job "${name}" holds contents: write without being gated to a tag`);
+    }
+  }
+});
+
+// package.json declares the supported runtime; the workflows decide what is
+// actually exercised. When those disagree, the version users are told to run
+// is not the version anything was tested on — and `verify` really did test on
+// one major while `build` packaged the release on another.
+test('every workflow runs the Node major that package.json declares', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const declared = /(\d+)/.exec(pkg.engines?.node ?? '')?.[1];
+  assert.ok(declared, 'package.json must declare engines.node');
+
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+  let seen = 0;
+
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const text = fs.readFileSync(path.join(workflowDir, file), 'utf8');
+    for (const [, version] of text.matchAll(/node-version:\s*'?(\d+)/g)) {
+      seen++;
+      assert.equal(version, declared,
+        `${file} pins node-version ${version} while package.json declares >=${declared}`);
+    }
+  }
+
+  assert.ok(seen >= 2, `expected to find the setup-node steps, saw ${seen}`);
+});
+
 // Release workflow: tag names are data, not shell (§5.28)
 // ---------------------------------------------------------------------------
 

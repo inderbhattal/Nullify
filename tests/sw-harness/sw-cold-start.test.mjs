@@ -130,7 +130,20 @@ test('3.1 (didn\'t re-break): a warm ALLOW_SITE still adds exactly one entry', a
 // §4.14 — no stats write may land before the restore
 // ---------------------------------------------------------------------------
 
-const TODAY = new Date().toISOString().slice(0, 10);
+// The worker's day stamp is LOCAL (`getCurrentDayStamp` uses getFullYear/
+// getMonth/getDate), because a user's "blocked today" should follow their own
+// day. This was `new Date().toISOString().slice(0, 10)`, which is UTC — so for
+// whatever part of the day a developer's local date differs from UTC, the seed
+// looked like yesterday's, the restore discarded it as stale, and the totals
+// came back 0 instead of 500. It passed here and in CI because both run UTC.
+function localDayStamp(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+const TODAY = localDayStamp();
 
 function statsSeed() {
   return {
@@ -210,4 +223,24 @@ test('4.14 (didn\'t re-break): a warm persist still writes current memory', asyn
   assert.equal(chrome.storage.session._data()['nullify:inFlightStats'].tabStats[3].blocked, 9);
 
   hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// The seed above is only meaningful if it matches the stamp the worker
+// compares against. When it did not, two §4.14 tests failed purely on the
+// runner's timezone -- and never in CI, which is UTC. Assert the agreement
+// rather than trusting two copies of the same arithmetic to stay in step.
+// ---------------------------------------------------------------------------
+
+test('the test day stamp matches the worker day stamp exactly', async () => {
+  const { hooks } = await loadServiceWorker({ seed: { settings: { enabled: true } } });
+
+  assert.equal(localDayStamp(), hooks.getCurrentDayStamp(),
+    'seed stamp and worker stamp must agree, or every dated-stats test is timezone-dependent');
+
+  // Pin the shape too: local, not UTC. A date whose local and UTC days differ
+  // is exactly the case that broke, so build one deliberately.
+  const probe = new Date(2026, 0, 1, 0, 30); // 00:30 local on 1 Jan
+  assert.equal(hooks.getCurrentDayStamp(probe), '2026-01-01',
+    'the worker stamp must follow the local calendar day');
 });

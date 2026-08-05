@@ -4543,6 +4543,11 @@ export const __testHooks = {
   persistTabStats,
   tabStats,
   getTotals: () => ({ totalBlockedToday, totalBlockedDate }),
+  // Exposed so tests seed the date stamp the worker actually compares against.
+  // A test that built its own stamp from `toISOString()` seeded a UTC date
+  // while the worker reads a LOCAL one, so the restore treated the seed as
+  // yesterday's and zeroed it — passing in UTC, failing everywhere else.
+  getCurrentDayStamp,
   clearInMemoryStatsForTest: () => { tabStats.clear(); totalBlockedToday = 0; },
   cancelPendingStatsPersistForTest: () => {
     if (_persistTimeout) { clearTimeout(_persistTimeout); _persistTimeout = null; }

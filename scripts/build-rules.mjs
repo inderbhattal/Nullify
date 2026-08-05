@@ -526,6 +526,43 @@ function dedupeDomains(domains) {
   return [...new Set((domains || []).map(normalizeCosmeticScopeDomain).filter(Boolean))];
 }
 
+/** An ABP option list always begins with an option name: `script`, `~third-party`, `domain=`… */
+const OPTION_LIST_HEAD = /^~?[a-z][a-z0-9-]*(?:[=,]|$)/;
+
+/**
+ * Split a filter line into its pattern and its `$options`, returning
+ * `[pattern, optionsStr]`.
+ *
+ * Neither delimiter can be located by itself, which is what made the earlier
+ * attempts wrong in both directions:
+ *
+ *  - `$` occurs inside a regex pattern as an anchor (`/…\.gif$/`) and inside
+ *    option VALUES (`replace=/a$/b/`), so `lastIndexOf('$')` mis-splits.
+ *  - `/` occurs inside a regex escaped and in character classes, and option
+ *    values are themselves slash-delimited (`replace=/video\.maxPop/0/`,
+ *    `header=server:/^openresty\//`), so neither `endsWith('/')` nor a
+ *    left-to-right scan for the closing delimiter is safe. A plain path
+ *    pattern such as `/theme/002/js/app.js?2.0|$script,1p,replace=/x/0/`
+ *    starts and ends with a slash while being no kind of regex.
+ *
+ * So find the OPTIONS first, by scanning `$` right to left for one whose tail
+ * actually looks like an option list, and only then ask whether what remains
+ * is a `/regex/` literal. Every `$` inside a regex body or an option value
+ * fails the option-list test and is skipped.
+ */
+function splitPatternAndOptions(rawRule) {
+  // `i >= 0` because the separator legitimately sits at index 0 in the
+  // empty-pattern form uBO uses for scope-only exceptions:
+  // `@@$generichide,domain=example.com`.
+  for (let i = rawRule.length - 1; i >= 0; i--) {
+    if (rawRule[i] !== '$' || (i > 0 && rawRule[i - 1] === '\\')) continue;
+    const tail = rawRule.slice(i + 1);
+    if (tail === '' || !OPTION_LIST_HEAD.test(tail)) continue;
+    return [rawRule.slice(0, i), tail];
+  }
+  return [rawRule, ''];
+}
+
 /**
  * Parse a single filter line into a structured rule object.
  * Returns a rule, SKIP_SILENT (comment/blank), or `{ skip, reason }`.
@@ -600,25 +637,7 @@ function parseLine(line) {
   const isException = line.startsWith('@@');
   const rawRule = isException ? line.slice(2) : line;
 
-  let pattern = rawRule;
-  let optionsStr = '';
-  if (rawRule.startsWith('/') && rawRule.endsWith('/') && rawRule.length > 2) {
-    // A complete /regex/ literal: any `$` inside it is a regex anchor, never
-    // an option separator. `/banner[0-9]+\.gif$/` used to be split at the `$`
-    // and shipped as a literal urlFilter containing regex syntax.
-  } else if (rawRule.startsWith('/') && rawRule.lastIndexOf('/$') > 0) {
-    // /regex/$options — for a regex literal the separator is only valid
-    // after the closing slash.
-    const sepIdx = rawRule.lastIndexOf('/$');
-    pattern = rawRule.slice(0, sepIdx + 1);
-    optionsStr = rawRule.slice(sepIdx + 2);
-  } else {
-    const dollarPos = rawRule.lastIndexOf('$');
-    if (dollarPos !== -1 && !rawRule.endsWith('$')) {
-      pattern = rawRule.slice(0, dollarPos);
-      optionsStr = rawRule.slice(dollarPos + 1);
-    }
-  }
+  const [pattern, optionsStr] = splitPatternAndOptions(rawRule);
 
   if (/(^|,)csp(=|,|$)/.test(optionsStr)) {
     // Neither direction is translated. Skipping the block form is merely a
@@ -871,6 +890,32 @@ function detectNestedQuantifiers(pattern) {
  * skip logs showed ~100 valid regex rules dropped with claimed costs like
  * 25617, against only 39 kept.
  */
+/**
+ * Instruction cost of matching "any character" under UTF-8.
+ *
+ * RE2 compiles a codepoint-spanning matcher (`.`, or a negated class) into an
+ * alternation over 1-, 2-, 3- and 4-byte sequences rather than a single byte
+ * range. Calibrated against the patterns Chrome actually refused at load.
+ */
+const UTF8_SPAN_COST = 5;
+
+/**
+ * Instruction budget for one regex rule.
+ *
+ * Chrome compiles `regexFilter` with RE2 under a 2KB memory cap and silently
+ * skips the rule at ruleset-load time if it does not fit, logging to
+ * chrome://extensions where nobody sees it. That cap buys far fewer
+ * instructions than it sounds like: RE2 builds both a forward and a reverse
+ * program, so a 79-character mostly-literal pattern can exceed it.
+ *
+ * Calibrated against the patterns Chrome actually refused across two load
+ * cycles: the cheapest confirmed rejection scored 104, so the budget sits
+ * below that with margin. Erring low is close to free -- a rule we drop is
+ * recorded in rules/skipped/ and auditable, whereas a rule Chrome drops is
+ * lost just as completely but silently, in a log nobody reads.
+ */
+const MAX_REGEX_NFA_COST = 90;
+
 function estimateRegexNfaCost(pattern) {
   let cost = 0;
   let i = 0;
@@ -892,8 +937,10 @@ function estimateRegexNfaCost(pattern) {
           k += 2;
         } else { ranges++; }
       }
-      // A negated class is the complement set: at most ranges + 1 ranges.
-      const classCost = Math.max(1, ranges) + (negated ? 1 : 0);
+      // A negated class matches the complement, which under UTF-8 spans the
+      // multi-byte space — RE2 emits the same byte-sequence alternation `.`
+      // gets, not one extra range.
+      const classCost = Math.max(1, ranges) + (negated ? UTF8_SPAN_COST : 0);
       i = j + 1;
       const [mult, next] = getQuantMult(pattern, i);
       cost += classCost * mult;
@@ -911,10 +958,12 @@ function estimateRegexNfaCost(pattern) {
       cost += shSize * mult;
       i = next;
     } else if (pattern[i] === '.') {
-      // One byte-range instruction in RE2, not 256 alternatives.
+      // Chrome runs RE2 over UTF-8, where `.` is not one byte-range but an
+      // alternation covering 1- to 4-byte sequences. Costing it at 1 is what
+      // let `.{100,}` patterns through to be rejected at load.
       i++;
       const [mult, next] = getQuantMult(pattern, i);
-      cost += mult;
+      cost += UTF8_SPAN_COST * mult;
       i = next;
     } else if (pattern[i] === '(' || pattern[i] === ')') {
       // Group bookkeeping (capture instructions) — cheap.
@@ -1188,8 +1237,8 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
     }
 
     const nfaCost = estimateRegexNfaCost(regexFilter);
-    if (nfaCost > 500) {
-      reportDrop(`regex: estimated NFA cost ${nfaCost} > 500 instructions (exceeds Chrome 2KB RE2 budget)`, pattern);
+    if (nfaCost > MAX_REGEX_NFA_COST) {
+      reportDrop(`regex: estimated NFA cost ${nfaCost} > ${MAX_REGEX_NFA_COST} instructions (exceeds Chrome 2KB RE2 budget)`, pattern);
       return null;
     }
 
@@ -2714,6 +2763,9 @@ async function buildFromVendoredLists(stagingDir) {
 
 export {
   parseLine,
+  splitPatternAndOptions,
+  estimateRegexNfaCost,
+  MAX_REGEX_NFA_COST,
   networkFilterToDNR,
   buildSourceBundleFallback,
   orderRulesForSharding,

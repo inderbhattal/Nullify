@@ -7,6 +7,9 @@ import {
   parseFilterList,
   applyBadfilterSuppression,
   buildDNRRules,
+  splitPatternAndOptions,
+  estimateRegexNfaCost,
+  MAX_REGEX_NFA_COST,
 } from './build-rules.mjs';
 
 /**
@@ -528,11 +531,17 @@ test('patterns containing .* survive the RE2 cost estimate', () => {
   assert.notEqual(convert('/ads[0-9a-z]+\\.example\\.com/'), null);
 });
 
-test('regex length cap is 256 per prior review 4.4', () => {
-  const ok = `/${'a'.repeat(200)}/`;
-  const tooLong = `/${'a'.repeat(300)}/`;
-  assert.notEqual(convert(ok), null, 'a 200-char literal regex fits the 2KB RE2 budget');
-  assert.equal(convert(tooLong), null, 'beyond 256 chars is still dropped');
+test('regex source length is bounded by the compiled budget, not by 256 chars', () => {
+  // Prior review 4.4 asked for the source-length cap to be raised to 256 on
+  // the theory that 256 characters fit Chrome's 2KB RE2 budget. Chrome
+  // disagrees: it refused an 79-character pattern at ruleset load, because the
+  // budget is spent on compiled instructions across BOTH the forward and
+  // reverse programs, and a literal character costs one instruction each.
+  // The source-length cap is now a backstop; the instruction budget is the
+  // limit that actually decides, and it binds first.
+  assert.notEqual(convert(`/${'a'.repeat(60)}/`), null, 'a short literal regex still fits');
+  assert.equal(convert(`/${'a'.repeat(200)}/`), null, 'a 200-char literal exceeds the compiled budget');
+  assert.equal(convert(`/${'a'.repeat(300)}/`), null, 'and so does anything past the source cap');
 });
 
 test('bounded quantifier unrolling is still costed', () => {
@@ -748,4 +757,95 @@ test('a literal $removeparam=name still becomes a queryTransform', () => {
       redirect: { transform: { queryTransform: { removeParams: ['utm_source'] } } },
     },
   });
+});
+
+
+// ---------------------------------------------------------------------------
+// Chrome refuses a regexFilter whose compiled RE2 program exceeds 2KB, and
+// says so only in chrome://extensions. Both defects below shipped rules that
+// were silently dropped at ruleset load.
+// ---------------------------------------------------------------------------
+
+test('the options separator is found before the regex delimiter, not after', () => {
+  // A plain path pattern that both starts and ends with `/`, because its
+  // `replace=` value is slash-delimited. Treating it as a regex literal put
+  // the whole option string into regexFilter.
+  assert.deepEqual(
+    splitPatternAndOptions(String.raw`/theme/002/js/application.js?2.0|$script,1p,replace=/video\.maxPop/0/`),
+    ['/theme/002/js/application.js?2.0|', String.raw`script,1p,replace=/video\.maxPop/0/`],
+  );
+
+  // `$` inside the pattern is an anchor; the separator is the later one whose
+  // tail actually parses as an option list.
+  assert.deepEqual(
+    splitPatternAndOptions(String.raw`/\/_static\/[a-z0-9]{12}\.js\?nonce=\d+$/$script,1p,match-case`),
+    [String.raw`/\/_static\/[a-z0-9]{12}\.js\?nonce=\d+$/`, 'script,1p,match-case'],
+  );
+
+  // A bare regex literal ending in an anchor has no options at all: the only
+  // `$` present is followed by `/`, which is not an option name.
+  assert.deepEqual(
+    splitPatternAndOptions(String.raw`/banner[0-9]+\.gif$/`),
+    [String.raw`/banner[0-9]+\.gif$/`, ''],
+  );
+
+  assert.deepEqual(splitPatternAndOptions('||example.com^$third-party'), ['||example.com^', 'third-party']);
+  assert.deepEqual(splitPatternAndOptions('||example.com^'), ['||example.com^', '']);
+});
+
+test('a rule whose options are slash-delimited never lands in regexFilter', () => {
+  for (const line of [
+    String.raw`/theme/002/js/application.js?2.0|$script,1p,replace=/video\.maxPop/0/`,
+    String.raw`/_static/delivery.js?nonce=$script,1p,header=server:/^openresty\//`,
+  ]) {
+    const parsed = parseLine(line);
+    if (parsed?.skip || parsed === null) continue; // dropped for an unsupported modifier is fine
+    const rule = networkFilterToDNR(parsed);
+    if (!rule) continue;
+    const rf = rule.condition.regexFilter ?? '';
+    for (const marker of ['$script,', ',replace=', ',header=']) {
+      assert.ok(!rf.includes(marker), `option text leaked into regexFilter: ${rf}`);
+    }
+  }
+});
+
+test('the RE2 budget rejects the patterns Chrome rejected', () => {
+  // Every one of these was refused at ruleset load with "exceeded the 2KB
+  // memory limit". The cheapest scored 104, which is why the budget sits below
+  // that. Cost is dominated by bounded repeats of a class, and by `.` — which
+  // under UTF-8 is a multi-byte alternation, not one byte range.
+  const refusedByChrome = [
+    String.raw`(https?:\/\/)104\.154\..{100,}`,
+    String.raw`^https?:\/\/[0-9a-f]{50,}\.s3\.amazonaws\.com\/[0-9a-f]{10}$`,
+    String.raw`^https:\/\/st\.pussyspace\.(?:com|net)\/upload\/cat\.image\/[_3a-z]{2,16}\.jpg$`,
+    String.raw`^https:\/\/cdn\.jsdelivr\.net\/npm\/[-a-z_]{4,22}@latest\/dist\/script\.min\.js$`,
+    String.raw`(https?:\/\/)\w{30,}\.me\/\w{30,}\.`,
+  ];
+  for (const pattern of refusedByChrome) {
+    assert.ok(
+      estimateRegexNfaCost(pattern) > MAX_REGEX_NFA_COST,
+      `should be over budget: ${pattern} scored ${estimateRegexNfaCost(pattern)}`,
+    );
+  }
+});
+
+test('ordinary regex filters stay within the RE2 budget', () => {
+  for (const pattern of [
+    String.raw`^https?:\/\/ads\.example\.com\/banner\.gif$`,
+    String.raw`\/pagead\/[0-9]{3}\.js`,
+    String.raw`^https:\/\/cdn\.example\.net\/[a-f0-9]{8}\.js$`,
+  ]) {
+    assert.ok(
+      estimateRegexNfaCost(pattern) <= MAX_REGEX_NFA_COST,
+      `should fit: ${pattern} scored ${estimateRegexNfaCost(pattern)}`,
+    );
+  }
+});
+
+test('a bounded repeat of a class is costed by its upper bound', () => {
+  // `{n,}` unrolls n times in RE2; costing it as 1 is what admitted `.{100,}`.
+  const one = estimateRegexNfaCost(String.raw`[0-9a-f]`);
+  const fifty = estimateRegexNfaCost(String.raw`[0-9a-f]{50,}`);
+  assert.ok(fifty >= one * 40, `expected ~50x growth, got ${one} -> ${fifty}`);
+  assert.ok(estimateRegexNfaCost('.') > 1, 'dot spans multi-byte sequences under UTF-8');
 });

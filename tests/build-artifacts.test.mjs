@@ -196,6 +196,28 @@ test('every workflow job that runs the tests builds the WASM artifact first', ()
   assert.ok(jobsChecked >= 2, `expected to find the test jobs, checked ${jobsChecked}`);
 });
 
+// The workflow header states that only the publishing job gets a write token.
+// That is a real constraint, not a comment: `build` runs on every push to main
+// now, so if it still carried `contents: write`, every merge would run a
+// release-capable token through the whole packaging pipeline.
+test('only a tag-gated job may hold a write token', () => {
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const text = fs.readFileSync(path.join(workflowDir, file), 'utf8');
+
+    for (const job of text.split(/\n {2}(?=[A-Za-z0-9_-]+:\n)/)) {
+      const name = (job.match(/^\s*([A-Za-z0-9_-]+):/) || [])[1] ?? '?';
+      const header = job.split('steps:')[0] ?? '';
+      if (!/permissions:\s*\n\s*contents:\s*write/.test(header)) continue;
+
+      assert.match(header, /if:\s*startsWith\(github\.ref, 'refs\/tags\/v'\)/,
+        `${file} job "${name}" holds contents: write without being gated to a tag`);
+    }
+  }
+});
+
 // Release workflow: tag names are data, not shell (§5.28)
 // ---------------------------------------------------------------------------
 

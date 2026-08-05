@@ -2,6 +2,8 @@ name: Build & Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -80,17 +82,21 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: node scripts/assert-release-version.mjs "$TAG"
 
+  # Runs on every push to main as well as on tags, so a merge that breaks the
+  # WASM build, the offline rules compile, the webpack bundle or the packaging
+  # step is caught at merge rather than at release time. It publishes nothing
+  # and holds no write token; that is the `release` job's job.
   build:
     needs: verify
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          # Same major as `verify` and test.yml — shipping a bundle built on a
+          # runtime the suite never ran against is a needless difference.
+          node-version: 22
           cache: npm
 
       - name: Install dependencies
@@ -154,12 +160,27 @@ jobs:
             release/*.zip
             release/SHA256SUMS
 
+  # The only job with a write token, and the only one that runs solely for a
+  # tag. Splitting it out is what lets `build` run on every merge without
+  # handing a release-capable token to every push.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the packaged extension
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nullify-extension
+          path: release
+
       # `env.TAG` is the same value as github.ref_name, but routing every
       # reference through one place means a future `run:` step cannot pick up
       # the raw expression by copy-paste. Action inputs are not shell, so this
       # is consistency rather than a second injection sink.
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         env:
           TAG: ${{ github.ref_name }}

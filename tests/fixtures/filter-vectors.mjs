@@ -343,6 +343,38 @@ export const FILTER_VECTORS = [
     },
   },
 
+  // --- scriptlet argument splitting (§5.38) --------------------------------
+  // Both live uBO YouTube rules, verbatim. Each broke a different way before
+  // the three splitters were reconciled: the first shredded into five
+  // arguments under Rust (leaving propsToMatch as `/`, matching every YouTube
+  // XHR) and collapsed into one under both JS parsers; the second lost its
+  // trailing quote to an unpaired-quote strip, so `json:"visible` failed to
+  // parse and the value fell back to the raw string.
+  {
+    line: String.raw`www.youtube.com##+js(trusted-replace-xhr-response, /"adPlacements.*?([A-Z]"\}|"\}{2\,4})\}\]\,/, , /playlist\?list=|\/player(?:\?.+)?$|watch\?[tv]=/)`,
+    expect: {
+      kind: 'scriptlet',
+      domains: ['www.youtube.com'],
+      excludedDomains: [],
+      name: 'trusted-replace-xhr-response',
+      args: [
+        String.raw`/"adPlacements.*?([A-Z]"\}|"\}{2,4})\}\],/`,
+        '',
+        String.raw`/playlist\?list=|\/player(?:\?.+)?$|watch\?[tv]=/`,
+      ],
+    },
+  },
+  {
+    line: 'm.youtube.com##+js(trusted-set, document.visibilityState, json:"visible")',
+    expect: {
+      kind: 'scriptlet',
+      domains: ['m.youtube.com'],
+      excludedDomains: [],
+      name: 'trusted-set',
+      args: ['document.visibilityState', 'json:"visible"'],
+    },
+  },
+
   // --- comments and blanks ------------------------------------------------
   { line: '! a comment', expect: { kind: 'skip' } },
   { line: '[Adblock Plus 2.0]', expect: { kind: 'skip' } },

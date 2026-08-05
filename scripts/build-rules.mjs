@@ -427,23 +427,57 @@ function nextId(isException = false) {
  * e.g. "set-constant, ads.enabled, false"  →  ['set-constant', 'ads.enabled', 'false']
  *      "json-prune, 'a, b', 'x'"           →  ['json-prune', 'a, b', 'x']
  */
+// Strips a *matched* surrounding quote pair only. Stripping first and last
+// independently mangles an argument that legitimately ends in a quote, such as
+// uBO's `trusted-set, document.visibilityState, json:"visible"`.
+function finalizeScriptletArg(raw) {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    if ((first === "'" || first === '"') && trimmed[trimmed.length - 1] === first) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+// Must stay behaviourally identical to `parseScriptletArgs` in
+// src/shared/filter-parser.js and `parse_scriptlet_args` in
+// wasm-core/src/lib.rs — the parity suite asserts it. `\,` is an escaped
+// comma that uBO unescapes rather than a separator, and a quote opens quoted
+// mode only when a matching close exists later; getting either wrong shreds
+// the shipped YouTube rules into the wrong number of arguments.
 function parseScriptletArgs(str) {
   const args = [];
   let current = '';
-  let inSingle = false, inDouble = false;
+  let quote = null;
 
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    if (ch === "'" && !inDouble) { inSingle = !inSingle; current += ch; }
-    else if (ch === '"' && !inSingle) { inDouble = !inDouble; current += ch; }
-    else if (ch === ',' && !inSingle && !inDouble) {
-      args.push(current.trim().replace(/^['"]|['"]$/g, ''));
-      current = '';
-    } else {
-      current += ch;
+
+    if (ch === '\\') {
+      if (str[i + 1] === ',') { current += ','; i++; continue; }
+      current += '\\';
+      continue;
     }
+
+    if (ch === "'" || ch === '"') {
+      if (quote === ch) quote = null;
+      else if (quote === null && str.indexOf(ch, i + 1) !== -1) quote = ch;
+      current += ch;
+      continue;
+    }
+
+    if (ch === ',' && quote === null) {
+      args.push(finalizeScriptletArg(current));
+      current = '';
+      continue;
+    }
+
+    current += ch;
   }
-  if (current.trim()) args.push(current.trim().replace(/^['"]|['"]$/g, ''));
+
+  if (current.trim()) args.push(finalizeScriptletArg(current));
   return args;
 }
 

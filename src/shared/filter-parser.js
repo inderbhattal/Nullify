@@ -9,30 +9,76 @@
 import { splitDomainList, evaluatePreprocessorCondition } from './filter-syntax.js';
 
 /**
- * Parse scriptlet argument string, respecting quoted commas.
+ * Trim one argument and strip a *matched* surrounding quote pair.
+ *
+ * Stripping the first and last quote independently mangles any argument that
+ * legitimately ends in a quote — uBO ships
+ * `trusted-set, document.visibilityState, json:"visible"`, which became
+ * `json:"visible` and then failed to JSON.parse.
+ */
+function finalizeScriptletArg(raw) {
+  const trimmed = raw.trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    if ((first === "'" || first === '"') && trimmed[trimmed.length - 1] === first) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+/**
+ * Parse scriptlet argument string, respecting quoted and escaped commas.
  * e.g. "set-constant, ads.enabled, false" → ['set-constant', 'ads.enabled', 'false']
+ *
+ * Must stay behaviourally identical to `parse_scriptlet_args` in
+ * wasm-core/src/lib.rs and to the copy in scripts/build-rules.mjs; the parity
+ * suite asserts it. Two rules that are easy to get wrong, both of which we did:
+ *
+ *  - `\,` is an escaped comma, not a separator, and uBO unescapes it. Splitting
+ *    on it shredded the shipped `trusted-replace-xhr-response` rule carrying
+ *    `{2\,4}` into five arguments.
+ *  - A quote only opens quoted mode when a matching close exists later.
+ *    Otherwise an unpaired quote leaves the state open and every subsequent
+ *    comma stops splitting, merging the rest of the line into one argument.
  */
 function parseScriptletArgs(str) {
   const args = [];
   let current = '';
-  let inSingle = false, inDouble = false;
+  let quote = null;
 
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    if (ch === "'" && !inDouble) {
-      inSingle = !inSingle;
-      current += ch;
-    } else if (ch === '"' && !inSingle) {
-      inDouble = !inDouble;
-      current += ch;
-    } else if (ch === ',' && !inSingle && !inDouble) {
-      args.push(current.trim().replace(/^['"]|['"]$/g, ''));
-      current = '';
-    } else {
-      current += ch;
+
+    if (ch === '\\') {
+      if (str[i + 1] === ',') {
+        current += ',';
+        i++;
+        continue;
+      }
+      // Any other escape is data: both characters survive so regex
+      // arguments stay intact.
+      current += '\\';
+      continue;
     }
+
+    if (ch === "'" || ch === '"') {
+      if (quote === ch) quote = null;
+      else if (quote === null && str.indexOf(ch, i + 1) !== -1) quote = ch;
+      current += ch;
+      continue;
+    }
+
+    if (ch === ',' && quote === null) {
+      args.push(finalizeScriptletArg(current));
+      current = '';
+      continue;
+    }
+
+    current += ch;
   }
-  if (current.trim()) args.push(current.trim().replace(/^['"]|['"]$/g, ''));
+
+  if (current.trim()) args.push(finalizeScriptletArg(current));
   return args;
 }
 

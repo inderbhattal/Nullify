@@ -809,6 +809,25 @@ test('a rule whose options are slash-delimited never lands in regexFilter', () =
   }
 });
 
+test('the RE2 budget straddles the boundary Chrome demonstrated', () => {
+  // Bisected over three load cycles against real chrome://extensions output.
+  // These two were refused; the third loaded. The budget must sit between
+  // them, and the gap is only three instructions wide -- so a recalibration
+  // that moves it up has to justify itself against this evidence.
+  const refused = [
+    String.raw`nyaa\.land\/static\/[a-z0-9]{32}\.jpg$`,          // scored 86
+    String.raw`\bgamatotv\.info\/[a-z0-9]{32}\.js\b`,            // scored 85
+  ];
+  for (const pattern of refused) {
+    assert.ok(
+      estimateRegexNfaCost(pattern) > MAX_REGEX_NFA_COST,
+      `Chrome refused this, we must too: ${pattern} scored ${estimateRegexNfaCost(pattern)}`,
+    );
+  }
+  // 38 characters is not a lot; `{32}` of a two-range class is what costs.
+  assert.ok(refused.every((p) => p.length < 40), 'these are short patterns, not obvious monsters');
+});
+
 test('the RE2 budget rejects the patterns Chrome rejected', () => {
   // Every one of these was refused at ruleset load with "exceeded the 2KB
   // memory limit". The cheapest scored 104, which is why the budget sits below

@@ -908,13 +908,20 @@ const UTF8_SPAN_COST = 5;
  * instructions than it sounds like: RE2 builds both a forward and a reverse
  * program, so a 79-character mostly-literal pattern can exceed it.
  *
- * Calibrated against the patterns Chrome actually refused across two load
- * cycles: the cheapest confirmed rejection scored 104, so the budget sits
- * below that with margin. Erring low is close to free -- a rule we drop is
- * recorded in rules/skipped/ and auditable, whereas a rule Chrome drops is
- * lost just as completely but silently, in a log nobody reads.
+ * Calibrated by bisection against what Chrome actually refused, over three
+ * load cycles. The boundary is sharp and low: patterns scoring 85 and 86 were
+ * refused, while 82 loaded. `nyaa\.land\/static\/[a-z0-9]{32}\.jpg$` is only
+ * 38 characters and does not fit -- `{32}` of a two-range class unrolls to 64
+ * instructions, doubled again by the reverse program.
+ *
+ * The budget sits at 80 rather than on the observed 82/85 boundary: this is a
+ * model of RE2's compiler, not RE2, and sitting exactly on the edge means any
+ * modelling error in an untested pattern shape ships a rule Chrome will drop.
+ * One known-good rule is a cheap premium. Erring low costs little either way --
+ * a rule we drop is recorded in rules/skipped/ and auditable, whereas a rule
+ * Chrome drops is lost just as completely and silently.
  */
-const MAX_REGEX_NFA_COST = 90;
+const MAX_REGEX_NFA_COST = 80;
 
 function estimateRegexNfaCost(pattern) {
   let cost = 0;

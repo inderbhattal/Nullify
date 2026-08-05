@@ -24,6 +24,7 @@ const FILTER_LISTS = [
   { id: 'ubo-filters',  name: 'uBO Filters',       desc: 'uBlock Origin default filter list' },
   { id: 'ubo-unbreak',  name: 'uBO Unbreak',       desc: 'Fixes over-blocking by other lists' },
   { id: 'anti-adblock', name: 'Anti-Adblock',      desc: 'Anti-adblock and badware fixes from uBO' },
+  { id: 'ubo-quick-fixes', name: 'uBO Quick Fixes', desc: 'Same-day countermeasures, including the current YouTube ad bypass' },
 ];
 
 // ---------------------------------------------------------------------------

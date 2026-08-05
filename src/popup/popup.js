@@ -17,6 +17,7 @@ const FILTER_LIST_NAMES = {
   'ubo-filters': 'uBO Filters',
   'ubo-unbreak': 'uBO Unbreak',
   'anti-adblock': 'Anti-Adblock',
+  'ubo-quick-fixes': 'uBO Quick Fixes',
 };
 
 let currentTab = null;

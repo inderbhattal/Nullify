@@ -34,6 +34,35 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # src/shared/wasm/ is a gitignored build product and
+      # src/background/service-worker.js imports its glue statically, so the
+      # sw-harness suite cannot even load without it. The `build` job below
+      # builds it too, but that is a separate runner — artifacts do not carry
+      # across jobs, so this gate needs its own copy or `npm test` dies at
+      # pretest.
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch, 2026-07
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            wasm-core/target
+          key: cargo-wasm-${{ hashFiles('wasm-core/Cargo.lock') }}
+
+      - name: Install wasm-pack
+        uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
+        with:
+          version: 'v0.13.1'
+
+      - name: Build WASM (required by the service-worker harness)
+        run: npm run build:wasm
+
       - name: Lint
         run: npm run lint
 

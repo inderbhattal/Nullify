@@ -163,6 +163,39 @@ test('system-unbreak priorities stay inside the documented band', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// Any job that runs the JS suite must build the WASM artifact first.
+// src/shared/wasm/ is gitignored and service-worker.js imports its glue
+// statically, so without it the whole sw-harness suite dies at pretest. This
+// was fixed in test.yml and missed in build.yml's verify job, which failed the
+// same way on the next release run — artifacts do not carry between jobs, so
+// every such job needs its own build step, in the right order.
+test('every workflow job that runs the tests builds the WASM artifact first', () => {
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+  let jobsChecked = 0;
+
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const text = fs.readFileSync(path.join(workflowDir, file), 'utf8');
+
+    // Split on two-space-indented job keys; enough structure for this check
+    // without taking on a YAML parser.
+    for (const job of text.split(/\n {2}(?=[A-Za-z0-9_-]+:\n)/)) {
+      const name = (job.match(/^\s*([A-Za-z0-9_-]+):/) || [])[1] ?? '?';
+      const testIdx = job.search(/run:\s*npm (?:test|run check)\b/);
+      if (testIdx === -1) continue;
+
+      jobsChecked++;
+      const wasmIdx = job.search(/run:\s*npm run build:wasm\b/);
+      assert.notEqual(wasmIdx, -1,
+        `${file} job "${name}" runs the tests without building the WASM artifact`);
+      assert.ok(wasmIdx < testIdx,
+        `${file} job "${name}" builds the WASM artifact after running the tests`);
+    }
+  }
+
+  assert.ok(jobsChecked >= 2, `expected to find the test jobs, checked ${jobsChecked}`);
+});
+
 // Release workflow: tag names are data, not shell (§5.28)
 // ---------------------------------------------------------------------------
 

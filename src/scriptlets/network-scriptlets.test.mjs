@@ -199,4 +199,9 @@ test('prevent-fetch: url: prefix, conjunction, and bare patterns still work', as
   preventFetch('adsbygoogle');
   const bare = await window.fetch('https://example.com/adsbygoogle.js');
   assert.equal(await bare.text(), '', 'bare substring form must keep working');
+
+  // Only the non-matching request should ever have reached the network. The
+  // body assertions alone cannot show this — a scriptlet that let a blocked
+  // request through and then discarded its body would pass them.
+  assert.equal(realCalls, 1, 'exactly one request should have hit the real fetch');
 });

@@ -50,6 +50,34 @@ test('trfr: empty propsToMatch matches every URL', async () => {
   assert.equal(await res.text(), 'body with adsOff flag');
 });
 
+// §5.38 — a content-type allowlist gated the replacement. uBO has no such
+// gate, and YouTube's player response arrives without a usable content-type on
+// some paths, so every shipped rule against it was skipped.
+
+test('trfr: a response with no content-type is still rewritten (uBO has no gate)', async () => {
+  globalThis.fetch = async () =>
+    new Response('{"adPlacements":[{"ad":1}],"videoDetails":{"videoId":"abc"}}', { status: 200 });
+  trustedReplaceFetchResponse('adPlacements', 'no_ads', 'player?');
+
+  const res = await window.fetch('https://www.youtube.com/youtubei/v1/player?key=x');
+  const text = await res.text();
+  assert.equal(text.includes('adPlacements'), false, 'the gate must not skip an untyped body');
+  assert.equal(text.includes('no_ads'), true);
+  assert.equal(text.includes('videoDetails'), true, 'the rest of the body survives');
+});
+
+test('trfr: an unmatched body comes back as the original response, stream unread', async () => {
+  globalThis.fetch = async () =>
+    new Response('{"videoDetails":{"videoId":"abc"}}', {
+      status: 200, headers: { 'content-type': 'application/octet-stream' },
+    });
+  trustedReplaceFetchResponse('adPlacements', 'no_ads', 'player?');
+
+  const res = await window.fetch('https://www.youtube.com/youtubei/v1/player?key=x');
+  assert.equal(res.bodyUsed, false, 'reading a clone must leave the body consumable');
+  assert.equal(await res.text(), '{"videoDetails":{"videoId":"abc"}}');
+});
+
 test('trxr: shipped uBO arg order rewrites matching responses only', () => {
   const FakeXHR = makeFakeXHRClass();
   globalThis.XMLHttpRequest = FakeXHR;

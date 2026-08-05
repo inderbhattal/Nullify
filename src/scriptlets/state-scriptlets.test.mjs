@@ -173,6 +173,43 @@ test('trusted-set-constant: stays configurable so a later rule can redefine', ()
   assert.equal(globalThis.__tscProp, 42, 'a later rule on the same path must win');
 });
 
+// §5.38 — uBO's `json:<JSON text>` spelling was unimplemented, so the shipped
+// `m.youtube.com##+js(trusted-set, document.visibilityState, json:"visible")`
+// pinned the literal 14-character string `json:"visible"`. Page code comparing
+// it to 'visible' still concluded the tab was hidden and paused playback.
+
+test('trusted-set-constant: json: prefix is parsed, not pinned verbatim', () => {
+  // Verbatim argument strings from scripts/filter-lists/annoyances.txt:1542.
+  trustedSetConstant('document.visibilityState', 'json:"visible"');
+  assert.equal(document.visibilityState, 'visible');
+
+  trustedSetConstant('__tscJsonObj', 'json:{"ads":[],"n":3}');
+  assert.deepEqual(globalThis.__tscJsonObj, { ads: [], n: 3 });
+
+  trustedSetConstant('__tscJsonNum', 'json:1e6');
+  assert.equal(globalThis.__tscJsonNum, 1e6, 'json: bypasses the int-range clamp');
+});
+
+test('trusted-set-constant: uBO scalar spellings resolve', () => {
+  trustedSetConstant('__tscUndef', 'undefined');
+  assert.equal('__tscUndef' in globalThis, true);
+  assert.equal(globalThis.__tscUndef, undefined);
+
+  trustedSetConstant('__tscFalse', 'false');
+  assert.equal(globalThis.__tscFalse, false);
+
+  trustedSetConstant('__tscEmpty', "''");
+  assert.equal(globalThis.__tscEmpty, '');
+
+  // uBO's `{"value":…}` envelope unwraps to the inner value.
+  trustedSetConstant('__tscEnvelope', '{"value":42}');
+  assert.equal(globalThis.__tscEnvelope, 42);
+
+  // Unparsable JSON must not be silently accepted as an object.
+  trustedSetConstant('__tscBadJson', 'json:{not json');
+  assert.equal('__tscBadJson' in globalThis, false, 'a broken json: value must abort');
+});
+
 // §5.36 — the noopTokens Set was written on every suppressed call and never
 // read: unbounded growth on polling pages. This pins the observable contract
 // the Set was (not) serving: suppression and clearTimeout passthrough.

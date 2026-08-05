@@ -137,82 +137,117 @@ function parsePrunePaths(pathsStr) {
 }
 
 function hasAllPaths(obj, paths) {
-  return paths.every((path) => getByPath(obj, path) !== undefined);
+  return paths.every((path) => objectFindOwner(obj, path.split('.'), 0, false));
 }
 
-/**
- * uBO wildcard segments: `[]`/`[-]` iterate array elements, `*` iterates own
- * keys. Everything else is a literal key. The isProtoPollutionKey guard is
- * applied per segment — including keys produced by a `*` expansion.
- */
+/** Terminal-segment array wildcards; see the note in `objectFindOwner`. */
 function isArrayWildcard(part) {
   return part === '[]' || part === '[-]';
-}
-
-function wildcardKeys(target, part) {
-  if (isArrayWildcard(part)) {
-    return Array.isArray(target) ? target.keys() : [];
-  }
-  return Object.keys(target);
-}
-
-function getByPath(obj, path) {
-  return findByPath(obj, path.split('.'), 0);
-}
-
-function findByPath(current, parts, index) {
-  if (index === parts.length) return current;
-  if (current == null || typeof current !== 'object') return undefined;
-  const part = parts[index];
-  if (isProtoPollutionKey(part)) return undefined;
-  if (isArrayWildcard(part) || part === '*') {
-    // A wildcard path "exists" if any branch resolves to a defined value.
-    for (const key of wildcardKeys(current, part)) {
-      if (isProtoPollutionKey(String(key))) continue;
-      const found = findByPath(current[key], parts, index + 1);
-      if (found !== undefined) return found;
-    }
-    return undefined;
-  }
-  return findByPath(current[part], parts, index + 1);
 }
 
 /** @returns {boolean} whether any key was actually removed. */
 function pruneObject(obj, paths) {
   let pruned = false;
   for (const path of paths) {
-    if (prunePath(obj, path.split('.'), 0)) pruned = true;
+    if (objectFindOwner(obj, path.split('.'), 0, true)) pruned = true;
   }
   return pruned;
 }
 
-function prunePath(target, parts, index) {
-  if (target == null || typeof target !== 'object') return false;
-  const part = parts[index];
-  if (isProtoPollutionKey(part)) return false;
-  const isLast = index === parts.length - 1;
-  let pruned = false;
+/**
+ * uBO's `objectFindOwnerFn` (resources/object-prune.js), in path-array form.
+ *
+ * §5.38: `[-]` used to be an alias of `[]` — the element was walked into and
+ * the leaf key deleted, but the element itself stayed. uBO's four wildcard
+ * families are distinct:
+ *
+ *   `[-]`  on an array : SPLICE OUT every element whose remaining path exists
+ *   `{-}`  on an object: DELETE every key whose remaining path exists
+ *   `[]` `{}` `*`      : iterate, removing nothing at this level
+ *   trailing `*`       : delete every own key
+ *
+ * The difference is what the shipped Shorts rule turns on:
+ * `json-prune, entries.[-].command.reelWatchEndpoint.adClientParams.isAd`
+ * must remove the ad reel from the sequence, not merely strip its `isAd` flag
+ * and leave it occupying a slot.
+ *
+ * The `isProtoPollutionKey` guard is applied per segment, including keys
+ * produced by a wildcard expansion.
+ *
+ * @param {unknown} owner
+ * @param {string[]} parts
+ * @param {number} index
+ * @param {boolean} prune  false = existence test only, never mutates.
+ * @returns {boolean} whether the path resolved (and, when pruning, removed).
+ */
+function objectFindOwner(owner, parts, index, prune) {
+  let current = owner;
+  let i = index;
 
-  if (isArrayWildcard(part) || part === '*') {
-    for (const key of [...wildcardKeys(target, part)]) {
-      if (isProtoPollutionKey(String(key))) continue;
-      if (isLast) {
-        if (Object.hasOwn(target, key)) pruned = true;
-        delete target[key];
-      } else if (prunePath(target[key], parts, index + 1)) {
-        pruned = true;
+  for (;;) {
+    if (current === null || typeof current !== 'object') return false;
+    const part = parts[i];
+    if (isProtoPollutionKey(part)) return false;
+
+    // --- terminal segment ---------------------------------------------------
+    if (i === parts.length - 1) {
+      if (prune === false) return Object.hasOwn(current, part);
+      let modified = false;
+      if (part === '*' || part === '{-}') {
+        for (const key of Object.keys(current)) {
+          if (isProtoPollutionKey(key)) continue;
+          delete current[key];
+          modified = true;
+        }
+      } else if (isArrayWildcard(part) && Array.isArray(current)) {
+        // Nullify extension (uBO reads a terminal `[]` as a literal key, i.e.
+        // a no-op): drop every element. No shipped rule ends in `[]`, but a
+        // hand-written one plainly means "empty this array".
+        modified = current.length !== 0;
+        current.length = 0;
+      } else if (Object.hasOwn(current, part)) {
+        delete current[part];
+        modified = true;
       }
+      return modified;
     }
-    // Deleting array indices leaves holes; a terminal `[]` means "drop the
-    // elements", so collapse the array too.
-    if (isLast && Array.isArray(target)) target.length = 0;
-    return pruned;
-  }
 
-  if (isLast) {
-    if (Object.hasOwn(target, part) === false) return false;
-    delete target[part];
-    return true;
+    // --- removing wildcards: the remainder is an existence test -------------
+    if (prune && part === '[-]' && Array.isArray(current)) {
+      let found = false;
+      for (let k = current.length - 1; k >= 0; k--) {
+        if (objectFindOwner(current[k], parts, i + 1, false) === false) continue;
+        current.splice(k, 1);
+        found = true;
+      }
+      return found;
+    }
+    if (prune && part === '{-}') {
+      let found = false;
+      for (const key of Object.keys(current)) {
+        if (isProtoPollutionKey(key)) continue;
+        if (objectFindOwner(current[key], parts, i + 1, false) === false) continue;
+        delete current[key];
+        found = true;
+      }
+      return found;
+    }
+
+    // --- iterating wildcards ------------------------------------------------
+    const iterates = part === '{}' || part === '*' || part === '{-}'
+      || (isArrayWildcard(part) && Array.isArray(current));
+    if (iterates) {
+      let found = false;
+      for (const key of Object.keys(current)) {
+        if (isProtoPollutionKey(key)) continue;
+        if (objectFindOwner(current[key], parts, i + 1, prune)) found = true;
+      }
+      return found;
+    }
+    if (part === '[]' || part === '[-]') return false; // array wildcard, not an array
+
+    if (Object.hasOwn(current, part) === false) return false;
+    current = current[part];
+    i += 1;
   }
-  return prunePath(target[part], parts, index + 1);
 }

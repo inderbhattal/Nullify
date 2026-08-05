@@ -1000,34 +1000,64 @@ fn parse_scriptlet(line: &str) -> Option<ParsedRule> {
     })
 }
 
-/// Finalize one raw argument the way the JS parsers do: trim whitespace, then
-/// strip at most ONE leading and ONE trailing quote character (of either
-/// kind), mirroring `replace(/^['"]|['"]$/g, '')` in filter-parser.js and
-/// build-rules.mjs. Interior quotes are preserved.
+/// Finalize one raw argument: trim whitespace, then strip a *matched*
+/// surrounding quote pair (`'x'` or `"x"`). Interior quotes are preserved.
+///
+/// §5.38: this used to strip a leading and a trailing quote independently,
+/// mirroring `replace(/^['"]|['"]$/g, '')` in the JS parsers. That mangles any
+/// argument that merely ends in a quote — uBO ships
+/// `##+js(trusted-set, document.visibilityState, json:"visible")`, and the
+/// unpaired-strip turned the value into `json:"visible`, which no JSON parser
+/// accepts.
 fn finalize_scriptlet_arg(raw: &str) -> String {
     let trimmed = raw.trim();
-    let trimmed = trimmed.strip_prefix(['\'', '"']).unwrap_or(trimmed);
-    let trimmed = trimmed.strip_suffix(['\'', '"']).unwrap_or(trimmed);
+    let mut chars = trimmed.chars();
+    if let (Some(first), Some(last)) = (chars.next(), chars.next_back()) {
+        if (first == '\'' || first == '"') && first == last {
+            return chars.as_str().to_string();
+        }
+    }
     trimmed.to_string()
 }
 
 /// Split a scriptlet argument list on commas, respecting quoted commas.
 ///
-/// Must match the JS parsers (filter-parser.js / build-rules.mjs): quote
-/// characters are kept in the argument text — `div[id='ad']` stays intact —
-/// and only one surrounding quote pair is stripped per argument. The one
-/// deliberate divergence is unpaired quotes: the JS parsers leave the quote
-/// state open so every later comma stops splitting and arguments merge
-/// (§5.17); here a quote only opens quoted mode when a matching close quote
-/// exists later in the string, so `aopr, don't, x` still splits into three
-/// arguments. Paired-quote inputs behave identically in all three engines.
+/// Quote characters are kept in the argument text — `div[id='ad']` stays
+/// intact — and only a matched surrounding quote pair is stripped per
+/// argument.
+///
+/// Divergences from the JS parsers (filter-parser.js / build-rules.mjs), both
+/// deliberate, both cases where the JS side is wrong:
+///  * Unpaired quotes: the JS parsers leave the quote state open so every
+///    later comma stops splitting and arguments merge (§5.17); here a quote
+///    only opens quoted mode when a matching close quote exists later in the
+///    string, so `aopr, don't, x` still splits into three arguments.
+///  * `\,` (§5.38): uBO's escaped comma. The JS parsers split on it and strip
+///    a trailing quote that has no partner; both are fixed here.
+///
+/// Paired-quote, escape-free inputs behave identically in all three engines.
 fn parse_scriptlet_args(s: &str) -> Vec<String> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut quote: Option<char> = None;
+    let mut chars = s.char_indices().peekable();
 
-    for (idx, ch) in s.char_indices() {
+    while let Some((idx, ch)) = chars.next() {
         match ch {
+            // §5.38: `\,` is an escaped comma, not a separator. uBO unescapes
+            // it to a plain comma; splitting on it shredded the shipped
+            // `www.youtube.com##+js(trusted-replace-xhr-response, /"adPlacements…{2\,4}…/, , /…/)`
+            // rule into five arguments, leaving `propsToMatch` as `/` — which
+            // matches every YouTube XHR. Any other backslash escape is data:
+            // both characters survive so regex arguments stay intact.
+            '\\' => {
+                if matches!(chars.peek(), Some(&(_, ','))) {
+                    chars.next();
+                    current.push(',');
+                    continue;
+                }
+                current.push('\\');
+            }
             '\'' | '"' => {
                 match quote {
                     Some(open) if open == ch => quote = None,
@@ -3566,6 +3596,50 @@ mod tests {
         assert_eq!(
             parse_scriptlet_args("foo, \"x, y\", 'z'"),
             vec!["foo".to_string(), "x, y".to_string(), "z".to_string()]
+        );
+    }
+
+    // §5.38 — `\,` is an escaped comma, not a separator. This is uBO's shipped
+    // YouTube rule, verbatim: it carries `{2\,4}` inside the regex and a
+    // trailing `\,`, and must parse as exactly three arguments (pattern, empty
+    // replacement, propsToMatch). Splitting on the escapes produced five, and
+    // `propsToMatch` came out as `/` — a substring of every YouTube XHR URL.
+    #[test]
+    fn scriptlet_args_keep_escaped_commas() {
+        let rule = "www.youtube.com##+js(trusted-replace-xhr-response, \
+                    /\"adPlacements.*?([A-Z]\"\\}|\"\\}{2\\,4})\\}\\]\\,/, , \
+                    /playlist\\?list=|\\/player(?:\\?.+)?$|watch\\?[tv]=/)";
+        let parsed = parse_scriptlet(rule).expect("rule must parse as a scriptlet");
+        assert_eq!(parsed.name.as_deref(), Some("trusted-replace-xhr-response"));
+        let args = parsed.args.expect("args");
+        assert_eq!(
+            args,
+            vec![
+                "/\"adPlacements.*?([A-Z]\"\\}|\"\\}{2,4})\\}\\],/".to_string(),
+                String::new(),
+                "/playlist\\?list=|\\/player(?:\\?.+)?$|watch\\?[tv]=/".to_string(),
+            ],
+            "escaped commas must stay inside their argument"
+        );
+    }
+
+    // §5.38 — only a *matched* surrounding quote pair is stripped. uBO ships
+    // `trusted-set, document.visibilityState, json:"visible"`; stripping the
+    // unpaired trailing quote left `json:"visible`, which no JSON parser takes.
+    #[test]
+    fn scriptlet_args_keep_an_unpaired_trailing_quote() {
+        assert_eq!(
+            parse_scriptlet_args("trusted-set, document.visibilityState, json:\"visible\""),
+            vec![
+                "trusted-set".to_string(),
+                "document.visibilityState".to_string(),
+                "json:\"visible\"".to_string()
+            ]
+        );
+        // A leading-only quote is equally untouched.
+        assert_eq!(
+            parse_scriptlet_args("foo, \"bar"),
+            vec!["foo".to_string(), "\"bar".to_string()]
         );
     }
 

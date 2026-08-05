@@ -15,19 +15,6 @@ import { proxyApply, toMatcher, toRegex, wrapInstanceGetter } from './shared-uti
  *   2. replacement  - Replacement text (empty string = remove)
  *   3. propsToMatch - URL pattern (string or /regex/); empty = match all
  */
-const TEXT_LIKE_TYPES = new Set([
-  'text/', 'application/javascript', 'application/json', 'application/xml',
-  'application/rss+xml', 'application/atom+xml', 'application/xhtml+xml',
-]);
-
-function isTextLikeResponse(response) {
-  const ct = response.headers.get('content-type') || '';
-  for (const type of TEXT_LIKE_TYPES) {
-    if (ct.includes(type)) return true;
-  }
-  return false;
-}
-
 export function trustedReplaceFetchResponse(pattern, replacement = '', propsToMatch = '') {
   if (!pattern) return;
 
@@ -38,15 +25,24 @@ export function trustedReplaceFetchResponse(pattern, replacement = '', propsToMa
     try {
       const response = await context.reflect();
       if (!response.ok) return response;
-      if (!isTextLikeResponse(response)) return response;
 
-      // Avoid buffering huge binary payloads into memory
+      // §5.38: there used to be a content-type allowlist here. uBO has no such
+      // gate, and YouTube's `/youtubei/v1/player` response is served without a
+      // usable `content-type` in some paths — every shipped
+      // `trusted-replace-fetch-response` rule against it was skipped. Bodies
+      // that are not text simply fail to match the pattern.
+      //
+      // Avoid buffering huge payloads into memory (uBO has no such guard, but
+      // a declared multi-megabyte body is never a filter-list target).
       const length = parseInt(response.headers.get('content-length') || '0', 10);
       if (length > 5 * 1024 * 1024) return response;
 
-      const text = await response.text();
+      // Read a clone: an unchanged body must be handed back with its stream
+      // still unread, exactly as uBO does.
+      const text = await response.clone().text();
       const findRe = toRegex(pattern);
-      const modified = findRe.test(text) ? text.replace(findRe, replacement) : text;
+      const modified = text.replace(findRe, replacement);
+      if (modified === text) return response;
 
       // When returning a NEW response from text, we MUST strip encoding/length headers
       // because the new payload is raw text, not the original (likely compressed) byte-stream.

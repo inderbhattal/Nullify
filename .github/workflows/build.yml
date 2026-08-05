@@ -26,9 +26,9 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: npm
@@ -49,7 +49,7 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -90,9 +90,9 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # Same major as `verify` and test.yml — shipping a bundle built on a
           # runtime the suite never ran against is a needless difference.
@@ -153,7 +153,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nullify-extension
           path: |
@@ -170,8 +170,24 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Releases in this repo are immutable: once published, a tag's release
+      # and its assets cannot be amended or replaced. The publish step then
+      # fails with a bare `422 tag_name was used by an immutable release`,
+      # which reads like a workflow bug rather than what it is — a re-run
+      # against a tag that has already shipped. Say so plainly instead, and
+      # before spending a download on it.
+      - name: Refuse to publish over an existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error title=Release already exists::$TAG has already been published, and releases here are immutable — it cannot be replaced. Bump the version and tag again (npm run version:bump), or delete the existing release if it was published in error."
+            exit 1
+          fi
+
       - name: Download the packaged extension
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: nullify-extension
           path: release
@@ -181,7 +197,7 @@ jobs:
       # the raw expression by copy-paste. Action inputs are not shell, so this
       # is consistency rather than a second injection sink.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         env:
           TAG: ${{ github.ref_name }}
         with:

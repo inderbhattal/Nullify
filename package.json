@@ -4,7 +4,7 @@
   "description": "A powerful MV3 Chrome ad blocker with uBlock Origin-level features",
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "setup": "npm install && npm run build:wasm && npm run build:sample-rules && npm run build:ext",

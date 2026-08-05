@@ -218,6 +218,31 @@ test('only a tag-gated job may hold a write token', () => {
   }
 });
 
+// package.json declares the supported runtime; the workflows decide what is
+// actually exercised. When those disagree, the version users are told to run
+// is not the version anything was tested on — and `verify` really did test on
+// one major while `build` packaged the release on another.
+test('every workflow runs the Node major that package.json declares', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const declared = /(\d+)/.exec(pkg.engines?.node ?? '')?.[1];
+  assert.ok(declared, 'package.json must declare engines.node');
+
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+  let seen = 0;
+
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const text = fs.readFileSync(path.join(workflowDir, file), 'utf8');
+    for (const [, version] of text.matchAll(/node-version:\s*'?(\d+)/g)) {
+      seen++;
+      assert.equal(version, declared,
+        `${file} pins node-version ${version} while package.json declares >=${declared}`);
+    }
+  }
+
+  assert.ok(seen >= 2, `expected to find the setup-node steps, saw ${seen}`);
+});
+
 // Release workflow: tag names are data, not shell (§5.28)
 // ---------------------------------------------------------------------------
 

@@ -113,6 +113,11 @@
         "id": "ubo-cookie-annoyances",
         "enabled": true,
         "path": "rules/ubo-cookie-annoyances.json"
+      },
+      {
+        "id": "ubo-quick-fixes",
+        "enabled": true,
+        "path": "rules/ubo-quick-fixes.json"
       }
     ]
   },

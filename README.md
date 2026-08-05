@@ -145,10 +145,11 @@ npm run build:ext
 #### Refreshing the upstream lists
 
 Upstream rotates constantly: measured, **6 of 8 lists changed within ~48 h** of
-a lock refresh. When the build fetched at build time, any list rotating between
-`git tag` and the CI build failed SRI and killed the release — a success window
-of minutes. Fetching is now a separate, deliberate step whose output is
-reviewed and committed:
+a lock refresh (that was before `ubo-quick-fixes`; there are nine lists now).
+When the build fetched at build time, any list rotating between `git tag` and
+the CI build failed SRI and killed the release — a success window of minutes.
+Fetching is now a separate, deliberate step whose output is reviewed and
+committed:
 
 ```bash
 # 1. Fetch upstream, expand every !#include, and write BOTH the snapshots and
@@ -173,6 +174,47 @@ build with the command to run. Nothing falls back to the network.
 Cosmetic filters and scriptlets still refresh for users on the runtime's own
 24 h update alarm; the snapshots pin what the *static DNR rulesets* are
 compiled from.
+
+#### `ubo-quick-fixes` is the volatile one — a deliberate trade-off
+
+`scripts/filter-lists/ubo-quick-fixes.txt` is a snapshot of uAssets'
+[`quick-fixes.txt`](https://github.com/uBlockOrigin/uAssets/blob/master/filters/quick-fixes.txt),
+which declares:
+
+```
+! Expires: 8 hours
+```
+
+That is **by far the shortest expiry of anything we carry** — the other eight
+lists declare 12 h to 4 days. quick-fixes.txt is where uBO lands its *same-day*
+counter-moves, and it is the only place uBO's modern YouTube machinery lives
+(`json-prune-fetch-response` / `json-prune-xhr-response` on `/youtubei/v1/player`,
+`trusted-json-edit-xhr-request` request shaping, `trusted-prevent-dom-bypass`);
+none of it is in `filters.txt`, which we ingest as `ubo-filters`.
+
+The consequence of vendoring it is real and is stated here rather than left
+implicit: **a snapshot of this list goes stale within a working day, and its
+static DNR rules only reach users on a release.** We accept that because:
+
+- The alternative — fetching at build time — did not merely go stale, it broke
+  releases outright (see above). Staleness degrades; a failed SRI check ships
+  nothing at all.
+- Its DNR rules are a small minority of the list (28 of ~460 lines at the last
+  refresh). Almost everything that matters is cosmetic/scriptlet, and **those
+  are re-fetched by the service worker on its own 24 h alarm** — `ubo-quick-fixes`
+  is registered in `REMOTE_FILTER_LISTS`, so a fresh YouTube counter-move does
+  reach installed users without a release.
+- `npm run refresh:lists` immediately before tagging keeps the snapshot within
+  hours of upstream, and the diff is small enough to actually read.
+
+If YouTube breaks and the fix is known to be in quick-fixes.txt, the response is
+`npm run refresh:lists && npm run build:rules` and a release — not a build-time
+fetch.
+
+The list is treated as **trusted** (`TRUSTED_FILTER_LIST_IDS` in the service
+worker): it is a `ublock-*` list, matching uBO's own `trustedListPrefixes:
+'ublock-'` gate, and its YouTube rules depend on `trusted-replace-*`,
+`trusted-json-edit-*` and `trusted-rpnt`, which are trust-gated.
 
 ### Load in Chrome
 

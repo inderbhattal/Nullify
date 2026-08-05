@@ -104,6 +104,12 @@ const REMOTE_FILTER_LISTS = [
   { id: 'malware',     url: 'https://malware-filter.gitlab.io/malware-filter/urlhaus-filter-online.txt' },
   { id: 'anti-adblock',url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/badware.txt' },
   { id: 'ubo-cookie-annoyances', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/annoyances-cookies.txt' },
+  // quick-fixes.txt: uBO's same-day counter-moves. It declares
+  // `! Expires: 8 hours`, so the runtime refresh below is the ONLY path by
+  // which a fresh YouTube counter-move reaches an installed user without a
+  // release — the vendored snapshot compiled into rules/ubo-quick-fixes.json
+  // covers only its handful of network rules.
+  { id: 'ubo-quick-fixes', url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt' },
 ];
 const REMOTE_FILTER_LIST_IDS = REMOTE_FILTER_LISTS.map((list) => list.id);
 const ALL_KNOWN_LIST_IDS = [
@@ -225,6 +231,7 @@ function getDefaultEnabledRulesets() {
     'system-unbreak': true,
     'anti-adblock': true,
     'ubo-cookie-annoyances': true,
+    'ubo-quick-fixes': true,
   };
 }
 
@@ -3055,6 +3062,7 @@ let RULESET_RULE_COUNTS = {
   'ubo-filters': 4579,
   'ubo-filters_2': 0,
   'ubo-cookie-annoyances': 46,
+  'ubo-quick-fixes': 28,
   'annoyances': 272,
   'easyprivacy': 25000,
   'easyprivacy_2': 25000,
@@ -3085,6 +3093,10 @@ async function loadRulesetCountsFromBuild() {
 const RULESET_ENABLE_PRIORITY = [
   'system-unbreak',
   'ubo-unbreak',
+  // Tens of rules, not thousands, and they are the counter-moves that keep
+  // YouTube/Facebook working this week — cheap to keep and expensive to drop,
+  // so it sits above the bulk lists in the budget fallback order.
+  'ubo-quick-fixes',
   'easylist',
   'easylist_2',
   'easylist_3',

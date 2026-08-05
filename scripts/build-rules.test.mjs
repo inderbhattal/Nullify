@@ -372,3 +372,133 @@ test('a promotion that cannot complete leaves the previous generation whole', { 
     fs.rmSync(parent, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// uAssets quick-fixes.txt (`ubo-quick-fixes`)
+//
+// uBO's modern YouTube ad-blocking machinery is NOT in filters.txt — the list
+// we already ingest as `ubo-filters`. It is in quick-fixes.txt: the live
+// json-prune-fetch-response / json-prune-xhr-response rules on
+// /youtubei/v1/player, the trusted-json-edit-xhr-request request shaping and
+// the trusted-prevent-dom-bypass counters. Every assertion below fails on the
+// code that shipped eight lists.
+// ---------------------------------------------------------------------------
+
+test('ubo-quick-fixes is configured, vendored and sized within its shard capacity', () => {
+  const list = FILTER_LISTS.find((l) => l.id === 'ubo-quick-fixes');
+  assert.ok(list, 'FILTER_LISTS must carry ubo-quick-fixes');
+  assert.equal(
+    list.url,
+    'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt',
+  );
+
+  const config = LIST_CONFIG['ubo-quick-fixes'];
+  assert.ok(config, 'LIST_CONFIG must carry ubo-quick-fixes');
+  // The declared totalLimit has to stay honest against what the shard writer
+  // can physically emit, or rules vanish with no skip-log record (§5.47).
+  assert.ok(
+    config.totalLimit <= config.parts * MAX_PER_FILE,
+    `totalLimit ${config.totalLimit} exceeds shard capacity ${config.parts * MAX_PER_FILE}`,
+  );
+  assert.equal(effectiveListLimit(config), config.totalLimit);
+
+  const snapshot = vendoredListPath('ubo-quick-fixes');
+  assert.ok(
+    fs.existsSync(snapshot),
+    'missing scripts/filter-lists/ubo-quick-fixes.txt — run `npm run refresh:lists`',
+  );
+});
+
+test('the committed quick-fixes snapshot is fully preprocessed, not raw', () => {
+  // The snapshot is what `build:rules` compiles and what the SRI lock covers,
+  // so preprocessor evaluation has already happened at refresh time. A residual
+  // `!#if` would mean the branch was neither taken nor dropped — it would reach
+  // the parser as a comment and the whole guarded section would ship.
+  const text = fs.readFileSync(vendoredListPath('ubo-quick-fixes'), 'utf8');
+  const residual = text.split('\n').filter((l) => /^!#(if|else|endif)\b/.test(l.trim()));
+  assert.deepEqual(residual, [], 'no preprocessor directive may survive into the snapshot');
+});
+
+test('preprocessor branches resolve the way a Chromium MV3 build needs', async () => {
+  // The exact condition strings quick-fixes.txt uses. Asserted through the
+  // shared evaluator so build, service worker and Rust core cannot disagree.
+  const { evaluatePreprocessorCondition } = await import('../src/shared/filter-syntax.js');
+
+  // We ARE MV3, so `!env_mv3` is false: the Firefox-era json-prune fallback is
+  // dropped rather than layered on top of the modern rules.
+  assert.equal(evaluatePreprocessorCondition('!env_mv3'), false);
+  // We have no HTML/response filtering, so `!cap_html_filtering` is TRUE — we
+  // take the +js(trusted-replace-*-response) branch, and the `!#else` branch
+  // (the `$replace=` network rules, which DNR cannot express) is excluded.
+  assert.equal(evaluatePreprocessorCondition('cap_html_filtering'), false);
+  assert.equal(evaluatePreprocessorCondition('!cap_html_filtering'), true);
+  // We are not Firefox and not uBO Lite.
+  assert.equal(evaluatePreprocessorCondition('env_firefox'), false);
+  assert.equal(evaluatePreprocessorCondition('ext_ubol'), false);
+  assert.equal(evaluatePreprocessorCondition('env_mobile'), false);
+});
+
+test('fetchAndExpand takes the MV3 branch of quick-fixes.txt nesting shapes', async () => {
+  // Mirrors the four shapes quick-fixes.txt actually uses, including the
+  // triple-nested `!#if !env_mv3 / !#if !cap_html_filtering / !#if env_firefox`
+  // header and the `!#if cap_html_filtering / !#else / !#if ext_ubol / !#else`
+  // double nesting. A synthetic fixture rather than the live list, because an
+  // 8-hour-expiry list rotates faster than this test could be maintained.
+  const source = [
+    '!#if !env_mv3',
+    '!#if !cap_html_filtering',
+    '!#if env_firefox',
+    'DROP_firefox_json_prune',
+    '!#endif',
+    '!#endif',
+    '!#endif',
+    '!#if !cap_html_filtering',
+    'KEEP_trusted_replace_xhr_response',
+    '!#else',
+    'DROP_replace_network_rule',
+    '!#endif',
+    '!#if ext_ubol',
+    'DROP_ubol_only',
+    '!#else',
+    'KEEP_full_ublock',
+    '!#endif',
+    '!#if cap_html_filtering',
+    'DROP_html_filtering',
+    '!#else',
+    '!#if ext_ubol',
+    'DROP_ubol_nested',
+    '!#else',
+    'KEEP_nested_fallback',
+    '!#endif',
+    '!#endif',
+    '!#if env_mobile',
+    'DROP_mobile_only',
+    '!#endif',
+    'KEEP_unconditional',
+  ].join('\n');
+
+  const text = await fetchAndExpand('https://lists.example/quick-fixes.txt', 0, async () => source);
+  const kept = text.split('\n').filter(Boolean);
+
+  assert.deepEqual(kept, [
+    'KEEP_trusted_replace_xhr_response',
+    'KEEP_full_ublock',
+    'KEEP_nested_fallback',
+    'KEEP_unconditional',
+  ]);
+});
+
+test('$replace= network rules are dropped rather than shipped broadened', () => {
+  // The `!#else` escape hatch above removes most of them, but quick-fixes.txt
+  // also carries unconditional `$replace=` rules (fbcdn, pvpoke, novelpia).
+  // DNR cannot rewrite response bodies; keeping the rule minus the option would
+  // turn "rewrite this script" into "block this script".
+  for (const line of [
+    '||static.xx.fbcdn.net/rsrc.php/$script,domain=web.facebook.com,replace=/a/b/',
+    '||www.youtube.com/youtubei/v1/player?$xhr,1p,replace=/"adPlacements"/"no_ads"/',
+  ]) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be skipped`);
+    assert.match(parsed.reason || '', /unsupported-option: replace=/);
+  }
+});

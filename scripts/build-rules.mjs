@@ -34,6 +34,26 @@
  * tag build had to recompile from the network. The success window for a
  * release was minutes. Snapshots move that race to refresh time, which is
  * exactly when a human is looking at the diff (§4.6).
+ *
+ * VOLATILITY — `ubo-quick-fixes` (uAssets quick-fixes.txt) declares
+ * `! Expires: 8 hours`, by far the shortest of anything we carry (the rest
+ * declare 12 h–4 days and in practice rotate on the order of a day). That list
+ * is where uBO lands same-day counter-moves against YouTube and Facebook, so a
+ * vendored snapshot of it goes stale within a working day and a fresh
+ * counter-move only reaches users on a release.
+ *
+ * That trade-off is deliberate, not an oversight. Vendoring costs freshness on
+ * the STATIC DNR rules; fetching at build time cost releases outright (see
+ * above). The mitigations are:
+ *   - the cosmetic/scriptlet half of quick-fixes.txt — which is where nearly
+ *     all of its YouTube machinery lives — is re-fetched by the service worker
+ *     on its own 24 h update alarm (REMOTE_FILTER_LISTS), so users do get those
+ *     without a release;
+ *   - only the handful of network rules are release-bound;
+ *   - `npm run refresh:lists` before a release keeps the snapshot within hours
+ *     of upstream.
+ * Anyone tempted to "fix" the staleness by reintroducing a build-time fetch
+ * should read §4.6 first.
  */
 
 import fs from 'fs';
@@ -112,6 +132,12 @@ const LIST_CONFIG = {
   'ubo-unbreak': { parts: 1, totalLimit: 25000 },
   'anti-adblock': { parts: 1, totalLimit: 25000 },
   'ubo-cookie-annoyances': { parts: 1, totalLimit: 25000 },
+  // quick-fixes.txt is ~500 lines and almost entirely cosmetic/scriptlet; it
+  // has never yielded more than a few dozen DNR rules. A single shard with a
+  // deliberately small ceiling keeps the declared budget honest (see the
+  // effectiveListLimit note above) — if upstream ever grows it past 5000 the
+  // smart-truncate log says so instead of the number quietly meaning nothing.
+  'ubo-quick-fixes': { parts: 1, totalLimit: 5000 },
 };
 
 const MAX_PER_FILE = 25000;
@@ -169,6 +195,18 @@ const FILTER_LISTS = [
     id: 'ubo-cookie-annoyances',
     url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/annoyances-cookies.txt',
     description: 'uBO Cookie Annoyances — Cookie banners and consent popups',
+  },
+  {
+    id: 'ubo-quick-fixes',
+    url: 'https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt',
+    // Where uBO lands its same-day YouTube/Facebook counter-moves — the
+    // json-prune-fetch-response / json-prune-xhr-response rules on
+    // /youtubei/v1/player, the trusted-json-edit-xhr-request request shaping
+    // and the trusted-prevent-dom-bypass counters. None of that is in
+    // filters.txt (`ubo-filters`), so without this list we ship none of it.
+    // Declares `! Expires: 8 hours` — the most volatile list we carry; see the
+    // VOLATILITY note in the file header for why we vendor it anyway.
+    description: 'uBO Quick Fixes — same-day YouTube/Facebook counter-moves (Expires: 8 hours)',
   },
 ];
 

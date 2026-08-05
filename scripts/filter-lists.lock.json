@@ -38,5 +38,10 @@
     "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/refs/heads/master/filters/annoyances-cookies.txt",
     "sha384": "sha384-KcYIirj5cSKiEMrSGIv8OiL6RYA/iofl8+BVSk9mWwgTMaHzyDKpA1l7C3Wq2jFj",
     "generatedAt": "2026-08-04T22:13:45.727Z"
+  },
+  "ubo-quick-fixes": {
+    "url": "https://raw.githubusercontent.com/uBlockOrigin/uAssets/master/filters/quick-fixes.txt",
+    "sha384": "sha384-+N2Me0B38HYYb64as+qWGVwk9ecuHVMcXFl9AyuWbc/3sxM9Csrb3cvBEhWGA2TJ",
+    "generatedAt": "2026-08-04T22:13:45.731Z"
   }
 }

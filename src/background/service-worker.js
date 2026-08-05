@@ -3851,7 +3851,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   //
   // §3.1 — EVERY allowlist reader and writer belongs here. The writers now
   // compose from storage rather than from `cachedAllowlist`, so this gate is
-  // defence in depth rather than the fix; the readers (`GET_ALLOWLIST`,
+  // defense in depth rather than the fix; the readers (`GET_ALLOWLIST`,
   // `IS_SITE_ALLOWED`) genuinely need the cache to be populated or they answer
   // "not allowlisted" for a site the user has allowlisted.
   const needsCache = NEEDS_CRITICAL_CACHE.has(message.type);

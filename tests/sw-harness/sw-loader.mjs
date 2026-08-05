@@ -39,6 +39,27 @@ let instanceCounter = 0;
 
 const NETWORK_DISABLED = 'network disabled in sw-harness';
 
+// The harness cuts the network on purpose, and the worker then correctly
+// reports every resulting failure — including a CRITICAL for WASM init. Left
+// alone that is ~11 alarming lines per loaded worker, which buries genuine
+// output and teaches the reader to skim past the word CRITICAL.
+//
+// Suppress only the messages the harness itself caused, matched on its own
+// sentinel string; anything else reaches the console untouched. Set
+// NULLIFY_TEST_VERBOSE=1 to see them.
+if (!process.env.NULLIFY_TEST_VERBOSE) {
+  for (const level of ['log', 'warn', 'error']) {
+    const original = console[level].bind(console);
+    console[level] = (...args) => {
+      const selfInflicted = args.some((arg) => {
+        if (typeof arg === 'string') return arg.includes(NETWORK_DISABLED);
+        return arg instanceof Error && arg.message.includes(NETWORK_DISABLED);
+      });
+      if (!selfInflicted) original(...args);
+    };
+  }
+}
+
 export async function loadServiceWorker({
   stub = null,
   idb = null,

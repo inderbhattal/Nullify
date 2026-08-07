@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nullify",
-  "version": "4.6.0",
+  "version": "4.7.0",
   "minimum_chrome_version": "120",
   "description": "Nullify — reduce ads to nothing. A powerful, privacy-focused ad blocker built on Manifest V3.",
   "author": "Nullify",
@@ -159,6 +159,6 @@
     }
   ],
   "content_security_policy": {
-    "extension_pages": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    "extension_pages": "default-src 'self'; connect-src 'self' https://easylist.to https://raw.githubusercontent.com https://malware-filter.gitlab.io; script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   }
 }

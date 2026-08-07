@@ -22,6 +22,62 @@ test('extension_pages CSP includes default-src self', () => {
   assert.match(csp, /script-src 'self' 'wasm-unsafe-eval'/);
 });
 
+test('connect-src explicitly allows every remote filter-list origin', () => {
+  const manifest = readJson('manifest.json');
+  const csp = manifest.content_security_policy?.extension_pages || '';
+
+  // With default-src 'self' present (§4.13), connect-src falls back to
+  // 'self' unless set explicitly — which blocks the service worker's own
+  // filter-list refresh. connect-src must therefore be spelled out.
+  const connectSrc = csp.split(';')
+    .map((d) => d.trim())
+    .find((d) => d.startsWith('connect-src '));
+  assert.ok(connectSrc, `connect-src must be explicit, got CSP: ${csp}`);
+  const allowedOrigins = new Set(
+    connectSrc.split(/\s+/).slice(1).filter((t) => t !== "'self'"));
+
+  // Runtime source of truth: REMOTE_FILTER_LISTS in the service worker.
+  const swSource = fs.readFileSync(
+    path.join(ROOT, 'src/background/service-worker.js'), 'utf8');
+  const listBlock = swSource.match(
+    /const REMOTE_FILTER_LISTS = \[([\s\S]*?)\];/);
+  assert.ok(listBlock, 'REMOTE_FILTER_LISTS not found in service-worker.js');
+  const swUrls = [...listBlock[1].matchAll(/url:\s*'(https:\/\/[^']+)'/g)]
+    .map((m) => m[1]);
+  assert.ok(swUrls.length > 0, 'REMOTE_FILTER_LISTS has no URLs');
+
+  // Build-time source of truth: the SRI lock over the same lists.
+  const lock = readJson('scripts/filter-lists.lock.json');
+  const lockUrls = Object.values(lock).map((e) => e.url);
+
+  for (const url of [...swUrls, ...lockUrls]) {
+    const origin = new URL(url).origin;
+    assert.ok(
+      allowedOrigins.has(origin),
+      `connect-src is missing ${origin} (needed for ${url})`);
+  }
+});
+
+test('extension pages carry no inline styles', () => {
+  // style-src falls back to default-src 'self' (§4.13), which blocks
+  // style="" attributes and injected <style> elements on extension pages.
+  // Styling must live in the page stylesheets — do not "fix" a blocked
+  // style by adding 'unsafe-inline', which reopens the §4.13 exfil channel.
+  const offenders = [];
+  for (const dir of ['src/popup', 'src/options']) {
+    for (const f of fs.readdirSync(path.join(ROOT, dir))) {
+      if (!/\.(html|js)$/.test(f)) continue;
+      const lines = fs.readFileSync(path.join(ROOT, dir, f), 'utf8').split('\n');
+      lines.forEach((line, i) => {
+        if (/style\s*=\s*["']|setAttribute\(\s*['"]style['"]|cssText|createElement\(\s*['"]style['"]/.test(line)) {
+          offenders.push(`${dir}/${f}:${i + 1}: ${line.trim()}`);
+        }
+      });
+    }
+  }
+  assert.deepEqual(offenders, []);
+});
+
 // ---------------------------------------------------------------------------
 // rules/system-unbreak.json — gstatic scoping (§5.49)
 // ---------------------------------------------------------------------------

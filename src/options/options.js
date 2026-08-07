@@ -758,16 +758,16 @@ class LiveLogger {
 
     const typeBadge = e.type === 'network' ? 'badge-network' : 'badge-cosmetic';
     const actionBadge = e.action === 'block' ? 'badge-block' : e.action === 'allow' ? 'badge-allow' : e.action === 'modify' ? 'badge-modify' : e.action === 'remove' ? 'badge-remove' : 'badge-hide';
-    const trackerBadge = e.isTracker ? '<span class="log-badge" style="background:rgba(255,121,198,0.15);color:#ff79c6;margin-left:4px">tracker</span>' : '';
-    const entityBadge = e.entity ? `<span class="log-badge" style="background:rgba(88,166,255,0.15);color:#58a6ff;margin-left:4px">${this.esc(e.entity)}</span>` : '';
+    const trackerBadge = e.isTracker ? '<span class="log-badge badge-tracker">tracker</span>' : '';
+    const entityBadge = e.entity ? `<span class="log-badge badge-entity">${this.esc(e.entity)}</span>` : '';
 
     let infoHtml = '';
     if (e.type === 'network') {
-      infoHtml = `<span class="log-url" title="Click to copy: ${this.esc(e.url)}" data-copy="${this.esc(e.url)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.url)}</span>
+      infoHtml = `<span class="log-url log-copy" title="Click to copy: ${this.esc(e.url)}" data-copy="${this.esc(e.url)}">${this.esc(e.url)}</span>
                   ${trackerBadge} ${entityBadge}
                   <span class="log-extra">${this.esc(e.method)} • ${this.esc(e.resourceType)} • ${this.esc(e.rulesetId)}#${this.esc(e.ruleId)}</span>`;
     } else {
-      infoHtml = `<span class="log-selector" title="Click to copy: ${this.esc(e.selector)}" data-copy="${this.esc(e.selector)}" style="cursor:pointer; text-decoration:underline dashed; text-underline-offset:2px">${this.esc(e.selector)}</span>
+      infoHtml = `<span class="log-selector log-copy" title="Click to copy: ${this.esc(e.selector)}" data-copy="${this.esc(e.selector)}">${this.esc(e.selector)}</span>
                   <span class="log-extra" title="${this.esc(e.hostname)}">${this.esc(e.hostname)}</span>`;
     }
 

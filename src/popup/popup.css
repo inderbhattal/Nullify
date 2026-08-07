@@ -152,6 +152,8 @@ body {
   margin-bottom: 12px;
 }
 
+.stats-grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+
 .stat-card {
   background: var(--bg2);
   border-radius: var(--radius);
@@ -183,6 +185,8 @@ body {
   gap: 6px;
   margin-bottom: 12px;
 }
+
+.quick-actions.cols-4 { grid-template-columns: repeat(4, 1fr); }
 
 .action-btn {
   background: var(--bg2);

@@ -63,8 +63,8 @@
       <section id="tab-filter-lists" class="tab-content active" role="tabpanel">
         <div class="section-header">
           <h2>Filter Lists</h2>
-          <div style="display:flex;align-items:center;gap:12px">
-            <span id="lastUpdateText" style="font-size:12px;color:var(--text-muted)"></span>
+          <div class="section-actions has-note">
+            <span id="lastUpdateText" class="section-note"></span>
             <button class="btn btn-primary" id="btnUpdateAll">Update All</button>
           </div>
         </div>
@@ -81,7 +81,7 @@
       <section id="tab-my-filters" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>My Filters</h2>
-          <div style="display:flex;gap:8px">
+          <div class="section-actions">
             <button class="btn btn-secondary" id="btnImportFilters" title="Import filters from file">Import</button>
             <button class="btn btn-secondary" id="btnExportFilters" title="Export filters to file">Export</button>
             <button class="btn btn-primary" id="btnApplyFilters">Apply</button>
@@ -110,7 +110,7 @@
       <section id="tab-allowlist" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>Allowlist</h2>
-          <div style="display:flex;gap:8px">
+          <div class="section-actions">
             <button class="btn btn-secondary" id="btnImportAllowlist" title="Import allowlist from file">Import</button>
             <button class="btn btn-secondary" id="btnExportAllowlist" title="Export allowlist to file">Export</button>
           </div>
@@ -133,9 +133,9 @@
       <section id="tab-logger" class="tab-content" role="tabpanel">
         <div class="section-header">
           <h2>Live Logger</h2>
-          <div style="display:flex;gap:8px">
-            <input type="text" id="loggerSearch" class="text-input" style="padding: 4px 10px; width: 180px;" placeholder="Search logs..." aria-label="Search logs">
-            <select id="loggerFilter" class="text-input" style="padding: 4px 8px; width: auto; flex: none;" aria-label="Filter log entries by type">
+          <div class="section-actions">
+            <input type="text" id="loggerSearch" class="text-input search-compact" placeholder="Search logs..." aria-label="Search logs">
+            <select id="loggerFilter" class="text-input select-compact" aria-label="Filter log entries by type">
               <option value="all">All Types</option>
               <option value="network">Network</option>
               <option value="cosmetic">Cosmetic</option>
@@ -233,7 +233,7 @@
               <strong>Browser Persona</strong>
               <span class="toggle-desc">Spoof your User-Agent and Client Hints to look like a standard system</span>
             </span>
-            <select id="settingPersona" class="text-input" style="width: 140px; padding: 4px 8px; flex: none;">
+            <select id="settingPersona" class="text-input select-persona">
               <option value="default">Default</option>
               <option value="windows">Windows / Chrome</option>
               <option value="mac">macOS / Chrome</option>

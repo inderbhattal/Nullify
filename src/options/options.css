@@ -121,6 +121,14 @@ body {
   color: var(--text);
 }
 
+.section-actions { display: flex; gap: 8px; }
+.section-actions.has-note { align-items: center; gap: 12px; }
+.section-note { font-size: 12px; color: var(--text-muted); }
+
+.text-input.search-compact { padding: 4px 10px; width: 180px; }
+.text-input.select-compact { padding: 4px 8px; width: auto; flex: none; }
+.text-input.select-persona { padding: 4px 8px; width: 140px; flex: none; }
+
 .section-desc {
   color: var(--text-muted);
   margin-bottom: 20px;
@@ -406,6 +414,10 @@ body {
 .badge-modify { color: var(--accent); font-style: italic; }
 .badge-hide { color: var(--yellow); }
 .badge-remove { color: #f85149; font-style: italic; }
+.badge-tracker { background: rgba(255,121,198,0.15); color: #ff79c6; margin-left: 4px; }
+.badge-entity { background: rgba(88,166,255,0.15); color: #58a6ff; margin-left: 4px; }
+
+.log-copy { cursor: pointer; text-decoration: underline dashed; text-underline-offset: 2px; }
 
 .log-url { color: var(--text); }
 .log-selector { color: var(--accent); }

@@ -619,6 +619,118 @@ test('4.2: dedup distinguishes rules by request domains, exclusions and methods'
   assert.equal(droppedRecords.filter((r) => r.reason.startsWith('dedup')).length, 1);
 });
 
+// §7.1 — `$3p`/`$1p` as the FIRST option never split. OPTION_LIST_HEAD wanted
+// a letter first, so `||host^$3p` was emitted as a urlFilter carrying the
+// literal text `$3p`, which matches nothing: 415 corpus lines, 56 of them
+// exceptions whose sites were therefore over-blocked. The Rust compiler
+// accepts `~?[13]p` as an option head; the build now does too.
+
+test('7.1: $3p as the first option splits into options, not a dead urlFilter', () => {
+  assert.deepEqual(
+    convert('||example.com^$3p'),
+    block({ urlFilter: '||example.com^', domainType: 'thirdParty' }),
+  );
+  assert.deepEqual(
+    convert('||example.com^$1p'),
+    block({ urlFilter: '||example.com^', domainType: 'firstParty' }),
+  );
+  assert.deepEqual(
+    convert('||example.com^$~3p'),
+    block({ urlFilter: '||example.com^', domainType: 'firstParty' }),
+  );
+  assert.deepEqual(
+    convert('||example.com^$3p,script'),
+    block({ urlFilter: '||example.com^', domainType: 'thirdParty', resourceTypes: ['script'] }),
+  );
+  assert.deepEqual(splitPatternAndOptions('||example.com^$3p'), ['||example.com^', '3p']);
+});
+
+test('7.1: an exception with $~3p first is a scoped allow', () => {
+  const rule = convert('@@||example.com^$~3p,script');
+  assert.deepEqual(rule, {
+    priority: 3,
+    condition: {
+      urlFilter: '||example.com^',
+      isUrlFilterCaseSensitive: false,
+      domainType: 'firstParty',
+      resourceTypes: ['script'],
+    },
+    action: { type: 'allow' },
+  });
+});
+
+test('7.1 (didn\'t re-break): $1/$2 replacement tails and digit runs are not option heads', () => {
+  // The wider head is exactly `~?[13]p` followed by `,`, `=` or the end —
+  // a `$1` inside a replace= value, or a `$1p` that continues, stays put.
+  assert.deepEqual(
+    splitPatternAndOptions('||example.com/a$replace=/(a)/$1/'),
+    ['||example.com/a', 'replace=/(a)/$1/'],
+  );
+  assert.deepEqual(
+    splitPatternAndOptions('/x\\.js$/$script,replace=/^(.)$/$1$2/'),
+    ['/x\\.js$/', 'script,replace=/^(.)$/$1$2/'],
+  );
+  assert.deepEqual(splitPatternAndOptions('||example.com/path$1proxy'), ['||example.com/path$1proxy', '']);
+  assert.deepEqual(splitPatternAndOptions('||example.com/path$2p'), ['||example.com/path$2p', '']);
+  assert.deepEqual(splitPatternAndOptions('||example.com/path$13p'), ['||example.com/path$13p', '']);
+});
+
+// §7.7 — three fail-open shapes the B1 second review found in Rust, which the
+// build shared. Each shipped a rule that was either wrongly scoped or
+// rejected by Chrome at index time (losing the whole rule silently).
+
+test('7.7: $~domain=x is refused, not read as un-negated', () => {
+  // Read as `domain=x` the rule is scoped TO x — the opposite of what was
+  // written. uBO does not accept the form; neither do we.
+  for (const line of ['||example.com^$~domain=a.com', '||example.com^$~from=a.com', '||example.com^$script,~domain=a.com']) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be refused`);
+    assert.match(parsed.reason, /unsupported-option: ~(domain|from)=/, line);
+  }
+});
+
+test('7.7: a $domain= entry that is exactly ~ refuses the rule', () => {
+  // `~` alone would emit an empty-string domain, which Chrome rejects at
+  // ruleset indexing — the whole rule vanished silently.
+  for (const line of ['||example.com^$domain=~', '||example.com^$domain=a.com|~', '||example.com^$from=~']) {
+    assert.equal(isDropped(line), true, `${line} must be dropped`);
+    assert.match(parseLine(line).reason, /unsupported-option: (domain|from)=~/, line);
+  }
+});
+
+test('7.7: an empty scoping value refuses the rule at parse time', () => {
+  for (const line of ['||example.com^$domain=', '||example.com^$domain=|', '||example.com^$from=']) {
+    const parsed = parseLine(line);
+    assert.equal(parsed.skip, true, `${line} must be refused`);
+    assert.match(parsed.reason, /unsupported-option: (domain|from)= \(empty\)/, line);
+  }
+});
+
+test('7.7: $script,~script refuses the rule — every included type is excluded', () => {
+  assert.equal(isDropped('||example.com^$script,~script'), true);
+  assert.equal(isDropped('||example.com^$script,image,~image,~script'), true);
+});
+
+test('7.7: resourceTypes is the include set minus the exclusions, never both lists', () => {
+  // A type in both lists is rejected by Chrome; with an include set, emit
+  // include minus exclude and no excludedResourceTypes at all.
+  assert.deepEqual(
+    convert('||example.com^$script,image,~script'),
+    block({ urlFilter: '||example.com^', resourceTypes: ['image'] }),
+  );
+  assert.deepEqual(
+    convert('||bad.example^$all,~image'),
+    block({ urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES.filter((t) => t !== 'image') }),
+  );
+});
+
+test('7.7 (didn\'t re-break): an exclusion with no include set is still excludedResourceTypes', () => {
+  assert.deepEqual(
+    convert('||example.com^$~script,~image'),
+    block({ urlFilter: '||example.com^', excludedResourceTypes: ['script', 'image'] }),
+  );
+});
+
 test('$csp exceptions are skipped, not converted to a network allow', () => {
   // $csp is not translated in either direction. Emitting an allow for the
   // exception form disables all network blocking on the domain.
@@ -969,7 +1081,7 @@ test('$domain= entries are lowercased, punycoded, and empty entries dropped', ()
 test('a $domain= list that normalises to nothing drops the rule instead of shipping it unscoped', () => {
   // Mirrors the wildcard-domain handling: losing every positive entry would
   // widen the rule from "on these sites" to "everywhere".
-  assert.equal(convert('||ads.example^$domain=|'), null);
+  assert.equal(isDropped('||ads.example^$domain=|'), true);
   assert.equal(convert('||ads.example^$domain=ex ample.com'), null);
 });
 

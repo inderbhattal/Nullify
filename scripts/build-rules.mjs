@@ -526,8 +526,17 @@ function dedupeDomains(domains) {
   return [...new Set((domains || []).map(normalizeCosmeticScopeDomain).filter(Boolean))];
 }
 
-/** An ABP option list always begins with an option name: `script`, `~third-party`, `domain=`… */
-const OPTION_LIST_HEAD = /^~?[a-z][a-z0-9-]*(?:[=,]|$)/;
+/**
+ * An ABP option list always begins with an option name: `script`,
+ * `~third-party`, `domain=`… — or one of the two digit-first party
+ * shorthands, `3p`/`1p` (§7.1). The letter-first rule alone never split
+ * `||host^$3p`, so 415 corpus lines shipped as a urlFilter carrying the
+ * literal text `$3p`, which matches nothing — 56 of them exceptions. The
+ * shorthand must be followed by `,`, `=` or the end, so a `$1` inside a
+ * `replace=` value or a `$1proxy` path stays part of the pattern. Mirrors
+ * the Rust compiler's `looks_like_option_list`.
+ */
+const OPTION_LIST_HEAD = /^~?(?:[13]p|[a-z][a-z0-9-]*)(?:[=,]|$)/;
 
 /**
  * Split a filter line into its pattern and its `$options`, returning
@@ -851,6 +860,14 @@ function parseOptions(optionsStr) {
     const negated = opt.startsWith('~');
     const optName = negated ? opt.slice(1) : opt;
 
+    // `$~domain=x` is not a form uBO accepts; read as un-negated it scoped
+    // the rule TO x instead of excluding it (§7.7a). The same holds for
+    // every `key=` option, so refuse them all, as the Rust compiler does.
+    if (negated && optName.includes('=')) {
+      lastUnsupportedOption = `~${optName.slice(0, optName.indexOf('=') + 1)}`;
+      return null;
+    }
+
     if (RESOURCE_TYPE_MAP[optName]) {
       if (negated) {
         options.excludedResourceTypes.push(RESOURCE_TYPE_MAP[optName]);
@@ -862,28 +879,27 @@ function parseOptions(optionsStr) {
     } else if (optName === 'first-party' || optName === '1p') {
       options.thirdParty = negated ? true : false;
     } else if (optName.startsWith('domain=') || optName.startsWith('from=')) {
-      // `$from=` is `$domain=` under its newer uBO name (§4.2).
-      const domains = optName.slice(optName.indexOf('=') + 1).split('|');
-      for (const d of domains) {
-        if (d.startsWith('~')) {
-          options.excludedInitiatorDomains.push(d.slice(1));
-        } else {
-          options.initiatorDomains.push(d);
-        }
+      // `$from=` is `$domain=` under its newer uBO name (§4.2). An entry
+      // that is exactly `~` refuses the option (§7.7b — it used to ship an
+      // empty-string domain Chrome rejects at index time, losing the whole
+      // rule silently), and a value that resolves to nothing refuses it too
+      // rather than shipping the rule unscoped.
+      const key = optName.slice(0, optName.indexOf('='));
+      const lists = splitScopedDomainValue(key, optName.slice(key.length + 1));
+      if (!lists) return null;
+      if (lists.included.length === 0 && lists.excluded.length === 0) {
+        lastUnsupportedOption = `${key}= (empty)`;
+        return null;
       }
+      options.initiatorDomains.push(...lists.included);
+      options.excludedInitiatorDomains.push(...lists.excluded);
     } else if (/^(?:to|denyallow|method|header)=/.test(optName)) {
       // §4.2 — the four modifiers DNR expresses one-to-one. Each fails
-      // closed the way the Rust compiler does: a negated key (`$~to=x`) is
-      // not a form uBO accepts and read as un-negated scopes the rule to the
-      // wrong hosts; a value that resolves to nothing would ship the rule
-      // without the scope it asked for.
+      // closed the way the Rust compiler does: a value that resolves to
+      // nothing would ship the rule without the scope it asked for.
       const eqIdx = optName.indexOf('=');
       const key = optName.slice(0, eqIdx);
       const value = optName.slice(eqIdx + 1);
-      if (negated) {
-        lastUnsupportedOption = `~${key}=`;
-        return null;
-      }
       if (key === 'to') {
         // Destination scoping → requestDomains; `~` entries → excludedRequestDomains.
         const lists = splitScopedDomainValue(key, value);
@@ -1447,15 +1463,29 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   // than relying on the version-dependent default.
   condition.isUrlFilterCaseSensitive = options.matchCase === true;
 
-  if (options.all) {
-    // `$all` is every type INCLUDING the document, on every list — the
-    // navigation is what `||host^$all` on badware.txt exists to stop (§4.1).
-    // An explicit type alongside it is contradictory; uBO keeps the
-    // superset, so we do too. On an exception this is a plain `allow` over
-    // the same set — `allowAllRequests` is `$document`'s job, not `$all`'s.
-    condition.resourceTypes = [...SECURITY_LIST_RESOURCE_TYPES];
-  } else if (options.resourceTypes.length > 0) {
-    condition.resourceTypes = options.resourceTypes;
+  // `$all` is every type INCLUDING the document, on every list — the
+  // navigation is what `||host^$all` on badware.txt exists to stop (§4.1).
+  // An explicit type alongside it is contradictory; uBO keeps the superset,
+  // so we do too. On an exception this is a plain `allow` over the same set
+  // — `allowAllRequests` is `$document`'s job, not `$all`'s.
+  const includedTypes = options.all ? [...SECURITY_LIST_RESOURCE_TYPES] : options.resourceTypes;
+  // DNR wants ONE of the two type lists; a type in both is rejected at
+  // index time and the whole rule is lost (§7.7c). With an include set,
+  // emit include minus exclude; if nothing is left the line asks for
+  // nothing. An exclusion with no include set stays excludedResourceTypes.
+  let resourceTypes = includedTypes;
+  let excludedResourceTypes = options.excludedResourceTypes;
+  if (includedTypes.length > 0 && excludedResourceTypes.length > 0) {
+    resourceTypes = includedTypes.filter((t) => !excludedResourceTypes.includes(t));
+    if (resourceTypes.length === 0) {
+      reportDrop('resource-types: every included type is also excluded — the rule matches nothing', pattern);
+      return null;
+    }
+    excludedResourceTypes = [];
+  }
+
+  if (resourceTypes.length > 0) {
+    condition.resourceTypes = resourceTypes;
   } else if (conversionOptions.coverDocuments && !exception) {
     // A DNR condition with no resourceTypes matches every type EXCEPT
     // main_frame. For a malicious-URL list that silently removes the one case
@@ -1463,8 +1493,8 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
     // Only applies where the filter author named no type of their own.
     condition.resourceTypes = [...SECURITY_LIST_RESOURCE_TYPES];
   }
-  if (options.excludedResourceTypes.length > 0) {
-    condition.excludedResourceTypes = options.excludedResourceTypes;
+  if (excludedResourceTypes.length > 0) {
+    condition.excludedResourceTypes = excludedResourceTypes;
   }
   if (initiatorDomains.length > 0) {
     condition.initiatorDomains = initiatorDomains;

@@ -20,6 +20,7 @@ import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
 const SHIELD_URL = new URL('../src/content/youtube-shield.js', import.meta.url);
+const SHARED_UTILS_URL = new URL('../src/scriptlets/shared-utils.js', import.meta.url);
 
 // Sum of PLAYER_POLL_DELAYS (50+100+200+400+800+1600+3000) plus slack — long
 // enough that the bounded poll chain is fully exhausted.
@@ -34,6 +35,24 @@ async function shieldBody() {
     _shieldBody = source.slice(start);
   }
   return _shieldBody;
+}
+
+// The shield imports `proxyApply`/`wrapInstanceGetter` (and through them the
+// bundle-wide `Function.prototype.toString` mask) from shared-utils.js, which
+// webpack inlines into the youtube-shield chunk. The harness evaluates the
+// real module source, exports stripped, ahead of the IIFE — so the §4.4
+// detectors below run against the genuine masking rather than a stand-in.
+// shared-utils.js is import-free and side-effect-free at load, which is what
+// makes evaluating it as a script possible.
+let _sharedUtilsBody = null;
+async function sharedUtilsBody() {
+  if (_sharedUtilsBody === null) {
+    const source = await readFile(SHARED_UTILS_URL, 'utf8');
+    assert.equal(/^import\b/m.test(source), false,
+      'shared-utils.js must stay import-free for the shield harness to inline it');
+    _sharedUtilsBody = source.replace(/^export\s+/gm, '');
+  }
+  return _sharedUtilsBody;
 }
 
 // Stand-ins for the module's static imports. The WASM path stays cold unless
@@ -53,7 +72,52 @@ const IMPORT_STUBS = `
 // than once per frame in production (document_start registration plus the
 // injectIntoOpenTabs late-injection path), so each evaluation gets its own
 // block scope — exactly like two separate executeScript calls.
-const injectionSource = (body) => `{\n${IMPORT_STUBS}\n${body}\n}`;
+const injectionSource = (body, utils) => `{\n${IMPORT_STUBS}\n${utils}\n${body}\n}`;
+
+// The §4.4 detector table (docs/REVIEW-2026-09.md §4.4): everything a page
+// can learn about a wrapped surface without calling it. Evaluated inside the
+// vm realm before and after injection; the two readings must be identical.
+//
+// `Function.prototype.toString.call(fn)` rather than `String(fn)`: the
+// harness's stand-in natives (XHR, Document, pageFetch, Response) live in the
+// host realm, so `String()` on a wrapper would resolve `toString` through the
+// *host* Function.prototype and never reach the vm realm's mask. In a real
+// page there is one realm and the two spellings are the same call.
+//
+// Own keys are recorded for the callable surfaces (a Proxy forwards them to
+// its native target) but not for the accessor functions: shared-utils'
+// `wrapInstanceGetter` builds those with a function expression, which carries
+// an own `prototype` a native getter lacks — a shared-utils concern, tracked
+// separately from this file.
+const DETECTOR_SNIPPET = `(() => {
+  const describe = (fn, withKeys) => (typeof fn === 'function' ? {
+    name: fn.name,
+    length: fn.length,
+    source: Function.prototype.toString.call(fn),
+    ...(withKeys ? { ownKeys: Reflect.ownKeys(fn).map(String) } : {}),
+  } : null);
+  const callable = (fn) => describe(fn, true);
+  const getter = (proto, prop) =>
+    describe(Object.getOwnPropertyDescriptor(proto, prop)?.get, false);
+  const xp = XMLHttpRequest.prototype;
+  return JSON.stringify({
+    'JSON.parse': callable(JSON.parse),
+    'fetch': callable(window.fetch),
+    'Response.prototype.json': callable(Response.prototype.json),
+    'XMLHttpRequest': callable(XMLHttpRequest),
+    'XMLHttpRequest.prototype.open': callable(xp.open),
+    'XMLHttpRequest.prototype.send': callable(xp.send),
+    'get XMLHttpRequest.prototype.responseText': getter(xp, 'responseText'),
+    'get XMLHttpRequest.prototype.response': getter(xp, 'response'),
+    'get XMLHttpRequest.prototype.readyState': getter(xp, 'readyState'),
+    'get XMLHttpRequest.prototype.status': getter(xp, 'status'),
+    'get XMLHttpRequest.prototype.statusText': getter(xp, 'statusText'),
+    'get XMLHttpRequest.prototype.responseURL': getter(xp, 'responseURL'),
+    'document.requestStorageAccess': callable(document.requestStorageAccess),
+    'document.requestStorageAccessFor': callable(document.requestStorageAccessFor),
+    'Function.prototype.toString': callable(Function.prototype.toString),
+  });
+})()`;
 
 // Lets the vm context's pending microtasks (the WASM bootstrap chain) drain.
 const flushAsync = () => new Promise((resolve) => setImmediate(resolve));
@@ -141,7 +205,13 @@ async function makeShieldHarness({
   }
 
   class XMLHttpRequestStub {
-    open() {}
+    // The platform rejects a non-instance receiver with its own TypeError;
+    // a wrapper must let that error through rather than raise its own.
+    open() {
+      if (!(this instanceof XMLHttpRequestStub)) {
+        throw new TypeError("Failed to execute 'open' on 'XMLHttpRequest': Illegal invocation");
+      }
+    }
     send() {}
     addEventListener() {}
     dispatchEvent() {
@@ -167,7 +237,14 @@ async function makeShieldHarness({
     for (const fn of map.get(type) || []) fn({ type });
   };
 
-  const documentStub = {
+  // `document` inherits the storage-access methods from a prototype, as it
+  // does on the platform, so an own-property write on `document` is visible
+  // as the leak it is (§4.4).
+  class DocumentStub {
+    requestStorageAccess() { return Promise.reject(new Error('page-owned')); }
+    requestStorageAccessFor() { return Promise.reject(new Error('page-owned')); }
+  }
+  const documentStub = Object.assign(Object.create(DocumentStub.prototype), {
     visibilityState,
     documentElement: {
       getAttribute: (name) => (name === 'data-nullify-wasm' ? wasmUrl : null),
@@ -175,11 +252,12 @@ async function makeShieldHarness({
     querySelector: (sel) => (sel === '#movie_player' ? currentPlayer : null),
     addEventListener: addListener(docListeners),
     removeEventListener: () => {},
-  };
+  });
 
   const sandbox = {
     console: { info: () => {}, warn: () => {}, error: () => {} },
     document: documentStub,
+    Document: DocumentStub,
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
     requestAnimationFrame: (fn) => timers.setTimeout(fn, 16),
@@ -205,13 +283,31 @@ async function makeShieldHarness({
   const context = vm.createContext(sandbox);
   const run = (code) => vm.runInContext(code, context, { filename: 'youtube-shield.vm.js' });
   const body = await shieldBody();
-  const inject = () => run(injectionSource(body));
+  const utils = await sharedUtilsBody();
+  const inject = () => run(injectionSource(body, utils));
   if (setup) run(setup);
+  // What the page had before the shield ran (after any `setup`): the
+  // identities the layer probes compare against, and the §4.4 detector
+  // reading every wrapper must reproduce.
+  const originals = {
+    fetch: sandbox.fetch,
+    XMLHttpRequest: sandbox.XMLHttpRequest,
+    xhrOpen: sandbox.XMLHttpRequest.prototype.open,
+    xhrSend: sandbox.XMLHttpRequest.prototype.send,
+    responseJson: sandbox.Response.prototype.json,
+    requestStorageAccess: sandbox.Document.prototype.requestStorageAccess,
+    functionToString: run('Function.prototype.toString'),
+  };
+  const detect = () => JSON.parse(run(DETECTOR_SNIPPET));
+  const before = detect();
   inject();
 
   return {
     run,
     inject,
+    originals,
+    detect,
+    before,
     releaseWasm: async () => {
       run('__releaseWasm && __releaseWasm()');
       await flushAsync();
@@ -234,25 +330,28 @@ async function makeShieldHarness({
 // ---------------------------------------------------------------------------
 
 // Every interception layer the old writable-global guard could switch off.
+// The fetch/XHR layers are recognised by identity against the pre-injection
+// originals: since §4.4 a wrapper is indistinguishable by name or source, so
+// "installed" can only mean "not the function the page had before".
+const trapProbe = (prop) => (h) =>
+  h.run(`typeof Object.getOwnPropertyDescriptor(window, '${prop}')?.set === 'function'`);
 const LAYER_PROBES = {
-  'JSON.parse hook': 'JSON.parse(\'{"adPlacements":[1]}\').adPlacements === false',
-  'fetch interceptor': 'window.fetch.name !== "pageFetch"',
-  'XHR subclass': 'window.XMLHttpRequest.name !== "XMLHttpRequestStub"',
-  'ytcfg trap': "typeof Object.getOwnPropertyDescriptor(window, 'ytcfg')?.set === 'function'",
-  'yt trap': "typeof Object.getOwnPropertyDescriptor(window, 'yt')?.set === 'function'",
-  'ytInitialPlayerResponse trap':
-    "typeof Object.getOwnPropertyDescriptor(window, 'ytInitialPlayerResponse')?.set === 'function'",
-  'playerResponse trap':
-    "typeof Object.getOwnPropertyDescriptor(window, 'playerResponse')?.set === 'function'",
-  'ytInitialData trap':
-    "typeof Object.getOwnPropertyDescriptor(window, 'ytInitialData')?.set === 'function'",
-  'initialPlayerResponse trap':
-    "typeof Object.getOwnPropertyDescriptor(window, 'initialPlayerResponse')?.set === 'function'",
+  'JSON.parse hook': (h) => h.run('JSON.parse(\'{"adPlacements":[1]}\').adPlacements === false'),
+  'fetch interceptor': (h) => h.run('window.fetch') !== h.originals.fetch,
+  'XHR interceptor': (h) =>
+    h.run('XMLHttpRequest.prototype.open') !== h.originals.xhrOpen
+    && h.run('XMLHttpRequest.prototype.send') !== h.originals.xhrSend,
+  'ytcfg trap': trapProbe('ytcfg'),
+  'yt trap': trapProbe('yt'),
+  'ytInitialPlayerResponse trap': trapProbe('ytInitialPlayerResponse'),
+  'playerResponse trap': trapProbe('playerResponse'),
+  'ytInitialData trap': trapProbe('ytInitialData'),
+  'initialPlayerResponse trap': trapProbe('initialPlayerResponse'),
 };
 
 function assertAllLayersInstalled(h, why) {
   for (const [layer, probe] of Object.entries(LAYER_PROBES)) {
-    assert.equal(h.run(probe), true, `${layer} must be installed ${why}`);
+    assert.equal(probe(h), true, `${layer} must be installed ${why}`);
   }
 }
 
@@ -273,20 +372,24 @@ test('§4.12: a page-planted kill-switch global no longer disables the shield', 
     'the DOM ad-skipper must attach despite the page-planted flag');
 });
 
-test('§4.12: a forged install brand without the pruning behaviour does not disable the shield', async () => {
-  // The marker moved onto the shield's own JSON.parse wrapper, so a page that
-  // knows the key can still plant it — but it is only honoured when JSON.parse
-  // actually neutralizes ad payloads, which a bare forgery does not.
+test('§4.12: a forged hook without the pruning behaviour does not disable the shield', async () => {
+  // The guard is purely behavioural (§4.4 removed the named brand): a page
+  // that wraps JSON.parse in a hook-shaped function — and even plants the
+  // symbol an older shield generation used to carry — only counts as
+  // "installed" if the wrapper actually neutralizes ad payloads, which a
+  // bare forgery does not.
   const h = await makeShieldHarness({
     player: makePlayerStub(),
     setup: `
+      const pageParse = JSON.parse;
+      JSON.parse = function parse(text, ...rest) { return pageParse.call(this, text, ...rest); };
       Object.defineProperty(JSON.parse, Symbol.for('$$jsonParseHookVersion'), {
         value: 99, writable: false, enumerable: false, configurable: false,
       });
     `,
   });
 
-  assertAllLayersInstalled(h, 'despite the forged install brand');
+  assertAllLayersInstalled(h, 'despite the forged hook');
 });
 
 test('§4.12: the shield publishes no self-identifying global', async () => {
@@ -308,13 +411,19 @@ test('§4.12 (didn\'t re-break): a second injection into the same frame is a no-
   // and settings change; without a working guard every one of those stacks
   // another copy of every interceptor.
   const h = await makeShieldHarness({ player: makePlayerStub() });
-  h.run('globalThis.__before = { parse: JSON.parse, fetch: window.fetch, xhr: window.XMLHttpRequest };');
+  h.run(`globalThis.__before = {
+    parse: JSON.parse, fetch: window.fetch,
+    open: XMLHttpRequest.prototype.open, send: XMLHttpRequest.prototype.send,
+  };`);
 
   h.inject();
 
   assert.equal(h.run('JSON.parse === __before.parse'), true, 'JSON.parse must not be re-wrapped');
   assert.equal(h.run('window.fetch === __before.fetch'), true, 'fetch must not be re-wrapped');
-  assert.equal(h.run('window.XMLHttpRequest === __before.xhr'), true, 'XHR must not be re-subclassed');
+  assert.equal(h.run('XMLHttpRequest.prototype.open === __before.open'), true,
+    'XHR open must not be re-wrapped');
+  assert.equal(h.run('XMLHttpRequest.prototype.send === __before.send'), true,
+    'XHR send must not be re-wrapped');
   assert.equal(h.playerObservers().length, 1, 'the ad-skipper must not attach twice');
 });
 
@@ -328,6 +437,205 @@ test('§4.12 (didn\'t re-break): a re-injection still installs when the page unh
 
   assert.equal(h.run('JSON.parse(\'{"adPlacements":[1]}\').adPlacements'), false,
     're-injection must re-install the JSON.parse hook');
+});
+
+// ---------------------------------------------------------------------------
+// §4.4 (REVIEW-2026-09) — every wrapper must be indistinguishable from the
+// platform original, and the shield must carry no readable brand.
+//
+// The shield exists to beat YouTube's anti-adblock detection, and until this
+// section it could be identified by name and version in one expression:
+// `JSON.parse.name === ""`, `String(fetch)` printing our source, an
+// `XMLHttpRequest` subclass with `_nUrl/_nCached/_nBlocked` on every
+// instance, `document.requestStorageAccess` reading as an arrow function,
+// and `JSON.parse[Symbol.for('$$jsonParseHookVersion')]` yielding the
+// shield version.
+// ---------------------------------------------------------------------------
+
+const PLAYER_XHR_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+const BLOCKED_XHR_URL = 'https://www.youtube.com/api/stats/ad_break';
+
+// A page-realm XHR stand-in that records what the shield does to it. The
+// readyState getter counts its reads: the shield's text path consults
+// readyState once per interceptor layer, so the count is a wrapper-depth
+// probe that a stacked second installation doubles.
+const RECORDING_XHR_SETUP = `
+  globalThis.__xhr = { readyStateReads: 0, nativeReadyState: 4, sent: [], events: [] };
+  window.XMLHttpRequest = class XMLHttpRequest {
+    open() {}
+    send(body) { __xhr.sent.push(body); }
+    addEventListener() {}
+    dispatchEvent(event) { __xhr.events.push(event.type); return true; }
+    get responseText() { return '{"adPlacements":[1],"streamingData":{}}'; }
+    get response() { return '{"adPlacements":[1],"streamingData":{}}'; }
+    get readyState() { __xhr.readyStateReads += 1; return __xhr.nativeReadyState; }
+    get status() { return 200; }
+    get statusText() { return 'OK'; }
+    get responseURL() { return 'native'; }
+    get responseType() { return ''; }
+  };
+`;
+
+test('4.4: every wrapper reports native name, length and source', async () => {
+  const h = await makeShieldHarness({ player: makePlayerStub() });
+  assertAllLayersInstalled(h, 'before the detector runs');
+
+  const after = h.detect();
+  for (const [surface, before] of Object.entries(h.before)) {
+    assert.notEqual(before, null, `${surface} must exist in the harness for the detector to cover it`);
+    assert.deepEqual(after[surface], before,
+      `${surface} must read exactly as the platform original did before injection`);
+  }
+  // The surfaces that are genuine natives in the vm realm must still print as
+  // such through the wrapper. (The stand-ins print their own source, and so
+  // does Node's Response.prototype.json, which undici implements in JS — the
+  // equality above is what covers those.)
+  for (const surface of ['JSON.parse', 'Function.prototype.toString']) {
+    assert.match(after[surface].source, /\[native code\]/, `${surface} must print as native code`);
+  }
+});
+
+test('4.4: XMLHttpRequest is the platform constructor and instances have no own properties', async () => {
+  const h = await makeShieldHarness();
+  assertAllLayersInstalled(h, 'before the instance probe');
+
+  assert.equal(h.run('window.XMLHttpRequest'), h.originals.XMLHttpRequest,
+    'the constructor the page sees must be the platform one, not a subclass');
+  assert.equal(h.run('Reflect.ownKeys(new XMLHttpRequest()).length'), 0,
+    'a fresh instance must carry no own properties');
+
+  // Per-request state must live off the instance across the whole request
+  // lifecycle, on both the scrub path and the pre-flight block path.
+  const ownKeysAfter = (url) => h.run(`(() => {
+    const x = new XMLHttpRequest();
+    x.open('GET', ${JSON.stringify(url)});
+    x.send();
+    void x.readyState; void x.status; void x.statusText; void x.responseURL;
+    void x.responseText; void x.response;
+    return Reflect.ownKeys(x).length;
+  })()`);
+  assert.equal(ownKeysAfter(PLAYER_XHR_URL), 0, 'no own state after a player request');
+  assert.equal(ownKeysAfter(BLOCKED_XHR_URL), 0, 'no own state after a pre-flight-blocked request');
+
+  // An illegal receiver must surface the platform's own error, not the
+  // WeakMap's "Invalid value used as weak map key".
+  const openError = (receiver) => h.run(`(() => {
+    try { XMLHttpRequest.prototype.open.call(${receiver}, 'GET', '/'); return null; }
+    catch (err) { return err.name + ': ' + err.message; }
+  })()`);
+  const platformError = "TypeError: Failed to execute 'open' on 'XMLHttpRequest': Illegal invocation";
+  assert.equal(openError('null'), platformError, 'open.call(null) must throw the native error');
+  assert.equal(openError('1'), platformError, 'open.call(<primitive>) must throw the native error');
+
+  // The same class of leak on `document`: the storage-access defuser must be
+  // inherited from Document.prototype, never written onto the instance.
+  assert.equal(h.run("Object.prototype.hasOwnProperty.call(document, 'requestStorageAccess')"), false,
+    'requestStorageAccess must not become an own property of document');
+  assert.equal(h.run("Object.prototype.hasOwnProperty.call(document, 'requestStorageAccessFor')"), false,
+    'requestStorageAccessFor must not become an own property of document');
+  assert.notEqual(h.run('Document.prototype.requestStorageAccess'), h.originals.requestStorageAccess,
+    'the defuser must be installed on Document.prototype');
+  const granted = await h.run('document.requestStorageAccess()');
+  assert.equal(granted.state, 'granted', 'the defuser must still resolve as granted');
+});
+
+test('4.4: no readable brand', async () => {
+  const h = await makeShieldHarness();
+  assert.equal(h.run('JSON.parse(\'{"adPlacements":[1]}\').adPlacements'), false,
+    'the JSON.parse hook must be installed for the brand probe to mean anything');
+
+  assert.equal(h.run('Object.getOwnPropertySymbols(JSON.parse).length'), 0,
+    'the wrapper must expose no own symbols');
+  assert.equal(h.run("JSON.parse[Symbol.for('$$jsonParseHookVersion')]"), undefined,
+    'the global-registry version brand must be gone');
+  assert.equal(h.run('Object.getOwnPropertyNames(JSON.parse).join(",")'), 'length,name',
+    'the wrapper must expose exactly the own names of the native');
+
+  const source = await readFile(SHIELD_URL, 'utf8');
+  assert.equal(source.includes('jsonParseHookVersion'), false, 'the brand name must not come back');
+  assert.equal(source.includes('Symbol.for('), false,
+    'no global-registry symbol — any page can look those up by name');
+});
+
+test('4.4: a second injection is still a no-op', async () => {
+  // Didn't re-break for §4.12: the idempotency guard is now the behavioural
+  // probe alone, and it must still stop injectIntoOpenTabs from stacking a
+  // second copy of every interceptor.
+  const h = await makeShieldHarness({ player: makePlayerStub(), setup: RECORDING_XHR_SETUP });
+
+  const readPlayerText = () => h.run(`(() => {
+    __xhr.readyStateReads = 0;
+    const x = new XMLHttpRequest();
+    x.open('GET', ${JSON.stringify(PLAYER_XHR_URL)});
+    const text = x.responseText;
+    return { text, depth: __xhr.readyStateReads };
+  })()`);
+
+  const first = readPlayerText();
+  assert.ok(first.text.includes('"adPlacements":false'), 'the XHR text path must be scrubbing');
+  assert.ok(first.depth >= 1, 'the depth probe must see at least one interceptor layer');
+
+  const SURFACES = {
+    parse: 'JSON.parse',
+    fetch: 'window.fetch',
+    json: 'Response.prototype.json',
+    open: 'XMLHttpRequest.prototype.open',
+    send: 'XMLHttpRequest.prototype.send',
+    responseText: "Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'responseText').get",
+    requestStorageAccess: 'Document.prototype.requestStorageAccess',
+    toString: 'Function.prototype.toString',
+  };
+  const entries = Object.entries(SURFACES);
+  h.run(`globalThis.__before = { ${entries.map(([key, expr]) => `${key}: ${expr}`).join(', ')} };`);
+
+  h.inject();
+
+  const second = readPlayerText();
+  assert.equal(second.depth, first.depth,
+    'a second injection must not add another interceptor layer (the probe count would double)');
+  assert.ok(second.text.includes('"adPlacements":false'));
+  for (const [key, expr] of entries) {
+    assert.equal(h.run(`${expr} === __before.${key}`), true,
+      `${expr} must keep its identity across a second injection`);
+  }
+  assert.equal(h.playerObservers().length, 1, 'the ad-skipper must not attach twice');
+});
+
+test('4.4: blocked XHR still synthesises a completed empty response', async () => {
+  // Didn't re-break for the pre-flight path: an ad-only endpoint never
+  // reaches the network, and the page still sees a finished 200 with an
+  // empty JSON body, exactly as the subclass used to synthesise.
+  const h = await makeShieldHarness({ setup: RECORDING_XHR_SETUP });
+  h.run('__xhr.nativeReadyState = 1;');
+
+  h.run(`
+    globalThis.__blocked = new XMLHttpRequest();
+    __blocked.open('POST', ${JSON.stringify(BLOCKED_XHR_URL)});
+    __blocked.send('{"context":{}}');
+  `);
+  assert.equal(h.run('__xhr.sent.length'), 0, 'the request must never reach send()');
+  assert.equal(h.run('__xhr.events.join(",")'), '', 'completion events are asynchronous');
+
+  h.timers.advance(1);
+
+  assert.equal(h.run('__xhr.events.join(",")'), 'readystatechange,load,loadend');
+  assert.equal(h.run('__blocked.readyState'), 4);
+  assert.equal(h.run('__blocked.status'), 200);
+  assert.equal(h.run('__blocked.statusText'), 'OK');
+  assert.equal(h.run('__blocked.responseURL'), BLOCKED_XHR_URL);
+  assert.equal(h.run('__blocked.responseText'), '{}');
+  assert.equal(h.run('__blocked.response'), '{}');
+  // responseType 'json' consumers get the parsed empty object.
+  h.run("Object.defineProperty(__blocked, 'responseType', { value: 'json' });");
+  assert.equal(h.run('JSON.stringify(__blocked.response)'), '{}');
+
+  // And an ordinary request on the same prototype is still sent.
+  h.run(`
+    const ordinary = new XMLHttpRequest();
+    ordinary.open('GET', 'https://www.youtube.com/api/stats/qoe');
+    ordinary.send('q');
+  `);
+  assert.equal(h.run('__xhr.sent.join(",")'), 'q', 'unrelated traffic must still reach send()');
 });
 
 // ---------------------------------------------------------------------------

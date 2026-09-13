@@ -409,3 +409,116 @@ test('5.15: CI clippy runs with -D warnings', () => {
   }
   assert.ok(seen >= 1, `expected at least one clippy step in the workflows, saw ${seen}`);
 });
+
+// ---------------------------------------------------------------------------
+// WASM artifact freshness (§5.16)
+// ---------------------------------------------------------------------------
+//
+// check-test-prereqs used to check that the artifact *exists*, not that it is
+// *current*. A stale src/shared/wasm/ then passes pretest and produces parity
+// failures that look like product bugs. The check records the source hash the
+// artifact was built from; a hash-file mismatch means the source changed,
+// while a rebase — which rewrites .rs mtimes without changing content — must
+// not demand a multi-minute rebuild.
+
+async function freshnessFixture() {
+  const { checkWasmFreshness } = await import('../scripts/check-test-prereqs.mjs');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nullify-wasm-fresh-'));
+  const src = path.join(dir, 'lib.rs');
+  const lock = path.join(dir, 'Cargo.lock');
+  const artifact = path.join(dir, 'nullify_core_bg.wasm');
+  const hashFile = path.join(dir, '.source-hash');
+  fs.writeFileSync(src, 'fn a() {}\n');
+  fs.writeFileSync(lock, '[[package]]\nname = "a"\n');
+  fs.writeFileSync(artifact, 'wasm-bytes');
+  const touch = (file, secondsAgo) => {
+    const t = new Date(Date.now() - secondsAgo * 1000);
+    fs.utimesSync(file, t, t);
+  };
+  const run = (env = {}) => checkWasmFreshness({
+    sourceFiles: [src, lock], artifact, hashFile, env,
+  });
+  return { dir, src, lock, artifact, hashFile, touch, run, checkWasmFreshness };
+}
+
+test('5.16: a changed source hash is reported stale', async () => {
+  const f = await freshnessFixture();
+  try {
+    // First green run: no hash file yet, artifact newer than the sources →
+    // fresh by mtime, and the content hash gets recorded for later runs.
+    f.touch(f.src, 60); f.touch(f.lock, 60); f.touch(f.artifact, 30);
+    const first = f.run();
+    assert.equal(first.fresh, true, first.reason);
+    assert.ok(fs.existsSync(f.hashFile), 'the first fresh run must write .source-hash');
+    const recorded = fs.readFileSync(f.hashFile, 'utf8').trim();
+    assert.match(recorded, /^[0-9a-f]{64}$/);
+
+    // Edit the source after the build → stale, and the hash file is untouched
+    // (it still describes what the artifact was built from).
+    fs.writeFileSync(f.src, 'fn a() {}\nfn b() {}\n');
+    const stale = f.run();
+    assert.equal(stale.fresh, false);
+    assert.match(stale.message, /STALE \(wasm-core source changed since it was built\)/);
+    assert.match(stale.message, /npm run build:wasm/);
+    assert.match(stale.message, /rebase/, 'the message must explain the rewritten-mtimes case');
+    assert.match(stale.message, /NULLIFY_ALLOW_STALE_WASM=1/);
+    assert.equal(fs.readFileSync(f.hashFile, 'utf8').trim(), recorded);
+
+    // The override reports the same state but is not an excuse to record the
+    // new hash — that would launder a stale artifact into a fresh one.
+    const overridden = f.run({ NULLIFY_ALLOW_STALE_WASM: '1' });
+    assert.equal(overridden.fresh, false);
+    assert.equal(overridden.allowed, true);
+    assert.equal(fs.readFileSync(f.hashFile, 'utf8').trim(), recorded);
+
+    // Rebuilding (artifact now newer than the edited source) makes it fresh
+    // again and refreshes the recorded hash. `npm run build:wasm` does not
+    // write the hash itself, so this path is how the file ever catches up.
+    fs.writeFileSync(f.artifact, 'wasm-bytes-v2');
+    const rebuilt = f.run();
+    assert.equal(rebuilt.fresh, true, rebuilt.reason);
+    const updated = fs.readFileSync(f.hashFile, 'utf8').trim();
+    assert.notEqual(updated, recorded);
+    assert.equal(updated, f.checkWasmFreshness.hashSources([f.src, f.lock]));
+  } finally {
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('5.16: an mtime-only skew with an unchanged hash is not', async () => {
+  const f = await freshnessFixture();
+  try {
+    f.touch(f.src, 60); f.touch(f.lock, 60); f.touch(f.artifact, 30);
+    assert.equal(f.run().fresh, true);
+    const recorded = fs.readFileSync(f.hashFile, 'utf8').trim();
+
+    // `git checkout` / rebase: every .rs file gets a new mtime, content is
+    // byte-identical. An mtime-only check would say stale here.
+    f.touch(f.src, 0); f.touch(f.lock, 0);
+    const after = f.run();
+    assert.equal(after.fresh, true, after.reason);
+    assert.equal(fs.readFileSync(f.hashFile, 'utf8').trim(), recorded);
+
+    // Control: without the hash file, the same skew *is* stale — that is the
+    // fallback the hash file exists to avoid, and its message says so.
+    fs.rmSync(f.hashFile);
+    const fallback = f.run();
+    assert.equal(fallback.fresh, false);
+    assert.match(fallback.message, /STALE/);
+    assert.match(fallback.message, /rebase/);
+    assert.ok(!fs.existsSync(f.hashFile), 'a stale run must not write the hash file');
+  } finally {
+    fs.rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test('5.16: the release build validates the compiled rulesets after compiling them', () => {
+  // rules/*.json are gitignored build products; the release job is the only
+  // place they exist, so it is the only place the schema test can run.
+  const workflow = fs.readFileSync(path.join(ROOT, '.github', 'workflows', 'build.yml'), 'utf8');
+  const compileIdx = workflow.search(/run:\s*npm run build:rules\b/);
+  const validateIdx = workflow.search(/run:\s*node --test tests\/compiled-rulesets\.test\.mjs\b/);
+  assert.notEqual(compileIdx, -1, 'build.yml must compile the rules');
+  assert.notEqual(validateIdx, -1, 'build.yml must run tests/compiled-rulesets.test.mjs');
+  assert.ok(validateIdx > compileIdx, 'the compiled-ruleset test must run after build:rules');
+});

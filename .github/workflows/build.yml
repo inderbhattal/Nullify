@@ -126,6 +126,13 @@ jobs:
       - name: Build filter rules (offline, from vendored snapshots)
         run: npm run build:rules
 
+      # The compiled shards are gitignored, so this job is the only place they
+      # exist and the only place their schema can be checked (§5.16). A static
+      # ruleset Chrome cannot parse is dropped at extension load with one
+      # console line and no blocking from that list — catch it before the ZIP.
+      - name: Validate compiled rulesets
+        run: node --test tests/compiled-rulesets.test.mjs
+
       - name: Build extension
         run: npm run build:ext
 

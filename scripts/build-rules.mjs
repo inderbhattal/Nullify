@@ -2419,26 +2419,51 @@ function buildSampleRulesetOutputs() {
   return outputs;
 }
 
-function buildSampleFilterSources() {
+/**
+ * When the vendored snapshot of `listId` was taken, from the SRI lock's
+ * per-list `generatedAt` (written by `npm run refresh:lists` alongside the
+ * hash); `null` when the lock does not know the list. Reuses the lock object
+ * already parsed for SRI verification.
+ */
+function generatedAtFor(listId, lock = FILTER_LIST_HASHES) {
+  return lock[listId]?.generatedAt ?? null;
+}
+
+/**
+ * Stamp every packaged source bundle with its snapshot's `generatedAt` (§4.5,
+ * D2). The SW's freshness model reads it from `filter-sources.json` before
+ * `db.putBulkFilterSources` (which copies only `cosmetic`/`scriptlets`), so
+ * without it the runtime can only guess a list's age from the build date.
+ * `null` is stamped explicitly so "unknown" is distinguishable from a bundle
+ * built before the field existed.
+ */
+function stampGeneratedAt(filterSources, lock = FILTER_LIST_HASHES) {
+  for (const [id, bundle] of Object.entries(filterSources)) {
+    bundle.generatedAt = generatedAtFor(id, lock);
+  }
+  return filterSources;
+}
+
+function buildSampleFilterSources(lock = FILTER_LIST_HASHES) {
   const sampleBundle = {
     cosmetic: generateSampleCosmeticRules(),
     scriptlets: generateSampleScriptletRules(),
   };
 
-  return Object.fromEntries(FILTER_LISTS.map(({ id }, index) => [
+  return stampGeneratedAt(Object.fromEntries(FILTER_LISTS.map(({ id }, index) => [
     id,
     index === 0 ? sampleBundle : createEmptySourceBundle(),
-  ]));
+  ])), lock);
 }
 
-function writeSampleOutputs(outDir = RULES_DIR) {
+function writeSampleOutputs(outDir = RULES_DIR, { lock = FILTER_LIST_HASHES } = {}) {
   log('🧪 Generating sample rule artifacts (offline mode)...\n');
 
   writeBuildOutputs({
     rulesetOutputs: buildSampleRulesetOutputs(),
     cosmeticRules: generateSampleCosmeticRules(),
     scriptletRules: generateSampleScriptletRules(),
-    filterSources: buildSampleFilterSources(),
+    filterSources: buildSampleFilterSources(lock),
   }, outDir);
 
   log('\n🎉 Sample build complete!');
@@ -2891,6 +2916,8 @@ async function buildFromVendoredLists(stagingDir) {
       if (!sourceBundle) sourceBundle = buildSourceBundleFallback(parsed);
       sourceBundle = mergeParsedCosmeticScopeExceptions(sourceBundle, parsed);
       sourceBundle = pruneDeniedCosmeticSelectors(sourceBundle);
+      // §4.5: when this snapshot was taken, for the SW's freshness model.
+      sourceBundle.generatedAt = generatedAtFor(list.id);
 
       // Clamp the configured limit to what the shards can physically hold —
       // a totalLimit above parts*MAX_PER_FILE used to let up to 5,000 rules
@@ -3020,6 +3047,8 @@ export {
   commitStagedRules,
   assertStaticRulePriorityBands,
   vendoredListPath,
+  writeSampleOutputs,
+  stampGeneratedAt,
   VENDORED_LISTS_DIR,
   RUNTIME_ALLOWLIST_PRIORITY,
   SYSTEM_UNBREAK_PRIORITY,

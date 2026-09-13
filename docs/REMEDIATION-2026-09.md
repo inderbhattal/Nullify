@@ -491,3 +491,21 @@ release 3 (v4.10.0, P2s; flip release-2 flags ON):
 Recommended amendments applied: 1 (`-abp-*` aliases → `PROC_OPS` + engine mapping), 2 (case-insensitive Aho-Corasick), 3 (`requestStorageAccess` via `proxyApply` on `Document.prototype`), 4 (A2d split into A2d1/A2d2), 5 (C1 split into C1a/C1b), 6 (`remove-class` takes one name or a regex), 7 (`requestMethods` validation in the A1 stub PR), 8 (A2c falls back to the unconditional write when the snapshot read fails), 9 (A2f race named; key cleared in `onCommitted` before injection), 10 (§5.16 compares a recorded source hash, mtime only as fallback), 11 (H's §5.15/§5.16 in release 1), 12 (`status-format.js` renders `id: null` lines — added to H's ownership).
 
 Planner notes of disagreement: none. One correction to the reviewer's citations: `content-main.js`'s regex is at `:104-105` (not `:96`) and the build's broad-`$popup` drop is at `build-rules.mjs:742-744` (not `:733`); neither changes the amendment.
+
+---
+
+## §7 Findings raised during implementation (release 1)
+
+Recorded here so the release-2 tracks pick them up; none blocks release 1.
+
+**7.1 `$3p`/`$1p` as the first option never splits in the build parser — 415 corpus rules emitted dead.** Found by Track B while porting `splitPatternAndOptions` and measured by the B1 second reviewer. `OPTION_LIST_HEAD` in `scripts/build-rules.mjs` requires a letter as the first character of the option tail, so `||host^$3p`, `$1p` and `$~3p` are treated as part of the pattern and emitted as a `urlFilter` carrying the literal text `$3p`, which matches nothing. Corpus: 415 network lines (ubo-filters 273, ubo-unbreak 125, others 17); 56 are `@@` exceptions (39 in ubo-unbreak), so those sites are over-blocked today. **Fix (Track D, D1, release 2):** accept `~?[13]p` in the head rule (one character class), then re-measure the 28 `$1`/`$2` replacement-text tails the wider head could touch. The Rust user-filter compiler (B1 PR 2) handles `$3p`-first correctly and pins the build's current answer as an `expect.build` seam vector, so D1's fix is caught by `wasm-parity.test.mjs`. Severity: P1 (coverage loss, silent).
+
+**7.2 Seam: D1 must edit `tests/fixtures/filter-vectors.mjs`, which Track B owns.** Twelve network vectors carry `expect.build = {emit, why}` pinning the build parser's current behaviour where it differs from the §3.3 table (`$to=`, `$from=`, `$denyallow=`, `$method=`, scoped `*`, `$all`, non-ASCII `$domain=`, `$redirect=`, literal `$removeparam=`, `$3p`-first). When D1 changes the build, those pins go stale and the parity test fails by design. D1's PR flips the pins in the same change; B reviews it. Ownership of the fixture file passes to D for that PR only.
+
+**7.3 Runtime fallback (`parseSimpleNetworkRule`) is looser than the build on four shapes** — `||$script` (emits `urlFilter "||"`), `$SCRIPT`, `$script,Image`, `\$script`; none vectored. Track A, A2 (the SW owner): make the fallback at least as strict as the build on these and add them as vectors; `emit_runtime ⇒ emit_build` already holds on the current 35.
+
+**7.4 A1 follow-ups deferred to A2** (from the A1 second review): a deduplicated `refreshMemoryCache()` retry in the critical-message gate when the allowlist cache is untrusted; a `getEffectiveEnabledRulesetsMap()` fallback for the index rebuild's lenient read; a local catch in `applyRulesets` instead of a fatal critical; options page disables Save when `GET_USER_FILTERS` answers `{error}` (Track H owns `options.js`).
+
+**7.5 A1b follow-ups:** the SW's `*` universal-selector predecessor rule still skips whitespace where Rust uses the immediate predecessor (§4.35 of 2026-08); the SW's `extractFirstOp` does not port the engine's nested-native scan or `MALFORMED` fail-closed shape. Both JS-path only; A2.
+
+**7.6 B1 compiler follow-ups:** `*$all` in a user filter is a browser-wide block as written (uBO does the same; consider requiring domain scoping for the empty-pattern form); three seam pins are permanent rather than dated; `:others()` re-walks the document once per rule per procedural run (C-track: a per-run shared `querySelectorAll('*')` snapshot if profiles show it).

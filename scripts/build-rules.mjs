@@ -743,6 +743,70 @@ function parseLine(line) {
 /** Set by `parseOptions` when it bails, so the skip reason can name the option. */
 let lastUnsupportedOption = null;
 
+/** The verbs DNR's `requestMethods` accepts (lowercase). */
+const DNR_REQUEST_METHODS = new Set([
+  'connect', 'delete', 'get', 'head', 'options', 'patch', 'post', 'put', 'other',
+]);
+
+/**
+ * `$header=` → `responseHeaders` needs Chrome ≥ 128 and the manifest floor is
+ * 120, so the arm is implemented behind a build flag and stays off until the
+ * floor decision (REMEDIATION §4.1 open question). Read per call, not at
+ * module load, so a test can flip it.
+ */
+function headerConditionsEnabled() {
+  return process.env.NULLIFY_ENABLE_HEADER_CONDITIONS === '1'
+    || process.argv.includes('--enable-header-conditions');
+}
+
+/**
+ * Split a `|`-delimited domain value into `{included, excluded}` by its `~`
+ * prefix. An entry that is exactly `~` would become an empty-string domain
+ * — Chrome rejects the whole rule at index time — so it refuses the option
+ * (returns null, naming it) rather than silently dropping the entry, which
+ * would ship the rule without the exclusion the author wrote. Mirrors the
+ * Rust compiler's `split_domain_list`.
+ */
+function splitScopedDomainValue(key, value) {
+  const included = [];
+  const excluded = [];
+  for (const entry of value.split('|')) {
+    const trimmed = entry.trim();
+    if (trimmed === '') continue;
+    if (trimmed.startsWith('~')) {
+      const host = trimmed.slice(1);
+      if (host === '') {
+        lastUnsupportedOption = `${key}=~ (empty exclusion entry)`;
+        return null;
+      }
+      excluded.push(host);
+    } else {
+      included.push(trimmed);
+    }
+  }
+  return { included, excluded };
+}
+
+/**
+ * uBO's `$header=name[:[~]value]` → one DNR `HeaderInfo`. A `/regex/` value
+ * has no DNR form (values are urlFilter-style patterns, plain text matching
+ * as a substring — the same reading uBO gives a literal value), so it is
+ * refused rather than shipped unconditional.
+ */
+function parseHeaderCondition(value) {
+  const colon = value.indexOf(':');
+  const name = (colon === -1 ? value : value.slice(0, colon)).trim().toLowerCase();
+  if (!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name)) return null;
+  if (colon === -1) return { header: name };
+  let headerValue = value.slice(colon + 1);
+  const negated = headerValue.startsWith('~');
+  if (negated) headerValue = headerValue.slice(1);
+  if (headerValue === '' || headerValue.startsWith('/')) return null;
+  return negated
+    ? { header: name, excludedValues: [headerValue] }
+    : { header: name, values: [headerValue] };
+}
+
 const COSMETIC_SCOPE_OPTIONS = new Map([
   ['generichide', 'generichide'],
   ['ghide', 'generichide'],
@@ -764,6 +828,10 @@ function parseOptions(optionsStr) {
     initiatorDomains: [],
     excludedInitiatorDomains: [],
     requestDomains: [],
+    excludedRequestDomains: [],
+    requestMethods: [],
+    excludedRequestMethods: [],
+    responseHeaders: [],
     thirdParty: null, // null=any, true=3rd-party, false=1st-party
     redirect: null,
     redirectRule: null,
@@ -793,14 +861,81 @@ function parseOptions(optionsStr) {
       options.thirdParty = negated ? false : true;
     } else if (optName === 'first-party' || optName === '1p') {
       options.thirdParty = negated ? true : false;
-    } else if (optName.startsWith('domain=')) {
-      const domains = optName.slice(7).split('|');
+    } else if (optName.startsWith('domain=') || optName.startsWith('from=')) {
+      // `$from=` is `$domain=` under its newer uBO name (§4.2).
+      const domains = optName.slice(optName.indexOf('=') + 1).split('|');
       for (const d of domains) {
         if (d.startsWith('~')) {
           options.excludedInitiatorDomains.push(d.slice(1));
         } else {
           options.initiatorDomains.push(d);
         }
+      }
+    } else if (/^(?:to|denyallow|method|header)=/.test(optName)) {
+      // §4.2 — the four modifiers DNR expresses one-to-one. Each fails
+      // closed the way the Rust compiler does: a negated key (`$~to=x`) is
+      // not a form uBO accepts and read as un-negated scopes the rule to the
+      // wrong hosts; a value that resolves to nothing would ship the rule
+      // without the scope it asked for.
+      const eqIdx = optName.indexOf('=');
+      const key = optName.slice(0, eqIdx);
+      const value = optName.slice(eqIdx + 1);
+      if (negated) {
+        lastUnsupportedOption = `~${key}=`;
+        return null;
+      }
+      if (key === 'to') {
+        // Destination scoping → requestDomains; `~` entries → excludedRequestDomains.
+        const lists = splitScopedDomainValue(key, value);
+        if (!lists) return null;
+        if (lists.included.length === 0 && lists.excluded.length === 0) {
+          lastUnsupportedOption = 'to= (empty)';
+          return null;
+        }
+        options.requestDomains.push(...lists.included);
+        options.excludedRequestDomains.push(...lists.excluded);
+      } else if (key === 'denyallow') {
+        // "Block, except requests TO these hosts" → excludedRequestDomains.
+        // uBO defines no `~` form for it.
+        const lists = splitScopedDomainValue(key, value);
+        if (!lists) return null;
+        if (lists.excluded.length > 0 || lists.included.length === 0) {
+          lastUnsupportedOption = 'denyallow= (empty or negated entry)';
+          return null;
+        }
+        options.excludedRequestDomains.push(...lists.included);
+      } else if (key === 'method') {
+        // `$method=get|~post` → requestMethods / excludedRequestMethods,
+        // lower-cased; a verb DNR does not know refuses the line.
+        let any = false;
+        for (const entry of value.split('|')) {
+          const trimmed = entry.trim();
+          if (trimmed === '') continue;
+          const verbNegated = trimmed.startsWith('~');
+          const verb = (verbNegated ? trimmed.slice(1) : trimmed).toLowerCase();
+          if (!DNR_REQUEST_METHODS.has(verb)) {
+            lastUnsupportedOption = `method=${verb}`;
+            return null;
+          }
+          any = true;
+          const target = verbNegated ? options.excludedRequestMethods : options.requestMethods;
+          if (!target.includes(verb)) target.push(verb);
+        }
+        if (!any) {
+          lastUnsupportedOption = 'method= (empty)';
+          return null;
+        }
+      } else if (!headerConditionsEnabled()) {
+        // `header=` without the flag: dropped and counted, as before.
+        lastUnsupportedOption = optName;
+        return null;
+      } else {
+        const headerInfo = parseHeaderCondition(value);
+        if (!headerInfo) {
+          lastUnsupportedOption = `${optName} (regex or empty header value has no DNR form)`;
+          return null;
+        }
+        options.responseHeaders.push(headerInfo);
       }
     } else if (optName === 'important') {
       options.important = true;
@@ -1044,7 +1179,8 @@ function isUnsafeGlobalFragmentImageRedirect(pattern, options, exception) {
   if (options.resourceTypes.length !== 1 || options.resourceTypes[0] !== 'image') return false;
   if (options.excludedResourceTypes.length > 0) return false;
   if (options.initiatorDomains.length > 0 || options.excludedInitiatorDomains.length > 0) return false;
-  if (options.requestDomains.length > 0) return false;
+  if (options.requestDomains.length > 0 || options.excludedRequestDomains.length > 0) return false;
+  if (options.requestMethods.length > 0 || options.excludedRequestMethods.length > 0) return false;
   return /^\*\.(?:png|gif|jpe?g|svg)#$/.test(pattern);
 }
 
@@ -1077,6 +1213,49 @@ function normalizeDomainList(domains) {
     if (!normalized.includes(ascii)) normalized.push(ascii);
   }
   return { domains: normalized, unencodable };
+}
+
+const DOMAIN_SCOPE_INITIATOR = { option: '$domain=', field: 'initiatorDomain', tag: 'domain' };
+const DOMAIN_SCOPE_REQUEST = { option: '$to=/$denyallow=', field: 'requestDomain', tag: 'request-domain' };
+
+/**
+ * Resolve one side of a domain scope (initiator or request) to what the
+ * DNR schema accepts, or report why the rule cannot ship.
+ *
+ * Wildcard entity domains (`gmx.*`) are invalid DNR domains — Chrome rejects
+ * the whole rule at ruleset indexing. The bundled PSL is a curated stop-list
+ * (membership predicate only), not an enumerable TLD set suitable for entity
+ * expansion, so these entries cannot be expanded. Then normalise what is
+ * left to the schema (§5.29). Both steps fail closed in each direction:
+ *  - an EXCLUSION we cannot honour (wildcard or unencodable) would over-apply
+ *    the rule → drop the rule;
+ *  - a POSITIVE entry we cannot honour only narrows the rule → drop the
+ *    entry; if none remain the rule would become unscoped → drop the rule.
+ */
+function resolveDomainScope(positive, excluded, pattern, scope) {
+  if (excluded.some((d) => d.includes('*'))) {
+    reportDrop(`wildcard-${scope.tag}-exclusion: ~entity.* in ${scope.option} cannot be expressed in DNR; dropping the rule rather than shipping it over-applied`, pattern);
+    return null;
+  }
+  let domains = positive;
+  if (domains.some((d) => d.includes('*'))) {
+    domains = domains.filter((d) => !d.includes('*'));
+    if (domains.length === 0) {
+      reportDrop(`wildcard-${scope.tag}-only: entity.* is invalid as a DNR ${scope.field} and no PSL entity expansion is available`, pattern);
+      return null;
+    }
+  }
+  const normalizedExcluded = normalizeDomainList(excluded);
+  if (normalizedExcluded.unencodable.length > 0) {
+    reportDrop(`invalid-${scope.tag}-exclusion: ~${normalizedExcluded.unencodable[0]} is not encodable as an ASCII domain; dropping the rule rather than shipping it over-applied`, pattern);
+    return null;
+  }
+  const normalizedPositive = normalizeDomainList(domains);
+  if (domains.length > 0 && normalizedPositive.domains.length === 0) {
+    reportDrop(`invalid-${scope.tag}-only: every ${scope.option} entry is empty or not encodable as an ASCII domain; dropping the rule rather than shipping it unscoped`, pattern);
+    return null;
+  }
+  return { domains: normalizedPositive.domains, excluded: normalizedExcluded.domains };
 }
 
 /**
@@ -1135,45 +1314,22 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
     return null;
   }
 
-  // Wildcard entity domains (`gmx.*`) are invalid DNR initiatorDomains —
-  // Chrome rejects the whole rule at ruleset indexing. The bundled PSL is a
-  // curated stop-list (membership predicate only), not an enumerable TLD set
-  // suitable for entity expansion, so these entries cannot be expanded.
-  // Fail closed in each direction:
-  //  - a wildcard EXCLUSION cannot be honoured, and dropping just the entry
-  //    would over-apply the rule on the excluded sites → drop the rule;
-  //  - a wildcard POSITIVE entry is dropped (narrower); if none remain the
-  //    rule would become unscoped (broader) → drop the rule.
-  if (options.excludedInitiatorDomains.some((d) => d.includes('*'))) {
-    reportDrop('wildcard-domain-exclusion: ~entity.* in $domain= cannot be expressed in DNR; dropping the rule rather than shipping it over-applied', pattern);
-    return null;
-  }
-  let initiatorDomains = options.initiatorDomains;
-  if (initiatorDomains.some((d) => d.includes('*'))) {
-    initiatorDomains = initiatorDomains.filter((d) => !d.includes('*'));
-    if (initiatorDomains.length === 0) {
-      reportDrop('wildcard-domain-only: entity.* is invalid as a DNR initiatorDomain and no PSL entity expansion is available', pattern);
-      return null;
-    }
-  }
+  // `$domain=` / `$from=`: see resolveDomainScope for the two-direction rule.
+  const initiatorScope = resolveDomainScope(
+    options.initiatorDomains, options.excludedInitiatorDomains, pattern, DOMAIN_SCOPE_INITIATOR);
+  if (!initiatorScope) return null;
+  const initiatorDomains = initiatorScope.domains;
+  const excludedInitiatorDomains = initiatorScope.excluded;
 
-  // Normalise what is left to the DNR schema (§5.29), in the same two
-  // directions the wildcard handling above uses:
-  //  - an EXCLUSION we cannot encode would over-apply the rule → drop it;
-  //  - a POSITIVE entry we cannot encode only narrows the rule, but if the
-  //    whole positive list empties out the rule becomes unscoped → drop it.
-  const normalizedExcluded = normalizeDomainList(options.excludedInitiatorDomains);
-  if (normalizedExcluded.unencodable.length > 0) {
-    reportDrop(`invalid-domain-exclusion: ~${normalizedExcluded.unencodable[0]} is not encodable as an ASCII domain; dropping the rule rather than shipping it over-applied`, pattern);
-    return null;
-  }
-  const normalizedInitiators = normalizeDomainList(initiatorDomains);
-  if (initiatorDomains.length > 0 && normalizedInitiators.domains.length === 0) {
-    reportDrop('invalid-domain-only: every $domain= entry is empty or not encodable as an ASCII domain; dropping the rule rather than shipping it unscoped', pattern);
-    return null;
-  }
-  initiatorDomains = normalizedInitiators.domains;
-  const excludedInitiatorDomains = normalizedExcluded.domains;
+  // `$to=` / `$denyallow=` (§4.2): the same two-direction rule, on the
+  // request side. A bare public suffix (`$to=com`) is kept: DNR accepts it
+  // syntactically and it can only narrow the rule (REVIEW §9 on whether
+  // Chrome honours it).
+  const requestScope = resolveDomainScope(
+    options.requestDomains, options.excludedRequestDomains, pattern, DOMAIN_SCOPE_REQUEST);
+  if (!requestScope) return null;
+  const requestDomains = requestScope.domains;
+  const excludedRequestDomains = requestScope.excluded;
 
   // `||co.uk^` with no `$domain=` scope is as broad as `||com^`. Checked here
   // rather than in convertPatternToUrlFilter because only this scope knows
@@ -1258,6 +1414,22 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
       reportDrop(`regex: invalid JS regex syntax (${e.message})`, pattern);
       return null;
     }
+  } else if (pattern === '' || pattern === '*') {
+    // `*$script,3p,domain=x.com` is "every third-party script on x.com": a
+    // condition with NO urlFilter (§4.2). With nothing to scope it, the same
+    // line would match every request — that form keeps being dropped. The
+    // scope test mirrors the Rust compiler's: a type set (`$all` included),
+    // initiator domains, request domains or a party constraint; a type
+    // EXCLUSION or a denyallow/method alone does not narrow it to a site.
+    const scoped = options.all
+      || options.resourceTypes.length > 0
+      || initiatorDomains.length > 0
+      || requestDomains.length > 0
+      || options.thirdParty !== null;
+    if (!scoped) {
+      reportDrop('urlFilter: empty or matches-everything ("*") with nothing to scope it', pattern);
+      return null;
+    }
   } else {
     urlFilter = convertPatternToUrlFilter(pattern);
     if (!urlFilter) return null; // convertPatternToUrlFilter calls reportDrop itself
@@ -1300,8 +1472,20 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   if (excludedInitiatorDomains.length > 0) {
     condition.excludedInitiatorDomains = excludedInitiatorDomains;
   }
-  if (options.requestDomains.length > 0) {
-    condition.requestDomains = options.requestDomains;
+  if (requestDomains.length > 0) {
+    condition.requestDomains = requestDomains;
+  }
+  if (excludedRequestDomains.length > 0) {
+    condition.excludedRequestDomains = excludedRequestDomains;
+  }
+  if (options.requestMethods.length > 0) {
+    condition.requestMethods = options.requestMethods;
+  }
+  if (options.excludedRequestMethods.length > 0) {
+    condition.excludedRequestMethods = options.excludedRequestMethods;
+  }
+  if (options.responseHeaders.length > 0) {
+    condition.responseHeaders = options.responseHeaders;
   }
   if (options.thirdParty === true) {
     condition.domainType = 'thirdParty';
@@ -1468,6 +1652,10 @@ function canonicalNetworkKey(parsed) {
     id: [...o.initiatorDomains].sort(),
     eid: [...o.excludedInitiatorDomains].sort(),
     rd: [...o.requestDomains].sort(),
+    xrd: [...o.excludedRequestDomains].sort(),
+    rm: [...o.requestMethods].sort(),
+    xrm: [...o.excludedRequestMethods].sort(),
+    rh: o.responseHeaders,
     tp: o.thirdParty,
     r: o.redirect,
     rp: o.removeparam,
@@ -1643,6 +1831,10 @@ function buildDNRRules(networkRules, conversionOptions = {}) {
         id: rule.condition.initiatorDomains,
         eid: rule.condition.excludedInitiatorDomains,
         rd: rule.condition.requestDomains,
+        xrd: rule.condition.excludedRequestDomains,
+        rm: rule.condition.requestMethods,
+        xrm: rule.condition.excludedRequestMethods,
+        rh: rule.condition.responseHeaders,
         dt: rule.condition.domainType,
         cs: rule.condition.isUrlFilterCaseSensitive,
         p: rule.priority,

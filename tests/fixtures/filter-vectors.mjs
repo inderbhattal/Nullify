@@ -438,11 +438,12 @@ export const FILTER_VECTORS = [
  * it is known to differ from the specification, with the reason — `emit`,
  * and `condition` where the build emits both before and after the fix so
  * the flag alone could not go stale. Two kinds:
- *  - dated: the build catches up later (D1 §4.1/§4.2 — `$all`, `$to=`,
- *    `$from=`, `$denyallow=`, `$method=`, scoped `*`; Track D's findings on
- *    digit-first option lists, `~domain=`, empty `~` entries, contradictory
- *    type lists). The pinned answer then stops matching and the parity test
- *    fails until the pin is removed.
+ *  - dated: the build catches up later (D1a §4.1 and D1b §4.2 landed —
+ *    `$all`, `$to=`, `$from=`, `$denyallow=`, `$method=`, scoped `*` are
+ *    unpinned; Track D's D1c findings on digit-first option lists,
+ *    `~domain=`, empty `~` entries and contradictory type lists remain).
+ *    The pinned answer then stops matching and the parity test fails until
+ *    the pin is removed.
  *  - permanent: user filters have no resource library and no punycoder
  *    (`$redirect=`, literal `$removeparam=`, non-ASCII `$domain=`).
  * The runtime fallback is allowed to be stricter than the build (drop where
@@ -452,8 +453,6 @@ const ALL_RESOURCE_TYPES = [
   'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
   'object', 'xmlhttprequest', 'ping', 'media', 'websocket', 'other',
 ];
-
-const D1 = 'D1 (§4.2) has not landed: the build parser refuses this option today';
 
 export const NETWORK_VECTORS = [
   // --- the review's nine lines ---------------------------------------------
@@ -470,7 +469,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', requestDomains: ['cdn.example'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -478,7 +476,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', initiatorDomains: ['site.example'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -486,7 +483,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', requestMethods: ['post'] },
-      build: { emit: false, why: D1 },
     },
   },
   { line: '||example.com^$header=content-type:image', expect: { kind: 'network', emit: false } },
@@ -530,7 +526,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', excludedRequestMethods: ['get'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -542,7 +537,6 @@ export const NETWORK_VECTORS = [
         requestDomains: ['cdn.example'],
         excludedRequestDomains: ['static.example'],
       },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -550,7 +544,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', excludedRequestDomains: ['cdn.example'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -645,7 +638,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { resourceTypes: ['script'], domainType: 'thirdParty', initiatorDomains: ['x.com'] },
-      build: { emit: false, why: D1 },
     },
   },
   { line: '*', expect: { kind: 'network', emit: false } },

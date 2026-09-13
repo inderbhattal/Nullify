@@ -35,6 +35,9 @@ export const StorageKeys = {
   REFERRER_CONTROL: 'referrerControl',
   BLOOM_FILL_THRESHOLD: 'bloomFillThreshold',
   USER_SCRIPTLET_RULES: 'userScriptletRules',
+  // `{[name]: boolean}` — runtime feature flags (REMEDIATION-2026-09 §2).
+  // Read through getFeatureFlag(); the defaults table lives with the consumer.
+  FEATURE_FLAGS: 'featureFlags',
 };
 
 /**
@@ -62,25 +65,87 @@ export function isQuotaError(err) {
   return QUOTA_MESSAGE_RE.test(String(err.message ?? err));
 }
 
-/** Get multiple values from storage in one call. */
+/**
+ * Typed error for a failed `chrome.storage.local.get` (REVIEW-2026-09 §3.1).
+ *
+ * A read that fails is NOT a read that found nothing. 2026-07 §5.11 collapsed
+ * the two into `{}`, and every read-modify-write downstream (allowlist, user
+ * filters, settings, stats, startup defaults) committed that empty result as
+ * authoritative. Strict readers reject with this so a writer answers `{error}`
+ * and writes nothing; read-only consumers use the `...OrEmpty` /
+ * `...OrDefault` variants below and keep degrading quietly.
+ */
+export class StorageReadError extends Error {
+  constructor(message, options) {
+    super(message, options);
+    this.name = 'StorageReadError';
+    this.code = 'READ_FAILED';
+  }
+}
+
+/**
+ * Get multiple values from storage in one call. STRICT: rejects with
+ * StorageReadError when Chrome reports the read failed (`runtime.lastError`).
+ * An `undefined` result WITHOUT lastError is "empty", not "failed", and still
+ * resolves `{}` (the 2026-07 §5.11 TypeError guard).
+ */
 export async function getStorageBulk(keys) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     chrome.storage.local.get(keys, (result) => {
-      // On a failed read Chrome sets chrome.runtime.lastError and invokes the
-      // callback with `undefined`. Resolve with an empty object so getStorage
-      // honors its "returns null" contract instead of throwing a TypeError.
-      if (chrome.runtime.lastError || !result) {
-        resolve({});
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new StorageReadError(err.message || 'chrome.storage.local read failed'));
         return;
       }
-      resolve(result);
+      resolve(result ?? {});
     });
   });
 }
 
-/** Get a single value from storage. Returns null if not found. */
+/**
+ * Get a single value from storage. STRICT (inherits getStorageBulk's
+ * rejection). Returns null if not found.
+ */
 export async function getStorage(key) {
   return (await getStorageBulk([key]))[key] ?? null;
+}
+
+/**
+ * LENIENT bulk read for consumers that write nothing based on the result:
+ * a failed read resolves `{}` exactly as it did before §3.1.
+ */
+export async function getStorageBulkOrEmpty(keys) {
+  try {
+    return await getStorageBulk(keys);
+  } catch (err) {
+    if (err instanceof StorageReadError) return {};
+    throw err;
+  }
+}
+
+/**
+ * LENIENT single read: `fallback` for a missing key AND for a failed read.
+ * Only for read-only consumers — never feed the result into a write.
+ */
+export async function getStorageOrDefault(key, fallback = null) {
+  try {
+    return (await getStorage(key)) ?? fallback;
+  } catch (err) {
+    if (err instanceof StorageReadError) return fallback;
+    throw err;
+  }
+}
+
+/**
+ * Read one runtime feature flag (lenient: a failed read yields the default).
+ * Only a stored boolean overrides `defaultValue`.
+ */
+export async function getFeatureFlag(name, defaultValue = false) {
+  const flags = await getStorageOrDefault(StorageKeys.FEATURE_FLAGS, null);
+  if (flags && typeof flags === 'object' && typeof flags[name] === 'boolean') {
+    return flags[name];
+  }
+  return defaultValue;
 }
 
 /**

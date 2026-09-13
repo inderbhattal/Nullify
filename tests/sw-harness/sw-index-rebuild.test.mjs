@@ -124,3 +124,67 @@ test('5.7: applyRulesets enables every list in ALL_KNOWN_LIST_IDS by default', a
 
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §3.2 — the JS CSS gate (WASM-down path) must refuse what the
+// browser refuses. The SW kept its own hand-copied operator list; `others` was
+// missing, so `div:others(.x)` passed `isSafeCssSelector` as "CSS" and was
+// emitted. The Rust gate (B1) now refuses any single-colon functional
+// pseudo-class a browser does not implement and any `::name` that is only a
+// prefix of a known pseudo-element; the SW mirrors both, and reads the one
+// shared operator list from src/shared/proc-ops.js (C1a).
+//
+// WASM never initialises in the harness (fetch is cut), so `buildPageBundle`
+// takes the JS path here by construction.
+// ---------------------------------------------------------------------------
+
+function cssSelectorsOf(bundle) {
+  return bundle.cssText.split('\n').filter(Boolean).map((line) => line.replace(/\s*\{.*$/, ''));
+}
+
+test('3.2: the JS CSS gate refuses unknown functional pseudo-classes', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const bundle = hooks.buildPageBundle({
+    domainSpecific: ['.good', 'div:others(.x)', 'div:bogus(1)', 'div::before2'],
+  });
+
+  assert.deepEqual(cssSelectorsOf(bundle), ['.good'],
+    `only .good may reach the page as CSS; got ${JSON.stringify(bundle.cssText)}`);
+  for (const refused of ['div:others(.x)', 'div:bogus(1)', 'div::before2']) {
+    assert.ok(!bundle.cssText.includes(refused), `${refused} must not be emitted as CSS`);
+  }
+  // `others` is a uBO operator: it is planned, not dropped.
+  assert.deepEqual(bundle.rules.domainSpecific.map((rule) => rule.selector), ['div:others(.x)']);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('3.2 (didn\'t re-break): native functional pseudo-classes still pass, one rule per selector', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const natives = ['div:has(.x)', 'div:not(:is(.a,.b))', 'li:nth-child(2n+1)', 'p:lang(en)', 'div:NOT(.y)', 'div::BEFORE', 'span::part(x)'];
+  const bundle = hooks.buildPageBundle({ domainSpecific: natives });
+
+  assert.deepEqual(cssSelectorsOf(bundle), natives,
+    'every native selector must pass the gate, case-insensitively, and each must be its own rule');
+  assert.equal(bundle.cssText.split('\n').length, natives.length, 'the JS fallback emits one rule per selector');
+  assert.deepEqual(bundle.rules.domainSpecific, []);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('3.2: the JS planner tokenises the shared operator names case-insensitively and canonicalises aliases', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const bundle = hooks.buildPageBundle({
+    domainSpecific: ['div:-abp-has(.x)', 'DIV:Has-Text(ad)', 'div:-abp-contains(promo)', 'div:remove-class(ad)'],
+  });
+
+  assert.equal(bundle.cssText, '', 'none of these is CSS');
+  const ops = bundle.rules.domainSpecific.map((rule) => rule.plan.filter((step) => step.type === 'op').map((step) => step.op));
+  assert.deepEqual(ops, [['has'], ['has-text'], ['has-text'], ['remove-class']],
+    'every plan step must carry the canonical uBO name the engine implements');
+
+  hooks.cancelPendingStatsPersistForTest();
+});

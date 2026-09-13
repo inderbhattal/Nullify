@@ -76,6 +76,12 @@ import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '.
 import { ancestorDomains } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
 import { applyScriptletExceptions } from '../shared/filter-syntax.js';
+import {
+  PROC_OPS,
+  PROC_OP_ALIASES,
+  isProceduralSelector,
+  NATIVE_FUNCTIONAL_PSEUDO_CLASSES,
+} from '../shared/proc-ops.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
@@ -476,45 +482,13 @@ async function computeBundledRuleDataVersion() {
   return bundledRuleDataVersionPromise;
 }
 
-// All known procedural operators that require JS evaluation.
-//
-// §5.20 — this list MUST equal `PROC_OPS` in src/content/cosmetic-engine.js
-// (and the operator set wasm-core plans against). `semantic` was missing here
-// only, so on the WASM-down path `div:semantic(x)` was not recognised as
-// procedural, passed `isSafeCssSelector`, and shipped to the page as literal
-// CSS — a selector no browser matches, i.e. the rule silently died. Which
-// rules a user got therefore depended on WASM health.
-//
-// TODO: there is still no canonical shared list; this is a hand-kept mirror of
-// the content-script one. Unifying the two (plus content-main's
-// PROC_TOKEN_REGEX) into src/shared/ is open work — see REVIEW-2026-08 §5.20.
-const PROC_OPS = [
-  'matches-css-before',
-  'matches-css-after',
-  'matches-css',
-  'has-text',
-  'nth-ancestor',
-  'upward',
-  'min-text-length',
-  'xpath',
-  'watch-attr',
-  'remove',
-  'style',
-  'matches-path',
-  'matches-attr',
-  'if-not',
-  'if',
-  'semantic',
-];
-
-// Compiled regex for high-performance detection (avoiding O(N) loops)
-const PROC_OP_REGEX = new RegExp(`:(?:${PROC_OPS.join('|')})\\(`, 'i');
-
-/** Returns true if the selector string contains any procedural operator. */
-function isProceduralSelector(selector) {
-  if (typeof selector !== 'string') return false;
-  return PROC_OP_REGEX.test(selector);
-}
+// The procedural operator list, `isProceduralSelector` and the native
+// functional pseudo-class allowlist come from src/shared/proc-ops.js (§3.2,
+// 2026-09): this file used to keep a hand-copied list that drifted (`others`
+// and the `-abp-*` aliases were missing), so on the WASM-down path those
+// selectors passed the CSS gate as "CSS" and were emitted as declarations no
+// browser matches. `tests/wasm-parity.test.mjs` pins the shared list equal to
+// the Rust core's `PROC_OP_NAMES`.
 
 /**
  * Depth-aware scan for the first procedural operator in a selector string.
@@ -529,9 +503,12 @@ function extractFirstOp(selector) {
     if (ch !== ':' || depth !== 0) continue;
 
     for (const op of PROC_OPS) {
-      if (selector.startsWith(op + '(', i + 1)) {
+      // Case-insensitive, like `isProceduralSelector`, the engine and the Rust
+      // matcher: `DIV:Has-Text(x)` must plan here too, not fall through as
+      // CSS the gate then refuses (§3.2).
+      const argStart = i + 1 + op.length + 1; // skip ':op('
+      if (selector.slice(i + 1, argStart).toLowerCase() === op + '(') {
         const base = selector.slice(0, i).trimEnd();
-        const argStart = i + 1 + op.length + 1;
 
         let d = 1, j = argStart;
         while (j < selector.length && d > 0) {
@@ -589,7 +566,9 @@ function parseProceduralPlan(selector) {
       plan.push({ type: 'css', selector: firstOp.base });
     }
     
-    plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
+    // Canonical uBO name, like the engine's planner: `:-abp-has()` plans as
+    // `has`, so every step is one `_applyOp` implements.
+    plan.push({ type: 'op', op: PROC_OP_ALIASES[firstOp.op] ?? firstOp.op, arg: firstOp.arg });
     remaining = firstOp.rest;
   }
   
@@ -712,14 +691,35 @@ function hasBalancedSelectorDelimiters(selector) {
   return !quote && bracketDepth === 0 && parenDepth === 0;
 }
 
+// Mirrors the Rust `KNOWN_PSEUDO_ELEMENTS` / `starts_with_ident_char`.
+const KNOWN_PSEUDO_ELEMENTS = [
+  '::before', '::after', '::first-line', '::first-letter',
+  '::selection', '::backdrop', '::placeholder', '::marker',
+  '::cue', '::slotted', '::part', '::file-selector-button',
+];
+
+/**
+ * True when `ch` can continue a CSS identifier, i.e. would make a preceding
+ * pseudo-element name a *different*, unknown name: ASCII alphanumerics, `-`,
+ * `_`, an escape, and any non-ASCII character (CSS idents admit U+0080+).
+ */
+function isIdentChar(ch) {
+  return ch !== undefined && ch !== '' && (/[A-Za-z0-9_\-\\]/.test(ch) || ch.charCodeAt(0) > 0x7f);
+}
+
 function hasInvalidUniversalUsage(selector) {
   let bracketDepth = 0;
   let parenDepth = 0;
   let quote = null;
   let escaped = false;
+  // The character immediately preceding the current one, unfiltered — needed
+  // to tell the second colon of a `::` pair from a pseudo-class colon.
+  let prev = null;
 
   for (let i = 0; i < selector.length; i++) {
     const ch = selector.charAt(i);
+    const prevChar = prev;
+    prev = ch;
 
     if (escaped) {
       escaped = false;
@@ -784,16 +784,54 @@ function hasInvalidUniversalUsage(selector) {
       }
     }
 
-    // Pseudo-element safety check
-    if (ch === ':' && i + 1 < selector.length && selector.charAt(i + 1) === ':') {
-      const pseudoRest = selector.slice(i);
-      const knownPseudoElements = [
-        '::before', '::after', '::first-line', '::first-letter',
-        '::selection', '::backdrop', '::placeholder', '::marker',
-        '::cue', '::slotted', '::part', '::file-selector-button',
-      ];
-      if (!knownPseudoElements.some(p => pseudoRest.startsWith(p))) {
-        return true; // Unknown pseudo-element — potential bypass
+    // Pseudo-element safety: reject a double colon followed by an unknown
+    // pseudo-element. A bare prefix match is not a match: `::before2` and
+    // `::first-line-x` start with a known name yet name a pseudo-element that
+    // does not exist, so the browser discards the declaration. Require the
+    // character after the name to be one that cannot continue an identifier
+    // (`(` for `::part(x)`, a combinator, a comma, `[`/`:`, or end of input).
+    // Names are ASCII case-insensitive: `::BEFORE` is valid CSS. Mirrors the
+    // Rust gate exactly (§3.2).
+    if (ch === ':' && selector.charAt(i + 1) === ':') {
+      const rest = selector.slice(i);
+      const known = KNOWN_PSEUDO_ELEMENTS.some((p) =>
+        rest.length >= p.length &&
+        rest.slice(0, p.length).toLowerCase() === p &&
+        !isIdentChar(rest.charAt(p.length))
+      );
+      if (!known) {
+        return true; // Unknown pseudo-element — could be bypass attempt
+      }
+      continue;
+    }
+
+    // Pseudo-class safety (§3.2): a single-colon *functional* pseudo-class
+    // must be one a browser knows. `div:others(.x)` — a uBO operator missing
+    // from this file's old hand-copied list — passed here as if it were CSS
+    // and was emitted; with the Rust joiner it was joined with up to 149
+    // legitimate selectors and the browser discarded the whole declaration.
+    //
+    // Outside brackets and quotes only (`[data-x=":bogus("]` is data), at ANY
+    // paren depth (`:not(:bogus(x))` is as invalid as `:bogus(x)`), and never
+    // the second colon of a `::` pair. Procedural operators never reach this
+    // function (the caller checks isProceduralSelector first), so their names
+    // are absent from the allowlist by design. Non-functional pseudo-classes
+    // (`:hover`) are not gated — accepted residual.
+    if (ch === ':' && bracketDepth === 0 && prevChar !== ':') {
+      // Identifier: `[A-Za-z_-][A-Za-z0-9_-]*`.
+      let j = i + 1;
+      while (j < selector.length) {
+        const c = selector.charAt(j);
+        const ident = /[A-Za-z_\-]/.test(c) || (j > i + 1 && /[0-9]/.test(c));
+        if (!ident) break;
+        j++;
+      }
+      if (j === i + 1) continue;
+      if (selector.charAt(j) === '(') {
+        const name = selector.slice(i + 1, j).toLowerCase();
+        if (!NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name)) {
+          return true;
+        }
       }
     }
   }
@@ -4644,6 +4682,7 @@ export const __testHooks = {
   },
   // Cosmetic index / navigation
   getCosmeticBundleForPage,
+  buildPageBundle,
   queueActiveIndexRebuild,
   isActiveIndexRebuildInFlight,
   currentRebuildGeneration,

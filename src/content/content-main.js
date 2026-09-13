@@ -13,6 +13,7 @@ import { CosmeticEngine } from './cosmetic-engine.js';
 import { activatePicker, deactivatePicker } from './element-picker.js';
 import { normalizeHostname } from '../shared/hostname.js';
 import { resolvePageRules } from '../shared/rule-transport.js';
+import { PROC_OP_REGEX } from '../shared/proc-ops.js';
 
 const hostname = normalizeHostname(location.hostname);
 const FRAME_STYLE_ID = '__nullify_frame_css__';
@@ -99,10 +100,11 @@ async function main() {
   // missing or undecodable — never lose procedural filtering over transport.
   const finalRules = resolvePageRules(initRes);
 
-  // Apply cosmetic rules. `semantic` belongs in this list: without it a
-  // string-form `div:semantic(x)` rule never constructs the engine (§5.20).
-  const PROC_TOKEN_REGEX = /:(?:has-text|upward|matches-css|matches-css-before|matches-css-after|matches-attr|matches-path|has|xpath|min-text-length|watch-attr|remove|if|if-not|nth-ancestor|style|semantic)\(/;
-  const isProceduralRule = (r) => typeof r === 'object' || (typeof r === 'string' && PROC_TOKEN_REGEX.test(r));
+  // Apply cosmetic rules. The check reads the one shared operator list: a
+  // hand-kept copy here omitted `semantic` (§5.20) and then `others` and its
+  // siblings (§3.2), so string-form rules for those operators — the WASM-down
+  // fallback shape — never constructed the engine at all.
+  const isProceduralRule = (r) => typeof r === 'object' || (typeof r === 'string' && PROC_OP_REGEX.test(r));
   const hasProcedural = finalRules?.generic?.some(isProceduralRule) ||
                        finalRules?.domainSpecific?.some(isProceduralRule);
   const hasExceptions = finalRules?.exceptions?.length > 0;

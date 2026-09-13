@@ -26,6 +26,8 @@ import test from 'node:test';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
+import { PROC_OP_REGEX } from '../shared/proc-ops.js';
+
 const SOURCE_URL = new URL('./content-main.js', import.meta.url);
 
 let _body = null;
@@ -123,6 +125,8 @@ function makeEnv({
     deactivatePicker: () => state.pickerCalls.push(['deactivate']),
     normalizeHostname: (h) => h,
     resolvePageRules: (res) => res?.rules ?? { generic: [], domainSpecific: [], exceptions: [] },
+    // The real shared list: the point of §3.2 is that this module reads it.
+    PROC_OP_REGEX,
   };
   context.globalThis = context;
   vm.createContext(context);
@@ -308,4 +312,23 @@ test('a page with no procedural rules still short-circuits (§5.20 didn\'t re-br
   });
   await run(env);
   assert.equal(FakeEngine.instances.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// docs/REVIEW-2026-09.md §3.2 — the engine-construction check reads the one
+// shared operator list, so an operator the engine tokenises always reaches it.
+// ---------------------------------------------------------------------------
+
+test('3.2: a string-form :others() rule constructs the engine', async () => {
+  const env = makeEnv({
+    hostname: 'example.test',
+    initRes: { isAllowed: false, rules: { generic: [], domainSpecific: ['div:others(.x)'], exceptions: [] } },
+  });
+  await run(env);
+
+  // Prior code's hand-kept PROC_TOKEN_REGEX omitted `others` (and the other
+  // §3.2 operators), so on the WASM-down fallback path a page whose only
+  // rule was `div:others(.x)` never constructed the engine at all.
+  assert.equal(FakeEngine.instances.length, 1);
+  assert.deepEqual(FakeEngine.instances[0].rules.domainSpecific, ['div:others(.x)']);
 });

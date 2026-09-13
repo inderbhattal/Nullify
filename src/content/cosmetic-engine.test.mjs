@@ -743,3 +743,96 @@ test('well-formed selectors are unaffected by the malformed-input guard (§5.20)
   assert.equal(parseProceduralPlan('div:semantic(x)')[1].op, 'semantic');
   assert.equal(parseProceduralPlan(':xpath(//div[contains(text(),"Ad")])')[0].op, 'xpath');
 });
+
+// ---------------------------------------------------------------------------
+// docs/REVIEW-2026-09.md §3.2 — one shared operator list; unknown operators
+// are tokenised as procedural (so they never reach a CSS joiner) and fail
+// closed in `_applyOp`.
+// ---------------------------------------------------------------------------
+
+const UNIMPLEMENTED_OPS = ['matches-media', 'shadow', 'matches-prop', 'others', 'remove-attr', 'remove-class'];
+
+test('3.2: :matches-media()/:shadow()/:matches-prop()/:others()/:remove-*() are procedural and fail closed', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  const target = domEl({ matches: () => true, getAttribute: () => 'x', className: 'cls' });
+  installDom({ queryResults: { div: [target] } });
+  const e = engine();
+  const rules = [
+    'div:matches-media((min-width: 800px))',
+    'div:shadow(.x)',
+    'div:matches-prop(foo)',
+    'div:others(.x)',
+    'div:remove-attr(data-x)',
+    'div:remove-class(cls)',
+  ];
+  // `div:semantic(x)` in string form rode the same hand-kept literal (§5.20).
+  e.init({ generic: rules, domainSpecific: ['div:semantic(x)'] }, true);
+
+  // Prior code: none of these was a known operator, so `div:shadow(.x)` and
+  // its siblings were pushed to `_cssSelectors` — and, on the SW/WASM path,
+  // comma-joined into a declaration the browser then discarded whole.
+  assert.deepEqual(e._cssSelectors, []);
+  assert.deepEqual(e._proceduralRules.map((r) => r.selector), [...rules, 'div:semantic(x)']);
+  assert.deepEqual(e._proceduralRules.map((r) => r.plan[1].op), [...UNIMPLEMENTED_OPS, 'semantic']);
+
+  // init() ran the first procedural scan; every rule matched `div` and every
+  // operator is unimplemented, so nothing may be hidden.
+  assert.equal(e._hideQueue.size, 0);
+  assert.equal(e._hiddenCount, 0);
+  for (const op of UNIMPLEMENTED_OPS) {
+    assert.equal(e._applyOp(target, op, 'x', `div:${op}(x)`), null, `${op} fails closed`);
+  }
+  e.stopObserver();
+});
+
+test('3.2: ABP aliases plan as their uBO equivalents', () => {
+  // The JS planner canonicalises the step name.
+  assert.deepEqual(parseProceduralPlan('div:-abp-has(.x)'), [
+    { type: 'css', kind: 'compound', selector: 'div' },
+    { type: 'op', op: 'has', arg: '.x' },
+  ]);
+  assert.equal(parseProceduralPlan('div:-abp-contains(ad)')[1].op, 'has-text');
+  assert.equal(parseProceduralPlan('div:-abp-properties(width: 300px)')[1].op, 'matches-css');
+
+  // The Rust planner emits the alias name unchanged, so `_applyOp` maps it too.
+  const e = engine();
+  const hit = makeEl({ descendants: [makeEl({ matchesSelectors: ['.x'] })] });
+  const miss = makeEl({ descendants: [] });
+  assert.equal(e._applyOp(hit, '-abp-has', '.x', 's'), hit);
+  assert.equal(e._applyOp(miss, '-abp-has', '.x', 's'), null);
+
+  const sponsored = { ...makeEl(), textContent: 'Sponsored ad' };
+  const article = { ...makeEl(), textContent: 'Real article' };
+  assert.equal(e._applyOp(sponsored, '-abp-contains', 'ad', 's'), sponsored);
+  assert.equal(e._applyOp(article, '-abp-contains', 'ad', 's'), null);
+
+  globalThis.getComputedStyle = () => ({ getPropertyValue: () => '300px' });
+  const wide = makeEl();
+  assert.equal(e._applyOp(wide, '-abp-properties', 'width: 300px', 's'), wide);
+  assert.equal(e._applyOp(wide, '-abp-properties', 'width: 728px', 's'), null);
+});
+
+test('3.2: the JS planner tokenises operator names case-insensitively', () => {
+  // The Rust planner (B1) matches case-insensitively; the two must agree on
+  // what is procedural or `DIV:Has-Text(x)` is a valid-looking CSS selector
+  // to one engine and a plan to the other.
+  assert.deepEqual(parseProceduralPlan('DIV:Has-Text(x)'), [
+    { type: 'css', kind: 'compound', selector: 'DIV' },
+    { type: 'op', op: 'has-text', arg: 'x' },
+  ]);
+  assert.equal(parseProceduralPlan('div:-ABP-HAS(.x)')[1].op, 'has');
+});
+
+test('3.2 (didn\'t re-break): native pseudo-classes stay CSS and known operators still plan', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  installDom();
+  const e = engine();
+  e.init({
+    generic: ['.plain-ad', 'div:has(.x)', 'div:not(:is(.a, .b))', 'li:nth-child(2n+1)'],
+    domainSpecific: ['div:has-text(Ad)', 'div:upward(2)', 'div:if-not(.keep)', 'div:matches-css(width: 1px)'],
+  }, true);
+
+  assert.deepEqual(e._cssSelectors, ['.plain-ad', 'div:has(.x)', 'div:not(:is(.a, .b))', 'li:nth-child(2n+1)']);
+  assert.deepEqual(e._proceduralRules.map((r) => r.plan[1].op), ['has-text', 'upward', 'if-not', 'matches-css']);
+  e.stopObserver();
+});

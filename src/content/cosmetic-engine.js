@@ -21,7 +21,13 @@
  *  - Operator chaining: div:has-text(Ad):upward(article) fully supported
  *  - Debounced MutationObserver re-runs (no thrashing)
  *  - Reports hidden element count to background
+ *
+ * The operator list lives in src/shared/proc-ops.js (§3.2, 2026-09): every
+ * name there is tokenised as procedural so it never reaches a CSS joiner;
+ * names this engine does not implement fail closed in `_applyOp`.
  */
+
+import { PROC_OPS, PROC_OP_ALIASES, isProceduralSelector } from '../shared/proc-ops.js';
 
 const STYLE_ID = '__adblock_cosmetic_styles__';
 const EXCEPTION_STYLE_ID = '__adblock_exception_styles__';
@@ -46,39 +52,9 @@ function _reportError(context, err) {
   console.warn(`[Nullify Cosmetic] ${context}: ${err?.message || err}`);
 }
 
-// All known procedural operators in specificity order
-// (longer names must come before shorter prefixes to avoid partial matches)
-const PROC_OPS = [
-  'matches-css-before',
-  'matches-css-after',
-  'matches-css',
-  'has-text',
-  'nth-ancestor',
-  'upward',
-  'min-text-length',
-  'xpath',
-  'watch-attr',
-  'remove',
-  'style',
-  'matches-path',
-  'matches-attr',
-  'if-not',
-  'if',
-  'semantic',
-];
-
 // ---------------------------------------------------------------------------
 // Selector parsing helpers
 // ---------------------------------------------------------------------------
-
-/** Returns true if the selector string contains any procedural operator. */
-function isProceduralSelector(selector) {
-  // Simple check first
-  for (const op of PROC_OPS) {
-    if (selector.includes(':' + op + '(')) return true;
-  }
-  return false;
-}
 
 /**
  * Returned by `extractFirstOp` when an operator's argument list never closes.
@@ -102,9 +78,11 @@ function extractFirstOp(selector) {
     if (ch !== ':' || depth !== 0) continue;
 
     for (const op of PROC_OPS) {
-      if (selector.startsWith(op + '(', i + 1)) {
+      // Case-insensitive, like the Rust matcher and `isProceduralSelector`:
+      // `DIV:Has-Text(x)` must plan here too, not fall through as CSS (§3.2).
+      const argStart = i + 1 + op.length + 1; // skip ':op('
+      if (selector.slice(i + 1, argStart).toLowerCase() === op + '(') {
         const base = selector.slice(0, i).trimEnd();
-        const argStart = i + 1 + op.length + 1; // skip ':op('
 
         // Find matching closing paren with depth tracking
         let d = 1, j = argStart;
@@ -239,18 +217,20 @@ export function parseProceduralPlan(selector) {
       plan.push(makeCssStep(firstOp.base));
     }
 
-    // Add the operator
-    plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
+    // Add the operator under its canonical uBO name: `:-abp-has()` plans as
+    // `has`, so every plan step this parser emits is one `_applyOp` names.
+    plan.push({ type: 'op', op: PROC_OP_ALIASES[firstOp.op] ?? firstOp.op, arg: firstOp.arg });
     remaining = firstOp.rest;
   }
 
   return plan;
 }
 
-/** Operators whose verdict is a function of the element's text content. */
-const TEXT_OPS = new Set(['has-text', 'min-text-length', 'semantic']);
+/** Operators whose verdict is a function of the element's text content.
+ *  `-abp-contains` is `has-text` as the Rust planner spells it (§3.2). */
+const TEXT_OPS = new Set(['has-text', '-abp-contains', 'min-text-length', 'semantic']);
 /** The same operators, as they appear nested inside another operator's argument. */
-const NESTED_TEXT_OP_REGEX = /:(?:has-text|min-text-length|semantic)\(/;
+const NESTED_TEXT_OP_REGEX = /:(?:has-text|-abp-contains|min-text-length|semantic)\(/i;
 
 /**
  * Does any step of this plan read text? A top-level `step.op` check misses
@@ -396,35 +376,24 @@ export class CosmeticEngine {
         continue;
       }
 
-      const isProcedural = isProceduralSelector(selector);
-      
-      // Fast-path: Chrome supports :has(), :not(), :is(), :where() natively now. 
-      // We only use the JS procedural engine if it contains custom Nullify operators.
-      const hasCustomOp = selector.includes(':has-text(') || selector.includes(':upward(') || 
-                         selector.includes(':xpath(') || selector.includes(':matches-css') || 
-                         selector.includes(':min-text-length') || selector.includes(':watch-attr') ||
-                         selector.includes(':nth-ancestor(') || selector.includes(':matches-path(') ||
-                         selector.includes(':matches-attr(') || selector.includes(':remove(') ||
-                         selector.includes(':style(') || selector.includes(':if(') ||
-                         selector.includes(':if-not(');
-
-      if (!hasCustomOp) {
+      // Chrome implements :has(), :not(), :is(), :where() natively; only a
+      // selector carrying one of the shared PROC_OPS needs the JS engine.
+      // The previous hand-kept literal here omitted `semantic` (§5.20) and
+      // every operator the engine had not implemented yet, which sent
+      // `div:others(.x)` to CSS instead of failing it closed (§3.2).
+      if (!isProceduralSelector(selector)) {
         cssSelectors.push(selector);
         continue;
       }
 
-      if (isProcedural) {
-        const plan = parseProceduralPlan(selector);
-        if (!plan || plan.length === 0) {
-          // Malformed line — a partial parse would silently become a
-          // different, valid rule (§5.20).
-          _reportError('Rejected malformed procedural selector', new Error(selector));
-          continue;
-        }
-        this._proceduralRules.push({ selector, plan });
-      } else {
-        cssSelectors.push(selector);
+      const plan = parseProceduralPlan(selector);
+      if (!plan || plan.length === 0) {
+        // Malformed line — a partial parse would silently become a
+        // different, valid rule (§5.20).
+        _reportError('Rejected malformed procedural selector', new Error(selector));
+        continue;
       }
+      this._proceduralRules.push({ selector, plan });
     }
 
     this._cssSelectors = cssSelectors;
@@ -841,7 +810,8 @@ export class CosmeticEngine {
           try { return el.closest(arg.trim()) || null; } catch { return null; }
         }
 
-        case 'has-text': {
+        case 'has-text':
+        case '-abp-contains': {
           let pattern;
           if (arg.startsWith('/')) {
             const lastSlash = arg.lastIndexOf('/');
@@ -859,6 +829,7 @@ export class CosmeticEngine {
         }
 
         case 'matches-css':
+        case '-abp-properties':
         case 'matches-css-before':
         case 'matches-css-after': {
           const pseudo = op === 'matches-css' ? null
@@ -937,8 +908,11 @@ export class CosmeticEngine {
         // exactly `:has()` and its negation. Both were tokenized by PROC_OPS
         // but had no case here, so they hit `default` and reported a match
         // unconditionally — hiding every element the base selector touched.
+        // `-abp-has` is the ABP spelling; the JS planner canonicalises it to
+        // `has`, the Rust planner emits it as written (§3.2).
         case 'has':
         case 'if':
+        case '-abp-has':
           return this._hasDescendantMatch(el, arg) ? el : null;
 
         case 'if-not':
@@ -997,6 +971,17 @@ export class CosmeticEngine {
         case 'where':
           return this._matchesProcedural(el, arg) ? el : null;
 
+        // Tokenised by PROC_OPS so they never reach a CSS joiner (§3.2), but
+        // not implemented here: `:remove-attr()`, `:remove-class()` and
+        // `:others()` land with C1b; `:matches-media()`, `:shadow()` and
+        // `:matches-prop()` have no implementation yet. Listed explicitly so
+        // the gap is visible; they fall through to the fail-closed default.
+        case 'matches-media':
+        case 'shadow':
+        case 'matches-prop':
+        case 'others':
+        case 'remove-attr':
+        case 'remove-class':
         default:
           // Fail closed. An operator the planner emits but this engine does not
           // implement must not be read as "matched" — that turns a parity gap

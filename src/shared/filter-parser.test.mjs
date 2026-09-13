@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { fetchAndExpand, parseLine, parseFilterList, LIST_FETCH_MAX_BYTES } from './filter-parser.js';
+import { fetchAndExpand, parseExpiresHeader, parseLine, parseFilterList, LIST_FETCH_MAX_BYTES } from './filter-parser.js';
 import { FILTER_VECTORS } from '../../tests/fixtures/filter-vectors.mjs';
 import { parseLine as buildParseLine } from '../../scripts/build-rules.mjs';
 
@@ -177,22 +177,19 @@ test('5.9: parallel !#include sub-fetches share ONE byte budget', async () => {
     '!#include d.txt',
   ].join('\n');
 
-  let refused = 0;
-  const originalWarn = console.warn;
-  console.warn = (...args) => { if (String(args[1] ?? '').includes('.txt')) refused++; };
-  try {
-    await withFetch((url) => {
-      if (url.endsWith('root.txt')) return Promise.resolve(textResponse(root, { url }));
-      return Promise.resolve(sizedResponse(perInclude, url));
-    }, async () => {
-      await fetchAndExpand('https://lists.example/root.txt');
-    });
-  } finally {
-    console.warn = originalWarn;
-  }
-
-  // 16 MB budget / 6 MB each: two land, the rest are refused and skipped.
-  assert.ok(refused >= 1, 'the shared budget must cut off later includes');
+  await withFetch((url) => {
+    if (url.endsWith('root.txt')) return Promise.resolve(textResponse(root, { url }));
+    return Promise.resolve(sizedResponse(perInclude, url));
+  }, async () => {
+    // 16 MB budget / 6 MB each: the third include overruns the SHARED budget.
+    // §4.3: an include that fails now fails the list rather than being
+    // skipped, so the overrun surfaces as a rejection naming the budget.
+    await assert.rejects(
+      fetchAndExpand('https://lists.example/root.txt'),
+      /budget/,
+      'the shared budget must cut off later includes',
+    );
+  });
 });
 
 test('5.9: the budget is not refilled per include — one huge child fails the list', async () => {
@@ -202,42 +199,33 @@ test('5.9: the budget is not refilled per include — one huge child fails the l
     }
     return Promise.resolve(sizedResponse(LIST_FETCH_MAX_BYTES + 1, url));
   }, async () => {
-    let warned = '';
-    const originalWarn = console.warn;
-    console.warn = (...args) => { warned += args.map(String).join(' '); };
-    try {
-      const text = await fetchAndExpand('https://lists.example/root.txt');
-      assert.equal(text.trim(), '', 'the oversized include must contribute nothing');
-    } finally {
-      console.warn = originalWarn;
-    }
-    assert.match(warned, /budget/);
+    // §4.3: the oversized include fails the whole list (it used to be
+    // skipped with a console.warn and the list stored without it).
+    await assert.rejects(
+      fetchAndExpand('https://lists.example/root.txt'),
+      /huge\.txt.*budget/,
+    );
   });
 });
 
 test('5.9: an http:// include inside an https list is refused, never fetched', async () => {
   const fetched = [];
-  let warned = '';
-  const originalWarn = console.warn;
-  console.warn = (...args) => { warned += args.map(String).join(' '); };
-  try {
-    await withFetch((url) => {
-      fetched.push(url);
-      return Promise.resolve(textResponse(
-        url.endsWith('root.txt') ? '!#include http://lists.example/sub.txt' : 'evil',
-        { url },
-      ));
-    }, async () => {
-      const text = await fetchAndExpand('https://lists.example/root.txt');
-      assert.equal(text.trim(), '', 'a plaintext include must expand to nothing');
-    });
-  } finally {
-    console.warn = originalWarn;
-  }
+  await withFetch((url) => {
+    fetched.push(url);
+    return Promise.resolve(textResponse(
+      url.endsWith('root.txt') ? '!#include http://lists.example/sub.txt' : 'evil',
+      { url },
+    ));
+  }, async () => {
+    // §4.3: refused means the list is rejected, not expanded with a hole.
+    await assert.rejects(
+      fetchAndExpand('https://lists.example/root.txt'),
+      /insecure include/i,
+    );
+  });
 
   assert.deepEqual(fetched, ['https://lists.example/root.txt'],
     'the http include must never reach fetch()');
-  assert.match(warned, /insecure include/i);
 });
 
 test('5.9: https includes, absolute and relative, still resolve', async () => {
@@ -254,4 +242,99 @@ test('5.9: https includes, absolute and relative, still resolve', async () => {
     assert.match(text, /REL/);
     assert.match(text, /ABS/);
   });
+});
+
+// --- §4.3 (2026-09): an !#include that fails fails the whole list ------------
+//
+// The build has thrown on a failed sub-file since 2026-08 §5.10; the runtime
+// copy kept returning '' for the include, and `fetchAndStoreRemoteFilterSources`
+// then stored the surviving fraction over a good list and reported success.
+
+test('4.3: a failed include rejects the whole list', async () => {
+  const fetched = [];
+  await withFetch((url) => {
+    fetched.push(url);
+    if (url.endsWith('easylist.txt')) {
+      return Promise.resolve(textResponse(
+        'example.com##.top-level-rule\n!#include easylist_general_block.txt',
+        { url },
+      ));
+    }
+    return Promise.resolve({ ok: false, status: 404, url });
+  }, async () => {
+    await assert.rejects(
+      fetchAndExpand('https://lists.example/easylist.txt'),
+      /easylist_general_block\.txt.*HTTP 404/,
+      'a 404 on a sub-file must reject, naming the include URL',
+    );
+  });
+  assert.ok(fetched.some((u) => u.endsWith('easylist_general_block.txt')),
+    'the include must have been attempted');
+});
+
+test('4.3: an insecure include rejects instead of silently vanishing', async () => {
+  const fetched = [];
+  await withFetch((url) => {
+    fetched.push(url);
+    return Promise.resolve(textResponse(
+      url.endsWith('root.txt') ? '!#include http://lists.example/sub.txt' : 'evil',
+      { url },
+    ));
+  }, async () => {
+    await assert.rejects(
+      fetchAndExpand('https://lists.example/root.txt'),
+      /insecure include/i,
+    );
+  });
+  assert.deepEqual(fetched, ['https://lists.example/root.txt'],
+    'the http include must never reach fetch()');
+});
+
+test('4.3: an include chain deeper than 5 levels rejects', async () => {
+  // Every file includes the next one: root -> d1 -> d2 -> ... — never bottoms
+  // out. The depth guard used to return '' and let the truncated list through.
+  await withFetch((url) => {
+    const level = Number((url.match(/d(\d+)\.txt$/) || [])[1] ?? 0);
+    return Promise.resolve(textResponse(`!#include d${level + 1}.txt`, { url }));
+  }, async () => {
+    await assert.rejects(
+      fetchAndExpand('https://lists.example/d0.txt'),
+      /depth/i,
+    );
+  });
+});
+
+test('4.3 (didn\'t re-break): a list with no includes still resolves', async () => {
+  await withFetch(() => Promise.resolve(textResponse('||ads.example^\n')), async () => {
+    const text = await fetchAndExpand('https://lists.example/a.txt');
+    assert.equal(text.trim(), '||ads.example^');
+  });
+});
+
+// --- `! Expires:` header (Track A2a consumes this for per-list cadence) -------
+
+test('parseExpiresHeader: "8 hours" -> 480 minutes', () => {
+  const text = '[Adblock Plus 2.0]\n! Title: quick fixes\n! Expires: 8 hours\n! Version: 1\n';
+  assert.equal(parseExpiresHeader(text), 480);
+});
+
+test('parseExpiresHeader: "4 days" -> 5760 minutes', () => {
+  assert.equal(parseExpiresHeader('! Title: EasyList\n! Expires: 4 days (update frequency)\n'), 5760);
+});
+
+test('parseExpiresHeader: minutes, singular units, spacing and case', () => {
+  assert.equal(parseExpiresHeader('!Expires:90 minutes\n'), 90);
+  assert.equal(parseExpiresHeader('!  expires:  1 Day\n'), 1440);
+  assert.equal(parseExpiresHeader('! EXPIRES: 1 hour\n'), 60);
+});
+
+test('parseExpiresHeader: absent, malformed, or past the 50-line header window -> null', () => {
+  assert.equal(parseExpiresHeader('! Title: nothing here\n||ads.example^\n'), null);
+  assert.equal(parseExpiresHeader('! Expires: soon\n'), null);
+  assert.equal(parseExpiresHeader(''), null);
+  assert.equal(parseExpiresHeader(null), null);
+  const late = Array(50).fill('! filler').concat('! Expires: 8 hours').join('\n');
+  assert.equal(parseExpiresHeader(late), null, 'line 51 is outside the header window');
+  const edge = Array(49).fill('! filler').concat('! Expires: 8 hours').join('\n');
+  assert.equal(parseExpiresHeader(edge), 480, 'line 50 is inside the header window');
 });

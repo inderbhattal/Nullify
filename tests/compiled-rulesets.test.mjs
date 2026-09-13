@@ -162,6 +162,16 @@ test('malware.json blocks navigations (has a main_frame block)', { skip }, () =>
   const entry = resources.find((r) => r.id === 'malware');
   assert.ok(entry, 'manifest must declare the malware ruleset');
   const rules = loadRules(entry);
+  if (rules.length === 0) {
+    // `npm run build:sample-rules` emits an empty malware shard (and a
+    // one-rule easylist); a full build never does. Only the sample shape is
+    // excused — an empty malware shard next to a real easylist is the dead
+    // list this test exists to catch.
+    const easylist = resources.find((r) => r.id === 'easylist');
+    const sampleBuild = easylist && loadRules(easylist).length < 10;
+    assert.ok(sampleBuild, 'malware.json is empty in a non-sample build');
+    return;
+  }
   assert.ok(
     rules.some((r) => r.action?.type === 'block' && (r.condition?.resourceTypes || []).includes('main_frame')),
     'malware.json has no block rule covering main_frame',

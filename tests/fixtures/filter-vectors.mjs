@@ -42,6 +42,40 @@ export const FILTER_VECTORS = [
     expect: { kind: 'cosmetic', domains: ['a.com', 'b.com'], excludedDomains: [], selector: '.shared-ad', exception: false },
   },
 
+  // --- native functional pseudo-classes (§3.2 must-not-change) -----------
+  // These are CSS, not procedural operators. They must classify as cosmetic
+  // in every parser and survive the CSS-safety gate in the Rust joiners; the
+  // gate now refuses unknown functional pseudo-classes and must not take
+  // these with it.
+  {
+    line: 'example.com##div:not(.x)',
+    expect: { kind: 'cosmetic', domains: ['example.com'], excludedDomains: [], selector: 'div:not(.x)', exception: false },
+  },
+  {
+    line: 'example.com##div:is(.a, .b)',
+    expect: { kind: 'cosmetic', domains: ['example.com'], excludedDomains: [], selector: 'div:is(.a, .b)', exception: false },
+  },
+  {
+    line: 'example.com##div:where(.a)',
+    expect: { kind: 'cosmetic', domains: ['example.com'], excludedDomains: [], selector: 'div:where(.a)', exception: false },
+  },
+  {
+    line: 'example.com##li:nth-child(2n+1)',
+    expect: { kind: 'cosmetic', domains: ['example.com'], excludedDomains: [], selector: 'li:nth-child(2n+1)', exception: false },
+  },
+  {
+    line: 'example.com##p:nth-of-type(2)',
+    expect: { kind: 'cosmetic', domains: ['example.com'], excludedDomains: [], selector: 'p:nth-of-type(2)', exception: false },
+  },
+  {
+    line: '##:lang(en) .ad',
+    expect: { kind: 'cosmetic', domains: [], excludedDomains: [], selector: ':lang(en) .ad', exception: false },
+  },
+  {
+    line: 'example.com##div:has(a[href*="/ads/"]):not(.keep)',
+    expect: { kind: 'cosmetic', domains: ['example.com'], excludedDomains: [], selector: 'div:has(a[href*="/ads/"]):not(.keep)', exception: false },
+  },
+
   // --- wildcard-TLD scoping ----------------------------------------------
   // These must classify as cosmetic/scriptlet. Treating them as network rules
   // shipped 3,130 garbage block rules whose urlFilter was the whole line.

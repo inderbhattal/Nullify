@@ -10,6 +10,11 @@ import {
   networkFilterToDNR,
 } from '../scripts/build-rules.mjs';
 import { parseLine as runtimeParseLine } from '../src/shared/filter-parser.js';
+import {
+  PROC_OPS,
+  NATIVE_FUNCTIONAL_PSEUDO_CLASSES,
+  isProceduralSelector,
+} from '../src/shared/proc-ops.js';
 
 /**
  * The fourth parity leg: the shipped WASM artifact, driven from Node.
@@ -375,4 +380,220 @@ test('user-filter bands equal the static compiler bands, number for number', { s
   for (const line of [`@@${pattern}$important`, '||x^$important,redirect=noop.js']) {
     assert.ok(allowlist[0].priority > staticPriority(line), line);
   }
+});
+
+// ---------------------------------------------------------------------------
+// §3.2 — unknown functional pseudo-classes never reach a CSS joiner
+// ---------------------------------------------------------------------------
+
+// The functional pseudo-classes a browser knows (`NATIVE_FUNCTIONAL_PSEUDO_
+// CLASSES` in src/shared/proc-ops.js, mirrored by the Rust constant of the
+// same name). Anything else after a single colon and before a `(` invalidates
+// the selector, and — because both joiners comma-join up to 150 selectors
+// into one declaration — the whole chunk.
+
+/**
+ * Every single-colon functional pseudo-class name in a CSS text, lowercased.
+ * Quoted strings are blanked first (`[href*=":ad("]` is data), and `::part(`
+ * is a pseudo-element, not a pseudo-class.
+ */
+function functionalPseudoClassesIn(css) {
+  const unquoted = css.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
+  const names = [];
+  for (const m of unquoted.matchAll(/(?<!:):([a-z_-][a-z0-9_-]*)\(/gi)) {
+    names.push(m[1].toLowerCase());
+  }
+  return names;
+}
+
+const bothJoiners = (input) => [
+  ['sanitize_and_compact_selectors', wasm.sanitize_and_compact_selectors(input, 100)],
+  ['build_css_from_selectors', wasm.build_css_from_selectors(input, '', 100)],
+];
+
+test('3.2: build_css_from_selectors never joins an unknown functional pseudo-class', { skip }, () => {
+  // The review's five-line input, verbatim.
+  const input = '.good-one\ndiv:others(.x)\n.good-two\n.a >>> .b\n.good-three';
+  for (const [label, css] of bothJoiners(input)) {
+    for (const good of ['.good-one', '.good-two', '.good-three']) {
+      assert.ok(css.includes(good), `${label}: ${good} must survive: ${css}`);
+    }
+    assert.ok(!css.includes('div:others('), `${label}: :others() must be dropped: ${css}`);
+    assert.ok(!css.includes(':others('), `${label}: ${css}`);
+  }
+
+  // Unknown names fail alone, at any nesting depth; the bracketed look-alike
+  // is data and survives.
+  for (const bad of ['div:bogus(1)', 'div:not(:bogus(1))', 'div:remove-attr(x)',
+    'html.show-intro-popup:remove-class(show-intro-popup)']) {
+    for (const [label, css] of bothJoiners(`${bad}\n.keep-me`)) {
+      assert.ok(!css.includes(bad), `${label}: ${bad} must be dropped: ${css}`);
+      assert.ok(css.includes('.keep-me'), `${label}: neighbour must survive: ${css}`);
+    }
+  }
+  for (const [label, css] of bothJoiners('[data-x=":bogus("]')) {
+    assert.ok(css.includes('[data-x=":bogus("]'), `${label}: ${css}`);
+  }
+
+  // Pseudo-element names are ASCII case-insensitive too: `::BEFORE` is valid
+  // CSS and survives; `::Before2` is as non-existent as `::before2`.
+  for (const [label, css] of bothJoiners('div::BEFORE\nx::Part(label)\ndiv::Before2')) {
+    assert.ok(css.includes('div::BEFORE'), `${label}: ${css}`);
+    assert.ok(css.includes('x::Part(label)'), `${label}: ${css}`);
+    assert.ok(!css.includes('Before2'), `${label}: ${css}`);
+  }
+});
+
+test('3.2: build_page_bundle plans :others()/:remove-attr()/:remove-class() as procedural', { skip }, () => {
+  const selectors = [
+    'div:others(.x)',
+    'div:remove-attr(data-x)',
+    'html.show-intro-popup:remove-class(show-intro-popup)',
+    'div:shadow(.x)',
+    'div:matches-media((min-width: 800px))',
+    'div:matches-prop(x)',
+    'div:-abp-has(.x)',
+    'div:-abp-contains(ad)',
+    'div:-abp-properties(width: 300px)',
+  ];
+  const bundle = wasm.build_page_bundle([], selectors, [], 100);
+  assert.equal(bundle.cssText, '', 'none of these is CSS');
+  assert.equal(bundle.rules.domainSpecific.length, selectors.length);
+  for (const [i, selector] of selectors.entries()) {
+    const rule = bundle.rules.domainSpecific[i];
+    assert.equal(rule.selector, selector);
+    const op = rule.plan.find((step) => step.type === 'op');
+    assert.ok(op, `${selector} must plan an op step: ${JSON.stringify(rule.plan)}`);
+    assert.equal(op.op, /:(-?[a-z-]+)\(/.exec(selector)[1], selector);
+  }
+
+  // Same classification from the batch planner the content script uses.
+  const planned = JSON.parse(wasm.plan_selector_rules_json(JSON.stringify(selectors)));
+  assert.deepEqual(planned.cssSelectors, []);
+  assert.equal(planned.proceduralRules.length, selectors.length);
+});
+
+test('3.2 (didn\'t re-break): native functional pseudo-classes survive the gate', { skip }, () => {
+  const good = [
+    'div:has(.x)',
+    'div:not(.x)',
+    ':is(.a, .b)',
+    ':where(.a)',
+    'li:nth-child(2n+1)',
+    'li:nth-last-child(1)',
+    'p:nth-of-type(2)',
+    'p:nth-last-of-type(2)',
+    'td:nth-col(2)',
+    ':lang(en)',
+    ':dir(rtl)',
+    ':host(.x)',
+    ':host-context(.dark)',
+    'x:state(open)',
+    'li:nth-child(2n+1 of :not([hidden]))',
+    'div:HAS(.x)',
+    'div:Not(:Is(.x))',
+    'a:hover:not(.x)',
+    'div::before',
+    'x::part(label)',
+  ];
+  for (const [label, css] of bothJoiners(good.join('\n'))) {
+    for (const selector of good) {
+      assert.ok(css.includes(selector), `${label}: ${selector} must survive: ${css}`);
+    }
+    for (const name of functionalPseudoClassesIn(css)) {
+      assert.ok(NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name), `${label}: ${name}`);
+    }
+  }
+
+  // …and every shared vector that carries one is emitted, not dropped.
+  const nativeRe = /:(?:has|not|is|where|nth-[a-z-]+|lang)\(/i;
+  const vectored = FILTER_VECTORS
+    .filter(({ expect }) => expect.kind === 'cosmetic' && !expect.exception)
+    .map(({ expect }) => expect.selector)
+    .filter((selector) => nativeRe.test(selector));
+  assert.ok(vectored.length >= 6, 'the vector table must carry native pseudo-class selectors');
+  const css = wasm.build_css_from_selectors(vectored.join('\n'), '', 100);
+  for (const selector of vectored) {
+    assert.ok(css.includes(selector), `${selector} must survive: ${css}`);
+  }
+});
+
+// Corpus-wide: for every vendored list, every selector that the source parser
+// hands to the CSS joiner must, once joined, carry only native functional
+// pseudo-classes. This is the assertion the review's 289-domain scan made by
+// hand.
+test('3.2: no selector reaching the CSS joiner in the vendored corpus carries a functional pseudo-class outside the native set', { skip }, () => {
+  const listDir = path.join(ROOT, 'scripts', 'filter-lists');
+  const lists = fs.readdirSync(listDir).filter((f) => f.endsWith('.txt')).sort();
+  assert.ok(lists.length > 0, 'vendored filter lists must be present');
+
+  let seen = 0;
+  const offenders = new Map(); // name -> first selector
+  for (const file of lists) {
+    const bundle = wasm.parse_filter_source(fs.readFileSync(path.join(listDir, file), 'utf8'));
+    const selectors = [
+      ...(bundle?.cosmetic?.generic ?? []),
+      ...Object.values(bundle?.cosmetic?.domainSpecific ?? {}).flat(),
+    ];
+    seen += selectors.length;
+    const css = wasm.build_css_from_selectors(selectors.join('\n'), '', 100);
+    for (const rule of css.split('\n')) {
+      for (const name of functionalPseudoClassesIn(rule)) {
+        if (!NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name) && !offenders.has(name)) {
+          const sample = rule.split(',').find((s) => s.toLowerCase().includes(`:${name}(`));
+          offenders.set(name, `${file}: ${sample}`);
+        }
+      }
+    }
+  }
+  assert.ok(seen > 10_000, `the corpus must yield real selectors, saw ${seen}`);
+  assert.deepEqual(
+    [...offenders.entries()],
+    [],
+    'non-native functional pseudo-classes reached a CSS declaration',
+  );
+});
+
+// The seam: the Rust core's operator list versus the shared JS one (C1a),
+// which the content engine and the SW both import. A name in one and not the
+// other is a selector that one engine plans as procedural and the other ships
+// as (dead) CSS — §5.20's defect, and §3.2's. Element by element: both lists
+// are longest-first within a shared prefix for their linear scanners, so the
+// order is part of the contract too.
+test('PROC_OPS: the engine, the SW and the Rust core list the same operator names', { skip }, () => {
+  const rust = JSON.parse(wasm.proc_op_names());
+  assert.ok(rust.length > 0);
+  assert.deepEqual(rust, [...PROC_OPS]);
+  assert.equal(new Set(rust).size, rust.length, 'no duplicate operator names');
+  for (const name of rust) {
+    assert.ok(!NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name), `${name} is native CSS, not an operator`);
+  }
+});
+
+// `DIV:Has-Text(x)` is one rule to the SW's case-insensitive regex; it must be
+// the same rule to the Rust planner, or which engine handled the page decides
+// whether the rule fires.
+test('3.2: the operator matcher is case-insensitive in both engines', { skip }, () => {
+  const selector = 'DIV:Has-Text(x)';
+
+  // Rust: detected, planned, and planned under the canonical operator name.
+  const bundle = wasm.build_page_bundle([], [selector], [], 100);
+  assert.equal(bundle.cssText, '', 'must not be emitted as CSS');
+  assert.equal(bundle.rules.domainSpecific.length, 1);
+  assert.deepEqual(
+    bundle.rules.domainSpecific[0].plan.map(({ type, selector: s, op, arg }) => ({ type, s, op, arg })),
+    [
+      { type: 'css', s: 'DIV', op: undefined, arg: undefined },
+      { type: 'op', s: undefined, op: 'has-text', arg: 'x' },
+    ],
+  );
+  const planned = JSON.parse(wasm.plan_selector_rules_json(JSON.stringify([selector])));
+  assert.equal(planned.proceduralRules.length, 1);
+  assert.deepEqual(planned.cssSelectors, []);
+
+  // JS: the shared detector the SW and the content engine both import.
+  assert.ok(isProceduralSelector(selector), `JS must detect ${selector}`);
+  assert.ok(isProceduralSelector('div:others(.x)'), 'JS must detect the new operators');
+  assert.ok(!isProceduralSelector('div:has(.x)'), 'a native pseudo-class is not an operator');
+  assert.ok(!isProceduralSelector('div:HAS(.x)'), 'in any case');
 });

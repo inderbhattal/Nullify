@@ -1526,29 +1526,94 @@ impl UrlSanitizer {
 // Procedural Selector Planning
 // ---------------------------------------------------------------------------
 
-/// All uBO/ABP procedural operators, longest-first to prevent partial prefix matches.
+/// All uBO/ABP procedural operators — THE list (§3.2). `proc_op_ac`
+/// (detection), `extract_first_op` (planning) and the `proc_op_names()` export
+/// are all generated from it; the JS engines are pinned to the export by
+/// `tests/wasm-parity.test.mjs`. Two hand-kept copies meant a name present in
+/// one and absent from the other: detected as procedural, planned as CSS.
+///
+/// Longest-first within a shared prefix, so the linear scan in
+/// `extract_first_op` cannot let `if` shadow `if-not`. Names are canonical
+/// lowercase; matching is ASCII case-insensitive everywhere (`DIV:Has-Text(x)`
+/// is one rule to the SW's `/i` regex and must be the same rule here).
+///
+/// The uBO action/predicate operators this core does not implement
+/// (`others`, `remove-attr`, `remove-class`, `shadow`, `matches-media`,
+/// `matches-prop`) and the three ABP aliases are listed so they are planned
+/// as procedural — and fail closed in the content engine — instead of passing
+/// the CSS gate as a pseudo-class no browser knows and taking a whole
+/// comma-joined declaration of legitimate hides down with them.
+const PROC_OP_NAMES: [&str; 25] = [
+    "matches-css-before",
+    "matches-css-after",
+    "matches-css",
+    "has-text",
+    "nth-ancestor",
+    "upward",
+    "min-text-length",
+    "xpath",
+    "watch-attr",
+    "remove-attr",
+    "remove-class",
+    "remove",
+    "style",
+    "matches-path",
+    "matches-attr",
+    "matches-media",
+    "matches-prop",
+    "shadow",
+    "others",
+    "-abp-properties",
+    "-abp-contains",
+    "-abp-has",
+    "if-not",
+    "if",
+    "semantic",
+];
+
+/// The functional pseudo-classes a browser knows. A single-colon `:name(`
+/// outside brackets and quotes whose name is not here is invalid CSS, and a
+/// selector list containing one invalid selector is discarded whole (CSS
+/// Selectors 4; only `:is()`/`:where()` forgive) — so it must never reach a
+/// joiner. Procedural operator names never reach the check that uses this
+/// list (`is_css_safe_selector` tests `contains_proc_op` first), so none is
+/// listed here. Non-functional pseudo-classes (`:hover`) are not gated:
+/// accepted residual, the allowlist would be long and brittle (§4.6).
+const NATIVE_FUNCTIONAL_PSEUDO_CLASSES: [&str; 15] = [
+    "not",
+    "is",
+    "where",
+    "has",
+    "nth-child",
+    "nth-last-child",
+    "nth-of-type",
+    "nth-last-of-type",
+    "nth-col",
+    "nth-last-col",
+    "lang",
+    "dir",
+    "host",
+    "host-context",
+    "state",
+];
+
+/// The operator list as a JSON array, for the JS side to pin itself against.
+#[wasm_bindgen]
+pub fn proc_op_names() -> String {
+    serde_json::to_string(&PROC_OP_NAMES).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn proc_op_ac() -> &'static AhoCorasick {
     static AC: OnceLock<AhoCorasick> = OnceLock::new();
     AC.get_or_init(|| {
-        AhoCorasick::new([
-            ":matches-css-before(",
-            ":matches-css-after(",
-            ":matches-css(",
-            ":has-text(",
-            ":nth-ancestor(",
-            ":min-text-length(",
-            ":matches-path(",
-            ":matches-attr(",
-            ":watch-attr(",
-            ":upward(",
-            ":remove(",
-            ":style(",
-            ":xpath(",
-            ":if-not(",
-            ":semantic(",
-            ":if(",
-        ])
-        .unwrap()
+        let patterns: Vec<String> = PROC_OP_NAMES
+            .iter()
+            .map(|name| format!(":{name}("))
+            .collect();
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&patterns)
+            .unwrap()
     })
 }
 
@@ -1664,25 +1729,6 @@ fn find_matching_paren(selector: &str, start: usize) -> Option<usize> {
 }
 
 fn extract_first_op(selector: &str) -> Option<FirstOp> {
-    let proc_ops = [
-        "matches-css-before",
-        "matches-css-after",
-        "matches-css",
-        "has-text",
-        "nth-ancestor",
-        "upward",
-        "min-text-length",
-        "xpath",
-        "watch-attr",
-        "remove",
-        "style",
-        "matches-path",
-        "matches-attr",
-        "if-not",
-        "if",
-        "semantic",
-    ];
-
     let mut depth = 0i32;
     for (idx, ch) in selector.char_indices() {
         match ch {
@@ -1699,9 +1745,16 @@ fn extract_first_op(selector: &str) -> Option<FirstOp> {
         }
 
         let after_colon = idx + ch.len_utf8();
-        for op in proc_ops {
-            let needle = format!("{op}(");
-            if selector[after_colon..].starts_with(&needle) {
+        let tail = &selector[after_colon..];
+        for op in PROC_OP_NAMES {
+            // `name(`, ASCII case-insensitively. `get` refuses a non-boundary
+            // slice; the `(` byte at `op.len()` makes that offset a boundary.
+            let matched = tail
+                .get(..op.len() + 1)
+                .is_some_and(|head| {
+                    head.as_bytes()[op.len()] == b'(' && head[..op.len()].eq_ignore_ascii_case(op)
+                });
+            if matched {
                 let base = selector[..idx].trim_end().to_string();
                 let arg_start = after_colon + op.len() + 1;
                 let close = find_matching_paren(selector, arg_start)?;
@@ -2020,13 +2073,59 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
                 // continue an identifier: `(` for the functional forms
                 // (`::part(x)`, `::slotted(x)`), a combinator, a selector-list
                 // comma, an attribute/pseudo continuation, or end of input.
+                // Names are ASCII case-insensitive: `::BEFORE` is valid CSS.
                 let known = KNOWN_PSEUDO_ELEMENTS.iter().any(|p| {
-                    rest.strip_prefix(p)
-                        .is_some_and(|after| !starts_with_ident_char(after))
+                    rest.get(..p.len()).is_some_and(|head| {
+                        head.eq_ignore_ascii_case(p) && !starts_with_ident_char(&rest[p.len()..])
+                    })
                 });
                 if !known {
                     // Unknown pseudo-element — could be bypass attempt
                     return true;
+                }
+            }
+            // Pseudo-class safety (§3.2): a single-colon *functional*
+            // pseudo-class must be one a browser knows. `div:others(.x)` —
+            // a uBO operator that was not in the operator set — passed here
+            // as if it were CSS and was joined with up to 149 legitimate
+            // selectors; the browser discarded the whole declaration, and
+            // every domain-specific hide on 289 sites died silently.
+            //
+            // Outside brackets and quotes only (`[data-x=":bogus("]` is
+            // data), at ANY paren depth (`:not(:bogus(x))` is as invalid as
+            // `:bogus(x)`), and never the second colon of a `::` pair.
+            // Procedural operators never reach this function (the caller
+            // checks `contains_proc_op` first), so their names are absent
+            // from the allowlist by design. Non-functional pseudo-classes
+            // (`:hover`) are not gated — accepted residual (§4.6).
+            ':' if bracket_depth == 0 && prev_char != Some(':') => {
+                let tail = &selector[idx + 1..];
+                let bytes = tail.as_bytes();
+                // Identifier: `[A-Za-z_-][A-Za-z0-9_-]*`. The leading `-`
+                // admits `-abp-*`, which are operators and never arrive here.
+                let mut name_len = 0;
+                while name_len < bytes.len() {
+                    let b = bytes[name_len];
+                    let ident = b.is_ascii_alphabetic()
+                        || b == b'_'
+                        || b == b'-'
+                        || (name_len > 0 && b.is_ascii_digit());
+                    if !ident {
+                        break;
+                    }
+                    name_len += 1;
+                }
+                if name_len == 0 {
+                    continue;
+                }
+                if bytes.get(name_len) == Some(&b'(') {
+                    let name = &tail[..name_len];
+                    let native = NATIVE_FUNCTIONAL_PSEUDO_CLASSES
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(name));
+                    if !native {
+                        return true;
+                    }
                 }
             }
             _ => {}
@@ -4000,6 +4099,134 @@ mod tests {
             sanitizer.sanitize("https://x.example/p"),
             "https://x.example/p"
         );
+    }
+
+    // §3.2 — an unknown single-colon functional pseudo-class (`div:bogus(1)`,
+    // or a uBO operator this core never learned, `div:others(.x)`) is invalid
+    // CSS. Comma-joined with up to 149 legitimate selectors it takes the whole
+    // declaration down with it, silently: every domain-specific hide on that
+    // site is dead and nothing observes it. Refuse it alone; never join it.
+    #[test]
+    fn css_safety_gate_rejects_unknown_functional_pseudo_classes() {
+        // The review's input, through the joiner the SW's page-bundle path
+        // feeds: the bad line drops, its neighbours' declaration survives.
+        assert_eq!(
+            build_css_from_selectors(".good-one\ndiv:others(.x)\n.good-two", "", 100),
+            ".good-one,.good-two { display: none !important; visibility: hidden !important; }"
+        );
+        assert_eq!(build_css_from_selectors("div:bogus(1)", "", 100), "");
+        // Nested inside a native pseudo-class: still refused (any paren depth).
+        assert_eq!(build_css_from_selectors("div:not(:bogus(1))", "", 100), "");
+        // Pseudo-class names are ASCII case-insensitive in CSS.
+        assert!(build_css_from_selectors("div:HAS(.x)", "", 100).contains("div:HAS(.x)"));
+        // Inside an attribute value the text is data, not a pseudo-class.
+        assert!(build_css_from_selectors("[data-x=\":bogus(\"]", "", 100)
+            .contains("[data-x=\":bogus(\"]"));
+        // A former CSS-passing uBO operator is an operator now: planned as
+        // procedural by the bundle builder, never emitted as CSS.
+        let bundle =
+            build_page_bundle_internal(vec![], vec!["div:others(.x)".into()], vec![], 100);
+        assert_eq!(bundle.css_text, "");
+        assert_eq!(bundle.rules.domain_specific.len(), 1);
+        assert_eq!(bundle.rules.domain_specific[0].selector, "div:others(.x)");
+        assert_eq!(
+            bundle.rules.domain_specific[0].plan[1].op.as_deref(),
+            Some("others")
+        );
+
+        for bad in [
+            "div:bogus(1)",
+            "div:not(:bogus(1))",
+            "a:Bogus(x)",
+            "div:nth-child(2):bogus()",
+            ".a:is(.b, :bogus(c))",
+            // Pseudo-element prefix shapes, now compared case-insensitively:
+            // `::Before2` is as non-existent as `::before2`.
+            "div::Before2",
+            "div::AFTERWARD",
+        ] {
+            assert!(has_invalid_universal_usage(bad), "{bad} must be flagged");
+            assert!(!is_css_safe_selector(bad), "{bad} must be refused");
+        }
+
+        // Must not change: every native functional pseudo-class, in any case;
+        // non-functional pseudo-classes (not gated — accepted residual); quoted
+        // and bracketed look-alikes; pseudo-elements in any case.
+        for ok in [
+            "div:has(.x)",
+            "div:not(.x)",
+            ":is(.a, .b)",
+            ":where(.a)",
+            "li:nth-child(2n+1)",
+            "li:nth-last-child(1)",
+            "p:nth-of-type(2)",
+            "p:nth-last-of-type(2)",
+            "td:nth-col(2)",
+            "td:nth-last-col(2)",
+            ":lang(en)",
+            ":dir(rtl)",
+            ":host(.x)",
+            ":host-context(.dark)",
+            "x:state(open)",
+            "a:hover",
+            "a:hover:not(.x)",
+            "li:nth-child(2n+1 of :not([hidden]))",
+            "div:HAS(.x)",
+            "div:Not(:Is(.x))",
+            "[data-x=\":bogus(\"]",
+            "a[title=':bogus(']",
+            "div::BEFORE",
+            "div::Before",
+            "input::PLACEHOLDER",
+            "x::Part(label)",
+            "div::before:hover",
+        ] {
+            assert!(!has_invalid_universal_usage(ok), "{ok} must not be flagged");
+            assert!(is_css_safe_selector(ok), "{ok} must stay CSS-safe");
+        }
+    }
+
+    // §3.2 — one operator list. `proc_op_ac` (detection) and `extract_first_op`
+    // (planning) used to be two hand-kept arrays; a name present in one and
+    // not the other is a selector detected as procedural but planned as CSS.
+    // Both are generated from `PROC_OP_NAMES`, and `proc_op_names()` exports
+    // it so the JS engines can be pinned to the same list.
+    #[test]
+    fn proc_op_names_match_the_aho_corasick_and_first_op_lists() {
+        assert_eq!(proc_op_ac().patterns_len(), PROC_OP_NAMES.len());
+        let exported: Vec<String> = serde_json::from_str(&proc_op_names()).unwrap();
+        let expected: Vec<String> = PROC_OP_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(exported, expected);
+
+        for name in PROC_OP_NAMES {
+            assert_eq!(name, name.to_ascii_lowercase(), "{name} must be canonical");
+            let lower = format!("div:{name}(x)");
+            assert!(contains_proc_op(&lower), "{lower}");
+            assert_eq!(extract_first_op(&lower).unwrap().op, name, "{lower}");
+            // Detection and planning are both ASCII case-insensitive, and the
+            // planned op name is the canonical lowercase one.
+            let upper = format!("DIV:{}(x)", name.to_ascii_uppercase());
+            assert!(contains_proc_op(&upper), "{upper}");
+            let first = extract_first_op(&upper).unwrap();
+            assert_eq!(first.op, name, "{upper}");
+            assert_eq!(first.base, "DIV");
+            assert_eq!(first.arg, "x");
+        }
+
+        // Longest-first within a shared prefix: no name is a prefix of a
+        // later one, so `if` cannot shadow `if-not` in the linear scan.
+        for (i, shorter) in PROC_OP_NAMES.iter().enumerate() {
+            for longer in &PROC_OP_NAMES[i + 1..] {
+                assert!(!longer.starts_with(shorter), "{shorter} must follow {longer}");
+            }
+        }
+
+        // The two lists are disjoint by construction: an operator never reaches
+        // `has_invalid_universal_usage`, and a native pseudo-class is never
+        // planned as an operator.
+        for native in NATIVE_FUNCTIONAL_PSEUDO_CLASSES {
+            assert!(!PROC_OP_NAMES.contains(&native), "{native} is native CSS");
+        }
     }
 }
 

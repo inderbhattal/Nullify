@@ -419,3 +419,307 @@ export const FILTER_VECTORS = [
   { line: '||ads.example.com^$script,third-party', expect: { kind: 'network' } },
   { line: '@@||safe.example.com^', expect: { kind: 'network' } },
 ];
+
+/**
+ * Network-option vectors (§3.3).
+ *
+ * A separate class from `FILTER_VECTORS`: those pin *classification* across
+ * the parsers; these pin what a network line COMPILES to — drop or emit, and
+ * for the mapped modifiers the DNR condition — across the three compilers
+ * that turn a user's line into a DNR rule: the build's `networkFilterToDNR`,
+ * the Rust core's `compile_user_filters`, and the SW's WASM-down fallback
+ * `parseSimpleNetworkRule`.
+ *
+ * `expect.emit` is the specification (REMEDIATION-2026-09 §3.3 table).
+ * `expect.condition`, when present, is the DNR condition the Rust compiler
+ * must produce (`isUrlFilterCaseSensitive` omitted unless `$match-case`).
+ *
+ * `expect.build`, when present, pins the build engine's CURRENT answer where
+ * it is known to differ from the specification, with the reason — `emit`,
+ * and `condition` where the build emits both before and after the fix so
+ * the flag alone could not go stale. Two kinds:
+ *  - dated: the build catches up later (D1 §4.1/§4.2 — `$all`, `$to=`,
+ *    `$from=`, `$denyallow=`, `$method=`, scoped `*`; Track D's findings on
+ *    digit-first option lists, `~domain=`, empty `~` entries, contradictory
+ *    type lists). The pinned answer then stops matching and the parity test
+ *    fails until the pin is removed.
+ *  - permanent: user filters have no resource library and no punycoder
+ *    (`$redirect=`, literal `$removeparam=`, non-ASCII `$domain=`).
+ * The runtime fallback is allowed to be stricter than the build (drop where
+ * it emits) but never looser.
+ */
+const ALL_RESOURCE_TYPES = [
+  'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
+  'object', 'xmlhttprequest', 'ping', 'media', 'websocket', 'other',
+];
+
+const D1 = 'D1 (§4.2) has not landed: the build parser refuses this option today';
+
+export const NETWORK_VECTORS = [
+  // --- the review's nine lines ---------------------------------------------
+  {
+    line: '||facebook.com^$removeparam=fbclid',
+    expect: {
+      kind: 'network', emit: false,
+      build: { emit: true, why: 'the static compiler ships a queryTransform redirect for a literal $removeparam=; user filters refuse every form (§3.3 table)' },
+    },
+  },
+  { line: "||example.com^$csp=script-src 'self'", expect: { kind: 'network', emit: false } },
+  {
+    line: '||example.com^$to=cdn.example',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', requestDomains: ['cdn.example'] },
+      build: { emit: false, why: D1 },
+    },
+  },
+  {
+    line: '||example.com^$from=site.example',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', initiatorDomains: ['site.example'] },
+      build: { emit: false, why: D1 },
+    },
+  },
+  {
+    line: '||example.com^$method=post',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', requestMethods: ['post'] },
+      build: { emit: false, why: D1 },
+    },
+  },
+  { line: '||example.com^$header=content-type:image', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$popunder', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$strict3p', expect: { kind: 'network', emit: false } },
+  { line: '@@||example.com^$genericblock', expect: { kind: 'network', emit: false } },
+  {
+    line: '/ads\\.js$/$script',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { regexFilter: 'ads\\.js$', resourceTypes: ['script'] },
+    },
+  },
+
+  // --- more refused options --------------------------------------------------
+  { line: '@@||example.com^$ghide', expect: { kind: 'network', emit: false } },
+  { line: '@@||example.com^$ehide', expect: { kind: 'network', emit: false } },
+  { line: '@@||example.com^$shide', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$redirect-rule=noop.js', expect: { kind: 'network', emit: false } },
+  {
+    line: '||example.com^$redirect=noop.js',
+    expect: {
+      kind: 'network', emit: false,
+      build: { emit: true, why: 'the static compiler ships a redirect-to-stub; user filters have no resource library and refuse $redirect=' },
+    },
+  },
+  { line: '||example.com^$badfilter', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$method=brew', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$script,bogus-option', expect: { kind: 'network', emit: false } },
+  {
+    line: '||example.com^$domain=münchen.de',
+    expect: {
+      kind: 'network', emit: false,
+      build: { emit: true, why: 'the build punycodes $domain= entries; the Rust compiler does not attempt it and drops the line (§3.3 table)' },
+    },
+  },
+
+  // --- mapped modifiers --------------------------------------------------------
+  {
+    line: '||example.com^$method=~get',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', excludedRequestMethods: ['get'] },
+      build: { emit: false, why: D1 },
+    },
+  },
+  {
+    line: '||example.com^$to=cdn.example|~static.example',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: {
+        urlFilter: '||example.com^',
+        requestDomains: ['cdn.example'],
+        excludedRequestDomains: ['static.example'],
+      },
+      build: { emit: false, why: D1 },
+    },
+  },
+  {
+    line: '||example.com^$denyallow=cdn.example',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', excludedRequestDomains: ['cdn.example'] },
+      build: { emit: false, why: D1 },
+    },
+  },
+  {
+    line: '||ads.example^$xhr',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||ads.example^', resourceTypes: ['xmlhttprequest'] },
+    },
+  },
+  {
+    line: '||ads.example^$css,frame,doc,beacon,object-subrequest',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: {
+        urlFilter: '||ads.example^',
+        resourceTypes: ['stylesheet', 'sub_frame', 'main_frame', 'ping', 'object'],
+      },
+    },
+  },
+  {
+    line: '||ads.example^$~script,3p',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||ads.example^', excludedResourceTypes: ['script'], domainType: 'thirdParty' },
+    },
+  },
+  {
+    line: '||ads.example^$domain=a.com|~b.com,1p',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: {
+        urlFilter: '||ads.example^',
+        domainType: 'firstParty',
+        initiatorDomains: ['a.com'],
+        excludedInitiatorDomains: ['b.com'],
+      },
+    },
+  },
+  {
+    line: '||bad.example^$all',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES },
+      // The build emits before and after D1, so the emit flag alone can
+      // never go stale: pin its CURRENT condition too.
+      build: {
+        emit: true,
+        condition: { urlFilter: '||bad.example^' },
+        why: 'D1 (§4.1) has not landed: the build still treats $all as ignorable and emits no resourceTypes (every type except main_frame)',
+      },
+    },
+  },
+  {
+    line: '||bad.example^$all,~image',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES.filter((t) => t !== 'image') },
+      build: {
+        emit: true,
+        condition: { urlFilter: '||bad.example^', excludedResourceTypes: ['image'] },
+        why: 'D1 (§4.1) has not landed: the build ignores $all and keeps only the exclusion',
+      },
+    },
+  },
+  {
+    line: '||pop.example^$popup',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||pop.example^', resourceTypes: ['main_frame'] },
+    },
+  },
+  { line: '/r.php?u=$popup', expect: { kind: 'network', emit: false } },
+  {
+    line: '@@/r.php?u=$popup',
+    expect: {
+      kind: 'network', emit: true, action: 'allow',
+      condition: { urlFilter: '/r.php?u=', resourceTypes: ['main_frame'] },
+    },
+  },
+  {
+    line: '||example.com^$match-case',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', isUrlFilterCaseSensitive: true },
+    },
+  },
+  {
+    line: '||example.com^$inline-script,script',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', resourceTypes: ['script'] },
+    },
+  },
+  {
+    line: '*$script,3p,domain=x.com',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { resourceTypes: ['script'], domainType: 'thirdParty', initiatorDomains: ['x.com'] },
+      build: { emit: false, why: D1 },
+    },
+  },
+  { line: '*', expect: { kind: 'network', emit: false } },
+
+  // --- scoping options that resolve to nothing never ship the rule unscoped --
+  { line: '||example.com^$domain=', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$domain=|', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$from=', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$to=', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$to=~', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$denyallow=', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$denyallow=~x.com', expect: { kind: 'network', emit: false } },
+  { line: '||example.com^$method=', expect: { kind: 'network', emit: false } },
+  {
+    line: '||example.com^$domain=~',
+    expect: {
+      kind: 'network', emit: false,
+      build: { emit: true, why: 'the build drops the empty entry and ships the rule unscoped (Track D finding)' },
+    },
+  },
+  {
+    line: '||example.com^$~domain=a.com',
+    expect: {
+      kind: 'network', emit: false,
+      build: { emit: true, why: 'the build treats ~domain= as un-negated and scopes the rule to a.com (Track D finding)' },
+    },
+  },
+  {
+    line: '||example.com^$script,~script',
+    expect: {
+      kind: 'network', emit: false,
+      build: { emit: true, why: 'the build emits script in both type lists, a rule Chrome rejects (Track D finding)' },
+    },
+  },
+
+  // --- `$3p`/`$1p` as the FIRST option ------------------------------------
+  // The build's OPTION_LIST_HEAD wants a letter first, so it never splits
+  // `$3p…` and ships a dead urlFilter carrying the literal text: 415 corpus
+  // lines, 56 of them exceptions (Track D finding). User filters compile to
+  // the scoped block the line asks for; the build's answer is pinned so its
+  // fix is caught here.
+  {
+    line: '||example.com^$3p',
+    expect: {
+      kind: 'network', emit: true, action: 'block',
+      condition: { urlFilter: '||example.com^', domainType: 'thirdParty' },
+      build: {
+        emit: true,
+        condition: { urlFilter: '||example.com^$3p' },
+        why: 'the build does not split a digit-first option list and ships urlFilter "||example.com^$3p" (Track D finding)',
+      },
+    },
+  },
+  {
+    line: '@@||example.com^$~3p,script',
+    expect: {
+      kind: 'network', emit: true, action: 'allow',
+      condition: { urlFilter: '||example.com^', domainType: 'firstParty', resourceTypes: ['script'] },
+      build: {
+        emit: true,
+        condition: { urlFilter: '||example.com^$~3p,script' },
+        why: 'the build does not split a digit-first option list and ships urlFilter "||example.com^$~3p,script" (Track D finding)',
+      },
+    },
+  },
+  {
+    line: '@@||safe.example^$important',
+    expect: {
+      kind: 'network', emit: true, action: 'allow',
+      condition: { urlFilter: '||safe.example^' },
+    },
+  },
+];

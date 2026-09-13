@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { FILTER_VECTORS } from './fixtures/filter-vectors.mjs';
+import { FILTER_VECTORS, NETWORK_VECTORS } from './fixtures/filter-vectors.mjs';
+import { loadServiceWorker } from './sw-harness/sw-loader.mjs';
 import {
   parseLine as buildParseLine,
   networkFilterToDNR,
@@ -596,4 +597,115 @@ test('3.2: the operator matcher is case-insensitive in both engines', { skip }, 
   assert.ok(isProceduralSelector('div:others(.x)'), 'JS must detect the new operators');
   assert.ok(!isProceduralSelector('div:has(.x)'), 'a native pseudo-class is not an operator');
   assert.ok(!isProceduralSelector('div:HAS(.x)'), 'in any case');
+});
+
+// ---------------------------------------------------------------------------
+// §3.3 — the user-filter compiler fails closed on unmapped options
+// ---------------------------------------------------------------------------
+
+// "Emit" per engine, exactly as REMEDIATION §3.3 defines it. The build parser
+// classifies `@@…$ghide` as `cosmetic-scope-exception` and `$csp=` as `skip`:
+// both are non-emitting network answers, never `undefined`.
+const emitBuild = (line) => {
+  const parsed = buildParseLine(line);
+  return parsed?.type === 'network' && networkFilterToDNR(parsed) !== null;
+};
+const compileWasm = (line) => wasm.compile_user_filters(line, 900_000);
+const emitWasm = (line) => compileWasm(line).dnrRules.length > 0;
+
+/** `isUrlFilterCaseSensitive` is stated explicitly by the build in both
+ *  directions and only when true by Rust; compare conditions without it. */
+const withoutCaseFlag = (condition) =>
+  Object.fromEntries(Object.entries(condition).filter(([key]) => key !== 'isUrlFilterCaseSensitive'));
+
+test('3.3: WASM, the build parser and the runtime fallback agree on drop-vs-emit for every network vector', { skip }, async () => {
+  // The runtime fallback lives inside the service worker; drive the real
+  // function through the harness hooks (read-only use of the SW).
+  const { hooks } = await loadServiceWorker();
+  const emitRuntime = (line) => hooks.parseSimpleNetworkRule(line, 900_000) !== null;
+
+  assert.ok(NETWORK_VECTORS.length >= 20, 'the network vector class must be populated');
+  const failures = [];
+  for (const { line, expect } of NETWORK_VECTORS) {
+    assert.equal(expect.kind, 'network', line);
+    const expectedBuild = expect.build ? expect.build.emit : expect.emit;
+
+    const wasmEmits = emitWasm(line);
+    const buildEmits = emitBuild(line);
+    const runtimeEmits = emitRuntime(line);
+
+    if (wasmEmits !== expect.emit) {
+      failures.push(`${line}: WASM ${wasmEmits ? 'emits' : 'drops'}, spec says ${expect.emit ? 'emit' : 'drop'}`);
+    }
+    if (buildEmits !== expectedBuild) {
+      failures.push(`${line}: build ${buildEmits ? 'emits' : 'drops'}, expected ${expectedBuild ? 'emit' : 'drop'}`
+        + (expect.build ? ` (pinned override: ${expect.build.why} — stale? remove it)` : ''));
+    }
+    // emit_wasm === emit_build, modulo the dated build overrides.
+    if (!expect.build && wasmEmits !== buildEmits) {
+      failures.push(`${line}: WASM ${wasmEmits ? 'emits' : 'drops'} but the build ${buildEmits ? 'emits' : 'drops'}`);
+    }
+    // emit_runtime ⇒ emit_build: the fallback may be stricter, never looser.
+    if (runtimeEmits && !buildEmits) {
+      failures.push(`${line}: the runtime fallback emits where the build drops`);
+    }
+
+    // A dropped line is reported, once, under its own text.
+    const compiled = compileWasm(line);
+    if (!wasmEmits) {
+      if (!Array.isArray(compiled.droppedLines) || compiled.droppedLines.length !== 1
+          || compiled.droppedLines[0].line !== line || !compiled.droppedLines[0].reason) {
+        failures.push(`${line}: dropped without a droppedLines entry: ${JSON.stringify(compiled.droppedLines)}`);
+      }
+    } else if (compiled.droppedLines?.length) {
+      failures.push(`${line}: emitted AND reported dropped`);
+    }
+  }
+  hooks.cancelPendingStatsPersistForTest?.();
+  assert.deepEqual(failures, []);
+});
+
+test('3.3: WASM maps $to/$from/$method to the DNR fields the build emits', { skip }, () => {
+  const checked = [];
+  for (const { line, expect } of NETWORK_VECTORS) {
+    if (!expect.condition) continue;
+    const compiled = compileWasm(line);
+    assert.equal(compiled.dnrRules.length, 1, `${line}: ${JSON.stringify(compiled.droppedLines)}`);
+    const [rule] = compiled.dnrRules;
+    assert.equal(rule.action.type, expect.action, line);
+    assert.deepEqual(rule.condition, expect.condition, `WASM condition for ${line}`);
+
+    // A pinned build condition must still be what the build emits: when the
+    // build catches up the pin goes stale and this says so.
+    if (expect.build?.condition) {
+      const built = networkFilterToDNR(buildParseLine(line));
+      assert.ok(built, `${line}: pinned build condition but the build drops`);
+      assert.deepEqual(
+        withoutCaseFlag(built.condition),
+        expect.build.condition,
+        `${line}: stale pin (${expect.build.why}) — remove the override`,
+      );
+    }
+
+    // Where the build already emits — and no dated divergence is pinned on
+    // the vector — its condition must be the same one.
+    if (!expect.build && emitBuild(line)) {
+      const built = networkFilterToDNR(buildParseLine(line));
+      assert.deepEqual(
+        withoutCaseFlag(rule.condition),
+        withoutCaseFlag(built.condition),
+        `WASM vs build condition for ${line}`,
+      );
+      assert.equal(built.action.type, rule.action.type, line);
+      checked.push(line);
+    }
+  }
+  // The seam is only pinned if the build engine actually took part.
+  assert.ok(checked.length >= 8, `build-side conditions compared: ${checked.length}`);
+  for (const modifier of ['$to=', '$from=', '$method=']) {
+    assert.ok(
+      NETWORK_VECTORS.some(({ line, expect }) => line.includes(modifier) && expect.condition),
+      `${modifier} must have a mapped vector`,
+    );
+  }
 });

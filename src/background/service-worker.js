@@ -218,7 +218,12 @@ function setCachedDomainRules(hostname, bundle) {
 const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
-const RULE_DATA_SCHEMA_VERSION = 3;
+// Bump to force one active-index rebuild and invalidate every persisted page
+// bundle on the first start after an update. 3 → 4 (REVIEW-2026-09 §3.2/§3.3,
+// A1c): release 1 shipped fixed compilers (B1, C1a/C1b, A1b) with unchanged
+// vendored snapshots, so without the bump the hash — and every cached cssText
+// carrying what the pre-fix engines emitted — would have survived the update.
+const RULE_DATA_SCHEMA_VERSION = 4;
 
 // Load config from storage with fallback to defaults
 async function loadConfig() {
@@ -1318,6 +1323,19 @@ chrome.runtime.onInstalled.addListener(async (details) => {
   try {
     if (details.reason === 'install') {
       await initializeDefaults();
+    }
+    if (details.reason === 'update') {
+      // §3.3 (REVIEW-2026-09, A1c) — dynamic DNR rules persist across updates
+      // and ensureBackgroundSetup skips applyUserFilters when the stored text
+      // equals USER_FILTERS_APPLIED, so user filters compiled by the pre-fix
+      // compiler would stay live until the user next edits the text. Clear
+      // the marker BEFORE background setup so the stored text is recompiled
+      // with the fixed compiler (one DNR write per update, the same write an
+      // edit triggers). Non-fatal: a failed clear must not derail the update
+      // boot; the next edit recompiles anyway.
+      await setStorage(StorageKeys.USER_FILTERS_APPLIED, '').catch((err) => {
+        reportError('onInstalled:clearUserFiltersApplied', err);
+      });
     }
 
     await ensureRuleDataReady();
@@ -4688,6 +4706,7 @@ export const __testHooks = {
   currentRebuildGeneration,
   isRuleIndexInterrupted,
   RULE_INDEX_STATE_KEY,
+  RULE_DATA_SCHEMA_VERSION,
   checkFilterListUpdates,
   getActiveRuleDataVersion: () => activeRuleDataVersion,
   performEarlyInjection,

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { loadServiceWorker } from './sw-loader.mjs';
+import { loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
 
 const SW_PATH = new URL('../../src/background/service-worker.js', import.meta.url);
 
@@ -187,4 +187,55 @@ test('3.2: the JS planner tokenises the shared operator names case-insensitively
     'every plan step must carry the canonical uBO name the engine implements');
 
   hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §3.2 / A1c — release-1 migration. The rebuild decision and
+// every persisted page bundle are keyed on computeBundledRuleDataVersion(), a
+// hash of RULE_DATA_SCHEMA_VERSION + the vendored snapshots. When a release
+// ships the same snapshots but a fixed compiler, the hash is unchanged and
+// every cached cssText still carries what the pre-fix engines emitted. Bumping
+// the schema number forces exactly one rebuild on the first start after the
+// update and invalidates every persisted bundle.
+// ---------------------------------------------------------------------------
+
+test('3.2: a schema bump rebuilds the index on an unchanged packaged bundle', async () => {
+  const first = await loadServiceWorker({ awaitReady: true, packagedSources: samplePackagedSources() });
+  first.hooks.cancelPendingStatsPersistForTest();
+
+  const stampAfterFirst = first.chrome.storage.local._data().ruleDataVersion;
+  assert.match(stampAfterFirst, /^rv\d+-[0-9a-f]+$/, 'precondition: the first boot stamped the rule-data version');
+  assert.equal(stampAfterFirst, `rv${first.hooks.RULE_DATA_SCHEMA_VERSION}-${stampAfterFirst.split('-')[1]}`,
+    'the stamp carries the module schema number');
+
+  // Cache a page bundle under the current stamp, as a navigation would.
+  await first.hooks.getCosmeticBundleForPage('example.com');
+  const activeVersion = first.hooks.getActiveRuleDataVersion();
+  assert.ok(await first.hooks.db.getPageBundle('example.com', activeVersion),
+    'precondition: a bundle was persisted under the current version');
+
+  // The release-0 profile: same snapshot hash, the previous schema number (3).
+  const releaseZeroStamp = stampAfterFirst.replace(/^rv\d+-/, 'rv3-');
+  await first.chrome.storage.local.set({ ruleDataVersion: releaseZeroStamp });
+
+  let rebuilds = 0;
+  const second = await loadServiceWorker({
+    stub: first.chrome,
+    idb: first.idb,
+    packagedSources: samplePackagedSources(),
+  });
+  const origClear = second.hooks.db.clearActiveRules.bind(second.hooks.db);
+  second.hooks.db.clearActiveRules = async () => { rebuilds++; return origClear(); };
+  await second.hooks.whenCriticalReady();
+  await second.hooks.whenBackgroundSetupDone();
+  second.hooks.cancelPendingStatsPersistForTest();
+
+  assert.equal(rebuilds, 1,
+    'the first start after the update must rebuild exactly once — the old schema number left the hash unchanged');
+  assert.equal(await second.hooks.db.getPageBundle('example.com', releaseZeroStamp), null,
+    'every bundle persisted under the release-0 stamp is invalidated');
+  assert.equal(second.chrome.storage.local._data().ruleDataVersion, stampAfterFirst,
+    'the rebuild re-stamps with the current schema number');
+  assert.deepEqual(await second.hooks.db.getCosmeticRules('example.com'), ['.site-ad'],
+    'the rebuilt index is complete');
 });

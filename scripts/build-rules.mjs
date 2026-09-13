@@ -410,9 +410,9 @@ const IGNORABLE_OPTIONS = new Set([
   // is blocked instead of stubbed — same direction, never broader.
   'empty',
   'mp4',
-  // Widens to every resource type including the document. Ignoring it yields
-  // "all types except main_frame", which is narrower.
-  'all',
+  // NOT here: `all`. It used to be, on the reasoning that ignoring it yields
+  // "every type except main_frame", which is narrower — but the document IS
+  // the point of `||host^$all` on badware.txt (§4.1). parseOptions maps it.
 ]);
 
 let ruleIdCounter = 1;
@@ -772,6 +772,7 @@ function parseOptions(optionsStr) {
     badfilter: false,
     matchCase: false,
     popup: false,
+    all: false,
     cosmeticScopeExceptions: [],
   };
 
@@ -803,6 +804,10 @@ function parseOptions(optionsStr) {
       }
     } else if (optName === 'important') {
       options.important = true;
+    } else if (optName === 'all') {
+      // Every resource type INCLUDING main_frame (§4.1). Resolved to the
+      // concrete set in networkFilterToDNR, after every type option is seen.
+      options.all = true;
     } else if (optName === 'badfilter') {
       // Pass-1 marker for the two-pass suppression in parseFilterList. The
       // rule itself must never ship; it exists to cancel its base form.
@@ -1270,7 +1275,14 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   // than relying on the version-dependent default.
   condition.isUrlFilterCaseSensitive = options.matchCase === true;
 
-  if (options.resourceTypes.length > 0) {
+  if (options.all) {
+    // `$all` is every type INCLUDING the document, on every list — the
+    // navigation is what `||host^$all` on badware.txt exists to stop (§4.1).
+    // An explicit type alongside it is contradictory; uBO keeps the
+    // superset, so we do too. On an exception this is a plain `allow` over
+    // the same set — `allowAllRequests` is `$document`'s job, not `$all`'s.
+    condition.resourceTypes = [...SECURITY_LIST_RESOURCE_TYPES];
+  } else if (options.resourceTypes.length > 0) {
     condition.resourceTypes = options.resourceTypes;
   } else if (conversionOptions.coverDocuments && !exception) {
     // A DNR condition with no resourceTypes matches every type EXCEPT
@@ -1462,6 +1474,7 @@ function canonicalNetworkKey(parsed) {
     imp: !!o.important,
     mc: o.matchCase === true,
     pop: o.popup === true,
+    all: o.all === true,
   });
 }
 

@@ -368,6 +368,50 @@ test('ordinary lists are unaffected — no implicit main_frame', () => {
   );
 });
 
+// §4.1 — `$all` means every resource type INCLUDING the document. The option
+// used to be "ignorable", which yields a condition with no resourceTypes —
+// every type EXCEPT main_frame — so on badware.txt (1,379 `||host^$all` lines,
+// enabled by default) the navigation the rule exists to stop went through and
+// only the page's subresources were blocked. Only the malware list had the
+// list-level pin. `$all` now maps to the full set on every list.
+const ALL_RESOURCE_TYPES = [
+  'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
+  'object', 'xmlhttprequest', 'ping', 'media', 'websocket', 'other',
+];
+
+test('4.1: $all covers main_frame on every list', () => {
+  const rule = networkFilterToDNR(parseLine('||bad.example^$all'));
+  assert.ok(rule, 'a $all rule must still convert');
+  assert.ok(rule.condition.resourceTypes, '$all must pin resource types explicitly (no field = no main_frame)');
+  assert.ok(rule.condition.resourceTypes.includes('main_frame'), '$all must block the navigation itself');
+  assert.ok(rule.condition.resourceTypes.includes('script'));
+  assert.deepEqual([...rule.condition.resourceTypes].sort(), [...ALL_RESOURCE_TYPES].sort());
+  assert.equal(rule.action.type, 'block');
+});
+
+test('4.1: $all on an exception is an allow, not allowAllRequests', () => {
+  // `allowAllRequests` is `$document`'s job (D3); `@@…$all` only un-blocks
+  // the same set the block form covers.
+  const rule = networkFilterToDNR(parseLine('@@||safe.example^$all'));
+  assert.ok(rule);
+  assert.equal(rule.action.type, 'allow');
+  assert.deepEqual([...rule.condition.resourceTypes].sort(), [...ALL_RESOURCE_TYPES].sort());
+});
+
+test('4.1: $all keeps the superset when an explicit type sits alongside it', () => {
+  // `$all,script` is contradictory; uBO treats $all as the superset.
+  const rule = networkFilterToDNR(parseLine('||bad.example^$all,script'));
+  assert.deepEqual([...rule.condition.resourceTypes].sort(), [...ALL_RESOURCE_TYPES].sort());
+});
+
+test('4.1: $all is no longer merely ignorable', () => {
+  // The rule converts (it is not an unsupported option) but the option now
+  // changes the emitted condition rather than vanishing.
+  const parsed = parseLine('||bad.example^$all');
+  assert.equal(parsed.type, 'network');
+  assert.equal(parsed.options.all, true);
+});
+
 test('$csp exceptions are skipped, not converted to a network allow', () => {
   // $csp is not translated in either direction. Emitting an allow for the
   // exception form disables all network blocking on the domain.

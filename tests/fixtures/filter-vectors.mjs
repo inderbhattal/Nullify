@@ -594,13 +594,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES },
-      // The build emits before and after D1, so the emit flag alone can
-      // never go stale: pin its CURRENT condition too.
-      build: {
-        emit: true,
-        condition: { urlFilter: '||bad.example^' },
-        why: 'D1 (§4.1) has not landed: the build still treats $all as ignorable and emits no resourceTypes (every type except main_frame)',
-      },
     },
   },
   {
@@ -608,10 +601,13 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES.filter((t) => t !== 'image') },
+      // D1a (§4.1) maps $all to the full set; the include-minus-exclude
+      // subtraction is D1c (§7.7c). Until it lands the build emits the
+      // exclusion alongside the set — a rule Chrome rejects — so pin that.
       build: {
         emit: true,
-        condition: { urlFilter: '||bad.example^', excludedResourceTypes: ['image'] },
-        why: 'D1 (§4.1) has not landed: the build ignores $all and keeps only the exclusion',
+        condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES, excludedResourceTypes: ['image'] },
+        why: 'D1c (§7.7c) has not landed: the build emits $all\'s full set and the ~image exclusion side by side',
       },
     },
   },

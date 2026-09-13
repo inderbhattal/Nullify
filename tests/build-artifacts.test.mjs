@@ -385,3 +385,27 @@ test('all three engines agree on the runtime allowlist band', async () => {
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// CI clippy must deny warnings (§5.15)
+// ---------------------------------------------------------------------------
+
+test('5.15: CI clippy runs with -D warnings', () => {
+  // The docs claim "clippy -D warnings clean", and it is — but a bare
+  // `cargo clippy` exits 0 on warnings, so CI would not notice the day it
+  // stopped being true. Any clippy invocation in any workflow must deny them.
+  const workflowDir = path.join(ROOT, '.github', 'workflows');
+  let seen = 0;
+  for (const file of fs.readdirSync(workflowDir)) {
+    if (!/\.ya?ml$/.test(file)) continue;
+    const lines = fs.readFileSync(path.join(workflowDir, file), 'utf8').split('\n');
+    for (const line of lines) {
+      const m = line.match(/^\s*(?:-\s+)?run:\s*(cargo clippy\b.*)$/);
+      if (!m) continue;
+      seen++;
+      assert.match(m[1], /--all-targets/, `${file}: clippy must cover tests too: ${m[1]}`);
+      assert.match(m[1], /\s--\s+-D\s+warnings\b/, `${file}: clippy must run with -D warnings: ${m[1]}`);
+    }
+  }
+  assert.ok(seen >= 1, `expected at least one clippy step in the workflows, saw ${seen}`);
+});

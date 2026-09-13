@@ -836,3 +836,214 @@ test('3.2 (didn\'t re-break): native pseudo-classes stay CSS and known operators
   assert.deepEqual(e._proceduralRules.map((r) => r.plan[1].op), ['has-text', 'upward', 'if-not', 'matches-css']);
   e.stopObserver();
 });
+
+// ---------------------------------------------------------------------------
+// docs/REVIEW-2026-09.md §3.2 (C1b) — the three action operators.
+// `:remove-attr()` / `:remove-class()` act on the element and hide nothing;
+// `:others()` is set-level: evaluated once per rule over every subject.
+// ---------------------------------------------------------------------------
+
+/** A stub element with a real parent/child tree, a classList and attributes. */
+function treeEl(tag, { className = '', attrs = {}, children = [] } = {}) {
+  const classes = new Set(className.split(/\s+/).filter(Boolean));
+  const attributes = new Map(Object.entries(attrs));
+  const el = domEl({
+    tagName: tag.toUpperCase(),
+    className,
+    children,
+    classList: {
+      contains: (c) => classes.has(c),
+      remove: (c) => classes.delete(c),
+      [Symbol.iterator]: () => classes[Symbol.iterator](),
+    },
+    getAttribute: (n) => (attributes.has(n) ? attributes.get(n) : null),
+    hasAttribute: (n) => attributes.has(n),
+    removeAttribute: (n) => attributes.delete(n),
+    getAttributeNames: () => [...attributes.keys()],
+    contains: (other) => other === el || children.some((c) => c.contains(other)),
+  });
+  for (const c of children) c.parentElement = el;
+  return el;
+}
+
+function flatten(el, out = []) {
+  out.push(el);
+  for (const c of el.children) flatten(c, out);
+  return out;
+}
+
+/** body > div.a > p.s1, body > div.c > p.s2, body > div.b > span — the brief's fixture. */
+function othersFixture() {
+  const s1 = treeEl('p', { className: 's1' });
+  const s2 = treeEl('p', { className: 's2' });
+  const span = treeEl('span');
+  const a = treeEl('div', { className: 'a', children: [s1] });
+  const c = treeEl('div', { className: 'c', children: [s2] });
+  const b = treeEl('div', { className: 'b', children: [span] });
+  const body = treeEl('body', { children: [a, c, b] });
+  const head = treeEl('head');
+  const html = treeEl('html', { children: [head, body] });
+  return { html, head, body, a, b, c, s1, s2, span };
+}
+
+function installTree(tree, queryResults) {
+  const all = flatten(tree.html);
+  const doc = installDom({ queryResults: { '*': all, ...queryResults } });
+  doc.documentElement = tree.html;
+  doc.head = tree.head;
+  doc.body = tree.body;
+  return doc;
+}
+
+test('3.2: :remove-attr() strips the named attribute and hides nothing', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  const el = treeEl('div', { attrs: { 'data-ad': '1', 'data-track-id': 'x', role: 'x' } });
+  installDom({ queryResults: { div: [el] } });
+  const e = engine();
+  e.init({ generic: ['div:remove-attr(data-ad)'], domainSpecific: [] }, true);
+
+  // Prior code: `remove-attr` fell through to the fail-closed default.
+  assert.equal(el.hasAttribute('data-ad'), false);
+  assert.equal(el.hasAttribute('role'), true);
+  assert.equal(e._hideQueue.size, 0);
+  assert.equal(e._hiddenCount, 0);
+
+  // Returns the element when something was removed, null otherwise.
+  assert.equal(e._applyOp(el, 'remove-attr', 'data-ad', 's'), null);
+  assert.equal(e._applyOp(el, 'remove-attr', '/^data-track/', 's'), el);
+  assert.equal(el.hasAttribute('data-track-id'), false);
+  e.stopObserver();
+});
+
+test('3.2: :remove-class() strips one class and hides nothing', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  const html = treeEl('html', { className: 'show-intro-popup other' });
+  installDom({ queryResults: { 'html.show-intro-popup': [html] } });
+  const e = engine();
+  e.init({ generic: ['html.show-intro-popup:remove-class(show-intro-popup)'], domainSpecific: [] }, true);
+
+  assert.equal(html.classList.contains('show-intro-popup'), false);
+  assert.equal(html.classList.contains('other'), true);
+  assert.equal(e._hideQueue.size, 0);
+  assert.equal(e._hiddenCount, 0);
+  e.stopObserver();
+});
+
+test('3.2: :remove-class() takes one name or a regex, not a list', () => {
+  const e = engine();
+  const el = treeEl('div', { className: 'a b ad-slot' });
+
+  // uBO's contract: one class name. A space-separated list is not a name.
+  assert.equal(e._applyOp(el, 'remove-class', 'a b', 's'), null);
+  assert.deepEqual([...el.classList], ['a', 'b', 'ad-slot']);
+
+  assert.equal(e._applyOp(el, 'remove-class', 'a', 's'), el);
+  assert.deepEqual([...el.classList], ['b', 'ad-slot']);
+  assert.equal(e._applyOp(el, 'remove-class', 'a', 's'), null); // nothing left to remove
+
+  assert.equal(e._applyOp(el, 'remove-class', '/^ad-/', 's'), el);
+  assert.deepEqual([...el.classList], ['b']);
+});
+
+test('3.2: :others() keeps every subject of a selector-list base and their paths', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  const t = othersFixture();
+  installTree(t, { 'p.s1, p.s2': [t.s1, t.s2] });
+  const e = engine();
+  e.init({ generic: [], domainSpecific: ['p.s1, p.s2:others()'] }, true);
+
+  // A per-element complement would have hidden p.s2 (and div.c) while
+  // evaluating p.s1, and vice versa — the set-level reading keeps both.
+  assert.equal(e._hideQueue.has(t.b), true);
+  assert.equal(e._hideQueue.has(t.span), true);
+  for (const kept of [t.a, t.c, t.s1, t.s2, t.body]) {
+    assert.equal(e._hideQueue.has(kept), false, `${kept.tagName}.${kept.className} is kept`);
+  }
+  assert.equal(e._hiddenCount, 2);
+  e.stopObserver();
+});
+
+test('3.2: :others() never touches the document scaffolding', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  const t = othersFixture();
+  installTree(t, { 'p.s2': [t.s2] });
+  const e = engine();
+  e.init({ generic: ['p.s2:others()'], domainSpecific: [] }, true);
+
+  for (const root of [t.html, t.head, t.body]) {
+    assert.equal(e._hideQueue.has(root), false, root.tagName);
+    assert.equal(e._hiddenElements.has(root), false, root.tagName);
+  }
+  // Everything off p.s2's path is hidden: div.a, p.s1, div.b, span.
+  assert.deepEqual([t.a, t.s1, t.b, t.span].map((x) => e._hideQueue.has(x)), [true, true, true, true]);
+  assert.equal(e._hideQueue.has(t.c), false);
+  e.stopObserver();
+});
+
+test('3.2: :others() skips and reports once above the element budget', () => {
+  globalThis.MutationObserver = StubMutationObserver;
+  const t = othersFixture();
+  const doc = installTree(t, { 'p.s2': [t.s2] });
+  const huge = flatten(t.html);
+  while (huge.length <= 5000) huge.push(treeEl('div'));
+  doc.querySelectorAll = (sel) => (sel === '*' ? huge : sel === 'p.s2' ? [t.s2] : []);
+
+  const warnings = [];
+  const origWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    const e = engine();
+    e.init({ generic: ['p.s2:others()'], domainSpecific: [] }, true);
+    e._applyAllProcedural();
+    e._applyAllProcedural();
+    assert.equal(e._hideQueue.size, 0);
+    assert.equal(warnings.filter((w) => /budget/.test(w)).length, 1);
+    e.stopObserver();
+  } finally {
+    console.warn = origWarn;
+  }
+});
+
+test('3.2: a trailing step after an action operator is rejected at ingestion', () => {
+  for (const sel of [
+    'div:remove-attr(x):upward(1)',
+    'div:remove-class(a) > p',
+    'div:others() span',
+    'div:remove():has-text(x)',
+  ]) {
+    assert.equal(parseProceduralPlan(sel), null, sel);
+  }
+  // The action operator as the last step is the supported shape.
+  assert.equal(parseProceduralPlan('div:has-text(x):remove-attr(y)').at(-1).op, 'remove-attr');
+  assert.equal(parseProceduralPlan('p.s1, p.s2:others()').length, 2);
+
+  globalThis.MutationObserver = StubMutationObserver;
+  installDom();
+  const e = engine();
+  e.init({ generic: ['div:remove-attr(x):upward(1)', 'div:others() span'], domainSpecific: [] }, true);
+  assert.equal(e._proceduralRules.length, 0);
+  e.stopObserver();
+});
+
+test('3.2: action operator results are never cached', () => {
+  const e = engine();
+  const el = treeEl('div');
+  assert.equal(e._applyOp(el, 'remove-attr', 'data-x', 's'), null);
+  el.getAttributeNames = () => ['data-x'];
+  el.hasAttribute = (n) => n === 'data-x';
+  // A cached "no attribute" verdict would return null here.
+  assert.equal(e._applyOp(el, 'remove-attr', 'data-x', 's'), el);
+  assert.equal(e._matchCache.has('remove-attr|data-x'), false);
+});
+
+test('3.2 (didn\'t re-break): :matches-media()/:shadow()/:matches-prop() still fail closed and :others() is not per-element', () => {
+  const e = engine();
+  const el = treeEl('div');
+  for (const op of ['matches-media', 'shadow', 'matches-prop', 'others']) {
+    assert.equal(e._applyOp(el, op, 'x', `div:${op}(x)`), null, op);
+  }
+  // `:remove()` still removes (regression guard for the existing action op).
+  const child = domEl({ parentElement: domEl() });
+  assert.equal(e._applyOp(child, 'remove', '', 'div:remove()'), null);
+  assert.equal(e._removeQueue.has(child), true);
+});

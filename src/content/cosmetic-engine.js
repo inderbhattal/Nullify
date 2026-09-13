@@ -18,10 +18,19 @@
  *      :min-text-length(n) hide elements with at least n chars of text
  *      :xpath(expr)        select elements via XPath expression
  *      :watch-attr(a,b)    re-evaluate when listed attributes change
+ *      :remove-attr(a|/re/) strip matching attributes (action, hides nothing)
+ *      :remove-class(c|/re/) strip one class (action, hides nothing)
+ *      :others()           hide everything off the subject set's paths (set-level)
  *  - Operator chaining: div:has-text(Ad):upward(article) fully supported
  *  - Debounced MutationObserver re-runs (no thrashing)
  *  - Reports hidden element count to background
+ *
+ * The operator list lives in src/shared/proc-ops.js (§3.2, 2026-09): every
+ * name there is tokenised as procedural so it never reaches a CSS joiner;
+ * names this engine does not implement fail closed in `_applyOp`.
  */
+
+import { PROC_OPS, PROC_OP_ALIASES, isProceduralSelector } from '../shared/proc-ops.js';
 
 const STYLE_ID = '__adblock_cosmetic_styles__';
 const EXCEPTION_STYLE_ID = '__adblock_exception_styles__';
@@ -33,6 +42,22 @@ const _errorStats = { errors: 0, lastError: null, proceduralFailures: 0 };
 // A procedural rule that keeps throwing is disabled after this many failures
 // instead of being allowed to abort the run for every rule after it (§4.11).
 const MAX_PROC_RULE_FAILURES = 3;
+
+// `:others()` walks the whole document once per rule per run. Above this many
+// elements the walk is skipped (and reported once per rule) rather than spent
+// on a page where hiding "everything else" would be indistinguishable from a
+// blank page anyway (§3.2).
+const OTHERS_MAX_ELEMENTS = 5000;
+
+/**
+ * Operators that act on the element instead of selecting it (§3.2). They are
+ * terminal — `parseProceduralPlan` rejects a plan with a step after one —
+ * never add the element to the hide queue, and are never cached by
+ * `_getCachedMatch` (they are stateful: the second run must see the element
+ * as it is now). `others` is additionally set-level: `_applyProcedural`
+ * evaluates it once per rule over every subject, never per element.
+ */
+const ACTION_OPS = new Set(['remove-attr', 'remove-class', 'remove', 'others']);
 
 // How far up from a mutation the observer marks ancestors as cache-dirty, so
 // that container-evaluated operators reading downward are re-evaluated (§3.3).
@@ -46,39 +71,9 @@ function _reportError(context, err) {
   console.warn(`[Nullify Cosmetic] ${context}: ${err?.message || err}`);
 }
 
-// All known procedural operators in specificity order
-// (longer names must come before shorter prefixes to avoid partial matches)
-const PROC_OPS = [
-  'matches-css-before',
-  'matches-css-after',
-  'matches-css',
-  'has-text',
-  'nth-ancestor',
-  'upward',
-  'min-text-length',
-  'xpath',
-  'watch-attr',
-  'remove',
-  'style',
-  'matches-path',
-  'matches-attr',
-  'if-not',
-  'if',
-  'semantic',
-];
-
 // ---------------------------------------------------------------------------
 // Selector parsing helpers
 // ---------------------------------------------------------------------------
-
-/** Returns true if the selector string contains any procedural operator. */
-function isProceduralSelector(selector) {
-  // Simple check first
-  for (const op of PROC_OPS) {
-    if (selector.includes(':' + op + '(')) return true;
-  }
-  return false;
-}
 
 /**
  * Returned by `extractFirstOp` when an operator's argument list never closes.
@@ -102,9 +97,11 @@ function extractFirstOp(selector) {
     if (ch !== ':' || depth !== 0) continue;
 
     for (const op of PROC_OPS) {
-      if (selector.startsWith(op + '(', i + 1)) {
+      // Case-insensitive, like the Rust matcher and `isProceduralSelector`:
+      // `DIV:Has-Text(x)` must plan here too, not fall through as CSS (§3.2).
+      const argStart = i + 1 + op.length + 1; // skip ':op('
+      if (selector.slice(i + 1, argStart).toLowerCase() === op + '(') {
         const base = selector.slice(0, i).trimEnd();
-        const argStart = i + 1 + op.length + 1; // skip ':op('
 
         // Find matching closing paren with depth tracking
         let d = 1, j = argStart;
@@ -197,6 +194,24 @@ function safeRegex(source, flags) {
 }
 
 /**
+ * The argument shape `:remove-attr()` and `:remove-class()` share: one exact
+ * name, or a `/regex/flags` literal. Returns a predicate over candidate
+ * names, or null when the argument is not one name (a space-separated list is
+ * not a name — uBO's contract is a single token) or the regex does not compile.
+ */
+function nameMatcher(arg) {
+  const spec = String(arg ?? '').trim();
+  if (!spec) return null;
+  if (spec.startsWith('/') && spec.lastIndexOf('/') > 0) {
+    const lastSlash = spec.lastIndexOf('/');
+    const re = safeRegex(spec.slice(1, lastSlash), spec.slice(lastSlash + 1));
+    return re ? (name) => re.test(name) : null;
+  }
+  if (/\s/.test(spec)) return null;
+  return (name) => name === spec;
+}
+
+/**
  * Build a css plan step, recording how the fragment attaches to the element
  * produced by the previous step (§4.12):
  *  - 'compound'   `:upward(1).cls`      — same element, checked with matches()
@@ -239,18 +254,27 @@ export function parseProceduralPlan(selector) {
       plan.push(makeCssStep(firstOp.base));
     }
 
-    // Add the operator
-    plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
+    // Add the operator under its canonical uBO name: `:-abp-has()` plans as
+    // `has`, so every plan step this parser emits is one `_applyOp` names.
+    plan.push({ type: 'op', op: PROC_OP_ALIASES[firstOp.op] ?? firstOp.op, arg: firstOp.arg });
     remaining = firstOp.rest;
   }
+
+  // Action operators are terminal. `div:remove-attr(x):upward(1)` has no
+  // meaning uBO defines, and running the tail against the element would hide
+  // it — the opposite of what an action rule does. Reject the whole line, the
+  // same shape as an unterminated argument (§5.20, §3.2).
+  const actionIdx = plan.findIndex((step) => step.type === 'op' && ACTION_OPS.has(step.op));
+  if (actionIdx !== -1 && actionIdx !== plan.length - 1) return null;
 
   return plan;
 }
 
-/** Operators whose verdict is a function of the element's text content. */
-const TEXT_OPS = new Set(['has-text', 'min-text-length', 'semantic']);
+/** Operators whose verdict is a function of the element's text content.
+ *  `-abp-contains` is `has-text` as the Rust planner spells it (§3.2). */
+const TEXT_OPS = new Set(['has-text', '-abp-contains', 'min-text-length', 'semantic']);
 /** The same operators, as they appear nested inside another operator's argument. */
-const NESTED_TEXT_OP_REGEX = /:(?:has-text|min-text-length|semantic)\(/;
+const NESTED_TEXT_OP_REGEX = /:(?:has-text|-abp-contains|min-text-length|semantic)\(/i;
 
 /**
  * Does any step of this plan read text? A top-level `step.op` check misses
@@ -396,35 +420,24 @@ export class CosmeticEngine {
         continue;
       }
 
-      const isProcedural = isProceduralSelector(selector);
-      
-      // Fast-path: Chrome supports :has(), :not(), :is(), :where() natively now. 
-      // We only use the JS procedural engine if it contains custom Nullify operators.
-      const hasCustomOp = selector.includes(':has-text(') || selector.includes(':upward(') || 
-                         selector.includes(':xpath(') || selector.includes(':matches-css') || 
-                         selector.includes(':min-text-length') || selector.includes(':watch-attr') ||
-                         selector.includes(':nth-ancestor(') || selector.includes(':matches-path(') ||
-                         selector.includes(':matches-attr(') || selector.includes(':remove(') ||
-                         selector.includes(':style(') || selector.includes(':if(') ||
-                         selector.includes(':if-not(');
-
-      if (!hasCustomOp) {
+      // Chrome implements :has(), :not(), :is(), :where() natively; only a
+      // selector carrying one of the shared PROC_OPS needs the JS engine.
+      // The previous hand-kept literal here omitted `semantic` (§5.20) and
+      // every operator the engine had not implemented yet, which sent
+      // `div:others(.x)` to CSS instead of failing it closed (§3.2).
+      if (!isProceduralSelector(selector)) {
         cssSelectors.push(selector);
         continue;
       }
 
-      if (isProcedural) {
-        const plan = parseProceduralPlan(selector);
-        if (!plan || plan.length === 0) {
-          // Malformed line — a partial parse would silently become a
-          // different, valid rule (§5.20).
-          _reportError('Rejected malformed procedural selector', new Error(selector));
-          continue;
-        }
-        this._proceduralRules.push({ selector, plan });
-      } else {
-        cssSelectors.push(selector);
+      const plan = parseProceduralPlan(selector);
+      if (!plan || plan.length === 0) {
+        // Malformed line — a partial parse would silently become a
+        // different, valid rule (§5.20).
+        _reportError('Rejected malformed procedural selector', new Error(selector));
+        continue;
       }
+      this._proceduralRules.push({ selector, plan });
     }
 
     this._cssSelectors = cssSelectors;
@@ -567,14 +580,77 @@ export class CosmeticEngine {
       return;
     }
 
+    const othersIdx = plan.findIndex((step) => step.type === 'op' && step.op === 'others');
+    if (othersIdx !== -1) {
+      // A plan from the WASM planner is not re-validated by
+      // `parseProceduralPlan`; a trailing step after `:others()` is the same
+      // malformed shape and is refused here, once (§3.2).
+      if (othersIdx !== plan.length - 1) {
+        rule.disabled = true;
+        _reportError('Rejected :others() with a trailing step', new Error(selector));
+        return;
+      }
+      // Set-level: collect every element the base and the preceding steps
+      // yield, then complement once over the whole subject set. 56 of the 70
+      // corpus `:others()` rules have a selector-list base (`#a, #b:others()`);
+      // a per-element complement would hide every *other* subject.
+      const subjects = [];
+      for (const el of elements) {
+        this._runPlanOnElement(el, plan.slice(planIdx, -1), selector, subjects);
+      }
+      this._applyOthers(rule, subjects);
+      return;
+    }
+
     for (const el of elements) {
       this._runPlanOnElement(el, plan.slice(planIdx), selector);
     }
   }
 
-  /** Run the remaining steps of a plan on a specific element. */
-  _runPlanOnElement(el, remainingPlan, fullSelector) {
+  /**
+   * `:others()` — hide every element that is neither a subject, nor on a
+   * subject's ancestor path, nor inside a subject (uBO's semantics), leaving
+   * the document scaffolding alone. Runs once per rule per procedural run;
+   * the walk is bounded by OTHERS_MAX_ELEMENTS (§3.2).
+   */
+  _applyOthers(rule, subjects) {
+    const subjectSet = new Set(subjects);
+    if (subjectSet.size === 0) return;
+
+    const all = document.querySelectorAll('*');
+    if (all.length > OTHERS_MAX_ELEMENTS) {
+      if (!rule.othersBudgetReported) {
+        rule.othersBudgetReported = true;
+        _reportError(`Skipped :others() above the ${OTHERS_MAX_ELEMENTS}-element budget`,
+          new Error(rule.selector));
+      }
+      return;
+    }
+
+    const keep = new Set(subjectSet);
+    for (const subject of subjectSet) {
+      for (let a = subject.parentElement; a; a = a.parentElement) keep.add(a);
+    }
+    const roots = [document.documentElement, document.head, document.body];
+    for (const el of all) {
+      if (keep.has(el) || roots.includes(el)) continue;
+      let inside = false;
+      for (const subject of subjectSet) {
+        if (subject.contains?.(el)) { inside = true; break; }
+      }
+      if (inside) continue;
+      this._hideElement(el, rule.selector);
+    }
+  }
+
+  /**
+   * Run the remaining steps of a plan on a specific element. With `sink`
+   * given, elements that survive the plan are collected into it instead of
+   * being hidden (the `:others()` subject pass).
+   */
+  _runPlanOnElement(el, remainingPlan, fullSelector, sink = null) {
     if (remainingPlan.length === 0) {
+      if (sink) { sink.push(el); return; }
       // Don't hide if the rule ended with a style application
       if (fullSelector.includes(':style(')) return;
       
@@ -587,8 +663,11 @@ export class CosmeticEngine {
 
     if (step.type === 'op') {
       const result = this._applyOp(el, step.op, step.arg, fullSelector);
+      // Action operators act and stop: nothing follows them (the planner
+      // guarantees it) and the element is never queued for hiding (§3.2).
+      if (ACTION_OPS.has(step.op)) return;
       if (result) {
-        this._runPlanOnElement(result, nextSteps, fullSelector);
+        this._runPlanOnElement(result, nextSteps, fullSelector, sink);
       }
     } else if (step.type === 'css') {
       // Continuation semantics depend on how the fragment was attached
@@ -598,13 +677,13 @@ export class CosmeticEngine {
       try {
         if (step.kind === 'child' || step.kind === 'descendant') {
           for (const child of el.querySelectorAll(`:scope ${step.selector}`)) {
-            this._runPlanOnElement(child, nextSteps, fullSelector);
+            this._runPlanOnElement(child, nextSteps, fullSelector, sink);
           }
         } else if (step.kind === 'sibling') {
           // Sibling continuations after a procedural op are unsupported —
           // match nothing rather than guess (fail closed).
         } else if (el.matches?.(step.selector)) {
-          this._runPlanOnElement(el, nextSteps, fullSelector);
+          this._runPlanOnElement(el, nextSteps, fullSelector, sink);
         }
       } catch { /* invalid selector */ }
     }
@@ -644,7 +723,10 @@ export class CosmeticEngine {
     this._mruKey = key;
   }
 
-  _getCachedMatch(el, op, arg, evaluator) {
+  _getCachedMatch(el, op, arg, evaluator, noCache = false) {
+    // Action operators are stateful — the second run must see the element as
+    // it is now, not last run's verdict (§3.2).
+    if (noCache) return evaluator();
     const key = `${op}|${arg}`;
     let opCache = this._matchCache.get(key);
     if (!opCache) {
@@ -841,7 +923,8 @@ export class CosmeticEngine {
           try { return el.closest(arg.trim()) || null; } catch { return null; }
         }
 
-        case 'has-text': {
+        case 'has-text':
+        case '-abp-contains': {
           let pattern;
           if (arg.startsWith('/')) {
             const lastSlash = arg.lastIndexOf('/');
@@ -859,6 +942,7 @@ export class CosmeticEngine {
         }
 
         case 'matches-css':
+        case '-abp-properties':
         case 'matches-css-before':
         case 'matches-css-after': {
           const pseudo = op === 'matches-css' ? null
@@ -933,12 +1017,45 @@ export class CosmeticEngine {
           this._removeElement(el, fullSelector);
           return null;
 
+        // Element-level action operators (§3.2): strip and report whether
+        // anything changed. Terminal and never hidden — see ACTION_OPS.
+        case 'remove-attr': {
+          const matches = nameMatcher(arg);
+          if (!matches) return null;
+          let removed = false;
+          for (const name of el.getAttributeNames?.() || []) {
+            if (matches(name)) { el.removeAttribute(name); removed = true; }
+          }
+          return removed ? el : null;
+        }
+
+        case 'remove-class': {
+          // One class name or a /regex/ — uBO's contract, not a list.
+          const matches = nameMatcher(arg);
+          if (!matches || !el.classList) return null;
+          let removed = false;
+          for (const cls of [...el.classList]) {
+            if (matches(cls)) { el.classList.remove(cls); removed = true; }
+          }
+          return removed ? el : null;
+        }
+
+        case 'others':
+          // Set-level: `_applyProcedural` evaluates it once per rule. Reaching
+          // it per element means it was nested inside another operator's
+          // argument, which has no defined meaning — fail closed.
+          _reportError('Refused per-element :others()', new Error(fullSelector));
+          return null;
+
         // uBO spells the legacy aliases `:if()` and `:if-not()`; they are
         // exactly `:has()` and its negation. Both were tokenized by PROC_OPS
         // but had no case here, so they hit `default` and reported a match
         // unconditionally — hiding every element the base selector touched.
+        // `-abp-has` is the ABP spelling; the JS planner canonicalises it to
+        // `has`, the Rust planner emits it as written (§3.2).
         case 'has':
         case 'if':
+        case '-abp-has':
           return this._hasDescendantMatch(el, arg) ? el : null;
 
         case 'if-not':
@@ -997,6 +1114,13 @@ export class CosmeticEngine {
         case 'where':
           return this._matchesProcedural(el, arg) ? el : null;
 
+        // Tokenised by PROC_OPS so they never reach a CSS joiner (§3.2), but
+        // not implemented here: `:matches-media()`, `:shadow()` and
+        // `:matches-prop()` have no implementation yet. Listed explicitly so
+        // the gap is visible; they fall through to the fail-closed default.
+        case 'matches-media':
+        case 'shadow':
+        case 'matches-prop':
         default:
           // Fail closed. An operator the planner emits but this engine does not
           // implement must not be read as "matched" — that turns a parity gap
@@ -1005,7 +1129,7 @@ export class CosmeticEngine {
           _reportError('Unimplemented procedural operator', new Error(op));
           return null;
       }
-    });
+    }, ACTION_OPS.has(op));
   }
 
   /** Apply an XPath expression directly to the document. */

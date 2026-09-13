@@ -123,3 +123,67 @@ test('chrome-stub: call log records every API touch', async () => {
   const apis = stub.calls.entries.map((c) => c.api);
   assert.deepEqual(apis, ['storage.set', 'storage.get', 'dnr.updateDynamicRules']);
 });
+
+// --- REVIEW-2026-09 §3.1 / §7.7 — read-fault injection, requestMethods ------
+
+test('_failNextRead fires once and clears lastError after the callback', async () => {
+  const stub = makeChromeStub();
+  await stub.storage.local.set({ allowlist: ['a.example'], other: 1 });
+
+  const fired = stub.storage.local._failNextRead((keys) => keys.includes('allowlist'));
+  assert.equal(fired(), false);
+
+  // A non-matching read is untouched and does not consume the fault.
+  assert.deepEqual(await stub.storage.local.get('other'), { other: 1 });
+  assert.equal(fired(), false);
+
+  // Callback form: Chrome's contract — result undefined, lastError set for
+  // the duration of the callback only.
+  const seen = await new Promise((resolve) => {
+    stub.storage.local.get(['allowlist'], (result) => {
+      resolve({ result, lastError: stub.runtime.lastError });
+    });
+  });
+  assert.equal(seen.result, undefined);
+  assert.equal(seen.lastError?.message, 'An unexpected error occurred');
+  assert.equal(stub.runtime.lastError, null, 'lastError must be cleared once the callback returns');
+  assert.equal(fired(), true);
+
+  // One-shot: the same read succeeds afterwards.
+  assert.deepEqual(await stub.storage.local.get(['allowlist']), { allowlist: ['a.example'] });
+
+  // Promise form rejects; the string-key form reaches the predicate as an array.
+  const firedAgain = stub.storage.local._failNextRead((keys) => keys.length === 1 && keys[0] === 'other');
+  await assert.rejects(() => stub.storage.local.get('other'), /An unexpected error occurred/);
+  assert.equal(firedAgain(), true);
+
+  // The call log marks the faulted read.
+  assert.equal(stub.calls.entries.filter((c) => c.api === 'storage.get' && c.failed).length, 2);
+});
+
+test('7.7: the stub rejects a requestMethods value Chrome rejects', async () => {
+  const stub = makeChromeStub();
+  const rule = (id, condition) => ({
+    id, priority: 1, action: { type: 'block' }, condition: { urlFilter: '||x.example^', ...condition },
+  });
+
+  for (const [condition, why] of [
+    [{ requestMethods: [] }, 'empty list'],
+    [{ requestMethods: ['GET'] }, 'uppercase'],
+    [{ requestMethods: ['fetch'] }, 'not in the enum'],
+    [{ excludedRequestMethods: [42] }, 'non-string'],
+  ]) {
+    await assert.rejects(
+      () => stub.declarativeNetRequest.updateDynamicRules({ addRules: [rule(1, condition)] }),
+      /requestMethods|excludedRequestMethods/,
+      `expected a rejection for ${why}`,
+    );
+  }
+  assert.equal((await stub.declarativeNetRequest.getDynamicRules()).length, 0,
+    'a rejected batch must leave state untouched');
+
+  await stub.declarativeNetRequest.updateDynamicRules({
+    addRules: [rule(1, { requestMethods: ['get', 'post'] }), rule(2, { excludedRequestMethods: ['other'] })],
+  });
+  assert.equal((await stub.declarativeNetRequest.getDynamicRules()).length, 2);
+});

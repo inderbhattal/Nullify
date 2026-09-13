@@ -60,7 +60,15 @@ const CONFIG = {
   ACTIVE_INDEX_REBUILD_STALL_MS: 120_000, // §5.4 — release a rebuild that never settles
 };
 
-import {getStorage, getStorageBulk, setStorage, StorageKeys} from '../shared/storage.js';
+import {
+  getStorage,
+  getStorageBulk,
+  getStorageBulkOrEmpty,
+  getStorageOrDefault,
+  setStorage,
+  StorageKeys,
+  StorageReadError,
+} from '../shared/storage.js';
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList, COSMETIC_SCOPE_OPTIONS} from '../shared/filter-parser.js';
@@ -68,6 +76,12 @@ import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '.
 import { ancestorDomains } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
 import { applyScriptletExceptions } from '../shared/filter-syntax.js';
+import {
+  PROC_OPS,
+  PROC_OP_ALIASES,
+  isProceduralSelector,
+  NATIVE_FUNCTIONAL_PSEUDO_CLASSES,
+} from '../shared/proc-ops.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
@@ -204,7 +218,12 @@ function setCachedDomainRules(hostname, bundle) {
 const ALARM_FILTER_UPDATE = 'filter-list-update';
 const ALARM_STATS_CLEANUP = 'stats-cleanup';
 const STATS_CLEANUP_INTERVAL_MINUTES = 30;
-const RULE_DATA_SCHEMA_VERSION = 3;
+// Bump to force one active-index rebuild and invalidate every persisted page
+// bundle on the first start after an update. 3 → 4 (REVIEW-2026-09 §3.2/§3.3,
+// A1c): release 1 shipped fixed compilers (B1, C1a/C1b, A1b) with unchanged
+// vendored snapshots, so without the bump the hash — and every cached cssText
+// carrying what the pre-fix engines emitted — would have survived the update.
+const RULE_DATA_SCHEMA_VERSION = 4;
 
 // Load config from storage with fallback to defaults
 async function loadConfig() {
@@ -468,45 +487,13 @@ async function computeBundledRuleDataVersion() {
   return bundledRuleDataVersionPromise;
 }
 
-// All known procedural operators that require JS evaluation.
-//
-// §5.20 — this list MUST equal `PROC_OPS` in src/content/cosmetic-engine.js
-// (and the operator set wasm-core plans against). `semantic` was missing here
-// only, so on the WASM-down path `div:semantic(x)` was not recognised as
-// procedural, passed `isSafeCssSelector`, and shipped to the page as literal
-// CSS — a selector no browser matches, i.e. the rule silently died. Which
-// rules a user got therefore depended on WASM health.
-//
-// TODO: there is still no canonical shared list; this is a hand-kept mirror of
-// the content-script one. Unifying the two (plus content-main's
-// PROC_TOKEN_REGEX) into src/shared/ is open work — see REVIEW-2026-08 §5.20.
-const PROC_OPS = [
-  'matches-css-before',
-  'matches-css-after',
-  'matches-css',
-  'has-text',
-  'nth-ancestor',
-  'upward',
-  'min-text-length',
-  'xpath',
-  'watch-attr',
-  'remove',
-  'style',
-  'matches-path',
-  'matches-attr',
-  'if-not',
-  'if',
-  'semantic',
-];
-
-// Compiled regex for high-performance detection (avoiding O(N) loops)
-const PROC_OP_REGEX = new RegExp(`:(?:${PROC_OPS.join('|')})\\(`, 'i');
-
-/** Returns true if the selector string contains any procedural operator. */
-function isProceduralSelector(selector) {
-  if (typeof selector !== 'string') return false;
-  return PROC_OP_REGEX.test(selector);
-}
+// The procedural operator list, `isProceduralSelector` and the native
+// functional pseudo-class allowlist come from src/shared/proc-ops.js (§3.2,
+// 2026-09): this file used to keep a hand-copied list that drifted (`others`
+// and the `-abp-*` aliases were missing), so on the WASM-down path those
+// selectors passed the CSS gate as "CSS" and were emitted as declarations no
+// browser matches. `tests/wasm-parity.test.mjs` pins the shared list equal to
+// the Rust core's `PROC_OP_NAMES`.
 
 /**
  * Depth-aware scan for the first procedural operator in a selector string.
@@ -521,9 +508,12 @@ function extractFirstOp(selector) {
     if (ch !== ':' || depth !== 0) continue;
 
     for (const op of PROC_OPS) {
-      if (selector.startsWith(op + '(', i + 1)) {
+      // Case-insensitive, like `isProceduralSelector`, the engine and the Rust
+      // matcher: `DIV:Has-Text(x)` must plan here too, not fall through as
+      // CSS the gate then refuses (§3.2).
+      const argStart = i + 1 + op.length + 1; // skip ':op('
+      if (selector.slice(i + 1, argStart).toLowerCase() === op + '(') {
         const base = selector.slice(0, i).trimEnd();
-        const argStart = i + 1 + op.length + 1;
 
         let d = 1, j = argStart;
         while (j < selector.length && d > 0) {
@@ -581,7 +571,9 @@ function parseProceduralPlan(selector) {
       plan.push({ type: 'css', selector: firstOp.base });
     }
     
-    plan.push({ type: 'op', op: firstOp.op, arg: firstOp.arg });
+    // Canonical uBO name, like the engine's planner: `:-abp-has()` plans as
+    // `has`, so every step is one `_applyOp` implements.
+    plan.push({ type: 'op', op: PROC_OP_ALIASES[firstOp.op] ?? firstOp.op, arg: firstOp.arg });
     remaining = firstOp.rest;
   }
   
@@ -704,14 +696,35 @@ function hasBalancedSelectorDelimiters(selector) {
   return !quote && bracketDepth === 0 && parenDepth === 0;
 }
 
+// Mirrors the Rust `KNOWN_PSEUDO_ELEMENTS` / `starts_with_ident_char`.
+const KNOWN_PSEUDO_ELEMENTS = [
+  '::before', '::after', '::first-line', '::first-letter',
+  '::selection', '::backdrop', '::placeholder', '::marker',
+  '::cue', '::slotted', '::part', '::file-selector-button',
+];
+
+/**
+ * True when `ch` can continue a CSS identifier, i.e. would make a preceding
+ * pseudo-element name a *different*, unknown name: ASCII alphanumerics, `-`,
+ * `_`, an escape, and any non-ASCII character (CSS idents admit U+0080+).
+ */
+function isIdentChar(ch) {
+  return ch !== undefined && ch !== '' && (/[A-Za-z0-9_\-\\]/.test(ch) || ch.charCodeAt(0) > 0x7f);
+}
+
 function hasInvalidUniversalUsage(selector) {
   let bracketDepth = 0;
   let parenDepth = 0;
   let quote = null;
   let escaped = false;
+  // The character immediately preceding the current one, unfiltered — needed
+  // to tell the second colon of a `::` pair from a pseudo-class colon.
+  let prev = null;
 
   for (let i = 0; i < selector.length; i++) {
     const ch = selector.charAt(i);
+    const prevChar = prev;
+    prev = ch;
 
     if (escaped) {
       escaped = false;
@@ -776,16 +789,54 @@ function hasInvalidUniversalUsage(selector) {
       }
     }
 
-    // Pseudo-element safety check
-    if (ch === ':' && i + 1 < selector.length && selector.charAt(i + 1) === ':') {
-      const pseudoRest = selector.slice(i);
-      const knownPseudoElements = [
-        '::before', '::after', '::first-line', '::first-letter',
-        '::selection', '::backdrop', '::placeholder', '::marker',
-        '::cue', '::slotted', '::part', '::file-selector-button',
-      ];
-      if (!knownPseudoElements.some(p => pseudoRest.startsWith(p))) {
-        return true; // Unknown pseudo-element — potential bypass
+    // Pseudo-element safety: reject a double colon followed by an unknown
+    // pseudo-element. A bare prefix match is not a match: `::before2` and
+    // `::first-line-x` start with a known name yet name a pseudo-element that
+    // does not exist, so the browser discards the declaration. Require the
+    // character after the name to be one that cannot continue an identifier
+    // (`(` for `::part(x)`, a combinator, a comma, `[`/`:`, or end of input).
+    // Names are ASCII case-insensitive: `::BEFORE` is valid CSS. Mirrors the
+    // Rust gate exactly (§3.2).
+    if (ch === ':' && selector.charAt(i + 1) === ':') {
+      const rest = selector.slice(i);
+      const known = KNOWN_PSEUDO_ELEMENTS.some((p) =>
+        rest.length >= p.length &&
+        rest.slice(0, p.length).toLowerCase() === p &&
+        !isIdentChar(rest.charAt(p.length))
+      );
+      if (!known) {
+        return true; // Unknown pseudo-element — could be bypass attempt
+      }
+      continue;
+    }
+
+    // Pseudo-class safety (§3.2): a single-colon *functional* pseudo-class
+    // must be one a browser knows. `div:others(.x)` — a uBO operator missing
+    // from this file's old hand-copied list — passed here as if it were CSS
+    // and was emitted; with the Rust joiner it was joined with up to 149
+    // legitimate selectors and the browser discarded the whole declaration.
+    //
+    // Outside brackets and quotes only (`[data-x=":bogus("]` is data), at ANY
+    // paren depth (`:not(:bogus(x))` is as invalid as `:bogus(x)`), and never
+    // the second colon of a `::` pair. Procedural operators never reach this
+    // function (the caller checks isProceduralSelector first), so their names
+    // are absent from the allowlist by design. Non-functional pseudo-classes
+    // (`:hover`) are not gated — accepted residual.
+    if (ch === ':' && bracketDepth === 0 && prevChar !== ':') {
+      // Identifier: `[A-Za-z_-][A-Za-z0-9_-]*`.
+      let j = i + 1;
+      while (j < selector.length) {
+        const c = selector.charAt(j);
+        const ident = /[A-Za-z_\-]/.test(c) || (j > i + 1 && /[0-9]/.test(c));
+        if (!ident) break;
+        j++;
+      }
+      if (j === i + 1) continue;
+      if (selector.charAt(j) === '(') {
+        const name = selector.slice(i + 1, j).toLowerCase();
+        if (!NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name)) {
+          return true;
+        }
       }
     }
   }
@@ -963,13 +1014,13 @@ const RULE_INDEX_BUILDING = 'building';
 
 /** True when a previous rebuild started and never finished. */
 async function isRuleIndexInterrupted() {
-  const marker = await getStorage(RULE_INDEX_STATE_KEY).catch(() => null);
+  const marker = await getStorageOrDefault(RULE_INDEX_STATE_KEY, null);
   return marker?.state === RULE_INDEX_BUILDING;
 }
 
 async function rebuildActiveRuleIndexFromStoredSources() {
   const enabledMap = normalizeEnabledRulesetsMap(
-    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
+    await getStorageOrDefault(StorageKeys.ENABLED_RULESETS, {})
   );
   const storedSources = await db.getAllFilterSources();
   const sourceMap = new Map(storedSources.map((entry) => [entry.listId, entry]));
@@ -1157,8 +1208,22 @@ async function ensureFilterSourcesReady() {
 }
 
 async function ensureRuleDataReady() {
-  const existingBloom = await getStorage(StorageKeys.BLOOM_FILTER);
-  const storedRuleDataVersion = await getStorage(StorageKeys.RULE_DATA_VERSION);
+  // §3.1 (REVIEW-2026-09) — BLOOM_FILTER only decides whether the derived
+  // index is (re)built, which is idempotent, so a failed read may degrade to
+  // "absent". RULE_DATA_VERSION feeds `putBulkFilterSources` — a destructive
+  // rewrite of the stored sources — so an unknown version must not read as
+  // "changed": report and leave the index alone for this SW life (the boot
+  // continues; the next wake retries).
+  const existingBloom = await getStorageOrDefault(StorageKeys.BLOOM_FILTER, null);
+  let storedRuleDataVersion;
+  try {
+    storedRuleDataVersion = await getStorage(StorageKeys.RULE_DATA_VERSION);
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('ensureRuleDataReady:storageRead', err);
+    activeRuleDataVersion = (await computeBundledRuleDataVersion().catch(() => null)) || null;
+    return false;
+  }
   const bundledRuleDataVersion = await computeBundledRuleDataVersion().catch(() => null);
   activeRuleDataVersion = bundledRuleDataVersion || storedRuleDataVersion || null;
   const hadSources = await db.hasFilterSources();
@@ -1259,6 +1324,19 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     if (details.reason === 'install') {
       await initializeDefaults();
     }
+    if (details.reason === 'update') {
+      // §3.3 (REVIEW-2026-09, A1c) — dynamic DNR rules persist across updates
+      // and ensureBackgroundSetup skips applyUserFilters when the stored text
+      // equals USER_FILTERS_APPLIED, so user filters compiled by the pre-fix
+      // compiler would stay live until the user next edits the text. Clear
+      // the marker BEFORE background setup so the stored text is recompiled
+      // with the fixed compiler (one DNR write per update, the same write an
+      // edit triggers). Non-fatal: a failed clear must not derail the update
+      // boot; the next edit recompiles anyway.
+      await setStorage(StorageKeys.USER_FILTERS_APPLIED, '').catch((err) => {
+        reportError('onInstalled:clearUserFiltersApplied', err);
+      });
+    }
 
     await ensureRuleDataReady();
     await Promise.all([
@@ -1290,7 +1368,11 @@ function ensureBackgroundSetup() {
     // budget-fallback decisions use fresh numbers, not the stale literals.
     await loadRulesetCountsFromBuild();
 
-    const data = await getStorageBulk([
+    // §3.1 — lenient on purpose: this is a read-only decision (equal strings
+    // ⇒ skip the apply, nothing written). A failed read degrades to
+    // "'' === ''" ⇒ skip, exactly as before; a strict rejection here would
+    // fail the whole background setup for that SW life.
+    const data = await getStorageBulkOrEmpty([
       StorageKeys.USER_FILTERS,
       StorageKeys.USER_FILTERS_APPLIED,
     ]);
@@ -1392,12 +1474,23 @@ function enqueueAllowlistOp(op) {
  * rebuildAllowlistState (or another enqueueAllowlistOp op) so rebuilds
  * never overlap.
  */
+// §3.1 (REVIEW-2026-09) — false until `cachedAllowlist` has been populated
+// from a read that actually succeeded: refreshMemoryCache's bulk read, or a
+// mutation (allowSite/disallowSite/addAllowlistDomains read storage strictly
+// and repopulate the cache in _rebuildAllowlistStateNow). Diagnostic only:
+// `isHostnameAllowedCached` is unchanged (a page load on an allowlisted site
+// during a degraded SW life is filtered, which is the safe direction).
+let allowlistCacheTrusted = false;
+
 async function _rebuildAllowlistStateNow(allowlist) {
   // §4.8 choke point: nothing that fails write-side validation may ever be
   // stored or become a DNR allowAllRequests rule — even via legacy persisted
   // state or a code path that skipped partitionAllowlistInput.
   const normalizedAllowlist = partitionAllowlistInput(allowlist).valid;
   cachedAllowlist = new Set(normalizedAllowlist);
+  // The list came from a strict read inside the op (or a successful refresh),
+  // so the cache is trustworthy again even after a degraded boot.
+  allowlistCacheTrusted = true;
   await setStorage(StorageKeys.ALLOWLIST, normalizedAllowlist);
   await rebuildAllowlistRules(normalizedAllowlist);
   rebuildAllowlistMatcher();
@@ -1416,13 +1509,28 @@ function rebuildAllowlistState(normalizedAllowlist) {
 // runtimeAssetPath are guaranteed to exist as module-level fns by then.
 
 async function refreshMemoryCache() {
-  const data = await getStorageBulk([
-    StorageKeys.SETTINGS,
-    StorageKeys.ALLOWLIST,
-    StorageKeys.GENERIC_CSS,
-    StorageKeys.GENERIC_PROCEDURAL_RULES,
-    StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS,
-  ]);
+  let data;
+  try {
+    data = await getStorageBulk([
+      StorageKeys.SETTINGS,
+      StorageKeys.ALLOWLIST,
+      StorageKeys.GENERIC_CSS,
+      StorageKeys.GENERIC_PROCEDURAL_RULES,
+      StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS,
+    ]);
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    // §3.1 — a failed read is NOT an empty allowlist. The old code fed `[]`
+    // into the §4.7 reconcile below, which then deleted every stored entry and
+    // every DNR allow rule with no user action and nothing reported. Skip the
+    // normalization check, the reconcile AND the shield sync (on a cold worker
+    // `cachedAllowlist` is empty, so a sync would compute `excludeMatches: []`
+    // and re-inject the shield into an allowlisted YouTube tab). Leave every
+    // cache as it was; the boot continues and a later wake retries the read.
+    reportError('refreshMemoryCache:storageRead', err);
+    allowlistCacheTrusted = false;
+    return;
+  }
 
   cachedSettings = data[StorageKeys.SETTINGS];
   const rawAllowlist = data[StorageKeys.ALLOWLIST] || [];
@@ -1431,6 +1539,7 @@ async function refreshMemoryCache() {
   // scrubbed on startup, not resurrected into a TLD-wide DNR allow rule.
   const normalizedAllowlist = partitionAllowlistInput(rawAllowlist).valid;
   cachedAllowlist = new Set(normalizedAllowlist);
+  allowlistCacheTrusted = true;
   let allowlistStateRebuilt = false;
 
   const needsNormalization =
@@ -1547,7 +1656,7 @@ async function ensureLoadedBloomUsable() {
 }
 
 async function loadBloomFilter() {
-  const data = await getStorage(StorageKeys.BLOOM_FILTER);
+  const data = await getStorageOrDefault(StorageKeys.BLOOM_FILTER, null);
   if (data) {
     try {
       if (typeof data === 'string') {
@@ -1698,7 +1807,21 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 // Initialization
 // ---------------------------------------------------------------------------
 async function initializeDefaults() {
-  const existing = await getStorage(StorageKeys.SETTINGS);
+  // §3.1 (REVIEW-2026-09) — this runs on EVERY worker start (ensureBackgroundSetup),
+  // not only from onInstalled. A failed SETTINGS read used to look like a
+  // fresh profile and rewrote ALLOWLIST=[], USER_FILTERS='' and the stats over
+  // the user's state. Only a read that SUCCEEDED and found nothing may write
+  // defaults; a failed read is reported and re-attempted on the next start.
+  // Not rethrown: at the ensureBackgroundSetup call site that would abort
+  // privacy rules, rulesets and the update alarm for this SW life.
+  let existing;
+  try {
+    existing = await getStorage(StorageKeys.SETTINGS);
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('initializeDefaults:storageRead', err);
+    return;
+  }
   if (existing) return;
 
   await setStorage(StorageKeys.SETTINGS, {
@@ -1735,7 +1858,7 @@ async function initializeDefaults() {
 // Privacy settings
 // ---------------------------------------------------------------------------
 async function applyPrivacySettings() {
-  const settings = await getStorage(StorageKeys.SETTINGS) || {};
+  const settings = await getStorageOrDefault(StorageKeys.SETTINGS, {});
 
   // Block WebRTC IP leaks
   if (chrome.privacy?.network?.webRTCIPHandlingPolicy) {
@@ -1999,7 +2122,7 @@ async function scheduleFilterUpdateAlarm() {
     // Derive the initial delay from the last successful check so a user whose
     // alarm was lost (e.g. by the pre-fix clear) catches up instead of
     // waiting another full interval.
-    const lastCheck = await getStorage(StorageKeys.LAST_UPDATE_CHECK);
+    const lastCheck = await getStorageOrDefault(StorageKeys.LAST_UPDATE_CHECK, null);
     let delayInMinutes = CONFIG.FILTER_UPDATE_INTERVAL_MINUTES;
     if (typeof lastCheck === 'number' && lastCheck > 0 && lastCheck <= Date.now()) {
       const elapsedMinutes = (Date.now() - lastCheck) / 60000;
@@ -2195,11 +2318,27 @@ async function readSessionStatsSnapshot() {
 // gets its own promise, started at module load, and every writer waits on it.
 let _statsRestorePromise = null;
 let _statsRestoreDone = false;
+// §3.1 — every writer re-attempts a failed restore; report the fault once per
+// episode (reset by the next successful restore) rather than per attempt.
+let _statsReadFaultReported = false;
 
 function ensureStatsRestored() {
   if (!_statsRestorePromise) {
     _statsRestorePromise = restorePersistedStats().catch((err) => {
-      // A failed restore must not wedge the writers forever — report it and
+      if (err instanceof StorageReadError) {
+        // §3.1 (REVIEW-2026-09) — a failed read is "unknown", not "zero". The
+        // old code restored 0 from the empty result and wrote it back over the
+        // stored day total (the §4.14 zeroing, through a different door).
+        // Leave the restore undone and drop the promise so the next writer
+        // re-attempts it; persistTabStats writes nothing until it succeeds.
+        if (!_statsReadFaultReported) {
+          reportError('restorePersistedStats:storageRead', err);
+          _statsReadFaultReported = true;
+        }
+        _statsRestorePromise = null;
+        return;
+      }
+      // Any other failure must not wedge the writers forever — report it and
       // let persistence resume against whatever is in memory.
       reportError('restorePersistedStats', err);
       _statsRestoreDone = true;
@@ -2254,6 +2393,7 @@ async function restorePersistedStats() {
   // Set BEFORE the write-back below: persistTabStats waits on the restore, and
   // the restore's own write must not wait on itself.
   _statsRestoreDone = true;
+  _statsReadFaultReported = false;
 
   if (
     data[StorageKeys.TOTAL_BLOCKED_DATE] !== totalBlockedDate ||
@@ -2410,7 +2550,12 @@ function updateBadge(tabId) {
 
 async function persistTabStats() {
   // §4.14 — never write a snapshot of memory that predates the restore.
-  if (!_statsRestoreDone) await ensureStatsRestored();
+  if (!_statsRestoreDone) {
+    await ensureStatsRestored();
+    // §3.1 — the restore's read failed: memory is still un-restored, so a
+    // persist from here would write zeros. Write nothing; retry next time.
+    if (!_statsRestoreDone) return;
+  }
   const snapshot = snapshotStatsForSession();
   mirrorStatsToSession();
   await Promise.all([
@@ -3886,7 +4031,7 @@ async function handleMessage(message, sender) {
       const hostname = resolveRequestHostname(sender, payload?.hostname);
       const [isAllowed, settings, cosmeticBundle, scriptletRules] = await Promise.all([
         isHostnameAllowedCached(hostname),
-        (await getStorage(StorageKeys.SETTINGS)) || {},
+        getStorageOrDefault(StorageKeys.SETTINGS, {}),
         getCosmeticBundleForPage(hostname),
         getScriptletRulesForPage(hostname),
       ]);
@@ -3963,7 +4108,7 @@ async function handleMessage(message, sender) {
       return { total: totalBlockedToday, networkStatsAvailable };
     }
     case 'GET_SETTINGS':
-      return (await getStorage(StorageKeys.SETTINGS)) || {};
+      return getStorageOrDefault(StorageKeys.SETTINGS, {});
     case 'UPDATE_SETTINGS': {
       // Partial merge — safe when multiple UI surfaces (popup + options)
       // may be editing settings concurrently. §5.33: the whole-object
@@ -4255,7 +4400,7 @@ async function getCosmeticBundleForPage(hostname) {
       }
     }
 
-    const userRules = (await getStorage(StorageKeys.USER_COSMETIC_RULES)) || {};
+    const userRules = await getStorageOrDefault(StorageKeys.USER_COSMETIC_RULES, {});
     const userGeneric = userRules.generic || [];
     const userExceptions = new Set([...(userRules.genericExceptions || []), ...domainExceptions]);
     const userDomainSelectors = [];
@@ -4332,7 +4477,7 @@ function isScriptletExcludedForHostname(rule, hostname) {
 }
 
 async function getScriptletRulesForPage(hostname) {
-  const userScriptlets = (await getStorage(StorageKeys.USER_SCRIPTLET_RULES)) || [];
+  const userScriptlets = await getStorageOrDefault(StorageKeys.USER_SCRIPTLET_RULES, []);
   // §5.25 — the trust gate runs here, before a single spec can be handed to
   // `injectScriptlets`. User filters can never invoke a trust-gated scriptlet,
   // whichever path wrote them (the options textarea or the element picker's
@@ -4520,6 +4665,7 @@ export const __testHooks = {
   disallowSite,
   addAllowlistDomains,
   refreshMemoryCache,
+  isAllowlistCacheTrusted: () => allowlistCacheTrusted,
   isHostnameAllowedCached,
   allowlistCoversHostname,
   partitionAllowlistInput,
@@ -4554,11 +4700,13 @@ export const __testHooks = {
   },
   // Cosmetic index / navigation
   getCosmeticBundleForPage,
+  buildPageBundle,
   queueActiveIndexRebuild,
   isActiveIndexRebuildInFlight,
   currentRebuildGeneration,
   isRuleIndexInterrupted,
   RULE_INDEX_STATE_KEY,
+  RULE_DATA_SCHEMA_VERSION,
   checkFilterListUpdates,
   getActiveRuleDataVersion: () => activeRuleDataVersion,
   performEarlyInjection,

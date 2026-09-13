@@ -3,7 +3,18 @@ import test from 'node:test';
 
 import * as storage from './storage.js';
 
-const { getStorage, getStorageBulk, setStorage, isQuotaError, StorageQuotaError } = storage;
+const {
+  getStorage,
+  getStorageBulk,
+  getStorageBulkOrEmpty,
+  getStorageOrDefault,
+  getFeatureFlag,
+  setStorage,
+  isQuotaError,
+  StorageQuotaError,
+  StorageReadError,
+  StorageKeys,
+} = storage;
 
 /**
  * Install a fake `chrome.storage.local`. Mirrors Chrome's callback contract:
@@ -40,19 +51,74 @@ function failingSet(message) {
   };
 }
 
-// --- §5.11: lastError / undefined-result handling on reads -----------------
+// --- REVIEW-2026-09 §3.1: a failed read must be distinguishable from empty --
+//
+// 2026-07 §5.11 made getStorageBulk resolve {} on lastError; every
+// read-modify-write downstream then committed "empty" as authoritative. The
+// strict readers now reject with StorageReadError; the lenient variants keep
+// the old contract for consumers that write nothing.
 
-test('5.11: getStorageBulk resolves {} when the read fails with lastError and an undefined result', async () => {
+test('3.1: getStorageBulk rejects with StorageReadError on lastError', async () => {
   installChrome({ get: failingGet('An unexpected error occurred') });
-  const result = await getStorageBulk(['a', 'b']);
-  assert.deepEqual(result, {});
+  await assert.rejects(
+    getStorageBulk(['a', 'b']),
+    (err) =>
+      err instanceof StorageReadError &&
+      err.name === 'StorageReadError' &&
+      err.code === 'READ_FAILED' &&
+      err.message === 'An unexpected error occurred',
+  );
+  // getStorage maps through getStorageBulk and inherits the rejection.
+  await assert.rejects(getStorage('anything'), StorageReadError);
 });
 
-test('5.11: getStorage returns null (does not throw) when the underlying read fails', async () => {
+test('3.1: getStorageBulkOrEmpty resolves {} on lastError', async () => {
   installChrome({ get: failingGet('An unexpected error occurred') });
-  // Prior code resolved `undefined` from getStorageBulk, so this line threw
-  // `TypeError: Cannot read properties of undefined`.
+  assert.deepEqual(await getStorageBulkOrEmpty(['a', 'b']), {});
+
+  installChrome({ get: (chrome, keys, callback) => { callback({ a: 1 }); } });
+  assert.deepEqual(await getStorageBulkOrEmpty(['a', 'b']), { a: 1 });
+});
+
+test('3.1: getStorageOrDefault resolves the fallback on lastError and for a missing key', async () => {
+  installChrome({ get: failingGet('An unexpected error occurred') });
+  assert.deepEqual(await getStorageOrDefault('settings', { enabled: true }), { enabled: true });
+  assert.equal(await getStorageOrDefault('settings'), null, 'the fallback defaults to null');
+
+  installChrome({ get: (chrome, keys, callback) => { callback({}); } });
+  assert.equal(await getStorageOrDefault('missing', 'fallback'), 'fallback');
+
+  installChrome({ get: (chrome, keys, callback) => { callback({ present: 0 }); } });
+  assert.equal(await getStorageOrDefault('present', 'fallback'), 0, 'a stored falsy value is not "missing"');
+});
+
+test('5.11 (kept): getStorage resolves null for an undefined result without lastError', async () => {
+  // Chrome has been observed invoking the callback with `undefined` and NO
+  // lastError. That is "empty", not "failed": the TypeError guard stays.
+  installChrome({ get: (chrome, keys, callback) => { callback(undefined); } });
+  assert.deepEqual(await getStorageBulk(['a']), {});
   assert.equal(await getStorage('anything'), null);
+});
+
+test('getFeatureFlag returns the default on a failed read', async () => {
+  assert.equal(StorageKeys.FEATURE_FLAGS, 'featureFlags');
+
+  installChrome({ get: failingGet('An unexpected error occurred') });
+  assert.equal(await getFeatureFlag('refreshCadenceV2', false), false);
+  assert.equal(await getFeatureFlag('refreshCadenceV2', true), true);
+
+  let requested = null;
+  installChrome({
+    get: (chrome, keys, callback) => {
+      requested = keys;
+      callback({ featureFlags: { refreshCadenceV2: true, broken: 'yes' } });
+    },
+  });
+  assert.deepEqual(requested, null);
+  assert.equal(await getFeatureFlag('refreshCadenceV2', false), true, 'a stored flag wins over the default');
+  assert.deepEqual(requested, ['featureFlags']);
+  assert.equal(await getFeatureFlag('unset', true), true, 'an absent flag yields the default');
+  assert.equal(await getFeatureFlag('broken', false), false, 'a non-boolean value is ignored');
 });
 
 test('5.11: getStorageBulk passes through a successful result unchanged', async () => {

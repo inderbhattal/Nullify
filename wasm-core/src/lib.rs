@@ -252,6 +252,15 @@ struct BucketedCosmeticRules {
     domain_exceptions: HashMap<String, Vec<String>>,
 }
 
+/// A network line the compiler refused, and why — the user-visible channel
+/// for §3.3's fail-closed drops (the UI renders it; `UNSUPPORTED_OPT_DROPS`
+/// only counts).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+struct DroppedLine {
+    line: String,
+    reason: String,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct CompiledUserFilters {
     #[serde(rename = "dnrRules")]
@@ -260,6 +269,8 @@ struct CompiledUserFilters {
     cosmetic_rules: BucketedCosmeticRules,
     #[serde(rename = "scriptletRules")]
     scriptlet_rules: Vec<ParsedRule>,
+    #[serde(rename = "droppedLines", default)]
+    dropped_lines: Vec<DroppedLine>,
 }
 
 #[cfg(test)]
@@ -469,11 +480,18 @@ fn compile_user_filters_internal(text: &str, start_id: u32) -> CompiledUserFilte
             continue;
         }
 
-        if let Some(rule) = parse_network_rule_to_dnr(line, next_id) {
-            if network_seen.insert(line.to_string()) {
+        if !network_seen.insert(line.to_string()) {
+            continue;
+        }
+        match parse_network_rule_to_dnr(line, next_id) {
+            Ok(rule) => {
                 compiled.dnr_rules.push(rule);
                 next_id += 1;
             }
+            Err(reason) => compiled.dropped_lines.push(DroppedLine {
+                line: line.to_string(),
+                reason,
+            }),
         }
     }
 
@@ -1121,11 +1139,25 @@ pub struct DnrCondition {
         skip_serializing_if = "Option::is_none"
     )]
     pub excluded_initiator_domains: Option<Vec<String>>,
+    #[serde(rename = "requestDomains", skip_serializing_if = "Option::is_none")]
+    pub request_domains: Option<Vec<String>>,
     #[serde(
         rename = "excludedRequestDomains",
         skip_serializing_if = "Option::is_none"
     )]
     pub excluded_request_domains: Option<Vec<String>>,
+    #[serde(rename = "requestMethods", skip_serializing_if = "Option::is_none")]
+    pub request_methods: Option<Vec<String>>,
+    #[serde(
+        rename = "excludedRequestMethods",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub excluded_request_methods: Option<Vec<String>>,
+    #[serde(
+        rename = "isUrlFilterCaseSensitive",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub is_url_filter_case_sensitive: Option<bool>,
 }
 
 // Counts filter rules dropped by the critical-path guard in
@@ -1157,17 +1189,189 @@ pub fn reset_unsupported_opt_drop_count() {
     UNSUPPORTED_OPT_DROPS.store(0, Ordering::Relaxed);
 }
 
-fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
+/// Resource types every list-scoped block should match when the author asks
+/// for `$all`. Enumerated rather than left implicit because a DNR condition
+/// with no `resourceTypes` matches every type EXCEPT `main_frame` — the one
+/// that matters for "block this host outright". Mirrors the build's
+/// `SECURITY_LIST_RESOURCE_TYPES`.
+const ALL_RESOURCE_TYPES: [&str; 12] = [
+    "main_frame",
+    "sub_frame",
+    "stylesheet",
+    "script",
+    "image",
+    "font",
+    "object",
+    "xmlhttprequest",
+    "ping",
+    "media",
+    "websocket",
+    "other",
+];
+
+/// The request methods DNR's `requestMethods` accepts.
+const DNR_REQUEST_METHODS: [&str; 9] = [
+    "connect", "delete", "get", "head", "options", "patch", "post", "put", "other",
+];
+
+/// uBO/ABP type option → DNR resource type, aliases included. Mirrors the
+/// build's `RESOURCE_TYPE_MAP`; a missing alias here is an option the
+/// fail-closed default refuses, i.e. lost coverage, never a broadened rule.
+fn dnr_resource_type(option: &str) -> Option<&'static str> {
+    Some(match option {
+        "script" => "script",
+        "image" => "image",
+        "stylesheet" | "css" => "stylesheet",
+        "object" | "object-subrequest" => "object",
+        "xmlhttprequest" | "xhr" => "xmlhttprequest",
+        "subdocument" | "frame" => "sub_frame",
+        "document" | "doc" => "main_frame",
+        "websocket" => "websocket",
+        "media" => "media",
+        "font" => "font",
+        "ping" | "beacon" => "ping",
+        "other" => "other",
+        _ => return None,
+    })
+}
+
+/// Options whose loss cannot make the emitted rule match anything the author
+/// did not intend: the rule is kept, the option dropped. Mirrors the build's
+/// `IGNORABLE_OPTIONS` (minus `all`, which is mapped here — §4.1).
+fn is_ignorable_option(option: &str) -> bool {
+    matches!(option, "inline-script" | "inline-font" | "empty" | "mp4")
+}
+
+/// User text embedded in a `droppedLines` reason, bounded: the UI renders
+/// these, and a single line may be 2 MB.
+fn reason_text(text: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    if text.chars().count() <= MAX_CHARS {
+        return text.to_string();
+    }
+    let mut shown: String = text.chars().take(MAX_CHARS).collect();
+    shown.push('\u{2026}');
+    shown
+}
+
+/// Does `tail` (the text after a `$`) look like the head of an option list?
+/// Mirrors the build's `OPTION_LIST_HEAD`, `^~?[a-z][a-z0-9-]*(?:[=,]|$)`,
+/// with one deliberate extension: `~?[13]p` (`$3p`, `$1p`, `$~3p`) as the
+/// FIRST option. The build's letter-first rule never splits those, so it
+/// ships a dead urlFilter carrying the literal `$3p` — 415 corpus lines, 56
+/// of them exceptions (Track D's finding). A user filter compiles to the
+/// scoped block it asks for.
+fn looks_like_option_list(tail: &str) -> bool {
+    let bytes = tail.strip_prefix('~').unwrap_or(tail).as_bytes();
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+    if (first == b'1' || first == b'3')
+        && bytes.get(1) == Some(&b'p')
+        && matches!(bytes.get(2), None | Some(b'=') | Some(b','))
+    {
+        return true;
+    }
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+    let name_len = bytes
+        .iter()
+        .take_while(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || **b == b'-')
+        .count();
+    matches!(bytes.get(name_len), None | Some(b'=') | Some(b','))
+}
+
+/// Split a network line into its pattern and its options.
+///
+/// Port of the build's `splitPatternAndOptions`: a regex pattern such as
+/// `/ads\.js$/$script` carries a `$` anchor, and `||example.com/$cash` a
+/// literal one, so the FIRST `$` is not the separator. Scan `$` right to left
+/// for one that is unescaped and whose tail parses as an option list; every
+/// `$` inside a regex body or an option value fails that test and is skipped.
+/// The separator legitimately sits at index 0 in uBO's empty-pattern form
+/// (`$script,domain=x`).
+fn split_pattern_and_options(raw: &str) -> (&str, Option<&str>) {
+    let bytes = raw.as_bytes();
+    for idx in (0..bytes.len()).rev() {
+        if bytes[idx] != b'$' || (idx > 0 && bytes[idx - 1] == b'\\') {
+            continue;
+        }
+        let tail = &raw[idx + 1..];
+        if tail.is_empty() || !looks_like_option_list(tail) {
+            continue;
+        }
+        return (&raw[..idx], Some(tail));
+    }
+    (raw, None)
+}
+
+/// Lower-case a `|`-separated domain list into `(included, excluded)`. A
+/// non-ASCII entry cannot be a DNR domain without punycoding, which is not
+/// attempted here (the build's `normalizeDomainList` does it; the SW's ASCII
+/// preflight refuses it) — fail closed on the whole line, in both directions:
+/// an unencodable exclusion would over-apply the rule, an unencodable
+/// positive entry could leave it unscoped.
+fn split_domain_list(value: &str) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut included = Vec::new();
+    let mut excluded = Vec::new();
+    for entry in value.split('|') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (negated, host) = match entry.strip_prefix('~') {
+            Some(rest) => (true, rest),
+            None => (false, entry),
+        };
+        // `~` alone would emit "" — an entry Chrome rejects at
+        // updateDynamicRules, taking the whole batch's retry with it.
+        if host.is_empty() {
+            return Err(format!("empty domain entry: {}", reason_text(entry)));
+        }
+        if !host.is_ascii() {
+            return Err(format!("unencodable domain: {}", reason_text(entry)));
+        }
+        let host = host.to_ascii_lowercase();
+        let list = if negated { &mut excluded } else { &mut included };
+        if !list.contains(&host) {
+            list.push(host);
+        }
+    }
+    Ok((included, excluded))
+}
+
+fn extend_option_list(target: &mut Option<Vec<String>>, values: Vec<String>) {
+    if values.is_empty() {
+        return;
+    }
+    let list = target.get_or_insert_with(Vec::new);
+    for value in values {
+        if !list.contains(&value) {
+            list.push(value);
+        }
+    }
+}
+
+/// Compile one network line to a DNR rule, or say why it cannot be.
+///
+/// §3.3 — this mirrors the build parser's contract (`parseOptions` /
+/// `networkFilterToDNR`), as a table: an option is MAPPED to the DNR field
+/// that expresses it exactly, IGNORABLE (dropped, rule kept) when losing it
+/// cannot broaden the rule, or REFUSED — the whole line is dropped. The
+/// previous behaviour recognised a handful of options and shipped the rule
+/// regardless: `||facebook.com^$removeparam=fbclid` became a hard block of
+/// facebook.com, `@@…$genericblock` a blanket allow, `$to=`/`$from=` lost
+/// their scope. Under-blocking is the recoverable direction; a dropped line
+/// is reported through `droppedLines` so the user can see it.
+fn parse_network_rule_to_dnr(line: &str, id: u32) -> Result<DnrRule, String> {
     let is_exception = line.starts_with("@@");
     let pattern_part = if is_exception { &line[2..] } else { line };
 
-    let (pattern, options_str) = match pattern_part.find('$') {
-        Some(idx) => (&pattern_part[..idx], Some(&pattern_part[idx + 1..])),
-        None => (pattern_part, None),
-    };
+    let (pattern, options_str) = split_pattern_and_options(pattern_part);
 
-    if pattern.is_empty() || pattern == "*" || pattern == "||" {
-        return None;
+    if pattern == "||" {
+        return Err("unscoped pattern: degenerate anchor".to_string());
     }
 
     // Safe Path Guard (Rust edition)
@@ -1195,19 +1399,15 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
             if !is_important {
                 // Tick diagnostic counter so silent drops are auditable.
                 CRITICAL_PATH_DROPS.fetch_add(1, Ordering::Relaxed);
-                return None;
+                return Err(format!("critical path: {path}"));
             }
         }
     }
 
     let mut condition = DnrCondition::default();
     let mut is_important = false;
-
-    if pattern.starts_with('/') && pattern.ends_with('/') && pattern.len() > 2 {
-        condition.regex_filter = Some(pattern[1..pattern.len() - 1].to_string());
-    } else {
-        condition.url_filter = Some(pattern.to_string());
-    }
+    let mut is_popup = false;
+    let mut is_all = false;
 
     if let Some(opts) = options_str {
         for opt in opts.split(',') {
@@ -1219,49 +1419,86 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                 opt_trimmed
             };
 
+            // Refuse: count for the diagnostic getter, report the reason.
+            let refuse = |name: &str| -> Result<DnrRule, String> {
+                UNSUPPORTED_OPT_DROPS.fetch_add(1, Ordering::Relaxed);
+                Err(format!("unsupported option: {}", reason_text(name)))
+            };
+
             // Options that take an argument (key=value).
             if let Some(eq_idx) = opt_name.find('=') {
                 let (key, value) = (&opt_name[..eq_idx], &opt_name[eq_idx + 1..]);
+                // `$~domain=x` is not a form uBO accepts; read as un-negated
+                // it scopes the rule to the wrong sites.
+                if negated {
+                    return refuse(&format!("~{key}"));
+                }
+                // A scoping option whose value resolves to nothing must not
+                // ship the rule UNSCOPED — that is the broadened shape again.
                 match key {
-                    "domain" => {
-                        // uBO: $domain=a.com|~b.com — pipe-delimited, '~' prefix excludes.
-                        let mut included: Vec<String> = Vec::new();
-                        let mut excluded: Vec<String> = Vec::new();
+                    // uBO: $domain=a.com|~b.com — pipe-delimited, '~' excludes.
+                    // `$from=` is the same option under its newer name.
+                    "domain" | "from" => {
+                        let (included, excluded) = split_domain_list(value)?;
+                        if included.is_empty() && excluded.is_empty() {
+                            return refuse(&format!("{key}= (empty)"));
+                        }
+                        extend_option_list(&mut condition.initiator_domains, included);
+                        extend_option_list(&mut condition.excluded_initiator_domains, excluded);
+                    }
+                    // Destination scoping: `$to=` → requestDomains, its `~`
+                    // entries and `$denyallow=` → excludedRequestDomains.
+                    "to" => {
+                        let (included, excluded) = split_domain_list(value)?;
+                        if included.is_empty() && excluded.is_empty() {
+                            return refuse("to= (empty)");
+                        }
+                        extend_option_list(&mut condition.request_domains, included);
+                        extend_option_list(&mut condition.excluded_request_domains, excluded);
+                    }
+                    // uBO's denyallow has no `~` form.
+                    "denyallow" => {
+                        let (included, excluded) = split_domain_list(value)?;
+                        if !excluded.is_empty() || included.is_empty() {
+                            return refuse("denyallow= (empty or negated)");
+                        }
+                        extend_option_list(&mut condition.excluded_request_domains, included);
+                    }
+                    // `$method=get|~post` → requestMethods / excludedRequestMethods,
+                    // lower-cased; a verb DNR does not know refuses the line.
+                    "method" => {
+                        let mut included = Vec::new();
+                        let mut excluded = Vec::new();
                         for entry in value.split('|') {
-                            let e = entry.trim();
-                            if e.is_empty() {
+                            let entry = entry.trim();
+                            if entry.is_empty() {
                                 continue;
                             }
-                            if let Some(stripped) = e.strip_prefix('~') {
-                                excluded.push(stripped.to_lowercase());
+                            let (verb_negated, verb) = match entry.strip_prefix('~') {
+                                Some(rest) => (true, rest),
+                                None => (false, entry),
+                            };
+                            let verb = verb.to_ascii_lowercase();
+                            if !DNR_REQUEST_METHODS.contains(&verb.as_str()) {
+                                return refuse(&format!("method={verb}"));
+                            }
+                            if verb_negated {
+                                excluded.push(verb);
                             } else {
-                                included.push(e.to_lowercase());
+                                included.push(verb);
                             }
                         }
-                        if !included.is_empty() {
-                            condition.initiator_domains = Some(included);
+                        if included.is_empty() && excluded.is_empty() {
+                            return refuse("method= (empty)");
                         }
-                        if !excluded.is_empty() {
-                            condition.excluded_initiator_domains = Some(excluded);
-                        }
+                        extend_option_list(&mut condition.request_methods, included);
+                        extend_option_list(&mut condition.excluded_request_methods, excluded);
                     }
-                    "denyallow" => {
-                        // Requests to these domains are allowed despite matching.
-                        let doms: Vec<String> = value
-                            .split('|')
-                            .map(|s| s.trim().to_lowercase())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        if !doms.is_empty() {
-                            condition.excluded_request_domains = Some(doms);
-                        }
-                    }
-                    // Known but unmappable-to-DNR options. Count them so the
-                    // coverage gap is auditable instead of invisible.
-                    "csp" | "rewrite" | "removeparam" | "redirect" | "redirect-rule" => {
-                        UNSUPPORTED_OPT_DROPS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => { /* unknown arg option — ignore */ }
+                    // Known and unmappable — `$csp`, `$redirect=`, `$removeparam=`,
+                    // `$header=`, `$replace=`, … — and anything unknown: the
+                    // option may be the one that narrows the rule, so shipping
+                    // the remainder over-blocks (or, for `@@`, over-allows).
+                    _ => return refuse(key),
                 }
                 continue;
             }
@@ -1272,45 +1509,21 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                 // means "don't apply generic element hiding here". The user-filter
                 // pipeline has no cosmetic-scope channel, and stripping the option
                 // would degrade the line into a bare network allow — disabling ALL
-                // blocking on the domain instead of only element hiding. Drop the
-                // rule and count it; never emit a network allow.
-                "elemhide" | "ehide" | "generichide" | "ghide" | "specifichide" | "shide" => {
-                    UNSUPPORTED_OPT_DROPS.fetch_add(1, Ordering::Relaxed);
-                    return None;
-                }
+                // blocking on the domain instead of only element hiding.
+                "elemhide" | "ehide" | "generichide" | "ghide" | "specifichide" | "shide"
+                | "genericblock" => return refuse(opt_name),
                 "badfilter" => {
                     // uBO: $badfilter invalidates a matching non-badfilter rule
                     // elsewhere. We don't model cross-rule invalidation, so
                     // the safest action is to drop this rule entirely rather
                     // than emit it as a live block.
-                    return None;
+                    return Err("badfilter: cancels another rule, never shipped".to_string());
                 }
                 "popup" => {
-                    let mut types = condition.resource_types.unwrap_or_default();
-                    if !types.iter().any(|t| t == "main_frame") {
-                        types.push("main_frame".to_string());
-                    }
-                    condition.resource_types = Some(types);
+                    is_popup = true;
+                    extend_option_list(&mut condition.resource_types, vec!["main_frame".to_string()]);
                 }
-                "script" | "image" | "stylesheet" | "xmlhttprequest" | "subdocument"
-                | "document" | "media" | "font" | "websocket" | "ping" | "other" => {
-                    let dnr_type = match opt_name {
-                        "subdocument" => "sub_frame",
-                        "document" => "main_frame",
-                        _ => opt_name,
-                    }
-                    .to_string();
-
-                    if negated {
-                        let mut types = condition.excluded_resource_types.unwrap_or_default();
-                        types.push(dnr_type);
-                        condition.excluded_resource_types = Some(types);
-                    } else {
-                        let mut types = condition.resource_types.unwrap_or_default();
-                        types.push(dnr_type);
-                        condition.resource_types = Some(types);
-                    }
-                }
+                "all" => is_all = true,
                 "third-party" | "3p" => {
                     condition.domain_type =
                         Some(if negated { "firstParty" } else { "thirdParty" }.to_string());
@@ -1319,9 +1532,86 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
                     condition.domain_type =
                         Some(if negated { "thirdParty" } else { "firstParty" }.to_string());
                 }
-                _ => {}
+                // ABP/uBO patterns are case-insensitive unless $match-case;
+                // DNR's default has flipped across Chrome versions, so only
+                // the explicit request is stated (the build states both).
+                "match-case" => {
+                    if !negated {
+                        condition.is_url_filter_case_sensitive = Some(true);
+                    }
+                }
+                _ => {
+                    if let Some(dnr_type) = dnr_resource_type(opt_name) {
+                        let target = if negated {
+                            &mut condition.excluded_resource_types
+                        } else {
+                            &mut condition.resource_types
+                        };
+                        extend_option_list(target, vec![dnr_type.to_string()]);
+                    } else if is_ignorable_option(opt_name) {
+                        // Cannot be expressed in MV3; the rest of the rule
+                        // still means what it says.
+                    } else {
+                        let shown = if opt_name.is_empty() { "(empty)" } else { opt_name };
+                        return refuse(shown);
+                    }
+                }
             }
         }
+    }
+
+    // `$all` is the superset; an explicit type alongside it is contradictory
+    // and uBO keeps the superset.
+    if is_all {
+        condition.resource_types =
+            Some(ALL_RESOURCE_TYPES.iter().map(|t| t.to_string()).collect());
+    }
+
+    // DNR wants one of the two type lists, and a type in both is rejected at
+    // updateDynamicRules. With an include set, emit include minus exclude;
+    // if nothing is left the line asks for nothing.
+    let subtracted = match (&condition.resource_types, &condition.excluded_resource_types) {
+        (Some(included), Some(excluded)) => Some(
+            included
+                .iter()
+                .filter(|t| !excluded.contains(t))
+                .cloned()
+                .collect::<Vec<String>>(),
+        ),
+        _ => None,
+    };
+    if let Some(remaining) = subtracted {
+        if remaining.is_empty() {
+            return Err("resource types: every included type is also excluded".to_string());
+        }
+        condition.resource_types = Some(remaining);
+        condition.excluded_resource_types = None;
+    }
+
+    // ABP $popup matches only script-opened popup windows; DNR's closest
+    // shape is a main_frame block. Fine for a rule anchored to a dedicated
+    // popup domain; for a broad pattern (`/r.php?u=`) it turns ordinary link
+    // clicks into ERR_BLOCKED_BY_CLIENT. Blocks keep only the `||host^` form;
+    // an exception on any pattern only ever un-blocks (mirrors the build).
+    if is_popup && !is_exception && !is_anchored_host_pattern(pattern) {
+        return Err("popup: broad pattern would block ordinary navigations".to_string());
+    }
+
+    if pattern.is_empty() || pattern == "*" {
+        // `*$script,3p,domain=x.com` is "every third-party script from
+        // x.com": a condition with no urlFilter at all. With nothing to
+        // scope it, the same line would match every request.
+        let scoped = condition.resource_types.is_some()
+            || condition.initiator_domains.is_some()
+            || condition.request_domains.is_some()
+            || condition.domain_type.is_some();
+        if !scoped {
+            return Err("unscoped pattern: empty or `*` with nothing to scope it".to_string());
+        }
+    } else if pattern.starts_with('/') && pattern.ends_with('/') && pattern.len() > 2 {
+        condition.regex_filter = Some(pattern[1..pattern.len() - 1].to_string());
+    } else {
+        condition.url_filter = Some(pattern.to_string());
     }
 
     // uBO ordering: a plain exception beats a plain block, but an $important
@@ -1356,7 +1646,7 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         (false, false) => 1u32, // plain block      -> BLOCK
     };
 
-    Some(DnrRule {
+    Ok(DnrRule {
         id,
         priority,
         action: DnrAction {
@@ -1365,6 +1655,19 @@ fn parse_network_rule_to_dnr(line: &str, id: u32) -> Option<DnrRule> {
         },
         condition,
     })
+}
+
+/// `||host^` or `||host` and nothing else — the only pattern shape on which a
+/// `$popup` BLOCK converts safely. Mirrors the build's `/^\|\|[a-z0-9.-]+\^?$/i`.
+fn is_anchored_host_pattern(pattern: &str) -> bool {
+    let Some(rest) = pattern.strip_prefix("||") else {
+        return false;
+    };
+    let host = rest.strip_suffix('^').unwrap_or(rest);
+    !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,29 +1829,94 @@ impl UrlSanitizer {
 // Procedural Selector Planning
 // ---------------------------------------------------------------------------
 
-/// All uBO/ABP procedural operators, longest-first to prevent partial prefix matches.
+/// All uBO/ABP procedural operators — THE list (§3.2). `proc_op_ac`
+/// (detection), `extract_first_op` (planning) and the `proc_op_names()` export
+/// are all generated from it; the JS engines are pinned to the export by
+/// `tests/wasm-parity.test.mjs`. Two hand-kept copies meant a name present in
+/// one and absent from the other: detected as procedural, planned as CSS.
+///
+/// Longest-first within a shared prefix, so the linear scan in
+/// `extract_first_op` cannot let `if` shadow `if-not`. Names are canonical
+/// lowercase; matching is ASCII case-insensitive everywhere (`DIV:Has-Text(x)`
+/// is one rule to the SW's `/i` regex and must be the same rule here).
+///
+/// The uBO action/predicate operators this core does not implement
+/// (`others`, `remove-attr`, `remove-class`, `shadow`, `matches-media`,
+/// `matches-prop`) and the three ABP aliases are listed so they are planned
+/// as procedural — and fail closed in the content engine — instead of passing
+/// the CSS gate as a pseudo-class no browser knows and taking a whole
+/// comma-joined declaration of legitimate hides down with them.
+const PROC_OP_NAMES: [&str; 25] = [
+    "matches-css-before",
+    "matches-css-after",
+    "matches-css",
+    "has-text",
+    "nth-ancestor",
+    "upward",
+    "min-text-length",
+    "xpath",
+    "watch-attr",
+    "remove-attr",
+    "remove-class",
+    "remove",
+    "style",
+    "matches-path",
+    "matches-attr",
+    "matches-media",
+    "matches-prop",
+    "shadow",
+    "others",
+    "-abp-properties",
+    "-abp-contains",
+    "-abp-has",
+    "if-not",
+    "if",
+    "semantic",
+];
+
+/// The functional pseudo-classes a browser knows. A single-colon `:name(`
+/// outside brackets and quotes whose name is not here is invalid CSS, and a
+/// selector list containing one invalid selector is discarded whole (CSS
+/// Selectors 4; only `:is()`/`:where()` forgive) — so it must never reach a
+/// joiner. Procedural operator names never reach the check that uses this
+/// list (`is_css_safe_selector` tests `contains_proc_op` first), so none is
+/// listed here. Non-functional pseudo-classes (`:hover`) are not gated:
+/// accepted residual, the allowlist would be long and brittle (§4.6).
+const NATIVE_FUNCTIONAL_PSEUDO_CLASSES: [&str; 15] = [
+    "not",
+    "is",
+    "where",
+    "has",
+    "nth-child",
+    "nth-last-child",
+    "nth-of-type",
+    "nth-last-of-type",
+    "nth-col",
+    "nth-last-col",
+    "lang",
+    "dir",
+    "host",
+    "host-context",
+    "state",
+];
+
+/// The operator list as a JSON array, for the JS side to pin itself against.
+#[wasm_bindgen]
+pub fn proc_op_names() -> String {
+    serde_json::to_string(&PROC_OP_NAMES).unwrap_or_else(|_| "[]".to_string())
+}
+
 fn proc_op_ac() -> &'static AhoCorasick {
     static AC: OnceLock<AhoCorasick> = OnceLock::new();
     AC.get_or_init(|| {
-        AhoCorasick::new([
-            ":matches-css-before(",
-            ":matches-css-after(",
-            ":matches-css(",
-            ":has-text(",
-            ":nth-ancestor(",
-            ":min-text-length(",
-            ":matches-path(",
-            ":matches-attr(",
-            ":watch-attr(",
-            ":upward(",
-            ":remove(",
-            ":style(",
-            ":xpath(",
-            ":if-not(",
-            ":semantic(",
-            ":if(",
-        ])
-        .unwrap()
+        let patterns: Vec<String> = PROC_OP_NAMES
+            .iter()
+            .map(|name| format!(":{name}("))
+            .collect();
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(&patterns)
+            .unwrap()
     })
 }
 
@@ -1664,25 +2032,6 @@ fn find_matching_paren(selector: &str, start: usize) -> Option<usize> {
 }
 
 fn extract_first_op(selector: &str) -> Option<FirstOp> {
-    let proc_ops = [
-        "matches-css-before",
-        "matches-css-after",
-        "matches-css",
-        "has-text",
-        "nth-ancestor",
-        "upward",
-        "min-text-length",
-        "xpath",
-        "watch-attr",
-        "remove",
-        "style",
-        "matches-path",
-        "matches-attr",
-        "if-not",
-        "if",
-        "semantic",
-    ];
-
     let mut depth = 0i32;
     for (idx, ch) in selector.char_indices() {
         match ch {
@@ -1699,9 +2048,16 @@ fn extract_first_op(selector: &str) -> Option<FirstOp> {
         }
 
         let after_colon = idx + ch.len_utf8();
-        for op in proc_ops {
-            let needle = format!("{op}(");
-            if selector[after_colon..].starts_with(&needle) {
+        let tail = &selector[after_colon..];
+        for op in PROC_OP_NAMES {
+            // `name(`, ASCII case-insensitively. `get` refuses a non-boundary
+            // slice; the `(` byte at `op.len()` makes that offset a boundary.
+            let matched = tail
+                .get(..op.len() + 1)
+                .is_some_and(|head| {
+                    head.as_bytes()[op.len()] == b'(' && head[..op.len()].eq_ignore_ascii_case(op)
+                });
+            if matched {
                 let base = selector[..idx].trim_end().to_string();
                 let arg_start = after_colon + op.len() + 1;
                 let close = find_matching_paren(selector, arg_start)?;
@@ -2020,13 +2376,59 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
                 // continue an identifier: `(` for the functional forms
                 // (`::part(x)`, `::slotted(x)`), a combinator, a selector-list
                 // comma, an attribute/pseudo continuation, or end of input.
+                // Names are ASCII case-insensitive: `::BEFORE` is valid CSS.
                 let known = KNOWN_PSEUDO_ELEMENTS.iter().any(|p| {
-                    rest.strip_prefix(p)
-                        .is_some_and(|after| !starts_with_ident_char(after))
+                    rest.get(..p.len()).is_some_and(|head| {
+                        head.eq_ignore_ascii_case(p) && !starts_with_ident_char(&rest[p.len()..])
+                    })
                 });
                 if !known {
                     // Unknown pseudo-element — could be bypass attempt
                     return true;
+                }
+            }
+            // Pseudo-class safety (§3.2): a single-colon *functional*
+            // pseudo-class must be one a browser knows. `div:others(.x)` —
+            // a uBO operator that was not in the operator set — passed here
+            // as if it were CSS and was joined with up to 149 legitimate
+            // selectors; the browser discarded the whole declaration, and
+            // every domain-specific hide on 289 sites died silently.
+            //
+            // Outside brackets and quotes only (`[data-x=":bogus("]` is
+            // data), at ANY paren depth (`:not(:bogus(x))` is as invalid as
+            // `:bogus(x)`), and never the second colon of a `::` pair.
+            // Procedural operators never reach this function (the caller
+            // checks `contains_proc_op` first), so their names are absent
+            // from the allowlist by design. Non-functional pseudo-classes
+            // (`:hover`) are not gated — accepted residual (§4.6).
+            ':' if bracket_depth == 0 && prev_char != Some(':') => {
+                let tail = &selector[idx + 1..];
+                let bytes = tail.as_bytes();
+                // Identifier: `[A-Za-z_-][A-Za-z0-9_-]*`. The leading `-`
+                // admits `-abp-*`, which are operators and never arrive here.
+                let mut name_len = 0;
+                while name_len < bytes.len() {
+                    let b = bytes[name_len];
+                    let ident = b.is_ascii_alphabetic()
+                        || b == b'_'
+                        || b == b'-'
+                        || (name_len > 0 && b.is_ascii_digit());
+                    if !ident {
+                        break;
+                    }
+                    name_len += 1;
+                }
+                if name_len == 0 {
+                    continue;
+                }
+                if bytes.get(name_len) == Some(&b'(') {
+                    let name = &tail[..name_len];
+                    let native = NATIVE_FUNCTIONAL_PSEUDO_CLASSES
+                        .iter()
+                        .any(|n| n.eq_ignore_ascii_case(name));
+                    if !native {
+                        return true;
+                    }
                 }
             }
             _ => {}
@@ -4000,6 +4402,426 @@ mod tests {
             sanitizer.sanitize("https://x.example/p"),
             "https://x.example/p"
         );
+    }
+
+    // §3.2 — an unknown single-colon functional pseudo-class (`div:bogus(1)`,
+    // or a uBO operator this core never learned, `div:others(.x)`) is invalid
+    // CSS. Comma-joined with up to 149 legitimate selectors it takes the whole
+    // declaration down with it, silently: every domain-specific hide on that
+    // site is dead and nothing observes it. Refuse it alone; never join it.
+    #[test]
+    fn css_safety_gate_rejects_unknown_functional_pseudo_classes() {
+        // The review's input, through the joiner the SW's page-bundle path
+        // feeds: the bad line drops, its neighbours' declaration survives.
+        assert_eq!(
+            build_css_from_selectors(".good-one\ndiv:others(.x)\n.good-two", "", 100),
+            ".good-one,.good-two { display: none !important; visibility: hidden !important; }"
+        );
+        assert_eq!(build_css_from_selectors("div:bogus(1)", "", 100), "");
+        // Nested inside a native pseudo-class: still refused (any paren depth).
+        assert_eq!(build_css_from_selectors("div:not(:bogus(1))", "", 100), "");
+        // Pseudo-class names are ASCII case-insensitive in CSS.
+        assert!(build_css_from_selectors("div:HAS(.x)", "", 100).contains("div:HAS(.x)"));
+        // Inside an attribute value the text is data, not a pseudo-class.
+        assert!(build_css_from_selectors("[data-x=\":bogus(\"]", "", 100)
+            .contains("[data-x=\":bogus(\"]"));
+        // A former CSS-passing uBO operator is an operator now: planned as
+        // procedural by the bundle builder, never emitted as CSS.
+        let bundle =
+            build_page_bundle_internal(vec![], vec!["div:others(.x)".into()], vec![], 100);
+        assert_eq!(bundle.css_text, "");
+        assert_eq!(bundle.rules.domain_specific.len(), 1);
+        assert_eq!(bundle.rules.domain_specific[0].selector, "div:others(.x)");
+        assert_eq!(
+            bundle.rules.domain_specific[0].plan[1].op.as_deref(),
+            Some("others")
+        );
+
+        for bad in [
+            "div:bogus(1)",
+            "div:not(:bogus(1))",
+            "a:Bogus(x)",
+            "div:nth-child(2):bogus()",
+            ".a:is(.b, :bogus(c))",
+            // Pseudo-element prefix shapes, now compared case-insensitively:
+            // `::Before2` is as non-existent as `::before2`.
+            "div::Before2",
+            "div::AFTERWARD",
+        ] {
+            assert!(has_invalid_universal_usage(bad), "{bad} must be flagged");
+            assert!(!is_css_safe_selector(bad), "{bad} must be refused");
+        }
+
+        // Must not change: every native functional pseudo-class, in any case;
+        // non-functional pseudo-classes (not gated — accepted residual); quoted
+        // and bracketed look-alikes; pseudo-elements in any case.
+        for ok in [
+            "div:has(.x)",
+            "div:not(.x)",
+            ":is(.a, .b)",
+            ":where(.a)",
+            "li:nth-child(2n+1)",
+            "li:nth-last-child(1)",
+            "p:nth-of-type(2)",
+            "p:nth-last-of-type(2)",
+            "td:nth-col(2)",
+            "td:nth-last-col(2)",
+            ":lang(en)",
+            ":dir(rtl)",
+            ":host(.x)",
+            ":host-context(.dark)",
+            "x:state(open)",
+            "a:hover",
+            "a:hover:not(.x)",
+            "li:nth-child(2n+1 of :not([hidden]))",
+            "div:HAS(.x)",
+            "div:Not(:Is(.x))",
+            "[data-x=\":bogus(\"]",
+            "a[title=':bogus(']",
+            "div::BEFORE",
+            "div::Before",
+            "input::PLACEHOLDER",
+            "x::Part(label)",
+            "div::before:hover",
+        ] {
+            assert!(!has_invalid_universal_usage(ok), "{ok} must not be flagged");
+            assert!(is_css_safe_selector(ok), "{ok} must stay CSS-safe");
+        }
+    }
+
+    // §3.2 — one operator list. `proc_op_ac` (detection) and `extract_first_op`
+    // (planning) used to be two hand-kept arrays; a name present in one and
+    // not the other is a selector detected as procedural but planned as CSS.
+    // Both are generated from `PROC_OP_NAMES`, and `proc_op_names()` exports
+    // it so the JS engines can be pinned to the same list.
+    #[test]
+    fn proc_op_names_match_the_aho_corasick_and_first_op_lists() {
+        assert_eq!(proc_op_ac().patterns_len(), PROC_OP_NAMES.len());
+        let exported: Vec<String> = serde_json::from_str(&proc_op_names()).unwrap();
+        let expected: Vec<String> = PROC_OP_NAMES.iter().map(|s| s.to_string()).collect();
+        assert_eq!(exported, expected);
+
+        for name in PROC_OP_NAMES {
+            assert_eq!(name, name.to_ascii_lowercase(), "{name} must be canonical");
+            let lower = format!("div:{name}(x)");
+            assert!(contains_proc_op(&lower), "{lower}");
+            assert_eq!(extract_first_op(&lower).unwrap().op, name, "{lower}");
+            // Detection and planning are both ASCII case-insensitive, and the
+            // planned op name is the canonical lowercase one.
+            let upper = format!("DIV:{}(x)", name.to_ascii_uppercase());
+            assert!(contains_proc_op(&upper), "{upper}");
+            let first = extract_first_op(&upper).unwrap();
+            assert_eq!(first.op, name, "{upper}");
+            assert_eq!(first.base, "DIV");
+            assert_eq!(first.arg, "x");
+        }
+
+        // Longest-first within a shared prefix: no name is a prefix of a
+        // later one, so `if` cannot shadow `if-not` in the linear scan.
+        for (i, shorter) in PROC_OP_NAMES.iter().enumerate() {
+            for longer in &PROC_OP_NAMES[i + 1..] {
+                assert!(!longer.starts_with(shorter), "{shorter} must follow {longer}");
+            }
+        }
+
+        // The two lists are disjoint by construction: an operator never reaches
+        // `has_invalid_universal_usage`, and a native pseudo-class is never
+        // planned as an operator.
+        for native in NATIVE_FUNCTIONAL_PSEUDO_CLASSES {
+            assert!(!PROC_OP_NAMES.contains(&native), "{native} is native CSS");
+        }
+    }
+
+    // §3.3 — the user-filter compiler used to recognise a handful of options,
+    // count a few as "unsupported" for a diagnostic nobody read, and ship the
+    // rule regardless: `||facebook.com^$removeparam=fbclid` became a hard block
+    // of facebook.com, `@@…$genericblock` a blanket allow. Every option not in
+    // the mapped or ignorable set now drops the rule, counted AND recorded in
+    // `droppedLines` for the UI.
+    #[test]
+    fn user_filter_compiler_fails_closed_on_unmapped_options() {
+        for (line, option) in [
+            ("||facebook.com^$removeparam=fbclid", "removeparam"),
+            ("||facebook.com^$removeparam", "removeparam"),
+            ("||example.com^$csp=script-src 'self'", "csp"),
+            ("||example.com^$header=content-type:image", "header"),
+            ("||example.com^$rewrite=abp-resource:blank-js", "rewrite"),
+            ("||example.com^$redirect=noop.js", "redirect"),
+            ("||example.com^$redirect-rule=noop.js", "redirect-rule"),
+            ("||example.com^$replace=/a/b/", "replace"),
+            ("||example.com^$urlskip=?url", "urlskip"),
+            ("||example.com^$uritransform=/a/b/", "uritransform"),
+            ("||example.com^$cname", "cname"),
+            ("||example.com^$ipaddress=1.2.3.4", "ipaddress"),
+            ("||example.com^$popunder", "popunder"),
+            ("||example.com^$strict1p", "strict1p"),
+            ("||example.com^$strict3p", "strict3p"),
+            ("||example.com^$permissions=geolocation=()", "permissions"),
+            ("@@||example.com^$genericblock", "genericblock"),
+            ("@@||example.com^$elemhide", "elemhide"),
+            ("@@||example.com^$ghide", "ghide"),
+            ("@@||example.com^$shide", "shide"),
+            ("||example.com^$script,bogus-option", "bogus-option"),
+            ("||example.com^$bogus=1,script", "bogus"),
+            ("||example.com^$method=brew", "method=brew"),
+            // A scoping option whose value resolves to nothing must not
+            // ship the rule UNSCOPED — that is the broadened shape again.
+            ("||example.com^$domain=", "domain= (empty)"),
+            ("||example.com^$domain=|", "domain= (empty)"),
+            ("||example.com^$from=", "from= (empty)"),
+            ("||example.com^$to=", "to= (empty)"),
+            ("||example.com^$denyallow=", "denyallow= (empty or negated)"),
+            ("||example.com^$denyallow=~x.com", "denyallow= (empty or negated)"),
+            ("||example.com^$method=", "method= (empty)"),
+            // `~` before a key=value option is not an option uBO accepts;
+            // treating it as un-negated scopes the rule to the wrong sites.
+            ("||example.com^$~domain=a.com", "~domain"),
+            ("||example.com^$~to=a.com", "~to"),
+            ("||example.com^$~method=get", "~method"),
+        ] {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert!(compiled.dnr_rules.is_empty(), "{line} must emit no rule");
+            assert_eq!(compiled.dropped_lines.len(), 1, "{line} must be recorded once");
+            assert_eq!(compiled.dropped_lines[0].line, line);
+            assert_eq!(
+                compiled.dropped_lines[0].reason,
+                format!("unsupported option: {option}"),
+                "{line}"
+            );
+        }
+
+        // Ignorable options drop the option, never the rule.
+        for line in [
+            "||example.com^$inline-script,script",
+            "||example.com^$inline-font",
+            "||example.com^$empty",
+            "||example.com^$mp4,media",
+        ] {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert_eq!(compiled.dnr_rules.len(), 1, "{line} must still emit");
+            assert!(compiled.dropped_lines.is_empty(), "{line}");
+        }
+
+        // Non-option drops are recorded too, under their own reason.
+        for (line, reason_prefix) in [
+            ("||example.com^$badfilter", "badfilter"),
+            ("/r.php?u=$popup", "popup"),
+            ("||example.com^$domain=münchen.de", "unencodable domain"),
+            ("||example.com^$to=~münchen.de", "unencodable domain"),
+            // An entry that is exactly `~` would emit "" — an entry Chrome
+            // rejects at updateDynamicRules.
+            ("||example.com^$domain=~", "empty domain entry"),
+            ("||example.com^$domain=~|~", "empty domain entry"),
+            ("||example.com^$to=~", "empty domain entry"),
+            // A type both included and excluded is a rule Chrome rejects.
+            ("||example.com^$script,~script", "resource types"),
+            ("*", "unscoped pattern"),
+        ] {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert!(compiled.dnr_rules.is_empty(), "{line} must emit no rule");
+            assert_eq!(compiled.dropped_lines.len(), 1, "{line}");
+            assert!(
+                compiled.dropped_lines[0].reason.starts_with(reason_prefix),
+                "{line}: {}",
+                compiled.dropped_lines[0].reason
+            );
+        }
+
+        // Reason strings embed user text bounded: the UI renders them.
+        let long = format!("||example.com^${}", "x".repeat(5000));
+        let compiled = compile_user_filters_internal(&long, 1);
+        assert!(compiled.dnr_rules.is_empty());
+        assert!(compiled.dropped_lines[0].reason.chars().count() <= 240, "{}", compiled.dropped_lines[0].reason.len());
+        assert!(compiled.dropped_lines[0].reason.starts_with("unsupported option: xxx"));
+        let long_domain = format!("||example.com^$domain={}", "\u{e9}".repeat(3000));
+        let compiled = compile_user_filters_internal(&long_domain, 1);
+        assert!(compiled.dropped_lines[0].reason.chars().count() <= 240);
+
+        // A batch records each dropped line and keeps the rest.
+        let compiled = compile_user_filters_internal(
+            "||ads.example^\n||facebook.com^$removeparam=fbclid\n@@||example.com^$ghide\n||ok.example^$script",
+            1,
+        );
+        assert_eq!(compiled.dnr_rules.len(), 2);
+        assert_eq!(compiled.dropped_lines.len(), 2);
+        assert_eq!(compiled.dropped_lines[0].line, "||facebook.com^$removeparam=fbclid");
+        assert_eq!(compiled.dropped_lines[1].line, "@@||example.com^$ghide");
+        assert!(compiled.dnr_rules[0].id < compiled.dnr_rules[1].id);
+    }
+
+    #[test]
+    fn user_filter_compiler_maps_to_from_method_and_type_aliases() {
+        let rule_for = |line: &str| {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert!(compiled.dropped_lines.is_empty(), "{line}: {:?}", compiled.dropped_lines.first().map(|d| &d.reason));
+            assert_eq!(compiled.dnr_rules.len(), 1, "{line} must emit exactly one rule");
+            compiled.dnr_rules.into_iter().next().unwrap()
+        };
+        let strs = |v: &[&str]| Some(v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        // $to= → requestDomains, `~` entries → excludedRequestDomains (with denyallow).
+        let c = rule_for("||example.com^$to=CDN.example|~static.example,denyallow=x.example").condition;
+        assert_eq!(c.url_filter.as_deref(), Some("||example.com^"));
+        assert_eq!(c.request_domains, strs(&["cdn.example"]));
+        assert_eq!(c.excluded_request_domains, strs(&["static.example", "x.example"]));
+
+        // $from= is $domain= by another name.
+        let c = rule_for("||example.com^$from=Site.example|~other.example").condition;
+        assert_eq!(c.initiator_domains, strs(&["site.example"]));
+        assert_eq!(c.excluded_initiator_domains, strs(&["other.example"]));
+
+        // $method= → requestMethods, lowercased; `~` → excludedRequestMethods.
+        let c = rule_for("||example.com^$method=POST|put").condition;
+        assert_eq!(c.request_methods, strs(&["post", "put"]));
+        assert_eq!(c.excluded_request_methods, None);
+        let c = rule_for("||example.com^$method=~get").condition;
+        assert_eq!(c.request_methods, None);
+        assert_eq!(c.excluded_request_methods, strs(&["get"]));
+
+        // Type aliases, and the review's type-less block.
+        let c = rule_for("||ads.example^$xhr").condition;
+        assert_eq!(c.resource_types, strs(&["xmlhttprequest"]));
+        let c = rule_for("||ads.example^$css,frame,doc,beacon,object-subrequest,~image").condition;
+        assert_eq!(c.resource_types, strs(&["stylesheet", "sub_frame", "main_frame", "ping", "object"]));
+        // With an include set, the exclusion is folded in (include minus
+        // exclude) and never emitted alongside it.
+        assert_eq!(c.excluded_resource_types, None);
+
+        // $all → the full enumerated set (a DNR condition with no types would
+        // silently exclude main_frame), and it wins over an explicit type.
+        let c = rule_for("||bad.example^$all").condition;
+        assert_eq!(c.resource_types.as_deref().map(|v| v.len()), Some(12));
+        assert!(c.resource_types.as_ref().unwrap().iter().any(|t| t == "main_frame"));
+        let c = rule_for("||bad.example^$script,all").condition;
+        assert_eq!(c.resource_types.as_deref().map(|v| v.len()), Some(12));
+        // Include minus exclude, never both lists: Chrome rejects a type that
+        // is in both, and the DNR docs say to set only one of the two.
+        let c = rule_for("||bad.example^$all,~image").condition;
+        assert_eq!(c.resource_types.as_deref().map(|v| v.len()), Some(11));
+        assert!(!c.resource_types.as_ref().unwrap().iter().any(|t| t == "image"));
+        assert_eq!(c.excluded_resource_types, None);
+        let c = rule_for("||bad.example^$script,image,~image").condition;
+        assert_eq!(c.resource_types, strs(&["script"]));
+        assert_eq!(c.excluded_resource_types, None);
+        let c = rule_for("||bad.example^$~image").condition;
+        assert_eq!(c.resource_types, None);
+        assert_eq!(c.excluded_resource_types, strs(&["image"]));
+
+        // $popup: anchored-host blocks and every exception; broad blocks drop.
+        let c = rule_for("||pop.example^$popup").condition;
+        assert_eq!(c.resource_types, strs(&["main_frame"]));
+        let rule = rule_for("@@/r.php?u=$popup");
+        assert_eq!(rule.action.action_type, "allow");
+        assert_eq!(rule.condition.resource_types, strs(&["main_frame"]));
+        assert!(compile_user_filters_internal("/r.php?u=$popup", 1).dnr_rules.is_empty());
+
+        // $match-case, party scoping, $important all still map.
+        let c = rule_for("||example.com^$match-case").condition;
+        assert_eq!(c.is_url_filter_case_sensitive, Some(true));
+        assert_eq!(rule_for("||example.com^$script").condition.is_url_filter_case_sensitive, None);
+        let c = rule_for("||example.com^$~script,3p").condition;
+        assert_eq!(c.domain_type.as_deref(), Some("thirdParty"));
+        assert_eq!(c.excluded_resource_types, strs(&["script"]));
+        assert_eq!(rule_for("||example.com^$first-party").condition.domain_type.as_deref(), Some("firstParty"));
+        // `$3p`/`$1p` as the FIRST option. The build's option-list head
+        // wants a letter first and ships a dead urlFilter carrying literal
+        // `$3p` (415 corpus lines; Track D's finding). Not mirrored: a user
+        // filter must compile to the scoped block it asks for.
+        for (line, party) in [
+            ("||example.com^$3p", "thirdParty"),
+            ("||example.com^$~3p", "firstParty"),
+            ("||example.com^$1p", "firstParty"),
+            ("||example.com^$~1p", "thirdParty"),
+        ] {
+            let c = rule_for(line).condition;
+            assert_eq!(c.url_filter.as_deref(), Some("||example.com^"), "{line}");
+            assert_eq!(c.domain_type.as_deref(), Some(party), "{line}");
+        }
+        let c = rule_for("||example.com^$1p,script").condition;
+        assert_eq!(c.domain_type.as_deref(), Some("firstParty"));
+        assert_eq!(c.resource_types, strs(&["script"]));
+        assert_eq!(split_pattern_and_options("||x^$3p,script"), ("||x^", Some("3p,script")));
+        assert_eq!(split_pattern_and_options("||x^$3px"), ("||x^$3px", None));
+        assert_eq!(split_pattern_and_options("||x^$2p"), ("||x^$2p", None));
+        assert_eq!(rule_for("||example.com^$important").priority, 4);
+
+        // Serialised names are the DNR schema's.
+        let json = serde_json::to_string(
+            &compile_user_filters_internal("||example.com^$to=a.example,method=post,match-case", 1),
+        )
+        .unwrap();
+        for key in ["\"requestDomains\"", "\"requestMethods\"", "\"isUrlFilterCaseSensitive\"", "\"droppedLines\""] {
+            assert!(json.contains(key), "{key} missing from {json}");
+        }
+        assert!(!json.contains("excludedRequestMethods"), "absent fields are omitted");
+    }
+
+    // A regex pattern's `$` anchor is not an option separator. The first-`$`
+    // split turned `/ads\.js$/$script` into urlFilter `/ads\.js` with the
+    // type lost; the build's right-to-left "does the tail look like an
+    // option list" scan keeps the anchor in the pattern.
+    #[test]
+    fn user_filter_compiler_splits_regex_anchors_from_options() {
+        let compiled = compile_user_filters_internal("/ads\\.js$/$script", 1);
+        assert_eq!(compiled.dnr_rules.len(), 1);
+        let c = &compiled.dnr_rules[0].condition;
+        assert_eq!(c.regex_filter.as_deref(), Some("ads\\.js$"));
+        assert_eq!(c.url_filter, None);
+        assert_eq!(c.resource_types, Some(vec!["script".to_string()]));
+
+        // No options at all: the anchor stays and nothing is split.
+        let compiled = compile_user_filters_internal("/ads\\.js$/", 1);
+        assert_eq!(compiled.dnr_rules[0].condition.regex_filter.as_deref(), Some("ads\\.js$"));
+
+        // A `$` whose tail does not parse as an option list is pattern text.
+        for line in ["||example.com/path$1", "||example.com/$1x", "||example.com/$Cash"] {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert_eq!(compiled.dnr_rules.len(), 1, "{line}");
+            assert_eq!(compiled.dnr_rules[0].condition.url_filter.as_deref(), Some(line));
+            assert_eq!(compiled.dnr_rules[0].condition.resource_types, None);
+        }
+        // …but a tail that does parse as one IS one, and an unknown option
+        // refuses the line — the same answer the build gives `$cash`.
+        let compiled = compile_user_filters_internal("||example.com/$cash", 1);
+        assert!(compiled.dnr_rules.is_empty());
+        assert_eq!(compiled.dropped_lines[0].reason, "unsupported option: cash");
+
+        // The split works on exceptions too, and the empty-pattern form.
+        let compiled = compile_user_filters_internal("@@/ads\\.js$/$script", 1);
+        assert_eq!(compiled.dnr_rules[0].action.action_type, "allow");
+        assert_eq!(compiled.dnr_rules[0].condition.regex_filter.as_deref(), Some("ads\\.js$"));
+        assert_eq!(
+            split_pattern_and_options("$script,domain=example.com"),
+            ("", Some("script,domain=example.com"))
+        );
+        assert_eq!(split_pattern_and_options("a\\$b$script"), ("a\\$b", Some("script")));
+    }
+
+    // `*$script,3p,domain=x.com` is a real uBO shape ("every third-party script
+    // from x.com"). DNR expresses it as a condition with no urlFilter at all;
+    // an unscoped `*` still drops.
+    #[test]
+    fn user_filter_compiler_scoped_star_pattern_has_no_url_filter() {
+        for line in ["*$script,3p,domain=x.com", "$script,3p,domain=x.com"] {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert_eq!(compiled.dnr_rules.len(), 1, "{line}");
+            let c = &compiled.dnr_rules[0].condition;
+            assert_eq!(c.url_filter, None, "{line}");
+            assert_eq!(c.regex_filter, None);
+            assert_eq!(c.resource_types, Some(vec!["script".to_string()]));
+            assert_eq!(c.domain_type.as_deref(), Some("thirdParty"));
+            assert_eq!(c.initiator_domains, Some(vec!["x.com".to_string()]));
+            let json = serde_json::to_string(&compiled.dnr_rules[0]).unwrap();
+            assert!(!json.contains("urlFilter"), "{json}");
+        }
+        for line in ["*$to=cdn.example", "*$3p", "*$script"] {
+            assert_eq!(compile_user_filters_internal(line, 1).dnr_rules.len(), 1, "{line}");
+        }
+        for line in ["*", "*$important", "*$match-case", "||"] {
+            let compiled = compile_user_filters_internal(line, 1);
+            assert!(compiled.dnr_rules.is_empty(), "{line} must drop");
+            assert_eq!(compiled.dropped_lines.len(), 1, "{line}");
+        }
     }
 }
 

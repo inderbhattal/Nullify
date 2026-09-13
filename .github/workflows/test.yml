@@ -88,4 +88,4 @@ jobs:
         run: cargo test --manifest-path wasm-core/Cargo.toml
 
       - name: Clippy
-        run: cargo clippy --manifest-path wasm-core/Cargo.toml --all-targets
+        run: cargo clippy --manifest-path wasm-core/Cargo.toml --all-targets -- -D warnings

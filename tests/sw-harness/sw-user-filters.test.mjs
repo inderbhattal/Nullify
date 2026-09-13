@@ -284,3 +284,62 @@ test('4.15: without isRegexSupported (packed-API drift), chunk retry isolates th
   hooks.setCompileUserFiltersOverrideForTest(null);
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §3.3 / A1c — release-1 migration. ensureBackgroundSetup skips
+// applyUserFilters when USER_FILTERS === USER_FILTERS_APPLIED, and dynamic
+// DNR rules persist across updates: a user whose My Filters were compiled by
+// the pre-fix compiler keeps its broadened rules until they next edit the
+// text. An update boot must clear the APPLIED marker before background setup
+// so the stored text is recompiled with the fixed compiler.
+// ---------------------------------------------------------------------------
+
+function recordingCompileOverride(calls) {
+  return (text) => {
+    calls.push(text);
+    return { dnrRules: [], cosmeticRules: { generic: [], domainSpecific: {} }, scriptletRules: [] };
+  };
+}
+
+test('3.3: an update boot recompiles user filters whose APPLIED marker matches', async () => {
+  const TEXT = '||ads.example^';
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: { userFilters: TEXT, userFiltersApplied: TEXT },
+  });
+  const compiled = [];
+  hooks.setCompileUserFiltersOverrideForTest(recordingCompileOverride(compiled));
+
+  // Fired right after load, as Chrome does on an extension update: the
+  // handler runs concurrently with startInitialization.
+  const installed = chrome.runtime.onInstalled._fireAsync({ reason: 'update' });
+  await installed;
+  await hooks.whenCriticalReady();
+  await hooks.whenBackgroundSetupDone();
+
+  assert.deepEqual(compiled, [TEXT],
+    'the stored text must be recompiled exactly once — the equal-marker check used to skip it');
+  assert.equal(chrome.storage.local._data().userFiltersApplied, TEXT,
+    'APPLIED is re-recorded once the recompile succeeded');
+  assert.ok(!hooks.errorReport.critical.some((e) => e.context !== 'WASM initialization'),
+    `the update handler and background setup must complete: ${JSON.stringify(hooks.errorReport.critical)}`);
+
+  hooks.setCompileUserFiltersOverrideForTest(null);
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('3.3 (didn\'t re-break): an ordinary wake with a matching APPLIED marker still skips the compile', async () => {
+  const TEXT = '||ads.example^';
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: { userFilters: TEXT, userFiltersApplied: TEXT },
+  });
+  const compiled = [];
+  hooks.setCompileUserFiltersOverrideForTest(recordingCompileOverride(compiled));
+  await hooks.whenCriticalReady();
+  await hooks.whenBackgroundSetupDone();
+
+  assert.deepEqual(compiled, [], 'no update, equal markers ⇒ nothing to recompile');
+  assert.equal(chrome.storage.local._data().userFiltersApplied, TEXT);
+
+  hooks.setCompileUserFiltersOverrideForTest(null);
+  hooks.cancelPendingStatsPersistForTest();
+});

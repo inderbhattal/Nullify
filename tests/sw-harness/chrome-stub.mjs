@@ -11,6 +11,21 @@
  * Design rule: stubs never silently succeed. A method that the SW expects
  * to throw on bad input throws here too. Listener events fire synchronously
  * unless explicitly deferred — tests should not depend on tick ordering.
+ *
+ * Fault injection (REVIEW-2026-09 §3.1): `storage.<area>._failNextRead(pred?)`
+ * arms a ONE-SHOT read fault. The next `get` whose key list satisfies `pred`
+ * (default: any read; the list is normalized to an array, so a string key,
+ * an array and the `{key: default}` object form all reach `pred` as an
+ * array of key names) fails the way Chrome fails a read: the callback runs
+ * with `undefined` while `runtime.lastError` is set — cleared again right
+ * after the callback returns — and the promise form rejects. Held reads
+ * (`_holdReads`) still gate a failing read. Returns `() => fired` so a test
+ * can prove the fault was consumed by the read it meant to hit.
+ *
+ * DNR schema (REVIEW-2026-08 §7.7, extended 2026-09): `validateDnrRuleSchema`
+ * also rejects `requestMethods` / `excludedRequestMethods` lists that are
+ * empty, non-string, uppercase, or outside Chrome's enum
+ * (connect delete get head options patch post put other).
  */
 
 class CallLog {
@@ -94,6 +109,12 @@ const DNR_DOMAIN_LIST_KEYS = [
   'requestDomains',
   'excludedRequestDomains',
 ];
+// chrome.declarativeNetRequest.RequestMethod — lowercase only; Chrome rejects
+// the whole batch for an unknown or uppercase value.
+const DNR_REQUEST_METHODS = new Set([
+  'connect', 'delete', 'get', 'head', 'options', 'patch', 'post', 'put', 'other',
+]);
+const DNR_REQUEST_METHOD_KEYS = ['requestMethods', 'excludedRequestMethods'];
 
 function validateDnrRuleSchema(rule) {
   const id = rule?.id;
@@ -144,6 +165,22 @@ function validateDnrRuleSchema(rule) {
       }
     }
   }
+
+  for (const key of DNR_REQUEST_METHOD_KEYS) {
+    const list = condition[key];
+    if (list === undefined) continue;
+    if (!Array.isArray(list) || list.length === 0) {
+      throw new Error(`Rule with id ${id}: ${key} must be a non-empty array`);
+    }
+    for (const entry of list) {
+      if (typeof entry !== 'string' || !DNR_REQUEST_METHODS.has(entry)) {
+        throw new Error(
+          `Rule with id ${id}: ${key} contains an invalid value ${JSON.stringify(entry)} ` +
+          `(expected one of ${[...DNR_REQUEST_METHODS].join(', ')}, lowercase)`
+        );
+      }
+    }
+  }
 }
 
 export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
@@ -172,7 +209,47 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     // Writes are never gated — Chrome does not order them behind reads.
     const withCallback = (result, cb) => settle(result, cb, null);
     const withReadCallback = (result, cb) => settle(result, cb, readGate);
+
+    // §3.1 (REVIEW-2026-09) — one-shot read fault, armed by `_failNextRead`
+    // and consumed by the first `get` whose key list satisfies the predicate.
+    // `runtime` is declared later in makeChromeStub but storageArea() is only
+    // invoked after it exists, so the fault can set `runtime.lastError`
+    // directly — exactly the shape src/shared/storage.js reads.
+    const READ_FAULT_MESSAGE = 'An unexpected error occurred';
+    let pendingReadFault = null;
+    const normalizeKeys = (keys) => {
+      if (keys == null) return [];
+      if (typeof keys === 'string') return [keys];
+      if (Array.isArray(keys)) return keys;
+      return Object.keys(keys);
+    };
+    const failRead = (cb, gate) => {
+      if (typeof cb === 'function') {
+        const fire = () => {
+          runtime.lastError = { message: READ_FAULT_MESSAGE };
+          try {
+            cb(undefined);
+          } finally {
+            runtime.lastError = null;
+          }
+        };
+        if (gate) gate.then(fire);
+        else queueMicrotask(fire);
+        return undefined;
+      }
+      const reject = () => { throw new Error(READ_FAULT_MESSAGE); };
+      return gate ? gate.then(reject) : Promise.reject(new Error(READ_FAULT_MESSAGE));
+    };
     return {
+      /**
+       * Make the next matching `get` fail with `runtime.lastError` set (see
+       * the file header). One-shot. Returns `() => fired`.
+       */
+      _failNextRead(predicate = () => true) {
+        const fault = { predicate, fired: false };
+        pendingReadFault = fault;
+        return () => fault.fired;
+      },
       /**
        * Hold every subsequent `get` until the returned function is called.
        * Writes are unaffected — Chrome does not order them behind reads.
@@ -188,6 +265,13 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
         };
       },
       get: (keys, cb) => {
+        if (pendingReadFault && pendingReadFault.predicate(normalizeKeys(keys))) {
+          const fault = pendingReadFault;
+          pendingReadFault = null;
+          fault.fired = true;
+          calls.push({ api: 'storage.get', keys, failed: true });
+          return failRead(cb, readGate);
+        }
         calls.push({ api: 'storage.get', keys });
         let out;
         if (keys == null) out = { ...data };

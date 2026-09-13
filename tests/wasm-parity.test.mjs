@@ -4,12 +4,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { FILTER_VECTORS } from './fixtures/filter-vectors.mjs';
+import { FILTER_VECTORS, NETWORK_VECTORS } from './fixtures/filter-vectors.mjs';
+import { loadServiceWorker } from './sw-harness/sw-loader.mjs';
 import {
   parseLine as buildParseLine,
   networkFilterToDNR,
 } from '../scripts/build-rules.mjs';
 import { parseLine as runtimeParseLine } from '../src/shared/filter-parser.js';
+import {
+  PROC_OPS,
+  NATIVE_FUNCTIONAL_PSEUDO_CLASSES,
+  isProceduralSelector,
+} from '../src/shared/proc-ops.js';
 
 /**
  * The fourth parity leg: the shipped WASM artifact, driven from Node.
@@ -374,5 +380,332 @@ test('user-filter bands equal the static compiler bands, number for number', { s
   assert.equal(allowlist[0].priority, expectedBand);
   for (const line of [`@@${pattern}$important`, '||x^$important,redirect=noop.js']) {
     assert.ok(allowlist[0].priority > staticPriority(line), line);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// §3.2 — unknown functional pseudo-classes never reach a CSS joiner
+// ---------------------------------------------------------------------------
+
+// The functional pseudo-classes a browser knows (`NATIVE_FUNCTIONAL_PSEUDO_
+// CLASSES` in src/shared/proc-ops.js, mirrored by the Rust constant of the
+// same name). Anything else after a single colon and before a `(` invalidates
+// the selector, and — because both joiners comma-join up to 150 selectors
+// into one declaration — the whole chunk.
+
+/**
+ * Every single-colon functional pseudo-class name in a CSS text, lowercased.
+ * Quoted strings are blanked first (`[href*=":ad("]` is data), and `::part(`
+ * is a pseudo-element, not a pseudo-class.
+ */
+function functionalPseudoClassesIn(css) {
+  const unquoted = css.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, '""');
+  const names = [];
+  for (const m of unquoted.matchAll(/(?<!:):([a-z_-][a-z0-9_-]*)\(/gi)) {
+    names.push(m[1].toLowerCase());
+  }
+  return names;
+}
+
+const bothJoiners = (input) => [
+  ['sanitize_and_compact_selectors', wasm.sanitize_and_compact_selectors(input, 100)],
+  ['build_css_from_selectors', wasm.build_css_from_selectors(input, '', 100)],
+];
+
+test('3.2: build_css_from_selectors never joins an unknown functional pseudo-class', { skip }, () => {
+  // The review's five-line input, verbatim.
+  const input = '.good-one\ndiv:others(.x)\n.good-two\n.a >>> .b\n.good-three';
+  for (const [label, css] of bothJoiners(input)) {
+    for (const good of ['.good-one', '.good-two', '.good-three']) {
+      assert.ok(css.includes(good), `${label}: ${good} must survive: ${css}`);
+    }
+    assert.ok(!css.includes('div:others('), `${label}: :others() must be dropped: ${css}`);
+    assert.ok(!css.includes(':others('), `${label}: ${css}`);
+  }
+
+  // Unknown names fail alone, at any nesting depth; the bracketed look-alike
+  // is data and survives.
+  for (const bad of ['div:bogus(1)', 'div:not(:bogus(1))', 'div:remove-attr(x)',
+    'html.show-intro-popup:remove-class(show-intro-popup)']) {
+    for (const [label, css] of bothJoiners(`${bad}\n.keep-me`)) {
+      assert.ok(!css.includes(bad), `${label}: ${bad} must be dropped: ${css}`);
+      assert.ok(css.includes('.keep-me'), `${label}: neighbour must survive: ${css}`);
+    }
+  }
+  for (const [label, css] of bothJoiners('[data-x=":bogus("]')) {
+    assert.ok(css.includes('[data-x=":bogus("]'), `${label}: ${css}`);
+  }
+
+  // Pseudo-element names are ASCII case-insensitive too: `::BEFORE` is valid
+  // CSS and survives; `::Before2` is as non-existent as `::before2`.
+  for (const [label, css] of bothJoiners('div::BEFORE\nx::Part(label)\ndiv::Before2')) {
+    assert.ok(css.includes('div::BEFORE'), `${label}: ${css}`);
+    assert.ok(css.includes('x::Part(label)'), `${label}: ${css}`);
+    assert.ok(!css.includes('Before2'), `${label}: ${css}`);
+  }
+});
+
+test('3.2: build_page_bundle plans :others()/:remove-attr()/:remove-class() as procedural', { skip }, () => {
+  const selectors = [
+    'div:others(.x)',
+    'div:remove-attr(data-x)',
+    'html.show-intro-popup:remove-class(show-intro-popup)',
+    'div:shadow(.x)',
+    'div:matches-media((min-width: 800px))',
+    'div:matches-prop(x)',
+    'div:-abp-has(.x)',
+    'div:-abp-contains(ad)',
+    'div:-abp-properties(width: 300px)',
+  ];
+  const bundle = wasm.build_page_bundle([], selectors, [], 100);
+  assert.equal(bundle.cssText, '', 'none of these is CSS');
+  assert.equal(bundle.rules.domainSpecific.length, selectors.length);
+  for (const [i, selector] of selectors.entries()) {
+    const rule = bundle.rules.domainSpecific[i];
+    assert.equal(rule.selector, selector);
+    const op = rule.plan.find((step) => step.type === 'op');
+    assert.ok(op, `${selector} must plan an op step: ${JSON.stringify(rule.plan)}`);
+    assert.equal(op.op, /:(-?[a-z-]+)\(/.exec(selector)[1], selector);
+  }
+
+  // Same classification from the batch planner the content script uses.
+  const planned = JSON.parse(wasm.plan_selector_rules_json(JSON.stringify(selectors)));
+  assert.deepEqual(planned.cssSelectors, []);
+  assert.equal(planned.proceduralRules.length, selectors.length);
+});
+
+test('3.2 (didn\'t re-break): native functional pseudo-classes survive the gate', { skip }, () => {
+  const good = [
+    'div:has(.x)',
+    'div:not(.x)',
+    ':is(.a, .b)',
+    ':where(.a)',
+    'li:nth-child(2n+1)',
+    'li:nth-last-child(1)',
+    'p:nth-of-type(2)',
+    'p:nth-last-of-type(2)',
+    'td:nth-col(2)',
+    ':lang(en)',
+    ':dir(rtl)',
+    ':host(.x)',
+    ':host-context(.dark)',
+    'x:state(open)',
+    'li:nth-child(2n+1 of :not([hidden]))',
+    'div:HAS(.x)',
+    'div:Not(:Is(.x))',
+    'a:hover:not(.x)',
+    'div::before',
+    'x::part(label)',
+  ];
+  for (const [label, css] of bothJoiners(good.join('\n'))) {
+    for (const selector of good) {
+      assert.ok(css.includes(selector), `${label}: ${selector} must survive: ${css}`);
+    }
+    for (const name of functionalPseudoClassesIn(css)) {
+      assert.ok(NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name), `${label}: ${name}`);
+    }
+  }
+
+  // …and every shared vector that carries one is emitted, not dropped.
+  const nativeRe = /:(?:has|not|is|where|nth-[a-z-]+|lang)\(/i;
+  const vectored = FILTER_VECTORS
+    .filter(({ expect }) => expect.kind === 'cosmetic' && !expect.exception)
+    .map(({ expect }) => expect.selector)
+    .filter((selector) => nativeRe.test(selector));
+  assert.ok(vectored.length >= 6, 'the vector table must carry native pseudo-class selectors');
+  const css = wasm.build_css_from_selectors(vectored.join('\n'), '', 100);
+  for (const selector of vectored) {
+    assert.ok(css.includes(selector), `${selector} must survive: ${css}`);
+  }
+});
+
+// Corpus-wide: for every vendored list, every selector that the source parser
+// hands to the CSS joiner must, once joined, carry only native functional
+// pseudo-classes. This is the assertion the review's 289-domain scan made by
+// hand.
+test('3.2: no selector reaching the CSS joiner in the vendored corpus carries a functional pseudo-class outside the native set', { skip }, () => {
+  const listDir = path.join(ROOT, 'scripts', 'filter-lists');
+  const lists = fs.readdirSync(listDir).filter((f) => f.endsWith('.txt')).sort();
+  assert.ok(lists.length > 0, 'vendored filter lists must be present');
+
+  let seen = 0;
+  const offenders = new Map(); // name -> first selector
+  for (const file of lists) {
+    const bundle = wasm.parse_filter_source(fs.readFileSync(path.join(listDir, file), 'utf8'));
+    const selectors = [
+      ...(bundle?.cosmetic?.generic ?? []),
+      ...Object.values(bundle?.cosmetic?.domainSpecific ?? {}).flat(),
+    ];
+    seen += selectors.length;
+    const css = wasm.build_css_from_selectors(selectors.join('\n'), '', 100);
+    for (const rule of css.split('\n')) {
+      for (const name of functionalPseudoClassesIn(rule)) {
+        if (!NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name) && !offenders.has(name)) {
+          const sample = rule.split(',').find((s) => s.toLowerCase().includes(`:${name}(`));
+          offenders.set(name, `${file}: ${sample}`);
+        }
+      }
+    }
+  }
+  assert.ok(seen > 10_000, `the corpus must yield real selectors, saw ${seen}`);
+  assert.deepEqual(
+    [...offenders.entries()],
+    [],
+    'non-native functional pseudo-classes reached a CSS declaration',
+  );
+});
+
+// The seam: the Rust core's operator list versus the shared JS one (C1a),
+// which the content engine and the SW both import. A name in one and not the
+// other is a selector that one engine plans as procedural and the other ships
+// as (dead) CSS — §5.20's defect, and §3.2's. Element by element: both lists
+// are longest-first within a shared prefix for their linear scanners, so the
+// order is part of the contract too.
+test('PROC_OPS: the engine, the SW and the Rust core list the same operator names', { skip }, () => {
+  const rust = JSON.parse(wasm.proc_op_names());
+  assert.ok(rust.length > 0);
+  assert.deepEqual(rust, [...PROC_OPS]);
+  assert.equal(new Set(rust).size, rust.length, 'no duplicate operator names');
+  for (const name of rust) {
+    assert.ok(!NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name), `${name} is native CSS, not an operator`);
+  }
+});
+
+// `DIV:Has-Text(x)` is one rule to the SW's case-insensitive regex; it must be
+// the same rule to the Rust planner, or which engine handled the page decides
+// whether the rule fires.
+test('3.2: the operator matcher is case-insensitive in both engines', { skip }, () => {
+  const selector = 'DIV:Has-Text(x)';
+
+  // Rust: detected, planned, and planned under the canonical operator name.
+  const bundle = wasm.build_page_bundle([], [selector], [], 100);
+  assert.equal(bundle.cssText, '', 'must not be emitted as CSS');
+  assert.equal(bundle.rules.domainSpecific.length, 1);
+  assert.deepEqual(
+    bundle.rules.domainSpecific[0].plan.map(({ type, selector: s, op, arg }) => ({ type, s, op, arg })),
+    [
+      { type: 'css', s: 'DIV', op: undefined, arg: undefined },
+      { type: 'op', s: undefined, op: 'has-text', arg: 'x' },
+    ],
+  );
+  const planned = JSON.parse(wasm.plan_selector_rules_json(JSON.stringify([selector])));
+  assert.equal(planned.proceduralRules.length, 1);
+  assert.deepEqual(planned.cssSelectors, []);
+
+  // JS: the shared detector the SW and the content engine both import.
+  assert.ok(isProceduralSelector(selector), `JS must detect ${selector}`);
+  assert.ok(isProceduralSelector('div:others(.x)'), 'JS must detect the new operators');
+  assert.ok(!isProceduralSelector('div:has(.x)'), 'a native pseudo-class is not an operator');
+  assert.ok(!isProceduralSelector('div:HAS(.x)'), 'in any case');
+});
+
+// ---------------------------------------------------------------------------
+// §3.3 — the user-filter compiler fails closed on unmapped options
+// ---------------------------------------------------------------------------
+
+// "Emit" per engine, exactly as REMEDIATION §3.3 defines it. The build parser
+// classifies `@@…$ghide` as `cosmetic-scope-exception` and `$csp=` as `skip`:
+// both are non-emitting network answers, never `undefined`.
+const emitBuild = (line) => {
+  const parsed = buildParseLine(line);
+  return parsed?.type === 'network' && networkFilterToDNR(parsed) !== null;
+};
+const compileWasm = (line) => wasm.compile_user_filters(line, 900_000);
+const emitWasm = (line) => compileWasm(line).dnrRules.length > 0;
+
+/** `isUrlFilterCaseSensitive` is stated explicitly by the build in both
+ *  directions and only when true by Rust; compare conditions without it. */
+const withoutCaseFlag = (condition) =>
+  Object.fromEntries(Object.entries(condition).filter(([key]) => key !== 'isUrlFilterCaseSensitive'));
+
+test('3.3: WASM, the build parser and the runtime fallback agree on drop-vs-emit for every network vector', { skip }, async () => {
+  // The runtime fallback lives inside the service worker; drive the real
+  // function through the harness hooks (read-only use of the SW).
+  const { hooks } = await loadServiceWorker();
+  const emitRuntime = (line) => hooks.parseSimpleNetworkRule(line, 900_000) !== null;
+
+  assert.ok(NETWORK_VECTORS.length >= 20, 'the network vector class must be populated');
+  const failures = [];
+  for (const { line, expect } of NETWORK_VECTORS) {
+    assert.equal(expect.kind, 'network', line);
+    const expectedBuild = expect.build ? expect.build.emit : expect.emit;
+
+    const wasmEmits = emitWasm(line);
+    const buildEmits = emitBuild(line);
+    const runtimeEmits = emitRuntime(line);
+
+    if (wasmEmits !== expect.emit) {
+      failures.push(`${line}: WASM ${wasmEmits ? 'emits' : 'drops'}, spec says ${expect.emit ? 'emit' : 'drop'}`);
+    }
+    if (buildEmits !== expectedBuild) {
+      failures.push(`${line}: build ${buildEmits ? 'emits' : 'drops'}, expected ${expectedBuild ? 'emit' : 'drop'}`
+        + (expect.build ? ` (pinned override: ${expect.build.why} — stale? remove it)` : ''));
+    }
+    // emit_wasm === emit_build, modulo the dated build overrides.
+    if (!expect.build && wasmEmits !== buildEmits) {
+      failures.push(`${line}: WASM ${wasmEmits ? 'emits' : 'drops'} but the build ${buildEmits ? 'emits' : 'drops'}`);
+    }
+    // emit_runtime ⇒ emit_build: the fallback may be stricter, never looser.
+    if (runtimeEmits && !buildEmits) {
+      failures.push(`${line}: the runtime fallback emits where the build drops`);
+    }
+
+    // A dropped line is reported, once, under its own text.
+    const compiled = compileWasm(line);
+    if (!wasmEmits) {
+      if (!Array.isArray(compiled.droppedLines) || compiled.droppedLines.length !== 1
+          || compiled.droppedLines[0].line !== line || !compiled.droppedLines[0].reason) {
+        failures.push(`${line}: dropped without a droppedLines entry: ${JSON.stringify(compiled.droppedLines)}`);
+      }
+    } else if (compiled.droppedLines?.length) {
+      failures.push(`${line}: emitted AND reported dropped`);
+    }
+  }
+  hooks.cancelPendingStatsPersistForTest?.();
+  assert.deepEqual(failures, []);
+});
+
+test('3.3: WASM maps $to/$from/$method to the DNR fields the build emits', { skip }, () => {
+  const checked = [];
+  for (const { line, expect } of NETWORK_VECTORS) {
+    if (!expect.condition) continue;
+    const compiled = compileWasm(line);
+    assert.equal(compiled.dnrRules.length, 1, `${line}: ${JSON.stringify(compiled.droppedLines)}`);
+    const [rule] = compiled.dnrRules;
+    assert.equal(rule.action.type, expect.action, line);
+    assert.deepEqual(rule.condition, expect.condition, `WASM condition for ${line}`);
+
+    // A pinned build condition must still be what the build emits: when the
+    // build catches up the pin goes stale and this says so.
+    if (expect.build?.condition) {
+      const built = networkFilterToDNR(buildParseLine(line));
+      assert.ok(built, `${line}: pinned build condition but the build drops`);
+      assert.deepEqual(
+        withoutCaseFlag(built.condition),
+        expect.build.condition,
+        `${line}: stale pin (${expect.build.why}) — remove the override`,
+      );
+    }
+
+    // Where the build already emits — and no dated divergence is pinned on
+    // the vector — its condition must be the same one.
+    if (!expect.build && emitBuild(line)) {
+      const built = networkFilterToDNR(buildParseLine(line));
+      assert.deepEqual(
+        withoutCaseFlag(rule.condition),
+        withoutCaseFlag(built.condition),
+        `WASM vs build condition for ${line}`,
+      );
+      assert.equal(built.action.type, rule.action.type, line);
+      checked.push(line);
+    }
+  }
+  // The seam is only pinned if the build engine actually took part.
+  assert.ok(checked.length >= 8, `build-side conditions compared: ${checked.length}`);
+  for (const modifier of ['$to=', '$from=', '$method=']) {
+    assert.ok(
+      NETWORK_VECTORS.some(({ line, expect }) => line.includes(modifier) && expect.condition),
+      `${modifier} must have a mapped vector`,
+    );
   }
 });

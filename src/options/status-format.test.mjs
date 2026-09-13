@@ -70,6 +70,38 @@ test('describeSkippedRules survives missing ids, reasons and arrays', () => {
   ]);
 });
 
+test('3.3: a dropped line renders its text, not #null', () => {
+  // A2's §3.3 surface: the Rust user-filter compiler now fails closed and the
+  // SW reports each dropped line as `{id: null, reason, line}` — there is no
+  // DNR id because the line never became a rule. Name the line, not "#null".
+  const detail = describeSkippedRules({
+    skippedNetwork: 1,
+    skippedRules: [{ id: null, reason: 'unsupported option: removeparam', line: '||x^$removeparam=a' }],
+  });
+  assert.deepEqual(detail, ['"||x^$removeparam=a": unsupported option: removeparam']);
+  assert.ok(!detail[0].includes('#null'), 'a dropped line must not render as "Rule #null"');
+  assert.ok(!detail[0].includes('#?'), 'a dropped line must not render as "Rule #?"');
+
+  // Didn't re-break: a Chrome-rejected rule with a numeric id keeps its wording.
+  assert.deepEqual(
+    describeSkippedRules({ skippedNetwork: 1, skippedRules: [{ id: 12, reason: 'regex is not supported' }] }),
+    ['Rule #12: regex is not supported'],
+  );
+
+  // A null id with no line to show falls back to just the reason — never "#null".
+  const bare = describeSkippedRules({ skippedNetwork: 1, skippedRules: [{ id: null, reason: 'unsupported option: removeparam' }] });
+  assert.deepEqual(bare, ['unsupported option: removeparam']);
+  assert.ok(!bare[0].includes('null'));
+
+  // The line text is passed through verbatim; the caller renders it with
+  // textContent, so the formatter must not escape or truncate it.
+  const raw = describeSkippedRules({
+    skippedNetwork: 1,
+    skippedRules: [{ id: null, reason: 'bad', line: '<script>"a&b"</script>' }],
+  });
+  assert.deepEqual(raw, ['"<script>"a&b"</script>": bad']);
+});
+
 test('the DNR-budget warning still shows, and carries the skip clause too', () => {
   const out = describeFilterApply({
     network: 6000,

@@ -36,13 +36,24 @@ export function skippedSuffix(skippedNetwork) {
  * Per-rule skip reasons as display lines. The SW caps `skippedRules` at 20
  * entries while `skippedNetwork` is the true total, so the overflow is stated
  * rather than silently dropped — the same honesty this whole finding is about.
+ *
+ * Two entry shapes arrive here:
+ *   - `{id, reason}` — a compiled rule Chrome's DNR refused; named by its id.
+ *   - `{id: null, reason, line}` — a user-filter line the compiler dropped
+ *     before it ever had an id (§3.3); named by its text, `"<line>": <reason>`.
+ * The line is user-authored and goes out verbatim — the caller renders detail
+ * with `textContent`, exactly as it does the reason.
  */
 export function describeSkippedRules(counts) {
   const total = toCount(counts?.skippedNetwork);
   const entries = Array.isArray(counts?.skippedRules) ? counts.skippedRules : [];
   const lines = entries.map((entry) => {
-    const id = entry?.id === undefined || entry?.id === null ? '?' : entry.id;
     const reason = entry?.reason ? String(entry.reason) : 'rejected by Chrome';
+    if (entry?.id === null) {
+      const line = typeof entry.line === 'string' && entry.line !== '' ? entry.line : null;
+      return line === null ? reason : `"${line}": ${reason}`;
+    }
+    const id = entry?.id === undefined ? '?' : entry.id;
     return `Rule #${id}: ${reason}`;
   });
   if (total > lines.length) {

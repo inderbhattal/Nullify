@@ -8,7 +8,10 @@
  *  Plus the APPEND_USER_FILTER message contract.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { loadServiceWorker } from './sw-loader.mjs';
 
@@ -339,6 +342,93 @@ test('3.3 (didn\'t re-break): an ordinary wake with a matching APPLIED marker st
 
   assert.deepEqual(compiled, [], 'no update, equal markers ⇒ nothing to recompile');
   assert.equal(chrome.storage.local._data().userFiltersApplied, TEXT);
+
+  hooks.setCompileUserFiltersOverrideForTest(null);
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §3.3 surface (A2) — B1 made `compile_user_filters` fail
+// closed on options it cannot express and report each dropped line through
+// `droppedLines: [{line, reason}]`. The SW used to discard that field, so the
+// options page said "Applied 0 network rules" and `skippedRules: []` for a
+// paste that was silently thrown away. Dropped lines now ride the existing
+// `skippedRules` channel as `{id: null, reason, line}` and count in
+// `skippedNetwork` (Track H renders `id: null` entries as the line text).
+// ---------------------------------------------------------------------------
+
+const REMOVEPARAM_LINE = '||x^$removeparam=a';
+
+test('3.3: dropped user-filter lines are reported through skippedRules', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  hooks.setCompileUserFiltersOverrideForTest(() => ({
+    dnrRules: [],
+    cosmeticRules: { generic: [], domainSpecific: {} },
+    scriptletRules: [],
+    droppedLines: [{ line: REMOVEPARAM_LINE, reason: 'unsupported option: removeparam' }],
+  }));
+
+  const res = await chrome.runtime.sendMessage({
+    type: 'SET_USER_FILTERS',
+    payload: { filters: REMOVEPARAM_LINE },
+  });
+
+  assert.equal(res.error, undefined, JSON.stringify(res));
+  assert.equal(res.network, 0);
+  assert.equal(res.skippedNetwork, 1,
+    'a line the compiler dropped is a skipped rule, not a silent no-op');
+  assert.ok(Array.isArray(res.skippedRules) && res.skippedRules.length === 1,
+    `expected one skippedRules entry, got ${JSON.stringify(res.skippedRules)}`);
+  assert.match(res.skippedRules[0].reason, /removeparam/,
+    'the reason must name the option that could not be expressed');
+  assert.deepEqual(res.skippedRules[0], {
+    id: null,
+    reason: 'unsupported option: removeparam',
+    line: REMOVEPARAM_LINE,
+  });
+  assert.equal(userRules(chrome).length, 0,
+    'the JS fallback must not resurrect the dropped line');
+
+  hooks.setCompileUserFiltersOverrideForTest(null);
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('3.3 (real compiler): a $removeparam line through compile_user_filters yields the entry', async (t) => {
+  // The harness cuts the network, so the worker's own WASM init fails; load
+  // the artifact from disk (as wasm-parity does) and route the REAL
+  // compile_user_filters through the override seam so the whole chain —
+  // Rust droppedLines → _applyUserFiltersNow → SET_USER_FILTERS reply — runs.
+  const wasmDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/shared/wasm');
+  const gluePath = path.join(wasmDir, 'nullify_core.js');
+  const bytesPath = path.join(wasmDir, 'nullify_core_bg.wasm');
+  if (!fs.existsSync(gluePath) || !fs.existsSync(bytesPath)) {
+    t.skip('WASM artifact not built (run `npm run build:wasm`)');
+    return;
+  }
+  const wasm = await import(pathToFileURL(gluePath).href);
+  await wasm.default({ module_or_path: fs.readFileSync(bytesPath) });
+
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  hooks.setCompileUserFiltersOverrideForTest(
+    (text, startId) => wasm.compile_user_filters(text, startId)
+  );
+
+  const res = await chrome.runtime.sendMessage({
+    type: 'SET_USER_FILTERS',
+    payload: { filters: '||facebook.com^$removeparam=fbclid\n||ads.example^' },
+  });
+
+  assert.equal(res.error, undefined, JSON.stringify(res));
+  assert.equal(res.network, 1, 'the expressible line still applies');
+  assert.equal(userRules(chrome).length, 1);
+  assert.equal(userRules(chrome)[0].condition.urlFilter, '||ads.example^');
+  assert.equal(res.skippedNetwork, 1);
+  assert.deepEqual(res.skippedRules, [{
+    id: null,
+    reason: 'unsupported option: removeparam',
+    line: '||facebook.com^$removeparam=fbclid',
+  }]);
 
   hooks.setCompileUserFiltersOverrideForTest(null);
   hooks.cancelPendingStatsPersistForTest();

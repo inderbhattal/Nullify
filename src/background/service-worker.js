@@ -2665,6 +2665,11 @@ async function _applyUserFiltersNow(filtersText) {
   let newRules = [];
   let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
   let userScriptlets = [];
+  // §3.3 (REVIEW-2026-09) — lines the compiler refused because their options
+  // cannot be expressed in DNR (B1: `$removeparam`, `$csp`, …). They ride the
+  // same skip channel as preflight rejections so the options page says the
+  // line was dropped instead of "Applied 0 network rules".
+  let droppedLines = [];
 
   const compiled = compileUserFiltersViaWasm(filtersText);
   const wasmSucceeded = compiled !== null;
@@ -2672,6 +2677,7 @@ async function _applyUserFiltersNow(filtersText) {
     newRules = compiled.dnrRules || [];
     cosmeticRules = compiled.cosmeticRules || cosmeticRules;
     userScriptlets = compiled.scriptletRules || [];
+    droppedLines = Array.isArray(compiled.droppedLines) ? compiled.droppedLines : [];
   } else if (lines.length > 0) {
     // JS fallback — only on actual WASM failure/unavailability (§5.14).
     let id = DNR_USER_RULES_START;
@@ -2717,7 +2723,16 @@ async function _applyUserFiltersNow(filtersText) {
   // urlFilter, non-RE2 regex) used to zero out the ENTIRE user ruleset.
   // Pre-validate what we can, then add in chunks and retry per-rule so a
   // rejection only drops the offending rule.
-  const { vetted, skipped } = await preflightUserDnrRules(budgeted);
+  const { vetted, skipped: preflightSkipped } = await preflightUserDnrRules(budgeted);
+  // Compile-stage drops come first: they are the earliest failure, and
+  // `id: null` + `line` is the shape the options page renders as the line
+  // text (no DNR id was ever assigned).
+  const skipped = droppedLines.map((dropped) => ({
+    id: null,
+    reason: typeof dropped?.reason === 'string' ? dropped.reason : 'unsupported line',
+    line: typeof dropped?.line === 'string' ? dropped.line : '',
+  }));
+  skipped.push(...preflightSkipped);
   if (outOfRangeCount > 0) {
     skipped.push({
       id: null,
@@ -2781,13 +2796,16 @@ async function _applyUserFiltersNow(filtersText) {
     }
   }
   // Honest total: every compiled rule that is not live in DNR, whether it was
-  // truncated, out of range, rejected by preflight or lost to a capacity stop.
-  const skippedNetworkTotal = newRules.length - appliedNetworkRules;
+  // truncated, out of range, rejected by preflight or lost to a capacity stop
+  // — plus every line the compiler dropped before a rule existed (§3.3).
+  const skippedNetworkTotal = newRules.length - appliedNetworkRules + droppedLines.length;
   if (skippedNetworkTotal > 0) {
     reportError(
       'userFilters:skippedRules',
       new Error(`${skippedNetworkTotal} user filter rule(s) skipped: ${skipped
-        .slice(0, 5).map((s) => `#${s.id} ${s.reason}`).join('; ')}`)
+        .slice(0, 5)
+        .map((s) => `${s.id == null && s.line ? s.line : `#${s.id}`} ${s.reason}`)
+        .join('; ')}`)
     );
   }
 

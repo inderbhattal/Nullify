@@ -56,7 +56,8 @@ const CONFIG = {
   BLOOM_BITS_PER_ITEM: 10,          // Bits per item for ~1% false positive rate
   DOMAIN_RULES_CACHE_MAX: 100,      // Max entries in LRU domain rules cache
   PAGE_BUNDLE_DB_MAX: 250,          // Max page bundles in IndexedDB
-  FILTER_UPDATE_INTERVAL_MINUTES: 1440,  // 24 hours
+  FILTER_UPDATE_INTERVAL_MINUTES: 1440,  // 24 hours — also the ceiling for a list's declared Expires
+  FILTER_EXPIRES_FLOOR_MINUTES: 120,     // §4.5 (A2a) — floor for a list's declared Expires
   ACTIVE_INDEX_REBUILD_STALL_MS: 120_000, // §5.4 — release a rebuild that never settles
 };
 
@@ -71,7 +72,7 @@ import {
 } from '../shared/storage.js';
 import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
-import {fetchAndExpand, parseFilterList, COSMETIC_SCOPE_OPTIONS} from '../shared/filter-parser.js';
+import {fetchAndExpand, parseFilterList, parseExpiresHeader, COSMETIC_SCOPE_OPTIONS} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '../shared/hostname.js';
 import { ancestorDomains } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
@@ -224,6 +225,50 @@ const STATS_CLEANUP_INTERVAL_MINUTES = 30;
 // vendored snapshots, so without the bump the hash — and every cached cssText
 // carrying what the pre-fix engines emitted — would have survived the update.
 const RULE_DATA_SCHEMA_VERSION = 4;
+
+// ---------------------------------------------------------------------------
+// Feature flags (REMEDIATION-2026-09 §2 conventions). One storage key,
+// `StorageKeys.FEATURE_FLAGS` (`{[name]: boolean}`), read leniently: a failed
+// or absent read yields the defaults below. A flag ships OFF in the release
+// that introduces it and ON in the next — a one-line flip here.
+//
+// `isFeatureEnabled` is synchronous so the paths that consume a flag never
+// await storage. The cache is filled once by `ensureFeatureFlagsLoaded()`
+// (stage 1 of every boot, before the rule-data merge that consumes it) and
+// re-read by `refreshMemoryCache()` on every wake.
+// ---------------------------------------------------------------------------
+const FEATURE_DEFAULTS = Object.freeze({
+  refreshCadenceV2: false, // §4.5 — A2a: Expires-driven refresh cadence
+});
+let cachedFeatureFlags = { ...FEATURE_DEFAULTS };
+let _featureFlagsPromise = null;
+
+/** Same rule as storage.js `getFeatureFlag`: only a stored boolean overrides a default. */
+function normalizeFeatureFlags(stored) {
+  const flags = { ...FEATURE_DEFAULTS };
+  if (stored && typeof stored === 'object') {
+    for (const name of Object.keys(FEATURE_DEFAULTS)) {
+      if (typeof stored[name] === 'boolean') flags[name] = stored[name];
+    }
+  }
+  return flags;
+}
+
+function isFeatureEnabled(name) {
+  return cachedFeatureFlags[name] === true;
+}
+
+function ensureFeatureFlagsLoaded() {
+  if (!_featureFlagsPromise) {
+    _featureFlagsPromise = getStorageOrDefault(StorageKeys.FEATURE_FLAGS, null)
+      .then((stored) => { cachedFeatureFlags = normalizeFeatureFlags(stored); })
+      .catch((err) => {
+        _featureFlagsPromise = null;
+        throw err;
+      });
+  }
+  return _featureFlagsPromise;
+}
 
 // Load config from storage with fallback to defaults
 async function loadConfig() {
@@ -964,14 +1009,85 @@ async function loadPackagedFilterSources() {
   }
 }
 
-async function fetchAndStoreRemoteFilterSources() {
+// ---------------------------------------------------------------------------
+// §4.5 (REVIEW-2026-09, A2a; flag `refreshCadenceV2`) — per-list refresh
+// metadata in StorageKeys.FILTER_LISTS_META:
+//   `{[listId]: {fetchedAt, expiresMinutes, schemaVersion}}`
+// `expiresMinutes` is the list's own `! Expires:` header (null when absent),
+// clamped both ways when consumed so `Expires: 7 days` still refreshes daily
+// and `Expires: 1 hour` does not hammer the mirror. `schemaVersion` records
+// which parser produced the stored copy, so a bundle from the previous
+// release's engine never survives a schema bump (see ensureRuleDataReady).
+// ---------------------------------------------------------------------------
+
+function clampExpiresMinutes(expiresMinutes) {
+  const declared = Number.isFinite(expiresMinutes) && expiresMinutes > 0
+    ? expiresMinutes
+    : CONFIG.FILTER_UPDATE_INTERVAL_MINUTES;
+  return Math.min(
+    CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
+    Math.max(CONFIG.FILTER_EXPIRES_FLOOR_MINUTES, declared)
+  );
+}
+
+/**
+ * The stored per-list meta (`{}` when never written), or `null` when the read
+ * failed. §3.1: it feeds a write, so a failed read must not degrade to "no
+ * list has meta" — callers fall back to today's behaviour instead (fetch
+ * every list, packaged copy wins, write nothing).
+ */
+async function readFilterListsMeta() {
+  let stored;
+  try {
+    stored = await getStorage(StorageKeys.FILTER_LISTS_META);
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('filterListsMeta:storageRead', err);
+    return null;
+  }
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+}
+
+/** Is this list's stored copy still inside its (clamped) Expires window? */
+function isListWithinExpiresWindow(entry, now) {
+  if (!entry || typeof entry.fetchedAt !== 'number') return false;
+  // Meta from another schema describes a copy the update boot has replaced.
+  if (entry.schemaVersion !== RULE_DATA_SCHEMA_VERSION) return false;
+  return entry.fetchedAt + clampExpiresMinutes(entry.expiresMinutes) * 60_000 > now;
+}
+
+/** clamp(min over the remote lists of (expiresMinutes ?? 1440), 120, 1440). */
+function filterUpdatePeriodMinutes(meta) {
+  let shortest = CONFIG.FILTER_UPDATE_INTERVAL_MINUTES;
+  for (const list of REMOTE_FILTER_LISTS) {
+    const declared = meta?.[list.id]?.expiresMinutes;
+    if (Number.isFinite(declared) && declared > 0) shortest = Math.min(shortest, declared);
+  }
+  return clampExpiresMinutes(shortest);
+}
+
+/**
+ * Refresh the remote lists. `force` (the options page's "Update All") ignores
+ * each list's Expires window; the alarm passes false. Under the flag the
+ * result also carries the merged meta (or `null` when it could not be read)
+ * so the caller can re-derive the alarm period without a second read.
+ */
+async function fetchAndStoreRemoteFilterSources({ force = false } = {}) {
   const sourceBundles = {};
   let fetchedAny = false;
   // §5.3 — which lists actually refreshed, so CHECK_FILTER_UPDATES can name
   // them instead of claiming a blanket success.
   const updatedLists = [];
+  const cadenceV2 = isFeatureEnabled('refreshCadenceV2');
+  const meta = cadenceV2 ? await readFilterListsMeta() : null;
+  const skippedFresh = [];
+  const fetchedMeta = {};
 
   for (const list of REMOTE_FILTER_LISTS) {
+    if (meta && !force && isListWithinExpiresWindow(meta[list.id], Date.now())) {
+      skippedFresh.push(list.id);
+      continue;
+    }
     try {
       log(`[AdBlock] Fetching ${list.id} source bundle...`);
       const text = await fetchAndExpand(list.url);
@@ -988,14 +1104,30 @@ async function fetchAndStoreRemoteFilterSources() {
       sourceBundles[list.id] = sourceBundle;
       updatedLists.push(list.id);
       fetchedAny = true;
+      if (cadenceV2) {
+        fetchedMeta[list.id] = {
+          fetchedAt: Date.now(),
+          expiresMinutes: parseExpiresHeader(text),
+          schemaVersion: RULE_DATA_SCHEMA_VERSION,
+        };
+      }
     } catch (err) {
       console.error(`[AdBlock] Failed to fetch ${list.id}:`, err.message);
     }
   }
 
-  if (!fetchedAny) return { updated: false, updatedLists: [] };
+  if (!fetchedAny) return { updated: false, updatedLists: [], skippedFresh, meta };
   await db.putBulkFilterSources(sourceBundles);
-  return { updated: true, updatedLists };
+  // Meta is written AFTER the sources it describes: a kill in between leaves
+  // the new copy without meta, which only costs one extra fetch next time.
+  // A failed meta read (null) writes nothing — the merge would be a
+  // read-that-feeds-a-write over an unknown base (§3.1).
+  let mergedMeta = meta;
+  if (meta) {
+    mergedMeta = { ...meta, ...fetchedMeta };
+    await setStorage(StorageKeys.FILTER_LISTS_META, mergedMeta);
+  }
+  return { updated: true, updatedLists, skippedFresh, meta: mergedMeta };
 }
 
 // §3.2 — the active-index rebuild is a destructive clear followed by a
@@ -1204,10 +1336,63 @@ async function ensureFilterSourcesReady() {
     return true;
   }
 
-  return (await fetchAndStoreRemoteFilterSources()).updated;
+  // Nothing is stored, so every list is stale by definition.
+  return (await fetchAndStoreRemoteFilterSources({ force: true })).updated;
+}
+
+/**
+ * §4.5 (A2a) item 5 — an update boot used to `putBulkFilterSources(packaged)`
+ * over every stored list, rolling each runtime refresh back to the release
+ * snapshot. Keep a list's runtime copy only when its meta proves the copy is
+ * from THIS schema and fresher than the packaged one (D2's `generatedAt`
+ * stamp); everything else gets the packaged copy — an absent stamp or absent
+ * meta means packaged wins, exactly as before. Meta describing a replaced copy
+ * is dropped so the +1 min refresh the install handler arms fetches it again
+ * instead of trusting a window that no longer describes what is stored.
+ */
+async function mergePackagedSourcesOnUpdate(packaged) {
+  const meta = await readFilterListsMeta();
+  const storedIds = new Set((await db.getAllFilterSources()).map((entry) => entry.listId));
+  const toWrite = {};
+  const kept = [];
+  const replacedWithMeta = [];
+
+  for (const [listId, source] of Object.entries(packaged)) {
+    const entry = meta?.[listId];
+    const generatedAt = Date.parse(source?.generatedAt);
+    const keep = !!entry &&
+      storedIds.has(listId) &&
+      entry.schemaVersion === RULE_DATA_SCHEMA_VERSION &&
+      typeof entry.fetchedAt === 'number' &&
+      Number.isFinite(generatedAt) &&
+      entry.fetchedAt > generatedAt;
+    if (keep) {
+      kept.push(listId);
+    } else {
+      toWrite[listId] = source;
+      if (entry) replacedWithMeta.push(listId);
+    }
+  }
+
+  if (Object.keys(toWrite).length > 0) {
+    await db.putBulkFilterSources(toWrite);
+  }
+  if (kept.length > 0) {
+    log(`[AdBlock] Update boot kept the fresher runtime copy of: ${kept.join(', ')}`);
+  }
+  if (meta && replacedWithMeta.length > 0) {
+    const next = { ...meta };
+    for (const listId of replacedWithMeta) delete next[listId];
+    await setStorage(StorageKeys.FILTER_LISTS_META, next).catch((err) => {
+      reportError('filterListsMeta:write', err);
+    });
+  }
 }
 
 async function ensureRuleDataReady() {
+  // The flags gate the merge below, and this is the first consumer on every
+  // boot path (stage 1 runs before refreshMemoryCache).
+  await ensureFeatureFlagsLoaded();
   // §3.1 (REVIEW-2026-09) — BLOOM_FILTER only decides whether the derived
   // index is (re)built, which is idempotent, so a failed read may degrade to
   // "absent". RULE_DATA_VERSION feeds `putBulkFilterSources` — a destructive
@@ -1241,7 +1426,11 @@ async function ensureRuleDataReady() {
   if (ruleDataChanged) {
     const packaged = await loadPackagedFilterSources();
     if (packaged && Object.keys(packaged).length > 0) {
-      await db.putBulkFilterSources(packaged);
+      if (isFeatureEnabled('refreshCadenceV2')) {
+        await mergePackagedSourcesOnUpdate(packaged);
+      } else {
+        await db.putBulkFilterSources(packaged);
+      }
       sourcesReady = true;
     }
   }
@@ -1339,6 +1528,9 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     }
 
     await ensureRuleDataReady();
+    if (details.reason === 'update' && isFeatureEnabled('refreshCadenceV2')) {
+      await rearmFilterUpdateAlarmAfterUpdate();
+    }
     await Promise.all([
       refreshMemoryCache(), // Fill RAM cache for speed
       ensureStatsRestored(),
@@ -1349,6 +1541,18 @@ chrome.runtime.onInstalled.addListener(async (details) => {
     reportError('onInstalled handler', err, { fatal: true });
   }
 });
+
+/**
+ * §4.5 (A2a) item 2 — an extension update is the one moment the stored lists
+ * may just have been rolled back to the release snapshot, so refresh within
+ * a minute. Recreating an alarm of the same name replaces it. This runs from
+ * the install handler only, never from ensureBackgroundSetup, so the 2026-08
+ * §4.5 "never reschedule on start" rule stands.
+ */
+async function rearmFilterUpdateAlarmAfterUpdate() {
+  const periodInMinutes = filterUpdatePeriodMinutes(await readFilterListsMeta());
+  chrome.alarms.create(ALARM_FILTER_UPDATE, { delayInMinutes: 1, periodInMinutes });
+}
 
 // ---- Startup Orchestration (Speed Optimized) ----
 let _criticalReady = false;
@@ -1517,6 +1721,7 @@ async function refreshMemoryCache() {
       StorageKeys.GENERIC_CSS,
       StorageKeys.GENERIC_PROCEDURAL_RULES,
       StorageKeys.GENERIC_COSMETIC_EXCLUDED_DOMAINS,
+      StorageKeys.FEATURE_FLAGS,
     ]);
   } catch (err) {
     if (!(err instanceof StorageReadError)) throw err;
@@ -1533,6 +1738,9 @@ async function refreshMemoryCache() {
   }
 
   cachedSettings = data[StorageKeys.SETTINGS];
+  // Lenient by construction: an absent or malformed value is the defaults,
+  // and the failed-read branch above leaves the previous cache in place.
+  cachedFeatureFlags = normalizeFeatureFlags(data[StorageKeys.FEATURE_FLAGS]);
   const rawAllowlist = data[StorageKeys.ALLOWLIST] || [];
   // §4.8: validation applies to stored state too — a legacy allowlist entry
   // like `co.uk` (persisted before write-side validation existed) must be
@@ -2123,14 +2331,23 @@ async function scheduleFilterUpdateAlarm() {
     // alarm was lost (e.g. by the pre-fix clear) catches up instead of
     // waiting another full interval.
     const lastCheck = await getStorageOrDefault(StorageKeys.LAST_UPDATE_CHECK, null);
-    let delayInMinutes = CONFIG.FILTER_UPDATE_INTERVAL_MINUTES;
+    // §4.5 (A2a, flag refreshCadenceV2) item 1 — a profile that has never
+    // checked (a fresh install) refreshes within a minute instead of a full
+    // interval from now, and the period follows the shortest declared
+    // Expires among the stored lists (1440 when none is recorded).
+    await ensureFeatureFlagsLoaded();
+    const cadenceV2 = isFeatureEnabled('refreshCadenceV2');
+    const periodInMinutes = cadenceV2
+      ? filterUpdatePeriodMinutes(await readFilterListsMeta())
+      : CONFIG.FILTER_UPDATE_INTERVAL_MINUTES;
+    let delayInMinutes = cadenceV2 ? 1 : periodInMinutes;
     if (typeof lastCheck === 'number' && lastCheck > 0 && lastCheck <= Date.now()) {
       const elapsedMinutes = (Date.now() - lastCheck) / 60000;
-      delayInMinutes = Math.max(1, CONFIG.FILTER_UPDATE_INTERVAL_MINUTES - elapsedMinutes);
+      delayInMinutes = Math.max(1, periodInMinutes - elapsedMinutes);
     }
     chrome.alarms.create(ALARM_FILTER_UPDATE, {
       delayInMinutes,
-      periodInMinutes: CONFIG.FILTER_UPDATE_INTERVAL_MINUTES,
+      periodInMinutes,
     });
   }
 
@@ -2144,7 +2361,7 @@ async function scheduleFilterUpdateAlarm() {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_FILTER_UPDATE) {
-    await checkFilterListUpdates();
+    await checkFilterListUpdates({ force: false });
   } else if (alarm.name === ALARM_STATS_CLEANUP) {
     await cleanupTabStats();
   }
@@ -2176,7 +2393,7 @@ let _filterUpdateInProgress = false;
  * `{ok:true}` on total failure told the options page "done", and the page then
  * read a LAST_UPDATE_CHECK that was never written.
  */
-async function checkFilterListUpdates() {
+async function checkFilterListUpdates({ force = false } = {}) {
   if (_filterUpdateInProgress) {
     log('[AdBlock] Filter update already in progress, skipping.');
     return {
@@ -2189,9 +2406,16 @@ async function checkFilterListUpdates() {
   _filterUpdateInProgress = true;
 
   try {
+    await ensureFeatureFlagsLoaded();
     log('[AdBlock] Refreshing per-list cosmetic/scriptlet sources...');
-    const { updated, updatedLists } = await fetchAndStoreRemoteFilterSources();
+    const { updated, updatedLists, skippedFresh, meta } =
+      await fetchAndStoreRemoteFilterSources({ force });
     if (!updated) {
+      if (skippedFresh.length > 0 && skippedFresh.length === REMOTE_FILTER_LISTS.length) {
+        // Alarm path only (force never skips): nothing was due, nothing failed.
+        log('[AdBlock] Every filter list is inside its Expires window; nothing to refresh');
+        return { ok: true, updatedLists: [], skippedFresh };
+      }
       console.warn('[AdBlock] No filter sources were refreshed');
       return {
         ok: false,
@@ -2203,11 +2427,28 @@ async function checkFilterListUpdates() {
     await queueActiveIndexRebuild();
     const checkedAt = Date.now();
     await setStorage(StorageKeys.LAST_UPDATE_CHECK, checkedAt);
+    // §4.5 (A2a) item 4 — `meta` is non-null only under the flag (and only
+    // when it could be read), so the flag-off path never touches the alarm.
+    if (meta) await reconcileFilterUpdateAlarmPeriod(meta);
     log('[AdBlock] Filter source update complete');
     return { ok: true, updatedLists, lastUpdateCheck: checkedAt };
   } finally {
     _filterUpdateInProgress = false;
   }
+}
+
+/**
+ * §4.5 (A2a) item 4 — the alarm period follows the shortest declared Expires
+ * among the lists (clamped to [120, 1440]). Recreate the alarm only when the
+ * period actually changes: a create resets the countdown, and an unchanged
+ * period must leave the alarm alone.
+ */
+async function reconcileFilterUpdateAlarmPeriod(meta) {
+  const periodInMinutes = filterUpdatePeriodMinutes(meta);
+  const alarm = await chrome.alarms.get(ALARM_FILTER_UPDATE);
+  if (alarm && alarm.periodInMinutes === periodInMinutes) return;
+  chrome.alarms.create(ALARM_FILTER_UPDATE, { delayInMinutes: periodInMinutes, periodInMinutes });
+  log(`[AdBlock] Filter update period is now ${periodInMinutes} min`);
 }
 
 // ---------------------------------------------------------------------------
@@ -4271,7 +4512,8 @@ async function handleMessage(message, sender) {
       // §5.3 — report what actually happened. `{ok:true}` on a total fetch
       // failure made "Update All" a silent no-op offline, and made the options
       // page render a `lastUpdateCheck` the SW never wrote.
-      return await checkFilterListUpdates();
+      // "Update All" ignores each list's Expires window (§4.5, A2a).
+      return await checkFilterListUpdates({ force: true });
     }
     case 'REPORT_CONTENT_ERROR': {
       // Content-script init failures used to die in a bare `.catch(() => {})`.
@@ -4664,6 +4906,9 @@ export const __testHooks = {
   applyRulesets,
   CONFIG,
   ALL_KNOWN_LIST_IDS,
+  // Feature flags (REMEDIATION-2026-09 §2)
+  isFeatureEnabled,
+  FEATURE_DEFAULTS,
   // User filters
   applyUserFilters,
   setAndApplyUserFilters,

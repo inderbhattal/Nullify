@@ -438,11 +438,12 @@ export const FILTER_VECTORS = [
  * it is known to differ from the specification, with the reason — `emit`,
  * and `condition` where the build emits both before and after the fix so
  * the flag alone could not go stale. Two kinds:
- *  - dated: the build catches up later (D1 §4.1/§4.2 — `$all`, `$to=`,
- *    `$from=`, `$denyallow=`, `$method=`, scoped `*`; Track D's findings on
- *    digit-first option lists, `~domain=`, empty `~` entries, contradictory
- *    type lists). The pinned answer then stops matching and the parity test
- *    fails until the pin is removed.
+ *  - dated: the build catches up later. None remain after D1 (release 2):
+ *    `$all` (D1a §4.1), `$to=`/`$from=`/`$denyallow=`/`$method=`/scoped `*`
+ *    (D1b §4.2), digit-first option lists, `~domain=`, `~` entries and
+ *    contradictory type lists (D1c §7.1/§7.7). A dated pin's answer stops
+ *    matching when the build catches up and the parity test fails until
+ *    the pin is removed.
  *  - permanent: user filters have no resource library and no punycoder
  *    (`$redirect=`, literal `$removeparam=`, non-ASCII `$domain=`).
  * The runtime fallback is allowed to be stricter than the build (drop where
@@ -452,8 +453,6 @@ const ALL_RESOURCE_TYPES = [
   'main_frame', 'sub_frame', 'stylesheet', 'script', 'image', 'font',
   'object', 'xmlhttprequest', 'ping', 'media', 'websocket', 'other',
 ];
-
-const D1 = 'D1 (§4.2) has not landed: the build parser refuses this option today';
 
 export const NETWORK_VECTORS = [
   // --- the review's nine lines ---------------------------------------------
@@ -470,7 +469,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', requestDomains: ['cdn.example'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -478,7 +476,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', initiatorDomains: ['site.example'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -486,7 +483,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', requestMethods: ['post'] },
-      build: { emit: false, why: D1 },
     },
   },
   { line: '||example.com^$header=content-type:image', expect: { kind: 'network', emit: false } },
@@ -530,7 +526,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', excludedRequestMethods: ['get'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -542,7 +537,6 @@ export const NETWORK_VECTORS = [
         requestDomains: ['cdn.example'],
         excludedRequestDomains: ['static.example'],
       },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -550,7 +544,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', excludedRequestDomains: ['cdn.example'] },
-      build: { emit: false, why: D1 },
     },
   },
   {
@@ -594,13 +587,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES },
-      // The build emits before and after D1, so the emit flag alone can
-      // never go stale: pin its CURRENT condition too.
-      build: {
-        emit: true,
-        condition: { urlFilter: '||bad.example^' },
-        why: 'D1 (§4.1) has not landed: the build still treats $all as ignorable and emits no resourceTypes (every type except main_frame)',
-      },
     },
   },
   {
@@ -608,11 +594,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||bad.example^', resourceTypes: ALL_RESOURCE_TYPES.filter((t) => t !== 'image') },
-      build: {
-        emit: true,
-        condition: { urlFilter: '||bad.example^', excludedResourceTypes: ['image'] },
-        why: 'D1 (§4.1) has not landed: the build ignores $all and keeps only the exclusion',
-      },
     },
   },
   {
@@ -649,7 +630,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { resourceTypes: ['script'], domainType: 'thirdParty', initiatorDomains: ['x.com'] },
-      build: { emit: false, why: D1 },
     },
   },
   { line: '*', expect: { kind: 'network', emit: false } },
@@ -665,42 +645,27 @@ export const NETWORK_VECTORS = [
   { line: '||example.com^$method=', expect: { kind: 'network', emit: false } },
   {
     line: '||example.com^$domain=~',
-    expect: {
-      kind: 'network', emit: false,
-      build: { emit: true, why: 'the build drops the empty entry and ships the rule unscoped (Track D finding)' },
-    },
+    expect: { kind: 'network', emit: false },
   },
   {
     line: '||example.com^$~domain=a.com',
-    expect: {
-      kind: 'network', emit: false,
-      build: { emit: true, why: 'the build treats ~domain= as un-negated and scopes the rule to a.com (Track D finding)' },
-    },
+    expect: { kind: 'network', emit: false },
   },
   {
     line: '||example.com^$script,~script',
-    expect: {
-      kind: 'network', emit: false,
-      build: { emit: true, why: 'the build emits script in both type lists, a rule Chrome rejects (Track D finding)' },
-    },
+    expect: { kind: 'network', emit: false },
   },
 
   // --- `$3p`/`$1p` as the FIRST option ------------------------------------
-  // The build's OPTION_LIST_HEAD wants a letter first, so it never splits
-  // `$3p…` and ships a dead urlFilter carrying the literal text: 415 corpus
-  // lines, 56 of them exceptions (Track D finding). User filters compile to
-  // the scoped block the line asks for; the build's answer is pinned so its
-  // fix is caught here.
+  // The build's OPTION_LIST_HEAD used to want a letter first, so it never
+  // split `$3p…` and shipped a dead urlFilter carrying the literal text: 415
+  // corpus lines, 56 of them exceptions (§7.1, fixed by D1c). Every engine
+  // now compiles the scoped rule the line asks for.
   {
     line: '||example.com^$3p',
     expect: {
       kind: 'network', emit: true, action: 'block',
       condition: { urlFilter: '||example.com^', domainType: 'thirdParty' },
-      build: {
-        emit: true,
-        condition: { urlFilter: '||example.com^$3p' },
-        why: 'the build does not split a digit-first option list and ships urlFilter "||example.com^$3p" (Track D finding)',
-      },
     },
   },
   {
@@ -708,11 +673,6 @@ export const NETWORK_VECTORS = [
     expect: {
       kind: 'network', emit: true, action: 'allow',
       condition: { urlFilter: '||example.com^', domainType: 'firstParty', resourceTypes: ['script'] },
-      build: {
-        emit: true,
-        condition: { urlFilter: '||example.com^$~3p,script' },
-        why: 'the build does not split a digit-first option list and ships urlFilter "||example.com^$~3p,script" (Track D finding)',
-      },
     },
   },
   {

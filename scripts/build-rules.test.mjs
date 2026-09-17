@@ -13,6 +13,8 @@ import {
   commitStagedRules,
   fetchAndExpand,
   vendoredListPath,
+  writeSampleOutputs,
+  stampGeneratedAt,
   FILTER_LISTS,
   LIST_CONFIG,
   MAX_PER_FILE,
@@ -501,4 +503,55 @@ test('$replace= network rules are dropped rather than shipped broadened', () => 
     assert.equal(parsed.skip, true, `${line} must be skipped`);
     assert.match(parsed.reason || '', /unsupported-option: replace=/);
   }
+});
+
+// ---------------------------------------------------------------------------
+// §4.5 — every packaged source carries the lock's generatedAt (D2)
+// ---------------------------------------------------------------------------
+// The SW's freshness model (A2a) needs to know how old a packaged list is;
+// the lock already records when each snapshot was taken, but the bundle
+// written to filter-sources.json never carried it, so the runtime could only
+// guess from the build date.
+
+test('4.5: every packaged source carries the lock\'s generatedAt', () => {
+  const outDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nullify-d2-'));
+  try {
+    const lock = {};
+    for (const [i, list] of FILTER_LISTS.entries()) {
+      lock[list.id] = { url: list.url, sha384: 'sha384-x', generatedAt: `2026-09-0${(i % 9) + 1}T00:00:00.000Z` };
+    }
+    // Drive the sample build path with the temp lock, as `--sample` would.
+    writeSampleOutputs(outDir, { lock });
+
+    const sources = JSON.parse(fs.readFileSync(path.join(outDir, 'filter-sources.json'), 'utf8'));
+    assert.ok(Object.keys(sources).length > 0, 'the sample build must package at least one source');
+    for (const [id, bundle] of Object.entries(sources)) {
+      assert.equal(
+        bundle.generatedAt,
+        lock[id]?.generatedAt ?? null,
+        `${id}: packaged source must carry the lock's generatedAt`,
+      );
+      assert.ok(bundle.generatedAt, `${id}: the sample build stamps every configured list`);
+    }
+  } finally {
+    fs.rmSync(outDir, { recursive: true, force: true });
+  }
+});
+
+test('4.5: a list missing from the lock is stamped null, not undefined', () => {
+  // `null` is an explicit "unknown" the SW can test for; an absent field
+  // would be indistinguishable from a bundle built before D2.
+  const stamped = stampGeneratedAt({ 'not-in-lock': { cosmetic: {}, scriptlets: [] } }, {});
+  assert.equal(stamped['not-in-lock'].generatedAt, null);
+  assert.ok(Object.hasOwn(stamped['not-in-lock'], 'generatedAt'));
+});
+
+test('4.5 (didn\'t re-break): stamping does not disturb the bundle\'s cosmetic and scriptlet halves', () => {
+  const bundle = { cosmetic: { generic: ['.ad'] }, scriptlets: [{ name: 'set' }] };
+  const stamped = stampGeneratedAt({ easylist: bundle }, { easylist: { generatedAt: '2026-01-01T00:00:00.000Z' } });
+  assert.deepEqual(stamped.easylist, {
+    cosmetic: { generic: ['.ad'] },
+    scriptlets: [{ name: 'set' }],
+    generatedAt: '2026-01-01T00:00:00.000Z',
+  });
 });

@@ -425,9 +425,19 @@ function resolveIncludeUrl(includePath, parentUrl, baseUrl) {
 /**
  * Fetch a filter list URL and expand any !#include directives.
  * Uses the browser fetch() API (available in service workers).
+ *
+ * §4.3 (2026-09): every include failure below THROWS. This used to return ''
+ * for the include and let the rest of the list through, so a 404/429 on one
+ * sub-file (raw.githubusercontent.com rate-limits) stored the surviving
+ * fraction over a good list and reported the list as updated — the runtime
+ * half of the fail-open the build closed in 2026-08 §5.10. The per-list
+ * `try/catch` in the service worker's `fetchAndStoreRemoteFilterSources`
+ * turns the throw into "keep the previous source, don't report this list".
  */
 export async function fetchAndExpand(url, depth = 0, budget = createFetchBudget()) {
-  if (depth > 5) return '';
+  if (depth > 5) {
+    throw new Error(`Include depth exceeded (more than 5 levels) at ${url} — refusing to silently truncate the list`);
+  }
   const text = await fetchTextBounded(url, budget);
 
   const baseUrl = url.slice(0, url.lastIndexOf('/') + 1);
@@ -471,18 +481,42 @@ export async function fetchAndExpand(url, depth = 0, budget = createFetchBudget(
       const includePath = m[1].trim();
       const includeUrl = resolveIncludeUrl(includePath, url, baseUrl);
       if (includeUrl === null) {
-        console.warn('[AdBlock] Refusing insecure include:', includePath, 'in', url);
-        return '';
+        throw new Error(`Refusing insecure include ${includePath} in ${url}`);
       }
       try {
         return await fetchAndExpand(includeUrl, depth + 1, budget);
       } catch (e) {
-        console.warn('[AdBlock] Skipping include:', includeUrl, e.message);
-        return '';
+        throw new Error(`!#include ${includeUrl} failed: ${e.message}`);
       }
     }
     return line;
   }));
 
   return expandedLines.join('\n');
+}
+
+/** How many leading lines of a list are treated as its header. */
+const EXPIRES_HEADER_LINES = 50;
+const EXPIRES_RE = /^!\s*Expires:\s*(\d+)\s*(hours?|days?|minutes?)/i;
+
+/**
+ * Read a list's `! Expires: N hours|days|minutes` header.
+ *
+ * Returns the interval in minutes, or `null` when the first 50 lines carry no
+ * parseable header. Consumed by the per-list refresh cadence (Track A2a):
+ * quick-fixes.txt declares `8 hours`, EasyList `4 days`.
+ */
+export function parseExpiresHeader(text) {
+  if (typeof text !== 'string' || text.length === 0) return null;
+  const lines = text.split('\n', EXPIRES_HEADER_LINES);
+  for (const line of lines) {
+    const m = line.trim().match(EXPIRES_RE);
+    if (!m) continue;
+    const n = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    if (unit.startsWith('hour')) return n * 60;
+    if (unit.startsWith('day')) return n * 24 * 60;
+    return n;
+  }
+  return null;
 }

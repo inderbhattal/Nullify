@@ -9,11 +9,10 @@ import init, {
   sanitize_youtube_experiments,
 } from '../shared/wasm/nullify_core.js';
 import { initWasmFromUrl } from '../shared/wasm-loader.js';
+import { proxyApply, wrapInstanceGetter } from '../scriptlets/shared-utils.js';
 
 (function() {
-  const SHIELD_VERSION = 3;
-
-  // ---- Idempotency guard (REVIEW-2026-08 §4.12) ----
+  // ---- Idempotency guard (REVIEW-2026-08 §4.12, REVIEW-2026-09 §4.4) ----
   //
   // This bundle is evaluated more than once per frame: registerContentScripts
   // runs it at document_start, and injectIntoOpenTabs re-injects it into
@@ -25,26 +24,21 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   // page kill switch for every layer below, and published a
   // `{version, startedAt, updatedAt}` fingerprint on every load.
   //
-  // Instead the marker is a symbol-keyed, non-enumerable, non-writable,
-  // non-configurable brand on the JSON.parse wrapper this shield installs,
-  // and it is honoured only when that wrapper still *behaves* like ours.
-  // Page script can plant the brand, but planting it without also rewriting
-  // ad payload keys to false no longer disables anything — the probe fails
-  // and the shield installs over the top.
-  const INSTALL_BRAND = Symbol.for('$$jsonParseHookVersion');
+  // Nor may it be a brand on the wrapper: the version marker §4.12 moved onto
+  // JSON.parse was a global-registry symbol any page could look up by name,
+  // which identified the extension *and its version* in one expression
+  // (§4.4). The guard is now the behavioural probe alone. A hook
+  // that neutralizes ad payloads the way ours does is treated as installed,
+  // whichever generation planted it — the version number bought nothing a
+  // forger could not also forge. A forged hook *without* the behaviour does
+  // not pass, so the shield installs over the top of it.
   const isShieldInstalled = () => {
     try {
-      // Behavioural probe. The randomized payload stops a page from
-      // special-casing one fixed probe string: to pass, JSON.parse has to
-      // actually neutralize ad payload keys the way the hook below does.
+      // The randomized payload stops a page from special-casing one fixed
+      // probe string: to pass, JSON.parse has to actually neutralize ad
+      // payload keys the way the hook below does.
       const probe = JSON.parse(`{"adPlacements":[${Math.random()}]}`);
-      if (!probe || probe.adPlacements !== false) return false;
-      const installed = JSON.parse[INSTALL_BRAND];
-      // A hook that behaves but carries an older brand is a previous shield
-      // generation, so let this one install over it. An unbranded hook is
-      // treated as installed rather than stacking a second copy of every
-      // interceptor on top of it.
-      return !(typeof installed === 'number' && installed < SHIELD_VERSION);
+      return Boolean(probe) && probe.adPlacements === false;
     } catch {
       return false;
     }
@@ -378,40 +372,28 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   // This is how uBlock Origin's json-prune scriptlet works — except here it's
   // installed synchronously in MAIN world before any async round-trip to the SW,
   // closing the timing window where ads could slip through.
-  const _origJSONParse = JSON.parse;
-  JSON.parse = function(text, ...rest) {
-    const result = _origJSONParse.call(this, text, ...rest);
-    return prunePayload(result);
-  };
-  // Locked idempotency brand — see isShieldInstalled() above. Non-enumerable
-  // so it stays out of Object.keys/JSON output, non-writable and
-  // non-configurable so a later page script cannot forge a newer generation
-  // onto our own wrapper.
-  try {
-    Object.defineProperty(JSON.parse, INSTALL_BRAND, {
-      value: SHIELD_VERSION,
-      writable: false,
-      enumerable: false,
-      configurable: false,
-    });
-  } catch {
-    // Branding is best effort; the behavioural probe still detects the hook.
-  }
+  //
+  // Every wrapper in this file goes through shared-utils' `proxyApply` /
+  // `wrapInstanceGetter`: an `apply`-trapping Proxy over the native, masked so
+  // `name`, `length`, own keys and `Function.prototype.toString` all read as
+  // the native's (the getters carry an own `prototype` until shared-utils
+  // builds them with method syntax). The plain function this used to be
+  // printed its own source and an empty name (§4.4).
+  proxyApply(JSON, 'parse', ({ reflect }) => prunePayload(reflect()));
 
   // 1b. Response.json hook — keep the scope narrow and let JSON.parse handle
   // text-backed consumers. The broader text()/arrayBuffer() hooks were touching
   // too much page traffic for little gain.
   if (window.Response?.prototype) {
-    const _origResponseJson = Response.prototype.json;
-    Response.prototype.json = async function(...args) {
-      const result = await _origResponseJson.apply(this, args);
-      if (isYoutubePlayerLikeUrl(this.url)) {
+    proxyApply(Response.prototype, 'json', async ({ thisArg, reflect }) => {
+      const result = await reflect();
+      if (isYoutubePlayerLikeUrl(thisArg.url)) {
         pruneAdKeys(result, true);
         pruneAdPaths(result);
         return result;
       }
       return prunePayload(result);
-    };
+    });
   }
 
   // 2. WASM Initialization
@@ -626,20 +608,28 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
   };
 
   // 4. Identity Trap-Defuser
-  const ok = () => Promise.resolve({ state: 'granted' });
-  if (document.requestStorageAccess) document.requestStorageAccess = ok;
-  if (document.requestStorageAccessFor) document.requestStorageAccessFor = ok;
+  //
+  // Installed on Document.prototype, where the platform keeps these, as
+  // masked proxies. The previous own-property arrow on `document` printed as
+  // `() => Promise.resolve({ state: 'granted' })` and appeared in
+  // `Object.getOwnPropertyNames(document)` — the same class of leak as the
+  // XHR instance fields (§4.4).
+  const grantStorageAccess = () => Promise.resolve({ state: 'granted' });
+  const documentProto = globalThis.Document?.prototype;
+  if (documentProto) {
+    proxyApply(documentProto, 'requestStorageAccess', grantStorageAccess);
+    proxyApply(documentProto, 'requestStorageAccessFor', grantStorageAccess);
+  }
 
   // 5. Network Interceptor — fetch
-  const origFetch = window.fetch;
-  window.fetch = async function(input, init) {
+  proxyApply(window, 'fetch', async ({ callArgs, reflect }) => {
+    const input = callArgs[0];
     const url = typeof input === 'string' ? input : input?.url || '';
 
     // Pre-flight block: return empty response without hitting network.
     // These are exact fixed endpoints, so crossing the JS->WASM boundary here
     // adds overhead without buying more coverage.
-    const blocked = shouldBlockRequestUrl(url);
-    if (blocked) {
+    if (shouldBlockRequestUrl(url)) {
       return new Response('{}', {
         status: 200,
         statusText: 'OK',
@@ -647,115 +637,120 @@ import { initWasmFromUrl } from '../shared/wasm-loader.js';
       });
     }
 
-    const response = await origFetch.call(this, input, init);
+    const response = await reflect();
     // The request URL can be relative and the response URL is post-redirect, so
     // check both before spending a clone on the body.
     if (isYoutubePlayerLikeUrl(url) || isYoutubePlayerLikeUrl(response?.url || '')) {
       return scrubPlayerResponse(response);
     }
     return response;
-  };
+  });
 
   // 5b. Network Interceptor — XMLHttpRequest
   // YouTube fires player requests via XHR on SPA navigations and some player
   // paths. Without this, those responses bypass scrubbing entirely and ads
   // that slip through fetch interception still render.
-  // Strategy: subclass XHR, override the response getters to return the
-  // scrubbed version lazily (memoised per-request so re-reads don't re-scrub).
-  const OrigXHR = window.XMLHttpRequest;
-  window.XMLHttpRequest = class extends OrigXHR {
-    constructor() {
-      super();
-      this._nUrl = '';
-      this._nCached = null;
-      this._nBlocked = false;
-    }
+  //
+  // Strategy: intercept open()/send() and the response getters on
+  // XMLHttpRequest.prototype, with per-request state in a WeakMap — the
+  // pattern prevent-xhr.js and trusted-replace-fetch-response.js use.
+  // `window.XMLHttpRequest` stays the platform constructor. The previous
+  // `class extends OrigXHR` replaced it (`XMLHttpRequest.name === ''`,
+  // `String(XMLHttpRequest)` printing our class body) and assigned
+  // `_nUrl/_nCached/_nBlocked` to every instance, where
+  // `Object.getOwnPropertyNames(new XMLHttpRequest())` — `[]` on a real
+  // browser — read them straight back (§4.4).
+  const XHR = window.XMLHttpRequest;
+  if (typeof XHR === 'function' && XHR.prototype) {
+    const xhrProto = XHR.prototype;
+    // { url, cached, blocked } per instance, reset on every open().
+    const xhrState = new WeakMap();
 
-    open(method, url, ...args) {
-      this._nUrl = typeof url === 'string' ? url : '';
-      this._nCached = null;
-      this._nBlocked = false;
-      return super.open(method, url, ...args);
-    }
+    proxyApply(xhrProto, 'open', ({ thisArg, callArgs, reflect }) => {
+      const url = callArgs[1];
+      // State is written before the native call so a re-open() on a reused
+      // instance clears the previous request even when the new open() throws.
+      try {
+        xhrState.set(thisArg, {
+          url: typeof url === 'string' ? url : '',
+          cached: null,
+          blocked: false,
+        });
+      } catch {
+        // Non-object `this` (open.call(null, …)): let the native open() raise
+        // its own "Illegal invocation" rather than the WeakMap's TypeError.
+      }
+      return reflect();
+    });
 
     // Pre-flight block — abort ad-only XHR requests before they reach the network.
-    send(...args) {
-      const url = this._nUrl;
-      const block = shouldBlockRequestUrl(url);
-      if (block) {
-        this._nBlocked = true;
-        this._nCached = '{}';
+    proxyApply(xhrProto, 'send', ({ thisArg, reflect }) => {
+      const state = xhrState.get(thisArg);
+      if (state !== undefined && shouldBlockRequestUrl(state.url)) {
+        state.blocked = true;
+        state.cached = '{}';
         // Synthesize a completed empty JSON response for ad-only endpoints.
         setTimeout(() => {
-          this.dispatchEvent(new Event('readystatechange'));
-          this.dispatchEvent(new ProgressEvent('load'));
-          this.dispatchEvent(new ProgressEvent('loadend'));
+          thisArg.dispatchEvent(new Event('readystatechange'));
+          thisArg.dispatchEvent(new ProgressEvent('load'));
+          thisArg.dispatchEvent(new ProgressEvent('loadend'));
         }, 0);
-        return;
+        return undefined;
       }
-      return super.send(...args);
-    }
+      return reflect();
+    });
 
-    _isPlayerText() {
-      return this.readyState === 4 &&
-             (this.responseType === '' || this.responseType === 'text') &&
-             isYoutubePlayerLikeUrl(this._nUrl);
-    }
+    const isPlayerText = (xhr, state) =>
+      xhr.readyState === 4 &&
+      (xhr.responseType === '' || xhr.responseType === 'text') &&
+      isYoutubePlayerLikeUrl(state.url);
 
-    _isPlayerJson() {
-      return this.readyState === 4 &&
-             this.responseType === 'json' &&
-             isYoutubePlayerLikeUrl(this._nUrl);
-    }
+    const isPlayerJson = (xhr, state) =>
+      xhr.readyState === 4 &&
+      xhr.responseType === 'json' &&
+      isYoutubePlayerLikeUrl(state.url);
 
-    _scrubbed() {
-      if (this._nCached === null) {
-        let original = '';
-        try {
-          original = super.responseText;
-          this._nCached = scrub(original);
-        } catch {
-          this._nCached = original || super.responseText;
-        }
+    // Scrub lazily and memoise per request, so re-reads don't re-scrub.
+    const scrubbedText = (state, original) => {
+      if (state.cached === null) state.cached = scrub(original);
+      return state.cached;
+    };
+
+    // The response getters are reproduced on the prototype. Each receives the
+    // native value first, so an instance the shield never saw open() (no
+    // state) reads exactly as the platform.
+    wrapInstanceGetter(xhrProto, 'responseText', (value, xhr) => {
+      const state = xhrState.get(xhr);
+      if (state === undefined) return value;
+      if (state.blocked) return state.cached;
+      return isPlayerText(xhr, state) ? scrubbedText(state, value) : value;
+    });
+
+    wrapInstanceGetter(xhrProto, 'response', (value, xhr) => {
+      const state = xhrState.get(xhr);
+      if (state === undefined) return value;
+      if (state.blocked) {
+        return xhr.responseType === 'json' ? JSON.parse(state.cached) : state.cached;
       }
-      return this._nCached;
-    }
-
-    get responseText() {
-      if (this._nBlocked) return this._nCached;
-      return this._isPlayerText() ? this._scrubbed() : super.responseText;
-    }
-
-    get response() {
-      if (this._nBlocked) {
-        if (this.responseType === 'json') return JSON.parse(this._nCached);
-        return this._nCached;
+      if (isPlayerJson(xhr, state)) {
+        pruneAdKeys(value, true);
+        pruneAdPaths(value);
+        return value;
       }
-      const r = super.response;
-      if (this._isPlayerJson()) {
-        pruneAdKeys(r, true);
-        pruneAdPaths(r);
-        return r;
-      }
-      return (this._isPlayerText() && typeof r === 'string') ? this._scrubbed() : r;
-    }
+      return (isPlayerText(xhr, state) && typeof value === 'string')
+        ? scrubbedText(state, value)
+        : value;
+    });
 
-    get readyState() {
-      return this._nBlocked ? 4 : super.readyState;
-    }
-
-    get status() {
-      return this._nBlocked ? 200 : super.status;
-    }
-
-    get statusText() {
-      return this._nBlocked ? 'OK' : super.statusText;
-    }
-
-    get responseURL() {
-      return this._nBlocked ? this._nUrl : super.responseURL;
-    }
-  };
+    const whenBlocked = (replacement) => (value, xhr) => {
+      const state = xhrState.get(xhr);
+      return state !== undefined && state.blocked ? replacement(state) : value;
+    };
+    wrapInstanceGetter(xhrProto, 'readyState', whenBlocked(() => 4));
+    wrapInstanceGetter(xhrProto, 'status', whenBlocked(() => 200));
+    wrapInstanceGetter(xhrProto, 'statusText', whenBlocked(() => 'OK'));
+    wrapInstanceGetter(xhrProto, 'responseURL', whenBlocked((state) => state.url));
+  }
 
   // 6. Variable Shield — neutralize ad fields on assignment.
   //

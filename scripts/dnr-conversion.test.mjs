@@ -807,6 +807,157 @@ test('$popup converts only for ||domain^-anchored patterns', () => {
 });
 
 // ---------------------------------------------------------------------------
+// $document exceptions (REVIEW-2026-09 §5.6)
+// ---------------------------------------------------------------------------
+
+// uBO's `@@…$document` switches ALL filtering off for the matching page. The
+// build emitted `allow` on `main_frame`, which only lets the navigation
+// through: every block still fired on the page the author asked to be left
+// alone (the NAI opt-out page is EasyList's one). DNR's equivalent is
+// `allowAllRequests` on the frame — main_frame/sub_frame are the only types
+// Chrome accepts on it, the same pair the runtime allowlist writes.
+const frameAllow = (condition, priority = 3) => ({
+  priority,
+  condition: {
+    isUrlFilterCaseSensitive: false,
+    resourceTypes: ['main_frame', 'sub_frame'],
+    ...condition,
+  },
+  action: { type: 'allowAllRequests' },
+});
+const plainAllow = (condition, priority = 3) => ({
+  priority,
+  condition: { isUrlFilterCaseSensitive: false, ...condition },
+  action: { type: 'allow' },
+});
+
+test('5.6: @@…$document becomes allowAllRequests on main_frame and sub_frame', () => {
+  assert.deepEqual(
+    convert('@@||optout.networkadvertising.org^$document'),
+    frameAllow({ urlFilter: '||optout.networkadvertising.org^' }),
+  );
+  // The `doc` alias, the way ubo-unbreak writes it.
+  assert.deepEqual(
+    convert('@@||ad.admitad.com/g/*&ulp=http$doc'),
+    frameAllow({ urlFilter: '||ad.admitad.com/g/*&ulp=http' }),
+  );
+  // The existing allow bands: nothing new can outrank an $important block
+  // unless the exception is $important itself.
+  assert.deepEqual(
+    convert('@@||optout.networkadvertising.org^$document,important'),
+    frameAllow({ urlFilter: '||optout.networkadvertising.org^' }, 6),
+  );
+  assert.equal(parseLine('@@||optout.networkadvertising.org^$document').options.documentException, true);
+});
+
+test('5.6: $to= on a $document exception carries over — the request domain IS the page', () => {
+  // `requestDomains` is matched against the frame's own URL, which is what
+  // uBO matches `$to=` against for a document.
+  assert.deepEqual(
+    convert('@@||example.com^$document,to=example.com'),
+    frameAllow({ urlFilter: '||example.com^', requestDomains: ['example.com'] }),
+  );
+  assert.deepEqual(
+    convert('@@*$document,to=example.com'),
+    frameAllow({ requestDomains: ['example.com'] }),
+  );
+});
+
+test('5.6 (didn\'t re-break): a $document exception DNR would scope by the navigation\'s initiator keeps the plain allow', () => {
+  // uBO tests `$domain=` and the party of a document against the page itself.
+  // DNR tests both against whoever STARTED the navigation: `initiatorDomains`
+  // would un-filter every page the named site links to, and `thirdParty` —
+  // never true of a page in uBO — is true of every typed URL. Neither is the
+  // rule that was written, so these keep the answer they always had.
+  assert.deepEqual(
+    convert('@@||example.com^$document,domain=example.com'),
+    plainAllow({ urlFilter: '||example.com^', resourceTypes: ['main_frame'], initiatorDomains: ['example.com'] }),
+  );
+  assert.deepEqual(
+    convert('@@||example.com^$document,from=~other.example'),
+    plainAllow({ urlFilter: '||example.com^', resourceTypes: ['main_frame'], excludedInitiatorDomains: ['other.example'] }),
+  );
+  assert.deepEqual(
+    convert('@@||example.com^$document,3p'),
+    plainAllow({ urlFilter: '||example.com^', resourceTypes: ['main_frame'], domainType: 'thirdParty' }),
+  );
+  // The one corpus line of this shape (anti-adblock).
+  assert.deepEqual(
+    convert('@@||toss.onelink.me/*service.toss.im$doc,1p'),
+    plainAllow({ urlFilter: '||toss.onelink.me/*service.toss.im', resourceTypes: ['main_frame'], domainType: 'firstParty' }),
+  );
+});
+
+test('5.6 (didn\'t re-break): a $document exception that names no page never becomes an unscoped allowAllRequests', () => {
+  // With no pattern and no `$to=` the condition would match every frame, and
+  // `allowAllRequests` there switches the blocker off everywhere.
+  assert.deepEqual(convert('@@*$document'), plainAllow({ resourceTypes: ['main_frame'] }));
+  assert.deepEqual(
+    convert('@@*$document,denyallow=example.com'),
+    plainAllow({ resourceTypes: ['main_frame'], excludedRequestDomains: ['example.com'] }),
+  );
+});
+
+test('5.6 (didn\'t re-break): @@…$popup stays a plain allow', () => {
+  // `$popup` pushes main_frame too (EasyList has dozens of `@@||ads.x.com^$popup`)
+  // and only ever meant "do not block this navigation".
+  assert.deepEqual(
+    convert('@@||ads.google.com^$popup'),
+    plainAllow({ urlFilter: '||ads.google.com^', resourceTypes: ['main_frame'] }),
+  );
+  // ubo-unbreak's `$doc,popup` pair: the types did not come from `doc` alone.
+  assert.equal(
+    convert('@@||awstrack.me/*auth.coindesk.com$doc,popup').action.type,
+    'allow',
+  );
+  assert.equal(
+    convert('@@||awstrack.me/*auth.coindesk.com$popup,doc').action.type,
+    'allow',
+  );
+});
+
+test('5.6 (didn\'t re-break): $document alongside another type stays a typed allow', () => {
+  assert.deepEqual(
+    convert('@@||jokerly.com/Okidak/vastChecker.htm$document,subdocument'),
+    plainAllow({ urlFilter: '||jokerly.com/Okidak/vastChecker.htm', resourceTypes: ['main_frame', 'sub_frame'] }),
+  );
+  assert.deepEqual(
+    convert('@@||example.com^$script,doc'),
+    plainAllow({ urlFilter: '||example.com^', resourceTypes: ['script', 'main_frame'] }),
+  );
+  assert.deepEqual(
+    convert('@@||example.com^$document,~script'),
+    plainAllow({ urlFilter: '||example.com^', resourceTypes: ['main_frame'] }),
+  );
+  const all = convert('@@||safe.example^$document,all');
+  assert.equal(all.action.type, 'allow');
+  assert.deepEqual([...all.condition.resourceTypes].sort(), [...ALL_RESOURCE_TYPES].sort());
+});
+
+test('5.6 (didn\'t re-break): an exception that names no type at all is untouched', () => {
+  // "Every type on the line is main_frame" is vacuously true of an empty list.
+  assert.deepEqual(
+    convert('@@||safe.example^$important'),
+    plainAllow({ urlFilter: '||safe.example^' }, 6),
+  );
+  assert.deepEqual(
+    convert('@@||safe.example^$match-case'),
+    { ...plainAllow({ urlFilter: '||safe.example^' }), condition: { urlFilter: '||safe.example^', isUrlFilterCaseSensitive: true } },
+  );
+});
+
+test('5.6 (didn\'t re-break): a blocking $document rule is still a main_frame block', () => {
+  assert.deepEqual(
+    convert('||bad.example^$document'),
+    block({ urlFilter: '||bad.example^', resourceTypes: ['main_frame'] }),
+  );
+  assert.deepEqual(
+    convert('||bad.example^$doc,important'),
+    block({ urlFilter: '||bad.example^', resourceTypes: ['main_frame'] }, 4),
+  );
+});
+
+// ---------------------------------------------------------------------------
 // redirect= / redirect-rule= (§5.42)
 // ---------------------------------------------------------------------------
 

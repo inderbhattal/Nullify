@@ -18,6 +18,18 @@ const STORE_PAGE_BUNDLES = 'page_bundles';
 const ALL_STORES = [STORE_COSMETIC, STORE_SCRIPTLET, STORE_FILTER_SOURCES, STORE_PAGE_BUNDLES];
 
 /**
+ * §5.8 — hard cap on the in-memory LRU touches `getPageBundle` records between
+ * prunes. Only a hit records one, so the map is already bounded by the rows in
+ * the store — which the service worker prunes to its own cap after every put —
+ * and it is emptied whenever those rows are pruned or cleared. The cap makes
+ * the bound unconditional (a worker can live for hours, and rows can vanish
+ * without this class hearing of it). It sits well above the store cap so that
+ * it costs no LRU accuracy in practice: past it the least recent touch is
+ * dropped, and that row simply ranks by its stored stamp.
+ */
+export const PAGE_BUNDLE_TOUCH_MAX = 1000;
+
+/**
  * Normalize an IndexedDB transaction/request error into something callers can
  * act on: quota failures map to the shared StorageQuotaError type, and a
  * missing error (possible on commit-time aborts) becomes a real Error.
@@ -50,6 +62,9 @@ export class RulesDB {
     this.db = null;
     this._openPromise = null;
     this._pendingCosmeticLookups = [];
+    // §5.8 — hostname -> Date.now() of the last getPageBundle hit, in touch
+    // order. Folded into the stored `updatedAt` by prunePageBundles.
+    this._bundleTouched = new Map();
   }
 
   async open() {
@@ -279,7 +294,10 @@ export class RulesDB {
       transaction.objectStore(STORE_SCRIPTLET).clear();
       transaction.objectStore(STORE_PAGE_BUNDLES).clear();
 
-      transaction.oncomplete = () => resolve();
+      transaction.oncomplete = () => {
+        this._bundleTouched.clear(); // §5.8 — the rows they describe are gone
+        resolve();
+      };
       rejectOnAbortOrError(transaction, reject);
     });
   }
@@ -355,30 +373,48 @@ export class RulesDB {
     });
   }
 
-  /** Get a compiled page bundle for a hostname. */
+  /**
+   * Get a compiled page bundle for a hostname.
+   *
+   * §5.8 — this runs on every page load, so it is strictly a read: a
+   * `readonly` transaction does not queue behind the active-index rebuild's
+   * write locks, and a cache hit costs no disk write. The LRU stamp goes to
+   * memory and reaches the row at the next prune. A record compiled under
+   * another rule-data version is a miss and is left where it is: rows are
+   * keyed by hostname, so the `putPageBundle` that follows the miss overwrites
+   * it, and a stale row nobody revisits is never touched again, which puts it
+   * first in line when `prunePageBundles` enforces the cap.
+   */
   async getPageBundle(hostname, expectedVersion = null) {
     const db = await this.open();
     return new Promise((resolve, reject) => {
-      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
+      const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readonly');
       const store = transaction.objectStore(STORE_PAGE_BUNDLES);
       const request = store.get(hostname);
       let bundle = null;
 
       request.onsuccess = () => {
         const record = request.result;
-        if (record && expectedVersion && record.version !== expectedVersion) {
-          store.delete(hostname);
-          return;
-        }
+        if (record && expectedVersion && record.version !== expectedVersion) return;
         bundle = record?.bundle || null;
-        if (record) {
-          store.put({ ...record, updatedAt: Date.now() });
-        }
+        if (record) this._touchPageBundle(hostname);
       };
       transaction.oncomplete = () => resolve(bundle);
       rejectOnAbortOrError(transaction, reject);
       request.onerror = (event) => reject(event.target.error);
     });
+  }
+
+  /**
+   * §5.8 — record an LRU hit in memory. Re-inserting keeps the Map in touch
+   * order, so at the cap the entry given up is the least recent touch.
+   */
+  _touchPageBundle(hostname) {
+    this._bundleTouched.delete(hostname);
+    if (this._bundleTouched.size >= PAGE_BUNDLE_TOUCH_MAX) {
+      this._bundleTouched.delete(this._bundleTouched.keys().next().value);
+    }
+    this._bundleTouched.set(hostname, Date.now());
   }
 
   /** Clear persisted page bundles without touching the active rule index. */
@@ -388,12 +424,24 @@ export class RulesDB {
       const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
       transaction.objectStore(STORE_PAGE_BUNDLES).clear();
 
-      transaction.oncomplete = () => resolve();
+      transaction.oncomplete = () => {
+        this._bundleTouched.clear(); // §5.8 — the rows they describe are gone
+        resolve();
+      };
       rejectOnAbortOrError(transaction, reject);
     });
   }
 
-  /** Remove the least-recently-used page bundles above the provided cap. */
+  /**
+   * Remove the least-recently-used page bundles above the provided cap.
+   *
+   * §5.8 — reads no longer stamp the row, so "recently used" is the stored
+   * `updatedAt` merged with the in-memory touches. This is also where those
+   * touches become durable: survivors get their merged stamp in the same
+   * `readwrite` transaction as the evictions, off the page-load path. Under
+   * the cap nothing is ranked, nothing is written and the touches are kept for
+   * a pass that needs them.
+   */
   async prunePageBundles(maxEntries) {
     if (!Number.isInteger(maxEntries) || maxEntries <= 0) return 0;
 
@@ -410,9 +458,11 @@ export class RulesDB {
 
     if (records.length <= maxEntries) return 0;
 
-    const staleRecords = [...records]
-      .sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0))
-      .slice(0, records.length - maxEntries);
+    const touched = new Map(this._bundleTouched);
+    const lastUsed = (record) => Math.max(record.updatedAt || 0, touched.get(record.hostname) || 0);
+    const ranked = [...records].sort((a, b) => lastUsed(a) - lastUsed(b));
+    const staleRecords = ranked.slice(0, records.length - maxEntries);
+    const survivors = ranked.slice(records.length - maxEntries);
 
     return new Promise((resolve, reject) => {
       const transaction = db.transaction([STORE_PAGE_BUNDLES], 'readwrite');
@@ -422,7 +472,31 @@ export class RulesDB {
         if (record?.hostname) store.delete(record.hostname);
       }
 
-      transaction.oncomplete = () => resolve(staleRecords.length);
+      for (const record of survivors) {
+        const touchedAt = touched.get(record.hostname) || 0;
+        if (touchedAt <= (record.updatedAt || 0)) continue;
+        // `records` is a snapshot from an earlier transaction: a rebuild's
+        // clearPageBundles() or another putPageBundle may have committed since
+        // (§5.3/§5.4). Stamp the row as it stands now — writing the snapshot
+        // back would resurrect a cleared bundle or overwrite a recompiled one
+        // under a version key that still matches.
+        const request = store.get(record.hostname);
+        request.onsuccess = () => {
+          const current = request.result;
+          if (current && (current.updatedAt || 0) < touchedAt) {
+            store.put({ ...current, updatedAt: touchedAt });
+          }
+        };
+      }
+
+      transaction.oncomplete = () => {
+        // The stamps are durable: drop the touches this pass consumed. A hit
+        // recorded since the snapshot carries a newer stamp and stays.
+        for (const [hostname, touchedAt] of touched) {
+          if (this._bundleTouched.get(hostname) === touchedAt) this._bundleTouched.delete(hostname);
+        }
+        resolve(staleRecords.length);
+      };
       rejectOnAbortOrError(transaction, reject);
     });
   }

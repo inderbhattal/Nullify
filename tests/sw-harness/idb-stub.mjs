@@ -6,10 +6,16 @@
  *
  * Request callbacks fire on a microtask; transaction oncomplete fires on a
  * macrotask, so requests issued from other requests' onsuccess handlers (as
- * RulesDB.getPageBundle does) still land before completion.
+ * RulesDB.prunePageBundles does) still land before completion.
  *
  * `_setFailure(err)` makes every subsequent transaction() call throw — used
  * to simulate a persistently broken IndexedDB (REVIEW §5.6).
+ *
+ * `_transactions` logs every transaction() call as one `{ store, mode }` entry
+ * per store in its scope (REVIEW-2026-09 §5.8), so `t.store === name` finds a
+ * multi-store transaction too. The mode is recorded, not enforced: a put()
+ * inside a `readonly` transaction still lands here, where real IndexedDB
+ * throws ReadOnlyError — assert on the rows as well as on the mode.
  */
 
 class StoreData {
@@ -24,6 +30,7 @@ class StoreData {
 
 export function makeIndexedDBStub() {
   const databases = new Map(); // name -> { version, stores: Map }
+  const transactions = []; // { store, mode } per store per transaction() call
   let failure = null;
 
   function fireSuccess(request, result) {
@@ -116,8 +123,11 @@ export function makeIndexedDBStub() {
     return {
       onversionchange: null,
       close() {},
-      transaction(names) {
+      transaction(names, mode = 'readonly') {
         if (failure) throw failure;
+        for (const store of Array.isArray(names) ? names : [names]) {
+          transactions.push({ store, mode });
+        }
         const tx = {
           oncomplete: null,
           onerror: null,
@@ -191,5 +201,6 @@ export function makeIndexedDBStub() {
     // Test-only handles:
     _setFailure(err) { failure = err || null; },
     _databases: databases,
+    _transactions: transactions,
   };
 }

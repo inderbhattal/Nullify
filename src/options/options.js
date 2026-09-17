@@ -4,6 +4,7 @@
 
 import './options.css';
 
+import { FILTER_LIST_DESCRIPTIONS, FILTER_LIST_NAMES } from '../shared/filter-list-names.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import { call, MAX_USER_FILTERS_BYTES, utf8ByteLength } from './messaging.js';
 import {
@@ -15,17 +16,13 @@ import {
 
 const $ = (id) => document.getElementById(id);
 
-const FILTER_LISTS = [
-  { id: 'easylist',     name: 'EasyList',        desc: 'The most widely used ad-blocking filter list' },
-  { id: 'easyprivacy',  name: 'EasyPrivacy',      desc: 'Tracker, analytics, and surveillance blocking' },
-  { id: 'annoyances',   name: 'Fanboy Annoyances', desc: 'Cookie notices, popups, social overlays' },
-  { id: 'ubo-cookie-annoyances', name: 'uBO Cookie Annoyances', desc: 'Surgically targets cookie consent and tracking notices' },
-  { id: 'malware',      name: 'Malware Blocklist', desc: 'Blocks malware and phishing URLs' },
-  { id: 'ubo-filters',  name: 'uBO Filters',       desc: 'uBlock Origin default filter list' },
-  { id: 'ubo-unbreak',  name: 'uBO Unbreak',       desc: 'Fixes over-blocking by other lists' },
-  { id: 'anti-adblock', name: 'Anti-Adblock',      desc: 'Anti-adblock and badware fixes from uBO' },
-  { id: 'ubo-quick-fixes', name: 'uBO Quick Fixes', desc: 'Same-day countermeasures, including the current YouTube ad bypass' },
-];
+// §5.17 — one card per row of the shared table, in its key order. The popup
+// reads the same table, so the two pages cannot name a list differently.
+const FILTER_LISTS = Object.entries(FILTER_LIST_NAMES).map(([id, name]) => ({
+  id,
+  name,
+  desc: FILTER_LIST_DESCRIPTIONS[id],
+}));
 
 // ---------------------------------------------------------------------------
 // Navigation

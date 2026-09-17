@@ -3,22 +3,11 @@
  */
 
 import './popup.css';
+import { FILTER_LIST_NAMES } from '../shared/filter-list-names.js';
 import { normalizeHostname } from '../shared/hostname.js';
 import { formatStatCount } from './format-count.js';
 
 const $ = (id) => document.getElementById(id);
-
-const FILTER_LIST_NAMES = {
-  easylist: 'EasyList',
-  easyprivacy: 'EasyPrivacy',
-  annoyances: 'Annoyances',
-  'ubo-cookie-annoyances': 'Cookie Annoyances',
-  malware: 'Malware',
-  'ubo-filters': 'uBO Filters',
-  'ubo-unbreak': 'uBO Unbreak',
-  'anti-adblock': 'Anti-Adblock',
-  'ubo-quick-fixes': 'uBO Quick Fixes',
-};
 
 let currentTab = null;
 let currentHostname = '';

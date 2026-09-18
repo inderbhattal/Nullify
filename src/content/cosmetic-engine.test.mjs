@@ -1047,3 +1047,130 @@ test('3.2 (didn\'t re-break): :matches-media()/:shadow()/:matches-prop() still f
   assert.equal(e._applyOp(child, 'remove', '', 'div:remove()'), null);
   assert.equal(e._removeQueue.has(child), true);
 });
+
+// ---------------------------------------------------------------------------
+// docs/REVIEW-2026-09.md §5.10 — page-visible fixed markers. Every element the
+// engine hid was stamped `__adblock_hidden__="1"` and the sheets it injects
+// carried fixed ids, so `document.querySelector('[__adblock_hidden__]')` was a
+// one-line blocker detector. The `_hiddenElements` WeakSet (§5.27) was already
+// the dedupe.
+// ---------------------------------------------------------------------------
+
+/** Unlike `installDom`'s rAF, this one can be flushed by hand. */
+function installFlushableRaf() {
+  let pending = null;
+  globalThis.requestAnimationFrame = (cb) => { pending = cb; return 1; };
+  return () => {
+    const cb = pending;
+    pending = null;
+    cb?.();
+    return typeof cb === 'function';
+  };
+}
+
+/** Give the stub document just enough to mount <style> nodes, in DOM order. */
+function installStyleSink(doc) {
+  const mounted = [];
+  doc.createElement = () => ({
+    id: '',
+    textContent: '',
+    remove() {
+      const i = mounted.indexOf(this);
+      if (i !== -1) mounted.splice(i, 1);
+    },
+  });
+  doc.head.prepend = (node) => { mounted.unshift(node); };
+  doc.head.appendChild = (node) => { mounted.push(node); };
+  return mounted;
+}
+
+test('5.10: hidden elements carry no attribute a page can query', () => {
+  const e = engine();
+  installDom();
+  const flush = installFlushableRaf();
+
+  const attrs = new Map();
+  const styled = {};
+  const el = domEl({
+    getAttribute: (name) => (attrs.has(name) ? attrs.get(name) : null),
+    setAttribute: (name, value) => { attrs.set(name, String(value)); },
+    style: { setProperty: (prop, value, priority) => { styled[prop] = `${value} !${priority}`; } },
+  });
+
+  e._hideElement(el, '.ad');
+  assert.equal(flush(), true, 'the hide was flushed');
+
+  // Prior code stamped `__adblock_hidden__="1"` in the flush.
+  assert.deepEqual([...attrs.keys()], []);
+  // Didn't re-break: the element is still hidden, by the inline style alone.
+  assert.deepEqual(styled, { display: 'none !important', visibility: 'hidden !important' });
+});
+
+test('5.10: a marker the page stamps itself does not switch hiding off', () => {
+  const e = engine();
+  installDom();
+
+  // `_hideElement` read the attribute back as a second dedupe, so a page could
+  // stamp `__adblock_hidden__` on its own ad containers and have the engine
+  // skip every one of them as "already hidden".
+  const el = domEl({ getAttribute: (name) => (name === '__adblock_hidden__' ? '1' : null) });
+  e._hideElement(el, '.ad');
+  assert.equal(e._hideQueue.has(el), true);
+  assert.equal(e._hiddenCount, 1);
+
+  // Didn't re-break (§5.27): the WeakSet alone still dedupes.
+  e._hideElement(el, '.ad');
+  assert.equal(e._hiddenCount, 1);
+});
+
+test('5.10: injected style ids are not fixed strings', async () => {
+  const rules = { generic: ['.plain-ad'], domainSpecific: [], exceptions: ['.keep'] };
+  const mounted = installStyleSink(installDom());
+  const e = engine();
+  e.init(rules); // `proceduralOnly` off: the engine injects its own sheets
+  assert.equal(mounted.length, 2);
+  const [hide, exception] = mounted;
+
+  // Prior code: the same two names on every page, so
+  // `document.getElementById('__adblock_cosmetic_styles__')` both detected the
+  // blocker and handed the page the sheet to remove.
+  assert.notEqual(hide.id, '__adblock_cosmetic_styles__');
+  assert.notEqual(exception.id, '__adblock_exception_styles__');
+
+  // One token per document: a second module instance is what a second
+  // document's content script gets, and it rolls its own.
+  const other = await import('./cosmetic-engine.js?a-second-document');
+  const otherMounted = installStyleSink(installDom());
+  const otherEngine = new other.CosmeticEngine();
+  otherEngine.init(rules);
+  assert.equal(otherMounted.length, 2);
+  for (const node of otherMounted) {
+    assert.equal(mounted.some((m) => m.id === node.id), false, `"${node.id}" is the same in every document`);
+  }
+
+  for (const { id } of [...mounted, ...otherMounted]) {
+    assert.doesNotMatch(id, /adblock|nullify/i);
+    // Still a usable id: non-empty, and never starting with a digit.
+    assert.match(id, /^[a-z][0-9a-z]*$/);
+  }
+  e.stopObserver();
+  otherEngine.stopObserver();
+});
+
+test('5.10 (didn\'t re-break): re-injection replaces the engine\'s own sheets and keeps their order', () => {
+  const mounted = installStyleSink(installDom());
+  const e = engine();
+  e._injectCSS(['.a']);
+  e._injectExceptionCSS(['.keep']);
+  const ids = mounted.map((node) => node.id);
+
+  // The tokens are rolled once and held in module scope, so a re-injection
+  // lands under the same ids instead of stacking a second pair of sheets.
+  e._injectCSS(['.b']);
+  e._injectExceptionCSS(['.keep-too']);
+  assert.equal(mounted.length, 2);
+  assert.deepEqual(mounted.map((node) => node.id), ids);
+  // The hide sheet stays first and the exception sheet last, so it still wins.
+  assert.match(mounted[0].textContent, /^\.b\{display:none!important/);
+  assert.match(mounted[1].textContent, /^\.keep-too\{display:revert!important/);
+});

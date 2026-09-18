@@ -16,8 +16,15 @@ import { resolvePageRules } from '../shared/rule-transport.js';
 import { PROC_OP_REGEX } from '../shared/proc-ops.js';
 
 const hostname = normalizeHostname(location.hostname);
-const FRAME_STYLE_ID = '__nullify_frame_css__';
-const FRAME_EXCEPTION_STYLE_ID = '__nullify_exception_css__';
+// Per-document random tokens, not fixed names (§5.10, 2026-09): the ids were
+// `__nullify_frame_css__` / `__nullify_exception_css__` on every page, which
+// made `document.getElementById(…)` a one-line blocker probe and a handle for
+// removing the sheet. Rolled once per document and held in module scope so a
+// re-injection still replaces by id; the `n` keeps an id from starting with a
+// digit.
+const randomStyleId = () => 'n' + Math.random().toString(36).slice(2, 10);
+const FRAME_STYLE_ID = randomStyleId();
+const FRAME_EXCEPTION_STYLE_ID = randomStyleId();
 const WASM_ATTR = 'data-nullify-wasm';
 const YOUTUBE_HOSTNAMES = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
 

@@ -80,7 +80,9 @@ function makeEnv({
     setAttribute: (name, value) => state.attrs.set(name, value),
     removeAttribute: (name) => state.attrs.delete(name),
     getAttribute: (name) => state.attrs.get(name) ?? null,
-    prepend: (node) => state.styles.push(node),
+    // `state.styles` is kept in DOM order, and `getElementById` / `remove()`
+    // below see it, so replace-by-id is observable (§5.10, 2026-09).
+    prepend: (node) => state.styles.unshift(node),
     appendChild: (node) => state.styles.push(node),
   };
 
@@ -95,8 +97,15 @@ function makeEnv({
       documentElement,
       head: null,
       readyState,
-      getElementById: () => null,
-      createElement: () => ({ id: '', textContent: '' }),
+      getElementById: (id) => state.styles.find((node) => node.id === id) ?? null,
+      createElement: () => ({
+        id: '',
+        textContent: '',
+        remove() {
+          const i = state.styles.indexOf(this);
+          if (i !== -1) state.styles.splice(i, 1);
+        },
+      }),
       addEventListener(type, fn) {
         if (!state.docListeners.has(type)) state.docListeners.set(type, []);
         state.docListeners.get(type).push(fn);
@@ -331,4 +340,60 @@ test('3.2: a string-form :others() rule constructs the engine', async () => {
   // rule was `div:others(.x)` never constructed the engine at all.
   assert.equal(FakeEngine.instances.length, 1);
   assert.deepEqual(FakeEngine.instances[0].rules.domainSpecific, ['div:others(.x)']);
+});
+
+// ---------------------------------------------------------------------------
+// docs/REVIEW-2026-09.md §5.10 — the two injected sheets carried the fixed ids
+// `__nullify_frame_css__` / `__nullify_exception_css__` on every page.
+// ---------------------------------------------------------------------------
+
+const STYLED_INIT = {
+  isAllowed: false,
+  cssText: '.ad{display:none!important}',
+  exceptionCss: '.keep{display:revert!important}',
+};
+
+test('5.10: injected style ids are not fixed strings', async () => {
+  // Two harness instances are two documents.
+  const a = makeEnv({ hostname: 'example.test', initRes: STYLED_INIT });
+  await run(a);
+  const b = makeEnv({ hostname: 'example.test', initRes: STYLED_INIT });
+  await run(b);
+
+  const idsA = a.state.styles.map((node) => node.id);
+  const idsB = b.state.styles.map((node) => node.id);
+  assert.equal(idsA.length, 2);
+  assert.equal(idsB.length, 2);
+
+  // Prior code: every document carried the same two names, so
+  // `document.getElementById('__nullify_frame_css__')` both detected the
+  // blocker and handed the page the sheet to remove.
+  for (const id of idsA) {
+    assert.equal(idsB.includes(id), false, `"${id}" is the same in every document`);
+  }
+  for (const id of [...idsA, ...idsB]) {
+    assert.doesNotMatch(id, /nullify|adblock/i);
+    // Still a usable id: non-empty, and never starting with a digit.
+    assert.match(id, /^[a-z][0-9a-z]*$/);
+  }
+});
+
+test('5.10 (didn\'t re-break): re-injection in the same document still replaces by id', async () => {
+  const env = makeEnv({ hostname: 'example.test', initRes: STYLED_INIT });
+  await run(env);
+  const first = [...env.state.styles];
+  assert.equal(first.length, 2);
+
+  // The tokens are rolled once per document and held in module scope, so a
+  // second pass finds the first pass's sheets by id and replaces them instead
+  // of stacking a duplicate pair.
+  await env.context.main();
+  assert.equal(env.state.styles.length, 2);
+  assert.deepEqual(env.state.styles.map((node) => node.id), first.map((node) => node.id));
+  for (const node of first) assert.equal(env.state.styles.includes(node), false, 'replaced, not kept');
+  // The hide sheet stays first and the exception sheet last, so it still wins.
+  assert.deepEqual(
+    env.state.styles.map((node) => node.textContent),
+    [STYLED_INIT.cssText, STYLED_INIT.exceptionCss]
+  );
 });

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   parseLine,
@@ -15,6 +17,7 @@ import {
   vendoredListPath,
   writeSampleOutputs,
   stampGeneratedAt,
+  assertRustParserAvailable,
   FILTER_LISTS,
   LIST_CONFIG,
   MAX_PER_FILE,
@@ -554,4 +557,81 @@ test('4.5 (didn\'t re-break): stamping does not disturb the bundle\'s cosmetic a
     scriptlets: [{ name: 'set' }],
     generatedAt: '2026-01-01T00:00:00.000Z',
   });
+});
+
+// ---------------------------------------------------------------------------
+// §5.14 — build:rules output must not depend on whether a WASM artifact
+// happens to be present (D3)
+// ---------------------------------------------------------------------------
+// With the artifact, filter-sources.json comes from the Rust parser; without
+// it, from the JS fallback — and when the artifact files were simply absent
+// the build did not even warn. Two developers could ship different bundles
+// from the same snapshots. The production build now refuses to run without
+// the Rust parser; the sample build never needed it and still runs.
+
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/**
+ * A throwaway checkout holding only what `build-rules.mjs` reads, with NO
+ * `src/shared/wasm/` — the state of a clone that never ran build:wasm.
+ */
+function artifactlessCheckout() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nullify-5.14-'));
+  const copy = (rel) => fs.cpSync(path.join(REPO_ROOT, rel), path.join(root, rel), { recursive: true });
+  fs.mkdirSync(path.join(root, 'src', 'shared'), { recursive: true });
+  for (const name of fs.readdirSync(path.join(REPO_ROOT, 'src', 'shared'))) {
+    if (name.endsWith('.js')) copy(path.join('src', 'shared', name));
+  }
+  copy(path.join('scripts', 'build-rules.mjs'));
+  copy(path.join('scripts', 'filter-lists.lock.json'));
+  copy(path.join('scripts', 'filter-lists'));
+  copy('manifest.json');
+  copy(path.join('rules', 'system-unbreak.json'));
+  assert.ok(!fs.existsSync(path.join(root, 'src', 'shared', 'wasm')), 'the checkout must carry no artifact');
+  return root;
+}
+
+function runBuild(root, ...args) {
+  return spawnSync(process.execPath, [path.join('scripts', 'build-rules.mjs'), ...args], {
+    cwd: root,
+    encoding: 'utf8',
+  });
+}
+
+test('5.14: a production build without the Rust parser fails instead of falling back', () => {
+  const root = artifactlessCheckout();
+  try {
+    const run = runBuild(root);
+    assert.notEqual(run.status, 0, `the build must fail with no artifact, but exited 0:\n${run.stdout}`);
+    assert.match(run.stderr, /Rust parser unavailable/, run.stderr);
+    assert.match(run.stderr, /npm run build:wasm/, 'the failure must say how to fix it');
+    // Nothing may reach rules/: a failed build leaves only the hand-maintained file.
+    const written = fs.readdirSync(path.join(root, 'rules')).filter((f) => f.endsWith('.json'));
+    assert.deepEqual(written, ['system-unbreak.json']);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('5.14: assertRustParserAvailable is the gate — ready passes, missing refuses with the fix', () => {
+  assert.throws(
+    () => assertRustParserAvailable(false, { sampleMode: false }),
+    /Rust parser unavailable[\s\S]*npm run build:wasm/,
+  );
+  assert.doesNotThrow(() => assertRustParserAvailable(true, { sampleMode: false }));
+});
+
+test('5.14 (didn\'t re-break): the sample build still runs without the artifact', () => {
+  assert.doesNotThrow(() => assertRustParserAvailable(false, { sampleMode: true }));
+
+  const root = artifactlessCheckout();
+  try {
+    const run = runBuild(root, '--sample');
+    assert.equal(run.status, 0, `--sample must not need the artifact:\n${run.stdout}${run.stderr}`);
+    for (const file of ['easylist.json', 'filter-sources.json', 'system-unbreak.json']) {
+      assert.ok(fs.existsSync(path.join(root, 'rules', file)), `the sample build must write ${file}`);
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

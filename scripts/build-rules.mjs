@@ -2849,6 +2849,20 @@ async function main() {
   }
 }
 
+/**
+ * §5.14 — the production build's output must not depend on whether a WASM
+ * artifact happens to be present. With the artifact, filter-sources.json
+ * comes from `parse_filter_source`; without it, from the JS fallback — and
+ * when the files were simply absent nothing was even logged — so two
+ * developers could ship different bundles from the same snapshots. Refuse
+ * instead; CI always builds the artifact first (build.yml). The sample build
+ * packages fixtures without consulting the parser, so it is exempt.
+ */
+function assertRustParserAvailable(ready, { sampleMode = false } = {}) {
+  if (ready || sampleMode) return;
+  throw new Error('Rust parser unavailable — run `npm run build:wasm` before `npm run build:rules`');
+}
+
 async function buildFromVendoredLists(stagingDir) {
   let rustSourceParserReady = false;
   let parseFilterSourceWithRust = null;
@@ -2863,12 +2877,13 @@ async function buildFromVendoredLists(stagingDir) {
         parseFilterSourceWithRust = fn;
         rustSourceParserReady = true;
       } else {
-        console.warn('⚠️  WASM loaded but parse_filter_source export missing — using JS fallback. Rebuild wasm with `npm run build:wasm` if Rust parser is expected.');
+        console.warn('⚠️  WASM loaded but parse_filter_source export missing — the artifact is stale.');
       }
     }
   } catch (err) {
-    console.warn(`⚠️  Rust source parser unavailable, falling back to JS extraction: ${err.message}`);
+    console.warn(`⚠️  Rust source parser failed to load: ${err.message}`);
   }
+  assertRustParserAvailable(rustSourceParserReady, { sampleMode: SAMPLE_MODE });
 
   const allCosmeticRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.cosmetic));
   const allScriptletRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.scriptlets));
@@ -3089,6 +3104,7 @@ export {
   vendoredListPath,
   writeSampleOutputs,
   stampGeneratedAt,
+  assertRustParserAvailable,
   VENDORED_LISTS_DIR,
   RUNTIME_ALLOWLIST_PRIORITY,
   SYSTEM_UNBREAK_PRIORITY,

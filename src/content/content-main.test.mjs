@@ -397,3 +397,40 @@ test('5.10 (didn\'t re-break): re-injection in the same document still replaces 
     [STYLED_INIT.cssText, STYLED_INIT.exceptionCss]
   );
 });
+
+// ---------------------------------------------------------------------------
+// docs/REVIEW-2026-09.md §5.11 — `performEarlyInjection` already inserts this
+// CSS as a user-origin sheet, so both copies landed in every frame.
+// ---------------------------------------------------------------------------
+
+test('5.11: no <style> is added when the SW reports the CSS was inserted', async () => {
+  const env = makeEnv({
+    hostname: 'example.test',
+    initRes: {
+      ...STYLED_INIT,
+      earlyCssApplied: true,
+      rules: { generic: ['div:has-text(Ad)'], domainSpecific: [], exceptions: [] },
+    },
+  });
+  await run(env);
+
+  // Prior code ignored the field and added both sheets on top of the one the
+  // SW had already inserted.
+  assert.deepEqual(env.state.styles, []);
+  // Only the sheets are skipped — the procedural pipeline still runs.
+  assert.equal(FakeEngine.instances.length, 1);
+});
+
+test('5.11 (didn\'t re-break): the <style> is added when the field is absent or false', async () => {
+  // Anything short of a strict `true` injects: the field is absent until the
+  // SW's `singleCssInjection` flag is on, and `'true'`/`1` are not a report.
+  for (const earlyCssApplied of [undefined, false, null, 'true', 1]) {
+    const env = makeEnv({ hostname: 'example.test', initRes: { ...STYLED_INIT, earlyCssApplied } });
+    await run(env);
+    assert.deepEqual(
+      env.state.styles.map((node) => node.textContent),
+      [STYLED_INIT.cssText, STYLED_INIT.exceptionCss],
+      `earlyCssApplied=${String(earlyCssApplied)}`
+    );
+  }
+});

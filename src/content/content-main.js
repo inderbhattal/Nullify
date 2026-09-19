@@ -93,15 +93,26 @@ async function main() {
     throw new Error(`GET_INIT_DATA failed: ${initRes.error}`);
   }
 
-  const { isAllowed, cssText, exceptionCss } = initRes || {};
+  const { isAllowed, cssText, exceptionCss, earlyCssApplied } = initRes || {};
 
   if (isAllowed === true) return;
 
   // Only now is the page known not to be allowlisted (§4.13).
   exposeYouTubeWasmUrl();
 
-  injectStyle(FRAME_STYLE_ID, cssText);
-  injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
+  // §5.11 (2026-09): `performEarlyInjection` has usually already inserted this
+  // same CSS as a user-origin sheet, so these two were a second copy of it in
+  // every frame. One field covers both sheets: that `insertCSS` carries the
+  // generic CSS, `bundle.cssText` and `bundle.exceptionCss` joined in that
+  // order, so skipping the pair can never strand a hide rule without its
+  // exception. Strictly `true` — the field is absent until the SW's
+  // `singleCssInjection` flag is on, and a reply that wins the race against
+  // the insertCSS reports false, which costs a duplicate in that window
+  // rather than a frame with no CSS at all.
+  if (earlyCssApplied !== true) {
+    injectStyle(FRAME_STYLE_ID, cssText);
+    injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
+  }
 
   // Prefers the base64 binary bundle, falls back to the JSON rules if it is
   // missing or undecodable — never lose procedural filtering over transport.

@@ -19,6 +19,10 @@
  * - Compares persistAcrossSessions in the same-registration short-circuit.
  * - Always invokes injectIntoOpenTabs after a registration touch so live
  *   tabs reflect the new excludeMatches without a reload.
+ * - Behind `shieldNoReinject` (§5.18, default off): an unchanged registration
+ *   is left alone entirely — no injection into open tabs. The flag is injected
+ *   (`isFeatureEnabled`) rather than read from storage here, so the harness
+ *   can drive it without a global chrome.
  */
 
 import { normalizeHostname } from '../shared/hostname.js';
@@ -37,6 +41,7 @@ export function createYouTubeShieldSync({
   runtimeAssetPath,
   scriptId,
   targets,
+  isFeatureEnabled = () => false,
 }) {
   const targetHostnames = new Set(targets.map(({ hostname }) => normalizeHostname(hostname)));
   let inFlight = null;
@@ -135,7 +140,13 @@ export function createYouTubeShieldSync({
       existing.persistAcrossSessions === registration.persistAcrossSessions;
 
     if (sameRegistration) {
-      await injectIntoOpenTabs();
+      // §5.18 — a persisted registration is injected by Chrome into every new
+      // document, including one opened while the worker was asleep, so
+      // re-injecting here evaluates the bundle a second time in every open
+      // YouTube tab on every wake. Only a changed excludeMatches needs live
+      // tabs touched, and that is the branch below, not this one. Read per
+      // sync: the SW's flag cache fills after start-up and can change later.
+      if (!isFeatureEnabled('shieldNoReinject')) await injectIntoOpenTabs();
       return;
     }
 

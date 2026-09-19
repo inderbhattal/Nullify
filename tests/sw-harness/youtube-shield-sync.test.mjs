@@ -22,7 +22,11 @@ const TARGETS = [
   { hostname: 'music.youtube.com', pattern: '*://music.youtube.com/*' },
 ];
 
-function setupHarness({ allowlist = new Set(), tabs = [] } = {}) {
+// `isFeatureEnabled` is injected, not imported: this harness never assigns
+// `globalThis.chrome`, so a storage-backed flag read could not see the stub.
+// Left undefined, the factory's own default (`() => false`) applies — the
+// flag-off path is the one every numbered scenario below exercises.
+function setupHarness({ allowlist = new Set(), tabs = [], isFeatureEnabled } = {}) {
   const stub = makeChromeStub();
   for (const tab of tabs) stub.tabs._addTab(tab);
 
@@ -30,6 +34,7 @@ function setupHarness({ allowlist = new Set(), tabs = [] } = {}) {
 
   const sync = createYouTubeShieldSync({
     chrome: stub,
+    isFeatureEnabled,
     isHostnameAllowed: (hostname) => {
       // Match the SW's parent-walk semantics so a "youtube.com" entry covers
       // www/m/music subdomains.
@@ -168,9 +173,10 @@ test('5. music.youtube.com allowlist isolates: www.youtube.com still receives sh
   assert.ok(!targetTabIds.includes(2), 'music tab must not be injected');
 });
 
-test('6. SW restart simulation: with persistAcrossSessions=true, a re-registration with same shape is a no-op', async () => {
+test('6. SW restart simulation: with persistAcrossSessions=true, a re-registration with same shape is a no-op (shieldNoReinject on)', async () => {
   const { stub, sync } = setupHarness({
     tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: (name) => name === 'shieldNoReinject',
   });
   await sync.syncRegistration();
   // Verify persistAcrossSessions was set so Chrome would keep the registration
@@ -187,9 +193,91 @@ test('6. SW restart simulation: with persistAcrossSessions=true, a re-registrati
   const regs = stub.calls.entries.filter((c) => c.api === 'scripting.registerContentScripts');
   assert.equal(updates.length, 0);
   assert.equal(regs.length, 0);
-  // But injection into open tabs always runs so live tabs get the shield even
-  // if they were opened during the SW restart window.
-  assert.ok(execScriptCalls(stub).length > 0);
+  // §5.18 — and no injection either. A persisted registration is injected by
+  // Chrome into every new document, including one opened while the worker was
+  // asleep; re-injecting here evaluates the bundle a second time in every open
+  // tab on every wake. Only a *changed* excludeMatches needs live tabs touched
+  // (#3, #4), and that is not this branch.
+  assert.equal(execScriptCalls(stub).length, 0);
+});
+
+test('6b (flag off): same-shape re-sync still injects', async () => {
+  // Default dependency (`() => false`): today's soak behaviour, pinned so the
+  // flag-off path stays byte-for-byte what shipped.
+  const { stub, sync } = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+  });
+  await sync.syncRegistration();
+  stub.calls.clear();
+
+  await sync.syncRegistration();
+
+  const updates = stub.calls.entries.filter((c) => c.api === 'scripting.updateContentScripts');
+  const regs = stub.calls.entries.filter((c) => c.api === 'scripting.registerContentScripts');
+  assert.equal(updates.length, 0);
+  assert.equal(regs.length, 0);
+  const injects = execScriptCalls(stub);
+  assert.equal(injects.length, 1);
+  assert.deepEqual(injects[0].target, { tabId: 1 });
+});
+
+test('5.18 (flag on): an excludeMatches-only update still injects — #3 must not regress', async () => {
+  // The flag skips the same-registration branch and nothing else: a host
+  // removed from the allowlist needs the live injection, since Chrome only
+  // applies the new excludeMatches to future documents.
+  const { stub, sync, allowlist } = setupHarness({
+    allowlist: ['youtube.com'],
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: (name) => name === 'shieldNoReinject',
+  });
+  await sync.syncRegistration();
+  stub.calls.clear();
+
+  allowlist.current.delete('youtube.com');
+  await sync.syncRegistration();
+
+  const updates = stub.calls.entries.filter((c) => c.api === 'scripting.updateContentScripts');
+  assert.equal(updates.length, 1, 'still the delta path');
+  const injects = execScriptCalls(stub);
+  assert.equal(injects.length, 1);
+  assert.deepEqual(injects[0].target, { tabId: 1 });
+});
+
+test('5.18 (flag on): a fresh registration still injects — #1 must not regress', async () => {
+  const { stub, sync } = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: (name) => name === 'shieldNoReinject',
+  });
+
+  await sync.syncRegistration();
+
+  const regs = stub.calls.entries.filter((c) => c.api === 'scripting.registerContentScripts');
+  assert.equal(regs.length, 1);
+  const injects = execScriptCalls(stub);
+  assert.equal(injects.length, 1);
+  assert.deepEqual(injects[0].target, { tabId: 1 });
+});
+
+test('5.18: the flag is read on every sync, not captured when the module is created', async () => {
+  // The SW's flag cache is filled asynchronously after start-up and can change
+  // while the worker lives; a value captured at factory time would make the
+  // flag inert on the first wake and stale on every later one.
+  const flag = { current: false };
+  const { stub, sync } = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: (name) => name === 'shieldNoReinject' && flag.current,
+  });
+  await sync.syncRegistration();
+
+  flag.current = true;
+  stub.calls.clear();
+  await sync.syncRegistration();
+  assert.equal(execScriptCalls(stub).length, 0, 'flag on at sync time: no re-injection');
+
+  flag.current = false;
+  stub.calls.clear();
+  await sync.syncRegistration();
+  assert.equal(execScriptCalls(stub).length, 1, 'flag off again: re-injection resumes');
 });
 
 test('7. concurrent sync calls are sequenced, not raced', async () => {

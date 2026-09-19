@@ -239,6 +239,7 @@ const RULE_DATA_SCHEMA_VERSION = 4;
 // ---------------------------------------------------------------------------
 const FEATURE_DEFAULTS = Object.freeze({
   refreshCadenceV2: false, // §4.5 — A2a: Expires-driven refresh cadence
+  rulesetDeltaApply: false, // §5.1 — A2b: apply only the static-ruleset delta
 });
 let cachedFeatureFlags = { ...FEATURE_DEFAULTS };
 let _featureFlagsPromise = null;
@@ -3577,13 +3578,23 @@ function getManifestRulesetIds() {
  * Run the sequential priority fallback: disable everything, then enable
  * rulesets one at a time in priority order, stopping at Chrome's static rule
  * limit. Returns the list of IDs that could not be enabled.
+ *
+ * §5.1 — with `deltaOnly` (flag `rulesetDeltaApply`) the caller passes the
+ * delta against getEnabledRulesets() and there is no reset: only
+ * `disableRulesetIds` is disabled, so a ruleset that is already enabled is
+ * never touched and no wake passes through a moment with every list off.
  */
-async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds) {
+async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds, { deltaOnly = false } = {}) {
   // Reset our static rulesets so budget checks start from a clean slate.
+  const resetRulesetIds = deltaOnly
+    ? disableRulesetIds
+    : [...new Set(enableRulesetIds.concat(disableRulesetIds))];
   try {
-    await chrome.declarativeNetRequest.updateEnabledRulesets({
-      disableRulesetIds: [...new Set(enableRulesetIds.concat(disableRulesetIds))],
-    });
+    if (!deltaOnly || resetRulesetIds.length > 0) {
+      await chrome.declarativeNetRequest.updateEnabledRulesets({
+        disableRulesetIds: resetRulesetIds,
+      });
+    }
   } catch (resetErr) {
     console.warn('[AdBlock] Reset before sequential fallback failed:', resetErr);
   }
@@ -3653,12 +3664,39 @@ async function applyRulesets() {
     console.warn('[AdBlock] Skipping ruleset IDs not declared in manifest:', unknownRulesetIds.join(', '));
   }
 
+  // §5.1 — flag `rulesetDeltaApply`. The unconditional batch below re-sends
+  // every ruleset on every SW start, and while it keeps failing (the shared
+  // static pool stays short for as long as another DNR extension holds it)
+  // the sequential fallback reset — disabled — all of them first: a window of
+  // zero network blocking on every wake. Under the flag only the difference
+  // against what Chrome already has enabled is applied: no call at all on a
+  // steady-state wake, and nothing that is already enabled is ever touched.
+  // `toDisable` is drawn from `disableRulesetIds`, so it can only hold a list
+  // the user turned off: never `system-unbreak` (always wanted above), and
+  // `ubo-unbreak` only on the user's own toggle. A snapshot that cannot be
+  // read falls back to the unconditional batch — never skip an apply.
+  let deltaOnly = false;
+  let toEnable = enableRulesetIds;
+  let toDisable = disableRulesetIds;
+  if (isFeatureEnabled('rulesetDeltaApply')) {
+    try {
+      const alreadyEnabled = new Set(await chrome.declarativeNetRequest.getEnabledRulesets());
+      toEnable = enableRulesetIds.filter((id) => !alreadyEnabled.has(id));
+      toDisable = disableRulesetIds.filter((id) => alreadyEnabled.has(id));
+      deltaOnly = true;
+    } catch (snapshotErr) {
+      console.warn('[AdBlock] Could not read enabled rulesets; applying the full set:', snapshotErr?.message || snapshotErr);
+    }
+  }
+
   try {
     // 1. Try batch operation first (most efficient)
-    await chrome.declarativeNetRequest.updateEnabledRulesets({
-      enableRulesetIds,
-      disableRulesetIds,
-    });
+    if (!deltaOnly || toEnable.length > 0 || toDisable.length > 0) {
+      await chrome.declarativeNetRequest.updateEnabledRulesets({
+        enableRulesetIds: toEnable,
+        disableRulesetIds: toDisable,
+      });
+    }
   } catch (err) {
     // 2. Fall back to the sequential per-ruleset path for ANY error —
     // previously only rule-limit errors triggered the fallback, so a single
@@ -3670,7 +3708,7 @@ async function applyRulesets() {
       console.warn('[AdBlock] Batch enable failed; falling back to sequential loading:', err?.message || err);
     }
 
-    const skippedRulesetIds = await applyRulesetsSequentially(enableRulesetIds, disableRulesetIds);
+    const skippedRulesetIds = await applyRulesetsSequentially(toEnable, toDisable, { deltaOnly });
 
     if (skippedRulesetIds.length > 0) {
       console.warn('[AdBlock] Skipped rulesets during sequential fallback:', skippedRulesetIds.join(', '));

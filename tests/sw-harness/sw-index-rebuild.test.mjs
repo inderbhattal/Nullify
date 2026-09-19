@@ -239,3 +239,266 @@ test('3.2: a schema bump rebuilds the index on an unchanged packaged bundle', as
   assert.deepEqual(await second.hooks.db.getCosmeticRules('example.com'), ['.site-ad'],
     'the rebuilt index is complete');
 });
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.1 / A2b — flag `rulesetDeltaApply`. applyRulesets re-sent
+// every static ruleset on every SW start, and when that batch failed (the
+// shared static pool stays short for as long as another DNR extension holds
+// it) the sequential fallback began by disabling ALL of them — system-unbreak
+// included — before re-enabling one at a time: a window of zero network
+// blocking on every wake. Under the flag only the difference against
+// getEnabledRulesets() is applied: nothing on a steady-state wake, and the
+// fallback disables only what the user turned off.
+//
+// `probeRulesetCalls` is the §5.1 repro stub. It logs every
+// updateEnabledRulesets call — including the ones Chrome refuses, which the
+// chrome stub's own call log never sees — next to the enabled set as it stood
+// when the call was made, and refuses a call the way Chrome does: nothing is
+// applied.
+// ---------------------------------------------------------------------------
+
+const DELTA_ON = { featureFlags: { rulesetDeltaApply: true } };
+const RULE_LIMIT = 'The set of enabled rulesets exceeds the rule count limit.';
+
+// The 16 static rulesets as applyRulesets derives them (ALL_KNOWN_LIST_IDS
+// expanded through RULESET_GROUPS), and in RULESET_ENABLE_PRIORITY order.
+const RULESETS_IN_LIST_ORDER = [
+  'system-unbreak',
+  'easylist', 'easylist_2', 'easylist_3', 'easylist_4',
+  'easyprivacy', 'easyprivacy_2', 'easyprivacy_3',
+  'ubo-filters', 'ubo-filters_2',
+  'ubo-unbreak', 'annoyances', 'malware', 'anti-adblock',
+  'ubo-cookie-annoyances', 'ubo-quick-fixes',
+];
+const RULESETS_IN_PRIORITY_ORDER = [
+  'system-unbreak', 'ubo-unbreak', 'ubo-quick-fixes',
+  'easylist', 'easylist_2', 'easylist_3', 'easylist_4',
+  'malware', 'ubo-filters', 'anti-adblock', 'annoyances',
+  'ubo-cookie-annoyances', 'ubo-filters_2',
+  'easyprivacy', 'easyprivacy_2', 'easyprivacy_3',
+];
+// "The pool is short": these shards did not fit and still do not.
+const UNFIT = ['easyprivacy', 'easyprivacy_2', 'easyprivacy_3'];
+const refuseUnfit = (call) => (call.enable.some((id) => UNFIT.includes(id)) ? RULE_LIMIT : null);
+
+function probeRulesetCalls(chrome) {
+  const dnr = chrome.declarativeNetRequest;
+  const probe = {
+    updates: [], // {enable, disable, enabledAtCall}
+    order: [],   // 'get' | 'update', in call order
+    refuse: () => null,
+    clear() { probe.updates.length = 0; probe.order.length = 0; },
+  };
+  const origUpdate = dnr.updateEnabledRulesets.bind(dnr);
+  const origGet = dnr.getEnabledRulesets.bind(dnr);
+  dnr.updateEnabledRulesets = async (options = {}) => {
+    const call = {
+      enable: [...(options.enableRulesetIds || [])],
+      disable: [...(options.disableRulesetIds || [])],
+      enabledAtCall: [...dnr._staticEnabled],
+    };
+    probe.updates.push(call);
+    probe.order.push('update');
+    const reason = probe.refuse(call);
+    if (reason) throw new Error(reason);
+    return origUpdate(options);
+  };
+  dnr.getEnabledRulesets = async () => {
+    probe.order.push('get');
+    return origGet();
+  };
+  return probe;
+}
+
+const shapeOf = (updates) => updates.map(({ enable, disable }) => ({ enable, disable }));
+const sorted = (ids) => [...ids].sort();
+
+test('5.1: the sequential fallback never disables an already-enabled ruleset', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
+  const dnr = chrome.declarativeNetRequest;
+
+  for (const id of UNFIT) dnr._staticEnabled.delete(id);
+  const enabledBefore = [...dnr._staticEnabled];
+  assert.equal(enabledBefore.length, RULESETS_IN_LIST_ORDER.length - UNFIT.length,
+    'precondition: every other ruleset is enabled');
+
+  const probe = probeRulesetCalls(chrome);
+  probe.refuse = refuseUnfit;
+  await hooks.applyRulesets();
+
+  assert.deepEqual(probe.updates.flatMap((call) => call.disable), [],
+    'every list is wanted, so no call may disable anything — least of all a ruleset that is already enabled');
+  for (const call of probe.updates) {
+    assert.deepEqual(enabledBefore.filter((id) => !call.enabledAtCall.includes(id)), [],
+      'there must be no moment at which an already-enabled ruleset is off');
+  }
+  assert.deepEqual(shapeOf(probe.updates), [
+    { enable: UNFIT, disable: [] },
+    ...UNFIT.map((id) => ({ enable: [id], disable: [] })),
+  ], 'the batch carries only the delta; the fallback retries only the delta, one at a time in priority order');
+  assert.deepEqual(sorted(dnr._staticEnabled), sorted(enabledBefore),
+    'and everything that was enabled before the fallback is enabled after it');
+  assert.equal(hooks.isFeatureEnabled('rulesetDeltaApply'), true, 'the seeded flag must be read');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.1: a steady-state wake issues no updateEnabledRulesets call', async () => {
+  const first = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
+  first.hooks.cancelPendingStatsPersistForTest();
+
+  // A fresh profile has nothing enabled: the delta is the whole set, once.
+  const firstLife = first.chrome.calls.filter((call) => call.api === 'dnr.updateEnabledRulesets');
+  assert.deepEqual(firstLife.map((call) => [call.enableRulesetIds, call.disableRulesetIds]),
+    [[RULESETS_IN_LIST_ORDER, []]]);
+
+  // The next wake: a new worker on the same profile. Enabled static rulesets
+  // persist across SW lives, so there is nothing to apply.
+  const probe = probeRulesetCalls(first.chrome);
+  const second = await loadServiceWorker({ stub: first.chrome, idb: first.idb, awaitReady: true });
+  second.hooks.cancelPendingStatsPersistForTest();
+
+  assert.deepEqual(shapeOf(probe.updates), [],
+    'a wake that finds every wanted ruleset enabled must not call updateEnabledRulesets');
+  assert.equal(probe.order[0], 'get', 'the decision is made from one getEnabledRulesets snapshot');
+  assert.deepEqual(sorted(first.chrome.declarativeNetRequest._staticEnabled), sorted(RULESETS_IN_LIST_ORDER));
+
+  // Same within one life: re-applying an applied state is free.
+  probe.clear();
+  const effective = await second.hooks.applyRulesets();
+  assert.deepEqual(shapeOf(probe.updates), []);
+  for (const listId of second.hooks.ALL_KNOWN_LIST_IDS) {
+    assert.equal(effective[listId], true, `list ${listId} stays enabled`);
+  }
+});
+
+test('5.1: the delta disables exactly what the user turned off — ubo-unbreak included, batch and fallback', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
+  const dnr = chrome.declarativeNetRequest;
+  const probe = probeRulesetCalls(chrome);
+
+  // The options-page toggle (SET_RULESET_ENABLED) stores the map and calls
+  // applyRulesets; ubo-unbreak is one of the lists that page offers.
+  await chrome.storage.local.set({ enabledRulesets: { 'ubo-unbreak': false } });
+  let effective = await hooks.applyRulesets();
+  assert.deepEqual(shapeOf(probe.updates), [{ enable: [], disable: ['ubo-unbreak'] }]);
+  assert.equal(effective['ubo-unbreak'], false, 'the user\'s toggle must land');
+
+  probe.clear();
+  await chrome.storage.local.set({ enabledRulesets: {} });
+  effective = await hooks.applyRulesets();
+  assert.deepEqual(shapeOf(probe.updates), [{ enable: ['ubo-unbreak'], disable: [] }]);
+  assert.equal(effective['ubo-unbreak'], true);
+
+  // Fallback path: the pool is short AND the user turns the list off. The
+  // only ruleset that may be disabled is the one the user asked for.
+  for (const id of UNFIT) dnr._staticEnabled.delete(id);
+  const mustStayOn = [...dnr._staticEnabled].filter((id) => id !== 'ubo-unbreak');
+  probe.clear();
+  probe.refuse = refuseUnfit;
+  await chrome.storage.local.set({ enabledRulesets: { 'ubo-unbreak': false } });
+  effective = await hooks.applyRulesets();
+
+  assert.deepEqual(shapeOf(probe.updates), [
+    { enable: UNFIT, disable: ['ubo-unbreak'] },
+    { enable: [], disable: ['ubo-unbreak'] },
+    ...UNFIT.map((id) => ({ enable: [id], disable: [] })),
+  ]);
+  for (const call of probe.updates) {
+    assert.deepEqual(mustStayOn.filter((id) => !call.enabledAtCall.includes(id)), [],
+      'no wanted ruleset may be off at any point of the fallback');
+  }
+  assert.equal(effective['ubo-unbreak'], false);
+  assert.deepEqual(sorted(dnr._staticEnabled), sorted(mustStayOn));
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.1: an unreadable getEnabledRulesets snapshot falls back to the unconditional batch', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
+  const dnr = chrome.declarativeNetRequest;
+  const probe = probeRulesetCalls(chrome);
+
+  // Only the first read fails — the snapshot the delta is computed from.
+  const readThrough = dnr.getEnabledRulesets;
+  let updatesSeenWhenReadFailed = null;
+  dnr.getEnabledRulesets = async () => {
+    if (updatesSeenWhenReadFailed === null) {
+      updatesSeenWhenReadFailed = probe.updates.length;
+      throw new Error('snapshot unavailable');
+    }
+    return readThrough();
+  };
+
+  await chrome.storage.local.set({ enabledRulesets: { annoyances: false } });
+  const effective = await hooks.applyRulesets();
+
+  assert.deepEqual(shapeOf(probe.updates), [{
+    enable: RULESETS_IN_LIST_ORDER.filter((id) => id !== 'annoyances'),
+    disable: ['annoyances'],
+  }], 'never skip an apply: without a snapshot the whole wanted set is sent, as before the flag');
+  assert.equal(effective.annoyances, false, 'the toggle must land even though the snapshot failed');
+  assert.equal(updatesSeenWhenReadFailed, 0,
+    'the read that failed must be the snapshot taken before the batch, or this test exercised nothing');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+for (const [mode, seed] of [['flag off', {}], ['flag on', DELTA_ON]]) {
+  test(`5.1 (didn't re-break): a missing ruleset id still does not block the others (${mode})`, async () => {
+    const { chrome, hooks } = await loadServiceWorker({ seed, awaitReady: true });
+    const dnr = chrome.declarativeNetRequest;
+
+    // A fresh profile whose manifest lost one shard: Chrome rejects any call
+    // naming it, so the batch fails for a reason that is not the rule limit.
+    dnr._staticEnabled.clear();
+    const probe = probeRulesetCalls(chrome);
+    probe.refuse = (call) => (call.enable.includes('easylist_4') ? 'Invalid ruleset id: easylist_4.' : null);
+
+    const effective = await hooks.applyRulesets();
+
+    assert.deepEqual(sorted(dnr._staticEnabled),
+      sorted(RULESETS_IN_LIST_ORDER.filter((id) => id !== 'easylist_4')),
+      'every other ruleset must be enabled by the sequential fallback');
+    assert.equal(effective.easylist, 'partial');
+    for (const listId of hooks.ALL_KNOWN_LIST_IDS.filter((id) => id !== 'easylist')) {
+      assert.equal(effective[listId], true, `list ${listId} must not be blocked by the missing shard`);
+    }
+    assert.deepEqual(probe.updates.filter((call) => call.enable.length === 1).map((call) => call.enable[0]),
+      RULESETS_IN_PRIORITY_ORDER, 'the fallback enables one ruleset at a time, in priority order');
+
+    hooks.cancelPendingStatsPersistForTest();
+  });
+}
+
+test('5.1 (flag off): behaviour is unchanged', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  const dnr = chrome.declarativeNetRequest;
+  assert.equal(hooks.FEATURE_DEFAULTS.rulesetDeltaApply, false, 'default OFF in the release that introduces it');
+  assert.equal(hooks.isFeatureEnabled('rulesetDeltaApply'), false);
+
+  // Every wake re-sends the whole set, with no snapshot read before it —
+  // although every ruleset is already enabled by the boot.
+  assert.deepEqual(sorted(dnr._staticEnabled), sorted(RULESETS_IN_LIST_ORDER),
+    'precondition: the boot already enabled every ruleset');
+  const probe = probeRulesetCalls(chrome);
+  await hooks.applyRulesets();
+  assert.deepEqual(shapeOf(probe.updates), [{ enable: RULESETS_IN_LIST_ORDER, disable: [] }]);
+  assert.deepEqual(probe.order, ['update', 'get', 'get'],
+    'the batch is unconditional: the two reads are the log line and the effective map, after it');
+
+  // Batch failure: reset (disable the union, wanted first), then single
+  // enables in priority order.
+  probe.clear();
+  probe.refuse = (call) => (call.enable.length > 1 ? RULE_LIMIT : null);
+  await chrome.storage.local.set({ enabledRulesets: { annoyances: false } });
+  const wanted = RULESETS_IN_LIST_ORDER.filter((id) => id !== 'annoyances');
+  await hooks.applyRulesets();
+  assert.deepEqual(shapeOf(probe.updates), [
+    { enable: wanted, disable: ['annoyances'] },
+    { enable: [], disable: [...wanted, 'annoyances'] },
+    ...RULESETS_IN_PRIORITY_ORDER.filter((id) => id !== 'annoyances').map((id) => ({ enable: [id], disable: [] })),
+  ]);
+
+  hooks.cancelPendingStatsPersistForTest();
+});

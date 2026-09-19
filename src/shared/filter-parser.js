@@ -422,6 +422,36 @@ function resolveIncludeUrl(includePath, parentUrl, baseUrl) {
   return includeUrl;
 }
 
+const INCLUDE_RE = /^!#include\s+(.+)$/;
+/** How many leading lines of a list are treated as its header. */
+const EXPIRES_HEADER_LINES = 50;
+const EXPIRES_RE = /^!\s*Expires:\s*(\d+)\s*(hours?|days?|minutes?)/i;
+
+/**
+ * Plan §7.9(c) — keep the top-level list's `! Expires:` header where
+ * `parseExpiresHeader` looks for it. The service worker scans the first
+ * EXPIRES_HEADER_LINES of the text `fetchAndExpand` returns, i.e. AFTER
+ * expansion, so an `!#include` above the header pushed it out of that window
+ * (null → the 24 h default). Moving the header ahead of the first include
+ * that precedes it keeps it inside the window: every line before that include
+ * is a plain line and expands to exactly itself. A header that no include
+ * precedes is left where it is, so a list without includes expands
+ * byte-for-byte as before. Comment lines carry no rule, and both engines skip
+ * them wherever they sit, so the reorder changes nothing that is parsed.
+ */
+function hoistExpiresHeader(lines) {
+  const limit = Math.min(lines.length, EXPIRES_HEADER_LINES);
+  let firstInclude = -1;
+  for (let i = 0; i < limit; i++) {
+    const trimmed = lines[i].trim();
+    if (EXPIRES_RE.test(trimmed)) {
+      if (firstInclude !== -1) lines.splice(firstInclude, 0, ...lines.splice(i, 1));
+      return;
+    }
+    if (firstInclude === -1 && INCLUDE_RE.test(trimmed)) firstInclude = i;
+  }
+}
+
 /**
  * Fetch a filter list URL and expand any !#include directives.
  * Uses the browser fetch() API (available in service workers).
@@ -433,6 +463,13 @@ function resolveIncludeUrl(includePath, parentUrl, baseUrl) {
  * half of the fail-open the build closed in 2026-08 §5.10. The per-list
  * `try/catch` in the service worker's `fetchAndStoreRemoteFilterSources`
  * turns the throw into "keep the previous source, don't report this list".
+ *
+ * Plan §7.9(c): the `! Expires:` header the caller reads off the result is
+ * the top-level list's own. An included file's `! Expires:` lines are dropped
+ * (they are comments; nothing else reads them), so one landing inside the
+ * scanned window can neither override the list's header nor stand in for a
+ * missing one, and the top-level header is hoisted above any include that
+ * precedes it — see `hoistExpiresHeader`.
  */
 export async function fetchAndExpand(url, depth = 0, budget = createFetchBudget()) {
   if (depth > 5) {
@@ -472,11 +509,14 @@ export async function fetchAndExpand(url, depth = 0, budget = createFetchBudget(
     }
 
     if (!stack[stack.length - 1]) continue;
+    if (depth > 0 && EXPIRES_RE.test(trimmed)) continue; // §7.9(c): not this list's header
     lines.push(line);
   }
 
+  if (depth === 0) hoistExpiresHeader(lines);
+
   const expandedLines = await Promise.all(lines.map(async (line) => {
-    const m = line.trim().match(/^!#include\s+(.+)$/);
+    const m = line.trim().match(INCLUDE_RE);
     if (m) {
       const includePath = m[1].trim();
       const includeUrl = resolveIncludeUrl(includePath, url, baseUrl);
@@ -494,10 +534,6 @@ export async function fetchAndExpand(url, depth = 0, budget = createFetchBudget(
 
   return expandedLines.join('\n');
 }
-
-/** How many leading lines of a list are treated as its header. */
-const EXPIRES_HEADER_LINES = 50;
-const EXPIRES_RE = /^!\s*Expires:\s*(\d+)\s*(hours?|days?|minutes?)/i;
 
 /**
  * Read a list's `! Expires: N hours|days|minutes` header.

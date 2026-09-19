@@ -365,6 +365,12 @@ test('5.10: injected style ids are not fixed strings', async () => {
   assert.equal(idsA.length, 2);
   assert.equal(idsB.length, 2);
 
+  // The pair must be distinct by construction, not by luck: injectStyle
+  // replaces by getElementById, so two equal ids would make the exception
+  // sheet remove the hide sheet and leave the frame with no cosmetic CSS.
+  assert.notEqual(idsA[0], idsA[1], 'the hide and exception sheets must not share an id');
+  assert.notEqual(idsB[0], idsB[1], 'the hide and exception sheets must not share an id');
+
   // Prior code: every document carried the same two names, so
   // `document.getElementById('__nullify_frame_css__')` both detected the
   // blocker and handed the page the sheet to remove.

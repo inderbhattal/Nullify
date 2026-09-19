@@ -22,9 +22,13 @@ const hostname = normalizeHostname(location.hostname);
 // removing the sheet. Rolled once per document and held in module scope so a
 // re-injection still replaces by id; the `n` keeps an id from starting with a
 // digit.
+// The two ids are one draw plus a suffix, not two draws: `injectStyle`
+// replaces by `getElementById`, so two equal draws would make the exception
+// sheet remove the hide sheet and the frame would lose its cosmetic CSS for
+// that page load. A page that can find one id can enumerate the other anyway.
 const randomStyleId = () => 'n' + Math.random().toString(36).slice(2, 10);
 const FRAME_STYLE_ID = randomStyleId();
-const FRAME_EXCEPTION_STYLE_ID = randomStyleId();
+const FRAME_EXCEPTION_STYLE_ID = `${FRAME_STYLE_ID}x`;
 const WASM_ATTR = 'data-nullify-wasm';
 const YOUTUBE_HOSTNAMES = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
 

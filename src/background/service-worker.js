@@ -4274,6 +4274,17 @@ function resolveRequestHostname(sender, claimed) {
   return hostnameFromSenderUrl(sender.url) || claimedHostname;
 }
 
+/**
+ * §4.14 — the error reply shape. `code` is present only when the failure
+ * carried one (`StorageReadError.code === 'READ_FAILED'`), so the options page
+ * and the popup can say "nothing was changed" for exactly that failure and
+ * keep their own sentence for every other.
+ */
+function errorResponse(err) {
+  const message = err?.message || String(err);
+  return err?.code ? { error: message, code: err.code } : { error: message };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!sender || sender.id !== chrome.runtime.id) {
     sendResponse({ error: 'foreign sender rejected' });
@@ -4309,7 +4320,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // page got zero cosmetic rules. The response shape is the caller's
     // problem; the failure being *invisible* was ours.
     reportError(`message:${message.type}`, err);
-    sendResponse({ error: err.message });
+    // §4.14 — carry the error's `code` (StorageReadError's `READ_FAILED`) to
+    // the caller. Chrome's wording is the same for every failing API, so the
+    // code is the only way an extension page can tell "the read failed and
+    // nothing was written" from a failure that happened after a write landed.
+    sendResponse(errorResponse(err));
   });
   return true;
 });
@@ -4460,7 +4475,7 @@ async function handleMessage(message, sender) {
         const { allowlist, rejected } = await addAllowlistDomains(payload.domains);
         return { ok: true, allowlist, rejected };
       } catch (err) {
-        return { error: err?.message || String(err) };
+        return errorResponse(err);
       }
     }
     case 'IS_SITE_ALLOWED': {

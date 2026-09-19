@@ -43,7 +43,13 @@ export async function call(type, payload) {
   }
   if (resp !== null && typeof resp === 'object' && !Array.isArray(resp)) {
     if (resp.error) {
-      throw new Error(String(resp.error));
+      // §4.14 — keep the worker's `code` on the Error. `status-format.js`
+      // reads it to tell a failed storage read (nothing was written) from a
+      // failure that happened after the write; Chrome's message text is the
+      // same for both and cannot carry that distinction.
+      const err = new Error(String(resp.error));
+      if (typeof resp.code === 'string') err.code = resp.code;
+      throw err;
     }
     if (resp.ok === false) {
       throw new Error(`${type} failed`);

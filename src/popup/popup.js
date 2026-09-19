@@ -26,7 +26,14 @@ async function call(type, payload) {
     throw new Error(`${type}: no response from service worker`);
   }
   if (resp !== null && typeof resp === 'object' && !Array.isArray(resp)) {
-    if (resp.error) throw new Error(String(resp.error));
+    if (resp.error) {
+      // §4.14 — keep the worker's `code` (StorageReadError's 'READ_FAILED'),
+      // the only way to tell a failed read that wrote nothing from a failure
+      // after a write; Chrome's message text is identical for both.
+      const err = new Error(String(resp.error));
+      if (typeof resp.code === 'string') err.code = resp.code;
+      throw err;
+    }
     if (resp.ok === false) throw new Error(`${type} failed`);
   }
   return resp;
@@ -188,7 +195,13 @@ function bindEvents() {
       isSiteAllowed = !!confirmRes?.allowed;
     } catch (err) {
       console.error('[Nullify] allowlist toggle failed:', err);
-      showPopupStatus(isSiteAllowed ? 'Could not resume blocking on this site' : 'Could not pause blocking on this site');
+      // The wording of the read fault is `STORAGE_READ_FAULT_MESSAGE` in
+      // src/options/status-format.js, restated rather than imported: the popup
+      // and the options page share a webpack split-chunk budget, and a shared
+      // chunk breaks both pages (their HTML loads one script by name).
+      showPopupStatus(err?.code === 'READ_FAILED'
+        ? 'Could not read saved settings — nothing was changed; try again'
+        : (isSiteAllowed ? 'Could not resume blocking on this site' : 'Could not pause blocking on this site'));
       return;
     }
     updateSiteStatusUI();

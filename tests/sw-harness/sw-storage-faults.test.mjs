@@ -401,3 +401,30 @@ test('3.1: a failed read during install does not write defaults over user state'
 
   hooks.cancelPendingStatsPersistForTest();
 });
+
+test('4.14: a failed read answers with the StorageReadError code, not just its text', async () => {
+  // The options page and the popup say "nothing was changed" for exactly this
+  // failure and keep their own sentence for every other. Chrome's message text
+  // ("An unexpected error occurred") comes out of every API, so the code is
+  // the only thing that carries the distinction across the message bus.
+  const { chrome, hooks } = await loadServiceWorker({
+    awaitReady: true,
+    seed: { allowlist: [...SEEDED] },
+  });
+
+  const fired = chrome.storage.local._failNextRead(readsAllowlist);
+  const res = await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: 'news.example' } });
+
+  assert.equal(fired(), true, 'the fault must have been consumed by the allowlist read');
+  assert.equal(res.code, 'READ_FAILED',
+    `the reply must carry StorageReadError's code, got ${JSON.stringify(res)}`);
+  assert.ok(res.error, 'and still carry the message text');
+
+  // A failure that is not a storage read must NOT be coded: the page would
+  // otherwise claim "nothing was changed" over a write that already landed.
+  const plain = await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: 'not a hostname' } });
+  assert.ok(plain?.error, 'precondition: an invalid domain is refused');
+  assert.equal(plain.code, undefined, 'an ordinary refusal must not carry a fault code');
+
+  hooks.cancelPendingStatsPersistForTest();
+});

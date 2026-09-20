@@ -47,16 +47,20 @@ const PINNED_MAJOR_PATTERNS = [
   { name: 'UA token', re: /Chrome\/\d+/, sample: 'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' },
   { name: 'sec-ch-ua entry', re: /;v=\\?"\d+/, sample: '"Chromium";v="122", "Not(A:Brand";v="24"' },
   { name: 'userAgentData brand entry', re: /\bversion:\s*['"]\d+/, sample: "{ brand: 'Google Chrome', version: '122' }" },
-  { name: 'full-version literal', re: /['"]\d+\.0\.0\.0['"]/, sample: "result.uaFullVersion = '122.0.0.0';" },
+  // `\d{2,}`, not `\d+`: a bare `\d+` also matches the string '0.0.0.0', which
+  // the service worker carries as a localhost entry in the HTTPS-upgrade rule's
+  // excludedRequestDomains and which has nothing to do with personas. Chrome
+  // majors have been two digits since 2010 and CHROME_MAJOR_FALLBACK is 140,
+  // so the narrowing costs no coverage — the self-check below still holds.
+  { name: 'full-version literal', re: /['"]\d{2,}\.0\.0\.0['"]/, sample: "result.uaFullVersion = '122.0.0.0';" },
 ];
 
 const SCANNED_SOURCES = [
   { path: '../scriptlets/persona-spoof.js', marker: 'export function personaSpoof' },
   { path: '../scriptlets/bot-stealth.js', marker: 'export function botStealth' },
-  // TODO(A2e): enable when the service worker's PERSONAS table is built by
-  // buildPersonas() from this module. Until then that file still carries the
-  // literals and is Track A's to change.
-  // { path: '../background/service-worker.js', marker: 'async function applyPersonaRules' },
+  // Enabled by A2e (e21fc86): the worker builds its table with buildPersonas()
+  // inside applyPersonaRules, so it must spell no major of its own either.
+  { path: '../background/service-worker.js', marker: 'async function applyPersonaRules' },
 ];
 
 test('5.9: no persona literal pins a Chrome major', () => {

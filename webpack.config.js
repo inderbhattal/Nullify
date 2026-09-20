@@ -63,19 +63,15 @@ export default {
   },
 
   optimization: {
-    // Keep the service worker and every content-script entry as single
-    // chunks. Content scripts (`content`, `youtube-shield`) have no chunk-
-    // loading runtime: the first time src/shared/ crosses the 20KB minSize,
-    // webpack would emit a common chunk they cannot load and content
-    // filtering would die at page load. Only the extension-page bundles
-    // (popup, options) may share chunks.
-    splitChunks: {
-      chunks(chunk) {
-        return chunk.name !== 'service-worker'
-          && chunk.name !== 'scriptlets-world'
-          && chunk.name !== 'content'
-          && chunk.name !== 'youtube-shield';
-      },
-    },
+    // Every entry is a single chunk. Content scripts (`content`,
+    // `youtube-shield`) and the MAIN-world scriptlets bundle have no
+    // chunk-loading runtime, and the extension pages are no better off:
+    // popup.html and options.html each load exactly ONE script by name, so a
+    // numbered chunk is emitted that nothing loads and both pages die at
+    // load. This block used to exempt only the first group, on the theory
+    // that a page with a document can fetch a chunk — it cannot, unless the
+    // HTML asks for it. The margin was 8.6 KB against the 20 KB `minSize`
+    // until the generated public-suffix table landed (§9.15).
+    splitChunks: false,
   },
 };

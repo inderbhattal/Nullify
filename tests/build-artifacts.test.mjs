@@ -120,19 +120,25 @@ test('system-unbreak rule ids are unique', () => {
 // webpack.config.js — splitChunks must exclude content scripts (§5.51)
 // ---------------------------------------------------------------------------
 
-test('splitChunks excludes every bundle that cannot load a shared chunk', async () => {
+test('splitChunks is off: no bundle here can load a shared chunk', async () => {
   const { default: config } = await import('../webpack.config.js');
-  const chunksFn = config.optimization?.splitChunks?.chunks;
-  assert.equal(typeof chunksFn, 'function');
+  assert.equal(
+    config.optimization?.splitChunks, false,
+    'no entry can load a shared chunk — the SW, the content scripts and the '
+    + 'MAIN-world bundle have no chunk-loading runtime, and popup.html and '
+    + 'options.html each load exactly one script by name (§9.15)');
+});
 
-  // No chunk-loading runtime exists in the SW, content scripts, or the
-  // MAIN-world scriptlets bundle — a shared chunk would fail at load.
-  for (const name of ['service-worker', 'scriptlets-world', 'content', 'youtube-shield']) {
-    assert.equal(chunksFn({ name }), false, `${name} must not be split`);
-  }
-  // Extension pages have a document and can load shared chunks.
-  for (const name of ['popup', 'options']) {
-    assert.equal(chunksFn({ name }), true, `${name} may share chunks`);
+test('9.15: every HTML page loads exactly one script, so nothing can need a chunk', () => {
+  // This is the reason splitChunks must stay off, asserted against the pages
+  // themselves rather than against the config that serves them.
+  for (const page of ['src/popup/popup.html', 'src/options/options.html']) {
+    const html = fs.readFileSync(path.join(ROOT, page), 'utf8');
+    const srcs = [...html.matchAll(/<script[^>]*\bsrc="([^"]+)"/g)].map((m) => m[1]);
+    assert.equal(
+      srcs.length, 1,
+      `${page} loads ${srcs.length} scripts (${srcs.join(', ')}); splitChunks may be re-enabled `
+      + 'for these pages only if their HTML learns to load what webpack emits');
   }
 });
 

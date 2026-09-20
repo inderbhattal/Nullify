@@ -57,24 +57,30 @@ export function spoofCss(selector, ...args) {
 
   // ---- Spoof getComputedStyle (one wrapper for every pair) ----
   const origGCS = window.getComputedStyle;
-  const wrapped = function (el, pseudo) {
-    const result = origGCS.call(this, el, pseudo);
-    if (pseudo || !matches(el)) return result;
-    return new Proxy(result, {
-      get(target, key) {
-        if (typeof key === 'string' && cssPairs.has(toCamelCase(key))) {
-          return cssPairs.get(toCamelCase(key));
-        }
-        if (key === 'getPropertyValue') {
-          return (p) => (cssPairs.has(toCamelCase(p))
-            ? cssPairs.get(toCamelCase(p))
-            : target.getPropertyValue(p));
-        }
-        const val = Reflect.get(target, key);
-        return typeof val === 'function' ? val.bind(target) : val;
-      },
-    });
-  };
+  // §7.8: method syntax, so the wrapper has no own `prototype` — a function
+  // expression has [[Construct]] and carries one, which `getComputedStyle`,
+  // a native method, does not. `maskNative` fixes the name, the arity and the
+  // source; the own keys are the caller's job.
+  const wrapped = ({
+    getComputedStyle(el, pseudo) {
+      const result = origGCS.call(this, el, pseudo);
+      if (pseudo || !matches(el)) return result;
+      return new Proxy(result, {
+        get(target, key) {
+          if (typeof key === 'string' && cssPairs.has(toCamelCase(key))) {
+            return cssPairs.get(toCamelCase(key));
+          }
+          if (key === 'getPropertyValue') {
+            return (p) => (cssPairs.has(toCamelCase(p))
+              ? cssPairs.get(toCamelCase(p))
+              : target.getPropertyValue(p));
+          }
+          const val = Reflect.get(target, key);
+          return typeof val === 'function' ? val.bind(target) : val;
+        },
+      });
+    },
+  }).getComputedStyle;
   maskNative(wrapped, origGCS);
   window.getComputedStyle = wrapped;
 }

@@ -84,21 +84,22 @@ const injectionSource = (body, utils) => `{\n${IMPORT_STUBS}\n${utils}\n${body}\
 // *host* Function.prototype and never reach the vm realm's mask. In a real
 // page there is one realm and the two spellings are the same call.
 //
-// Own keys are recorded for the callable surfaces (a Proxy forwards them to
-// its native target) but not for the accessor functions: shared-utils'
-// `wrapInstanceGetter` builds those with a function expression, which carries
-// an own `prototype` a native getter lacks — a shared-utils concern, tracked
-// separately from this file.
+// Own keys are recorded for every surface, callable and accessor alike: a
+// Proxy forwards them to its native target, and since §7.8
+// `wrapInstanceGetter` builds its accessor with method syntax, so neither
+// carries the own `prototype` a function expression would have. The generic
+// form of this comparison — every helper, every call site — is
+// tests/wrapped-accessor-detect.test.mjs.
 const DETECTOR_SNIPPET = `(() => {
-  const describe = (fn, withKeys) => (typeof fn === 'function' ? {
+  const describe = (fn) => (typeof fn === 'function' ? {
     name: fn.name,
     length: fn.length,
     source: Function.prototype.toString.call(fn),
-    ...(withKeys ? { ownKeys: Reflect.ownKeys(fn).map(String) } : {}),
+    ownKeys: Reflect.ownKeys(fn).map(String),
   } : null);
-  const callable = (fn) => describe(fn, true);
+  const callable = (fn) => describe(fn);
   const getter = (proto, prop) =>
-    describe(Object.getOwnPropertyDescriptor(proto, prop)?.get, false);
+    describe(Object.getOwnPropertyDescriptor(proto, prop)?.get);
   const xp = XMLHttpRequest.prototype;
   return JSON.stringify({
     'JSON.parse': callable(JSON.parse),

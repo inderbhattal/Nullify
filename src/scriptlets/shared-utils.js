@@ -468,9 +468,15 @@ export function wrapInstanceGetter(proto, prop, transform) {
   const desc = Object.getOwnPropertyDescriptor(proto, prop);
   if (desc?.get === undefined) return false;
   const nativeGetter = desc.get;
-  const getter = function () {
-    return transform(nativeGetter.call(this), this);
-  };
+  // §7.8: method syntax, not a function expression. A function expression has
+  // [[Construct]] and therefore an own `prototype`; a native getter has
+  // neither, so `Object.getOwnPropertyNames(desc.get)` told the page which
+  // accessors were wrapped — the leak §4.4 closed for the callables.
+  const getter = ({
+    get() {
+      return transform(nativeGetter.call(this), this);
+    },
+  }).get;
   maskNative(getter, nativeGetter);
   try {
     Object.defineProperty(proto, prop, { ...desc, get: getter, configurable: true });

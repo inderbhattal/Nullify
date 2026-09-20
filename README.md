@@ -20,7 +20,7 @@
 | Malware blocking | ✅ | Via DNR static rulesets |
 | Annoyances (cookie banners, popups) | ✅ | Via DNR + cosmetic |
 | Cosmetic filtering (##) | ✅ | Content script CSS injection |
-| Generic element hiding | ✅ | 42+ selectors bundled |
+| Generic element hiding | ✅ | 12,000+ generic selectors compiled from the lists |
 | Domain-specific element hiding | ✅ | Per-domain rules |
 | MutationObserver (dynamic content) | ✅ | Hides dynamically injected ads |
 | Procedural cosmetics `:has()` `:upward()` | ✅ | JS-based fallback engine |
@@ -103,7 +103,7 @@ The registry in `src/scriptlets/index.js` dispatches 88 registry names (uBO alia
 | Type | Limit | Our Usage |
 |---|---|---|
 | Static rulesets | 50 enabled max | 16 declared / 8 enabled in the manifest / 16 requested at runtime |
-| Static rules | 30,000 guaranteed | ~22 (sample), ~65K+ compiled (full; enabled-by-default sum draws on the shared global pool) |
+| Static rules | 30,000 guaranteed | 120,000+ rules across all 16 declared rulesets; 60,000+ in the 8 the manifest enables (the guarantee is one shared pool) |
 | Dynamic rules | 30,000 (Chrome 121+) | User rules + allowlist |
 | Regex rules | 1,000 per type | Minimal |
 

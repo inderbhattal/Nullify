@@ -336,10 +336,20 @@ const MAX_YT_PLAYER_BYTES: usize = 32 * 1024 * 1024;
 /// Total selector/scriptlet entries across all sources fed to the index
 /// compiler (the shipped corpus is ~45k selectors).
 const MAX_INDEX_INPUT_ENTRIES: usize = 1_000_000;
-/// Text handed to `is_semantic_ad` (§5.4). The content engine never sends
-/// more than 400 characters, and the service worker's own cap of 1024 UTF-16
-/// units is at most 3072 UTF-8 bytes, so nothing it forwards is refused here.
+/// Text handed to `is_semantic_ad` (REVIEW-2026-09 §5.4). The content engine
+/// never sends more than 400 characters, and the service worker's own cap of
+/// 1024 UTF-16 units is at most 3072 UTF-8 bytes, so nothing it forwards is
+/// refused here.
 const MAX_SEMANTIC_TEXT_BYTES: usize = 4096;
+/// The worker's cap, in UTF-16 units (`CHECK_SEMANTIC_AD`, service-worker.js).
+const SW_SEMANTIC_CAP_UTF16_UNITS: usize = 1024;
+// Module scope, NOT inside `#[cfg(test)]`: a const block in a test-only
+// function is evaluated only when the test target is compiled, so it gated
+// `cargo test` and not `wasm-pack build` — a cap lowered below the worker's
+// would have shipped. A BMP character is one UTF-16 unit and at most three
+// UTF-8 bytes; a supplementary one is two units and four bytes, i.e. two
+// bytes per unit. Three is therefore the worst case.
+const _: () = assert!(MAX_SEMANTIC_TEXT_BYTES >= SW_SEMANTIC_CAP_UTF16_UNITS * 3);
 
 /// Refuse an oversized input with a structured, machine-readable error.
 fn check_input_size(function: &str, unit: &str, actual: usize, max: usize) -> Result<(), String> {
@@ -4875,11 +4885,10 @@ mod tests {
         assert!(is_semantic_ad(&semantic_ad_text(MAX_SEMANTIC_TEXT_BYTES, false, "x")));
         assert!(!is_semantic_ad(&"x".repeat(MAX_SEMANTIC_TEXT_BYTES)));
 
-        // The cap must never refuse what the service worker's own cap admits:
-        // 1024 UTF-16 units are at most three bytes each. Checked at compile
-        // time, so lowering the cap below that does not build.
-        const SW_CAP_UTF16_UNITS: usize = 1024;
-        const { assert!(MAX_SEMANTIC_TEXT_BYTES >= SW_CAP_UTF16_UNITS * 3) };
+        // The cap must never refuse what the service worker's own cap admits.
+        // The compile-time half of this lives at module scope beside the
+        // constant, so it gates `wasm-pack build` and not just `cargo test`.
+        const SW_CAP_UTF16_UNITS: usize = SW_SEMANTIC_CAP_UTF16_UNITS;
         let widest = semantic_ad_text((SW_CAP_UTF16_UNITS - 9) * 3 + 9, false, "あ");
         assert_eq!(widest.encode_utf16().count(), SW_CAP_UTF16_UNITS);
         assert!(is_semantic_ad(&widest));

@@ -1063,3 +1063,107 @@ for (const [mode, seed, expectReinjection] of [
       'default OFF in the release that introduces it');
   });
 }
+
+// ---------------------------------------------------------------------------
+// REMEDIATION-2026-09 §7.5 — the worker's copy of the procedural planner had
+// drifted from the content engine's. Both run on the WASM-down path, so a
+// divergence here is a rule that behaves differently depending on whether the
+// Rust core happened to load.
+//
+//  - `extractFirstOp` never checked that a `(` closed. `div:has-text(Ad`
+//    sliced anyway and yielded arg `"A"` — a malformed line silently became a
+//    DIFFERENT, valid rule hiding everything containing "A" (§5.20). The
+//    engine returns MALFORMED and the plan is dropped.
+//  - `rest` was trimmed, and the leading whitespace is exactly what tells a
+//    descendant continuation from a compound one (§4.12): `div:has-text(x) .ad`
+//    and `div:has-text(x).ad` produced identical plans.
+//  - the `*` check walked backwards past whitespace to find the preceding
+//    character, so `div *` — an ordinary descendant universal — was read as
+//    `div*` and refused. Rust uses the immediate predecessor (2026-08 §4.35).
+// ---------------------------------------------------------------------------
+
+const planOf = (hooks, selector) => {
+  const bundle = hooks.buildPageBundle({ domainSpecific: [selector] });
+  return {
+    css: (bundle.cssText || '').split('\n').filter(Boolean).map((l) => l.replace(/\s*\{.*$/, '')),
+    rules: (bundle.rules?.domainSpecific || []),
+  };
+};
+
+test('7.5: an unterminated procedural argument is refused, not silently truncated', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const truncated = planOf(hooks, 'div:has-text(Ad');
+  assert.deepEqual(truncated.css, [], 'a malformed selector must not reach the page as CSS');
+  assert.deepEqual(truncated.rules, [],
+    'nor as a plan: slicing an unclosed argument turned `:has-text(Ad` into `:has-text(A)`, ' +
+    'a different and perfectly valid rule that hides everything containing "A"');
+
+  // The same check is needed in the nested-native scan, which has its own
+  // paren walk.
+  const nested = planOf(hooks, 'div:has(span:has-text(Ad)');
+  assert.deepEqual(nested.rules, [], 'an unterminated :has( must fail closed too');
+  assert.deepEqual(nested.css, []);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.5 (didn\'t re-break): a well-formed procedural selector still plans', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const ok = planOf(hooks, 'div:has-text(Ad)');
+  assert.equal(ok.rules.length, 1, 'the closed form must still plan');
+  assert.deepEqual(ok.rules[0].plan, [
+    // `kind` is the engine's `makeCssStep` shape: its executor reads
+    // `step.kind` at four sites and plans built here used to carry none, so
+    // every continuation fell into the compound branch.
+    { type: 'css', kind: 'compound', selector: 'div' },
+    { type: 'op', op: 'has-text', arg: 'Ad' },
+  ]);
+
+  const nested = planOf(hooks, 'div:has(span:has-text(Ad))');
+  assert.equal(nested.rules.length, 1, 'a closed nested form must still plan');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.5: a descendant continuation is not collapsed into a compound one', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const descendant = planOf(hooks, 'div:has-text(x) .ad');
+  const compound = planOf(hooks, 'div:has-text(x).ad');
+
+  assert.equal(descendant.rules.length, 1);
+  assert.equal(compound.rules.length, 1);
+  assert.notDeepEqual(descendant.rules[0].plan, compound.rules[0].plan,
+    '`div:has-text(x) .ad` matches .ad INSIDE the div; `div:has-text(x).ad` matches a div that is itself .ad — ' +
+    'trimming `rest` made them the same plan');
+
+  // And the descendant form keeps its combinator, so the step is a descendant
+  // lookup rather than a compound filter on the same element.
+  assert.deepEqual(descendant.rules[0].plan.at(-1), { type: 'css', kind: 'descendant', selector: '.ad' });
+  assert.deepEqual(compound.rules[0].plan.at(-1), { type: 'css', kind: 'compound', selector: '.ad' });
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.5: a descendant universal selector is valid CSS', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  // Rust uses the IMMEDIATE predecessor, so a space before `*` makes it a
+  // descendant combinator, not an identifier continuation.
+  for (const valid of ['div *', 'div * span', '.ad > *', '*', 'div:not(.keep) *']) {
+    const bundle = planOf(hooks, valid);
+    assert.ok(bundle.css.length + bundle.rules.length > 0,
+      `${JSON.stringify(valid)} is valid CSS and must not be dropped`);
+  }
+
+  // No space: `*` really does continue the identifier, and that is invalid.
+  for (const invalid of ['div*', 'a1*', '.ad*']) {
+    const bundle = planOf(hooks, invalid);
+    assert.deepEqual([...bundle.css, ...bundle.rules], [],
+      `${JSON.stringify(invalid)} must still be refused`);
+  }
+
+  hooks.cancelPendingStatsPersistForTest();
+});

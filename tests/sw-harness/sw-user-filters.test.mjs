@@ -433,3 +433,145 @@ test('3.3 (real compiler): a $removeparam line through compile_user_filters yiel
   hooks.setCompileUserFiltersOverrideForTest(null);
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// REMEDIATION-2026-09 §7.3 — the runtime fallback `parseSimpleNetworkRule` is
+// what compiles My Filters when WASM is unavailable, and it was looser than
+// the build parser on four shapes. The invariant the plan states is
+// `emit_runtime ⇒ emit_build`: the fallback may refuse a line the build
+// accepts, never the other way round. Each of the four emitted a DNR rule
+// matching nothing, so this is silent coverage loss on the WASM-down path
+// rather than over-blocking — the user's line is accepted and then does
+// nothing, with no "dropped" count to show for it.
+//
+// The build parser is imported rather than re-described here, so this cannot
+// drift into asserting against a copy of its rules (the sw-dnr-bands
+// convention). scripts/build-rules.mjs is read, never written — it is Track
+// D's file.
+// ---------------------------------------------------------------------------
+
+const buildDnrFor = async (line) => {
+  const { parseLine, networkFilterToDNR } = await import('../../scripts/build-rules.mjs');
+  const parsed = parseLine(line);
+  if (!parsed || parsed.type !== 'network') return null;
+  try {
+    return networkFilterToDNR(parsed, 1);
+  } catch {
+    return null;
+  }
+};
+
+// The four §7.3 shapes, each with a realistic sibling that carries a real
+// pattern, plus the anchor-only forms and controls that must keep working.
+const SEVEN_THREE_LINES = [
+  '||$script', '\\$script', '||ads.example^\\$script',
+  '||$image', '|$script', '^$script', '$script', '*$script',
+  '||ads.example^$script', '@@||ads.example^$script', '||ads.example^',
+  '||ads.example^$script,image', 'ads.example$image', '@@||ads.example^',
+  '||ads.example/a$b^', '||ads.example^$', '||ads.example^$script,',
+];
+
+test('7.3: the runtime fallback never emits a rule the build parser refuses', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const violations = [];
+  for (const line of SEVEN_THREE_LINES) {
+    const runtime = hooks.parseSimpleNetworkRule(line, DNR_USER_RULES_START);
+    if (!runtime) continue; // refusing is always allowed
+    const build = await buildDnrFor(line);
+    if (!build) {
+      violations.push(`${JSON.stringify(line)}: runtime emitted ${JSON.stringify(runtime.condition)}, build refused it`);
+      continue;
+    }
+    if ((build.condition.urlFilter ?? null) !== (runtime.condition.urlFilter ?? null)) {
+      violations.push(`${JSON.stringify(line)}: urlFilter ${JSON.stringify(runtime.condition.urlFilter)} vs build ${JSON.stringify(build.condition.urlFilter)}`);
+    }
+  }
+  assert.deepEqual(violations, [], `emit_runtime => emit_build must hold:\n${violations.join('\n')}`);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.3: the shapes the fallback got wrong', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+  const parse = (line) => hooks.parseSimpleNetworkRule(line, DNR_USER_RULES_START);
+
+  // 1. An anchor with nothing after it is not a pattern. This emitted
+  //    `urlFilter: "||"`, which matches nothing.
+  assert.equal(parse('||$script'), null, '`||$script` has no pattern to match');
+  assert.equal(parse('||$image'), null);
+  assert.equal(parse('|$script'), null);
+  assert.equal(parse('^$script'), null);
+
+  // 2. A backslash-escaped `$` is a literal dollar in the pattern, not the
+  //    option separator. This emitted `urlFilter: "\\"` plus a script type.
+  const escaped = parse('||ads.example^\\$script');
+  assert.equal(escaped.condition.urlFilter, '||ads.example^\\$script');
+  assert.equal(escaped.condition.resourceTypes, undefined);
+
+  // 3. Found while vectoring the others, same root cause and the opposite
+  //    direction: a `$` inside the URL with no option list after it made the
+  //    fallback drop the line entirely, where the build keeps the whole
+  //    pattern. `b^` is not an option list, so there is nothing to split on.
+  const dollarInPath = parse('||ads.example/a$b^');
+  assert.equal(dollarInPath.condition.urlFilter, '||ads.example/a$b^',
+    'a dollar that is part of the URL must not be read as an option separator');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.3 (didn\'t re-break): ordinary user filters still compile', async () => {
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+  const parse = (line) => hooks.parseSimpleNetworkRule(line, DNR_USER_RULES_START);
+
+  const block = parse('||ads.example^$script');
+  assert.equal(block.condition.urlFilter, '||ads.example^');
+  assert.deepEqual(block.condition.resourceTypes, ['script']);
+  assert.equal(block.action.type, 'block');
+
+  const multi = parse('||ads.example^$script,image');
+  assert.deepEqual(multi.condition.resourceTypes, ['script', 'image'],
+    'a lowercase option list is still a list');
+
+  const allow = parse('@@||ads.example^$script');
+  assert.equal(allow.action.type, 'allow');
+  assert.deepEqual(allow.condition.resourceTypes, ['script']);
+
+  const plain = parse('||ads.example^');
+  assert.equal(plain.condition.urlFilter, '||ads.example^');
+  assert.equal(plain.condition.resourceTypes, undefined);
+
+
+  // Options this parser cannot express still drop the line (§5.6).
+  assert.equal(parse('||ads.example^$removeparam=x'), null);
+  assert.equal(parse('||ads.example^$domain=other.example'), null);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.3: option-name case is the one divergence left, and it is deliberate', async () => {
+  // The runtime matches option names case-insensitively, which
+  // `sw-trust-boundary.test.mjs` pins as intentional ("like uBO's"); the
+  // build's own option-list head is lowercase-only, so it leaves the same
+  // token in the pattern. Both cannot be right, and the file that pins the
+  // runtime side is not this track's to change — so the disagreement is
+  // recorded here rather than silently decided. If either side moves, this
+  // test says so instead of a corpus quietly changing shape.
+  const { hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const upper = hooks.parseSimpleNetworkRule('||ads.example^$SCRIPT', DNR_USER_RULES_START);
+  assert.deepEqual(upper.condition.resourceTypes, ['script'],
+    'runtime: an uppercase option name is still an option');
+  assert.equal(upper.condition.urlFilter, '||ads.example^');
+
+  const build = await buildDnrFor('||ads.example^$SCRIPT');
+  assert.equal(build.condition.urlFilter, '||ads.example^$SCRIPT',
+    'build: the same token stays in the pattern');
+  assert.equal(build.condition.resourceTypes, undefined);
+
+  // Both still EMIT, so the §7.3 invariant `emit_runtime => emit_build` holds
+  // even here; it is the rule they emit that differs.
+  assert.ok(upper && build);
+
+  hooks.cancelPendingStatsPersistForTest();
+});

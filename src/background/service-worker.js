@@ -553,6 +553,30 @@ async function computeBundledRuleDataVersion() {
 /**
  * Depth-aware scan for the first procedural operator in a selector string.
  */
+/**
+ * §7.5 — a selector whose argument never closed. The engine returns this and
+ * the plan is dropped; the worker used to slice anyway, which turned
+ * `div:has-text(Ad` into `:has-text(A)` — a different, perfectly valid rule
+ * (§5.20). Both copies run on the WASM-down path, so they have to agree.
+ */
+const MALFORMED = Symbol('malformed-procedural-selector');
+
+/**
+ * Build a css plan step, recording how the fragment attaches to the element
+ * the previous step produced (§4.12) — the engine's `makeCssStep`, which its
+ * executor already reads (`step.kind`). Plans built here carried no `kind` at
+ * all, so every continuation fell into the executor's compound branch and
+ * `div:has-text(x) span` matched a div that was itself a span.
+ */
+function makeCssStep(rawSelector) {
+  const trimmed = rawSelector.trim();
+  let kind = 'compound';
+  if (trimmed.startsWith('>')) kind = 'child';
+  else if (/^[+~]/.test(trimmed)) kind = 'sibling';
+  else if (/^\s/.test(rawSelector)) kind = 'descendant';
+  return { type: 'css', kind, selector: trimmed };
+}
+
 function extractFirstOp(selector) {
   let depth = 0;
 
@@ -577,8 +601,14 @@ function extractFirstOp(selector) {
           j++;
         }
 
+        // §7.5 — the argument never closed. Slicing anyway silently drops the
+        // last character and ships a different rule; fail closed instead.
+        if (d > 0) return MALFORMED;
+
         const arg = selector.slice(argStart, j - 1);
-        const rest = selector.slice(j).trimStart();
+        // §7.5/§4.12 — raw: the leading whitespace (or lack of it) is what
+        // distinguishes a descendant continuation from a compound one.
+        const rest = selector.slice(j);
         return { base, op, arg, rest };
       }
     }
@@ -594,12 +624,13 @@ function extractFirstOp(selector) {
         else if (selector[j] === ')') d--;
         j++;
       }
+      if (d > 0) return MALFORMED; // unterminated `:has(` etc — §7.5
       const inner = selector.slice(idx + pseudo.length, j - 1);
       if (isProceduralSelector(inner)) {
         const base = selector.slice(0, idx).trimEnd();
         const op = pseudo.slice(1, -1);
         const arg = inner;
-        const rest = selector.slice(j).trimStart();
+        const rest = selector.slice(j); // raw — §7.5/§4.12, see above
         return { base, op, arg, rest };
       }
     }
@@ -615,15 +646,17 @@ function parseProceduralPlan(selector) {
   const plan = [];
   let remaining = selector;
 
-  while (remaining) {
+  while (remaining && remaining.trim()) {
     const firstOp = extractFirstOp(remaining);
+    // §7.5 — one malformed step drops the whole rule, like the engine.
+    if (firstOp === MALFORMED) return null;
     if (!firstOp) {
-      plan.push({ type: 'css', selector: remaining.trim() });
+      plan.push(makeCssStep(remaining));
       break;
     }
-    
+
     if (firstOp.base) {
-      plan.push({ type: 'css', selector: firstOp.base });
+      plan.push(makeCssStep(firstOp.base));
     }
     
     // Canonical uBO name, like the engine's planner: `:-abp-has()` plans as
@@ -698,7 +731,10 @@ function classifyAndPlanSelectors(selectors) {
   const proceduralRules = [];
   for (const selector of cleanSelectors) {
     if (isProceduralSelector(selector)) {
-      proceduralRules.push({ selector, plan: parseProceduralPlan(selector) });
+      // §7.5 — a malformed selector yields no plan at all; drop the rule
+      // rather than ship `plan: null` or a truncated parse of it.
+      const plan = parseProceduralPlan(selector);
+      if (plan) proceduralRules.push({ selector, plan });
     } else {
       cssSelectors.push(selector);
     }
@@ -817,15 +853,12 @@ function hasInvalidUniversalUsage(selector) {
     }
 
     if (ch === '*' && bracketDepth === 0 && parenDepth === 0) {
-      // Universal selector (*) is invalid when preceded by alphanumeric/identifier chars
-      let prev = null;
-      for (let j = i - 1; j >= 0; j--) {
-        const pc = selector.charAt(j);
-        if (!/\s/.test(pc)) {
-          prev = pc;
-          break;
-        }
-      }
+      // §7.5 — `*` continues an identifier only when it IMMEDIATELY follows
+      // one, which is the rule Rust uses (2026-08 §4.35). Walking back past
+      // whitespace read `div *` — an ordinary descendant universal — as
+      // `div*` and refused it, so every list rule using one was dropped on
+      // the WASM-down path.
+      const prev = i > 0 ? selector.charAt(i - 1) : null;
       if (prev && /[A-Za-z0-9_\-)\]]/.test(prev)) {
         return true;
       }
@@ -3403,6 +3436,34 @@ const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = COSMETIC_SCOPE_OPTIONS;
  * and is visible to the user, where a mis-parsed one silently over-blocks or
  * (worse, for an `@@` line) silently disables blocking.
  */
+/**
+ * §7.3 — find the `$` that starts the option list the way the build parser's
+ * `splitPatternAndOptions` does, and for the same reasons: `$` is a regex
+ * anchor and appears inside option values, so `lastIndexOf('$')` mis-splits.
+ * Scan right to left, skip an escaped `\$`, and require the tail to look like
+ * an option list.
+ *
+ * The head is matched case-INSENSITIVELY, which is where this deliberately
+ * parts company with the build. `5.6: parseSimpleNetworkRule refuses every
+ * option it cannot express` pins `$Script, image` as a script+image rule
+ * ("like uBO's"), while the build's own head is lowercase-only and leaves
+ * `$SCRIPT` in the pattern. Both cannot be right; until that is decided the
+ * runtime keeps the behaviour its tests pin, and the divergence is pinned as
+ * well (`7.3: option-name case is the one divergence left`). Everything else
+ * here mirrors scripts/build-rules.mjs `splitPatternAndOptions` (Track D's).
+ */
+const SIMPLE_RULE_OPTION_LIST_HEAD = /^~?(?:[13]p|[a-z][a-z0-9-]*)(?:[=,]|$)/i;
+
+function splitSimpleRuleOptions(pattern) {
+  for (let i = pattern.length - 1; i >= 0; i--) {
+    if (pattern[i] !== '$' || (i > 0 && pattern[i - 1] === '\\')) continue;
+    const tail = pattern.slice(i + 1);
+    if (tail === '' || !SIMPLE_RULE_OPTION_LIST_HEAD.test(tail)) continue;
+    return [pattern.slice(0, i), tail];
+  }
+  return [pattern, ''];
+}
+
 function parseSimpleNetworkRule(line, id) {
   const isException = line.startsWith('@@');
   const pattern = isException ? line.slice(2) : line;
@@ -3410,15 +3471,23 @@ function parseSimpleNetworkRule(line, id) {
   if (!pattern || pattern.length < 3) return null;
   if (pattern.includes('##') || pattern.includes('#@#') || pattern.includes('##+js')) return null;
 
-  const dollarPos = pattern.lastIndexOf('$');
-  let urlFilter = pattern;
+  const [rawUrlFilter, optionsStr] = splitSimpleRuleOptions(pattern);
+  let urlFilter = rawUrlFilter;
   let resourceTypes = null;
 
-  if (dollarPos > 0) {
-    urlFilter = pattern.slice(0, dollarPos);
+  // §5.6 — a trailing `$` with nothing after it is an option list the user
+  // wrote and this parser could not read, so it keeps failing closed. The
+  // build leaves it in the pattern; being STRICTER than the build is always
+  // allowed, and `emit_runtime ⇒ emit_build` (§7.3) still holds.
+  if (!optionsStr && /(^|[^\\])\$$/.test(rawUrlFilter)) return null;
+
+  if (optionsStr) {
     const types = [];
 
-    for (const raw of pattern.slice(dollarPos + 1).split(',')) {
+    for (const raw of optionsStr.split(',')) {
+      // Lowercased: §5.6 pins option matching as case-insensitive. See the
+      // note on SIMPLE_RULE_OPTION_LIST_HEAD — the build disagrees, and that
+      // is the one §7.3 shape left open rather than silently decided here.
       const option = raw.trim().toLowerCase();
 
       // A cosmetic-scope option means the line is not a network rule at all.
@@ -3446,7 +3515,12 @@ function parseSimpleNetworkRule(line, id) {
   }
 
   urlFilter = urlFilter.trim();
-  if (!urlFilter) return null;
+  // §7.3 — a pattern made only of anchors and wildcards has no literal content
+  // to match on. `||$script` used to emit `urlFilter: "||"`, which matches
+  // nothing; the build refuses `||`, `|` and `^` outright. A bare `*` is the
+  // browser-wide form the build expresses by dropping the urlFilter entirely —
+  // refusing it here is the safe direction for a line the user typed.
+  if (!urlFilter || !/[^|^*]/.test(urlFilter)) return null;
 
   const condition = { urlFilter };
   if (resourceTypes) condition.resourceTypes = resourceTypes;

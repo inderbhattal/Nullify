@@ -23,8 +23,12 @@ import test from 'node:test';
 
 import { makeChromeStub } from './chrome-stub.mjs';
 import { drainTicks, loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
+import { CHROME_MAJOR_FALLBACK } from '../../src/shared/personas.js';
 
 const FLAG_ON = { featureFlags: { privacyRulesDiff: true } };
+
+const unexpectedCriticals = (hooks) =>
+  hooks.errorReport.critical.filter((e) => e.context !== 'WASM initialization');
 
 // The privacy band, id by id (service-worker.js DNR_*_RULES_START).
 const HEADER_RULE_IDS = [800_000, 800_001];
@@ -387,3 +391,127 @@ for (const [mode, seed] of [['flag off', {}], ['flag on', FLAG_ON]]) {
     hooks.cancelPendingStatsPersistForTest();
   });
 }
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.9 (A2e) — the persona table was a literal frozen at Chrome
+// 122. A `user-agent` and `sec-ch-ua` claiming a two-year-old Chrome is a
+// beacon rather than camouflage, and some sites gate on the major. The table
+// now comes from src/shared/personas.js, built from the running browser's
+// major, and is spelled in that one module for both this surface and the
+// MAIN-world persona-spoof scriptlet.
+// ---------------------------------------------------------------------------
+
+/**
+ * Stub the running browser's major. 151 on purpose: it is neither the old
+ * literal (122) nor CHROME_MAJOR_FALLBACK (140), so an assertion on it cannot
+ * be satisfied by a reverted table or by detection that has stopped working.
+ */
+function stubNavigator(value) {
+  const had = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+  return () => {
+    if (had) Object.defineProperty(globalThis, 'navigator', had);
+    else delete globalThis.navigator;
+  };
+}
+
+const navigatorWithMajor = (major) => ({
+  userAgentData: { brands: [{ brand: 'Google Chrome', version: String(major) }] },
+  userAgent: `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`,
+});
+
+const personaHeaders = (chrome) => Object.fromEntries(
+  chrome.declarativeNetRequest._dynamic.get(PERSONA_RULE_ID)
+    .action.requestHeaders.map((h) => [h.header, h.value]));
+
+const setPersona = (chrome, stealthPersona) => chrome.runtime.sendMessage(
+  { type: 'UPDATE_SETTINGS', payload: { stealthPersona } });
+
+test('5.9: persona UA strings carry the running major, not a literal', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  const restore = stubNavigator(navigatorWithMajor(151));
+  try {
+    await setPersona(chrome, 'windows');
+    const headers = personaHeaders(chrome);
+
+    assert.match(headers['user-agent'], /Chrome\/151\.0\.0\.0 /,
+      'the UA must claim the browser the user is actually running');
+    assert.doesNotMatch(headers['user-agent'], /Chrome\/122/,
+      'and never the literal the table was frozen at');
+    assert.equal(headers['sec-ch-ua'],
+      '"Chromium";v="151", "Not(A:Brand";v="24", "Google Chrome";v="151"',
+      'the client hint has to tell the same story as the UA, or the pair is the beacon');
+    assert.equal(headers['sec-ch-ua-platform'], '"Windows"',
+      'the persona still claims its operating system');
+    assert.match(headers['user-agent'], /Windows NT 10\.0; Win64; x64/);
+  } finally {
+    restore();
+  }
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.9: the major is read when the rule is built, not when the worker loads', async () => {
+  // Track F's seam note: building the table at module scope would freeze the
+  // major at worker-evaluation time and force every consumer to stub
+  // `navigator` before import. A browser update mid-worker-life must be picked
+  // up by the next apply.
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  const restore = stubNavigator(navigatorWithMajor(151));
+  try {
+    await setPersona(chrome, 'mac');
+    assert.match(personaHeaders(chrome)['user-agent'], /Chrome\/151\.0\.0\.0 /);
+
+    // The browser updates under a worker that is already running.
+    Object.defineProperty(globalThis, 'navigator', {
+      value: navigatorWithMajor(152), configurable: true, writable: true,
+    });
+    await setPersona(chrome, 'default');
+    await setPersona(chrome, 'mac');
+    assert.match(personaHeaders(chrome)['user-agent'], /Chrome\/152\.0\.0\.0 /,
+      'the next apply must carry the new major');
+    assert.match(personaHeaders(chrome)['user-agent'], /Macintosh; Intel Mac OS X 10_15_7/);
+  } finally {
+    restore();
+  }
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.9 (didn\'t re-break): an unreadable navigator still yields a usable persona', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  // A navigator whose every read throws — the worker evaluates detection at
+  // apply time, where a throw would take the whole privacy apply down.
+  const hostile = { get userAgentData() { throw new Error('nope'); }, get userAgent() { throw new Error('nope'); } };
+  const restore = stubNavigator(hostile);
+  try {
+    await setPersona(chrome, 'linux');
+    const headers = personaHeaders(chrome);
+    assert.match(headers['user-agent'], new RegExp(`Chrome/${CHROME_MAJOR_FALLBACK}\\.0\\.0\\.0 `),
+      'the documented fallback major, not a crash and not an empty rule');
+    assert.equal(headers['sec-ch-ua-platform'], '"Linux"');
+    assert.deepEqual(unexpectedCriticals(hooks), [], 'and no fatal error from the apply');
+  } finally {
+    restore();
+  }
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.9 (didn\'t re-break): default and unknown personas still remove the rule', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  const restore = stubNavigator(navigatorWithMajor(151));
+  try {
+    await setPersona(chrome, 'windows');
+    assert.equal(chrome.declarativeNetRequest._dynamic.has(PERSONA_RULE_ID), true);
+
+    await setPersona(chrome, 'default');
+    assert.equal(chrome.declarativeNetRequest._dynamic.has(PERSONA_RULE_ID), false,
+      '"default" means no persona rule at all');
+
+    await setPersona(chrome, 'windows');
+    await setPersona(chrome, 'not-a-persona');
+    assert.equal(chrome.declarativeNetRequest._dynamic.has(PERSONA_RULE_ID), false,
+      'an id with no persona must remove the rule, never ship a half-built one');
+  } finally {
+    restore();
+  }
+  hooks.cancelPendingStatsPersistForTest();
+});

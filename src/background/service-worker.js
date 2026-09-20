@@ -84,6 +84,7 @@ import {
   NATIVE_FUNCTIONAL_PSEUDO_CLASSES,
 } from '../shared/proc-ops.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
+import { buildPersonas, detectChromeMajor } from '../shared/personas.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
   CORE_FILTER_SOURCE,
@@ -198,6 +199,11 @@ function getYouTubeShieldSync() {
     runtimeAssetPath,
     scriptId: YOUTUBE_SHIELD_SCRIPT_ID,
     targets: YOUTUBE_SHIELD_TARGETS,
+    // §5.18 (A2g) — the function, not its result: the module reads the flag
+    // once per sync, and this worker's cache fills after start-up and can
+    // change while the worker lives. F2 defaults this to `() => false`, so
+    // without this line the flag reads as true everywhere and changes nothing.
+    isFeatureEnabled,
   });
   return _youtubeShieldSync;
 }
@@ -242,6 +248,7 @@ const FEATURE_DEFAULTS = Object.freeze({
   rulesetDeltaApply: false, // §5.1 — A2b: apply only the static-ruleset delta
   privacyRulesDiff: false, // §5.2 — A2c: write only the privacy rules that changed
   singleCssInjection: false, // §5.11 — A2f: report the early CSS so the content script can skip its copy
+  shieldNoReinject: false, // §5.18 — F2/A2g: do not re-inject an unchanged shield registration
 });
 let cachedFeatureFlags = { ...FEATURE_DEFAULTS };
 let _featureFlagsPromise = null;
@@ -2349,28 +2356,24 @@ async function applyUpgradeSchemeRules(enabled, plan = null) {
   await emitPrivacyRules(plan, [ruleId], rules);
 }
 
-const PERSONAS = {
-  windows: {
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    platform: 'Windows'
-  },
-  mac: {
-    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    platform: 'macOS'
-  },
-  linux: {
-    ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    platform: 'Linux'
-  }
-};
-
-/** Apply DNR rules to spoof User-Agent and Client Hints. */
+/**
+ * Apply DNR rules to spoof User-Agent and Client Hints.
+ *
+ * §5.9 — the table used to be a literal here, frozen at Chrome 122, with a
+ * second copy in the MAIN-world persona-spoof scriptlet. A `user-agent` and
+ * `sec-ch-ua` claiming a two-year-old Chrome is a beacon rather than
+ * camouflage, and the two copies could disagree. Both now come from
+ * `src/shared/personas.js`, built from the running browser's major.
+ *
+ * Built HERE rather than at module scope on purpose: the major is then read
+ * when a rule is written, so a browser update is picked up by the next apply
+ * instead of being frozen at worker-evaluation time, and nothing has to stub
+ * `navigator` before this file is imported. `detectChromeMajor` never throws
+ * — start-up is not a place to discover a hostile navigator.
+ */
 async function applyPersonaRules(personaId, plan = null) {
   const ruleId = DNR_PERSONA_RULES_START;
-  const persona = PERSONAS[personaId];
+  const persona = buildPersonas(detectChromeMajor())[personaId];
 
   if (!persona || personaId === 'default') {
     await emitPrivacyRules(plan, [ruleId]);

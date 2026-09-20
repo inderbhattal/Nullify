@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { makeChromeStub } from './chrome-stub.mjs';
 import { drainTicks, loadServiceWorker, samplePackagedSources, waitFor } from './sw-loader.mjs';
 
 const SW_PATH = new URL('../../src/background/service-worker.js', import.meta.url);
@@ -1000,3 +1001,53 @@ test('5.11: a reload of the same URL does not inherit the previous document\'s r
 
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.18 (A2g) — the shield was re-injected into every open
+// YouTube tab on every worker wake, even when the registration was unchanged.
+// Track F's F2 put that behind `shieldNoReinject` and takes the flag as an
+// injected dependency defaulting to `() => false`, so the module ships inert
+// until the worker hands it the real reader. This is that wiring: without it
+// the flag exists in storage, reads as true through `isFeatureEnabled`, and
+// changes nothing at all.
+// ---------------------------------------------------------------------------
+
+const SHIELD_FLAG_ON = { featureFlags: { shieldNoReinject: true } };
+const shieldInjections = (chrome, from = 0) => chrome.calls.entries
+  .slice(from)
+  .filter((call) => call.api === 'scripting.executeScript');
+
+for (const [mode, seed, expectReinjection] of [
+  ['flag on', SHIELD_FLAG_ON, false],
+  ['flag off', {}, true],
+]) {
+  test(`5.18 (A2g): the worker's own isFeatureEnabled reaches the shield sync (${mode})`, async () => {
+    const stub = makeChromeStub();
+    stub.tabs._tabs.set(1, { id: 1, url: 'https://www.youtube.com/' });
+
+    const first = await loadServiceWorker({ stub, seed, awaitReady: true });
+    first.hooks.cancelPendingStatsPersistForTest();
+    assert.ok(shieldInjections(stub).length >= 1,
+      'precondition: the first life registers and injects into the open tab');
+
+    // A warm wake on the same profile and the same browser session: same
+    // registration, same tab, nothing for the shield to do.
+    const before = stub.calls.entries.length;
+    const second = await loadServiceWorker({ stub, idb: first.idb, seed, awaitReady: true });
+    second.hooks.cancelPendingStatsPersistForTest();
+
+    const reinjected = shieldInjections(stub, before);
+    assert.equal(second.hooks.isFeatureEnabled('shieldNoReinject'), Boolean(seed.featureFlags),
+      'precondition: the flag reads as seeded');
+    if (expectReinjection) {
+      assert.ok(reinjected.length >= 1,
+        'flag off must stay byte-for-byte what shipped: every wake sweeps the open tabs');
+    } else {
+      assert.deepEqual(reinjected, [],
+        'an unchanged registration must not re-evaluate the bundle in a live page');
+    }
+
+    assert.equal(second.hooks.FEATURE_DEFAULTS.shieldNoReinject, false,
+      'default OFF in the release that introduces it');
+  });
+}

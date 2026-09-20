@@ -1,12 +1,25 @@
 /**
  * Bullseye regression suite for the YouTube shield sync module.
  *
- * These are the seven scenarios from docs/IMPLEMENTATION.md §7 that, taken
- * together, would have prevented every YouTube outage in the project's git
- * history (see commits b327340, 3a35970, f9b4f39).
+ * These are the scenarios from docs/IMPLEMENTATION.md §7 that, taken together,
+ * would have prevented every YouTube outage in the project's git history (see
+ * commits b327340, 3a35970, f9b4f39).
  *
  * Each test wires a fresh chrome-stub into createYouTubeShieldSync and
  * asserts the observable side effects on stub.scripting.* and stub.calls.
+ *
+ * Numbering, honestly: these are *proxies* for §7's scenarios, which describe a
+ * real browser (`tests/regression/youtube/` does not exist). 1 through 6 line
+ * up. Test 7 below does NOT: §7's #7 is "upgrade in place" — install v(N-1),
+ * browse YouTube, reload the extension, verify blocking continues with no
+ * manual refresh — and nothing in this repository covers it. It is the other
+ * half of the case §7.9's extension-life sweep addresses, so it is the obvious
+ * gap to close next; it is recorded here rather than invented, because a
+ * convincing one needs a real extension reload, not a stub.
+ *
+ * `shieldNoReinject` (§5.18) changes when open tabs are injected into, so the
+ * scenarios that must be flag-independent run under both settings — see
+ * `FLAG_MODES`.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -22,13 +35,66 @@ const TARGETS = [
   { hostname: 'music.youtube.com', pattern: '*://music.youtube.com/*' },
 ];
 
+// The flag settings every scenario that must be flag-independent runs under.
+// `undefined` exercises the factory's own default (`() => false`).
+const FLAG_MODES = [
+  ['flag off', undefined],
+  ['flag on', (name) => name === 'shieldNoReinject'],
+];
+
+const SHIELD_ON = (name) => name === 'shieldNoReinject';
+
 // `isFeatureEnabled` is injected, not imported: this harness never assigns
 // `globalThis.chrome`, so a storage-backed flag read could not see the stub.
-// Left undefined, the factory's own default (`() => false`) applies — the
-// flag-off path is the one every numbered scenario below exercises.
-function setupHarness({ allowlist = new Set(), tabs = [], isFeatureEnabled } = {}) {
-  const stub = makeChromeStub();
+//
+// `stub` reuses an existing chrome-stub, which is how a *new service worker*
+// is simulated: the module's own state is gone (a new factory) but Chrome's
+// registration store and `storage.session` are not. Clearing
+// `stub.storage.session` on top of that is a new *extension* life.
+//
+// The three fault hooks make the failures `injectIntoOpenTabs` swallows
+// observable. They are mutable through the returned `faults` handle, so a test
+// can make a call fail on one sync and succeed on the next.
+function setupHarness({
+  allowlist = new Set(),
+  tabs = [],
+  isFeatureEnabled,
+  stub: existingStub = null,
+  failInject = null,
+  failQuery = false,
+  failFrames = null,
+} = {}) {
+  const stub = existingStub || makeChromeStub();
   for (const tab of tabs) stub.tabs._addTab(tab);
+
+  if (!stub._faults) {
+    stub._faults = { inject: null, query: false, frames: null };
+    // Each wrapper delegates first, so the attempt is recorded in `calls`
+    // exactly as a successful one would be, and only then rejects.
+    const realExec = stub.scripting.executeScript;
+    stub.scripting.executeScript = async (injection) => {
+      const out = await realExec.call(stub.scripting, injection);
+      if (stub._faults.inject?.(injection)) {
+        throw new Error('Cannot access contents of the page');
+      }
+      return out;
+    };
+    const realQuery = stub.tabs.query;
+    stub.tabs.query = async (filter) => {
+      const out = await realQuery.call(stub.tabs, filter);
+      if (stub._faults.query) throw new Error('Tabs cannot be queried right now');
+      return out;
+    };
+    const realFrames = stub.webNavigation.getAllFrames;
+    stub.webNavigation.getAllFrames = async (arg) => {
+      const out = await realFrames.call(stub.webNavigation, arg);
+      if (stub._faults.frames?.(arg?.tabId)) throw new Error('No tab with given id');
+      return out;
+    };
+  }
+  stub._faults.inject = failInject;
+  stub._faults.query = failQuery;
+  stub._faults.frames = failFrames;
 
   const allowlistRef = { current: new Set(allowlist) };
 
@@ -52,12 +118,15 @@ function setupHarness({ allowlist = new Set(), tabs = [], isFeatureEnabled } = {
     targets: TARGETS,
   });
 
-  return { stub, sync, allowlist: allowlistRef };
+  return { stub, sync, allowlist: allowlistRef, faults: stub._faults };
 }
 
 function execScriptCalls(stub) {
   return stub.calls.entries.filter((c) => c.api === 'scripting.executeScript');
 }
+
+const injectedTabIds = (stub) =>
+  execScriptCalls(stub).map((c) => c.target.tabId).sort((a, b) => a - b);
 
 test('1. cold install on a YT tab registers the shield and injects into the open tab', async () => {
   const { stub, sync } = setupHarness({
@@ -78,30 +147,36 @@ test('1. cold install on a YT tab registers the shield and injects into the open
   assert.deepEqual(injects[0].target, { tabId: 1 });
 });
 
-test('2. allowlist add on open YT tab updates excludeMatches without page reload', async () => {
-  const { stub, sync, allowlist } = setupHarness({
-    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+// Scenarios 2, 4 and 5 are about the registration's shape, which no flag may
+// touch. Running each under both settings costs nothing and proves it, and is
+// what closes the flag-on coverage gap the §5.18 second review found: with the
+// flag on, only #1, #3 and #6 were being exercised.
+for (const [mode, isFeatureEnabled] of FLAG_MODES) {
+  test(`2 (${mode}). allowlist add on open YT tab updates excludeMatches without page reload`, async () => {
+    const { stub, sync, allowlist } = setupHarness({
+      tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+      isFeatureEnabled,
+    });
+    await sync.syncRegistration();
+    stub.calls.clear();
+
+    // User toggles allowlist for youtube.com.
+    allowlist.current.add('youtube.com');
+    await sync.syncRegistration();
+
+    const registered = await stub.scripting.getRegisteredContentScripts();
+    assert.deepEqual(
+      registered[0].excludeMatches.sort(),
+      TARGETS.map((t) => t.pattern).sort()
+    );
+
+    // updateContentScripts must have been called (delta path), not full
+    // unregister + register.
+    const updates = stub.calls.entries.filter((c) => c.api === 'scripting.updateContentScripts');
+    const unregs = stub.calls.entries.filter((c) => c.api === 'scripting.unregisterContentScripts');
+    assert.equal(updates.length, 1, 'expected exactly one updateContentScripts call');
+    assert.equal(unregs.length, 0, 'must not have torn down the registration');
   });
-  await sync.syncRegistration();
-  stub.calls.clear();
-
-  // User toggles allowlist for youtube.com.
-  allowlist.current.add('youtube.com');
-  await sync.syncRegistration();
-
-  const registered = await stub.scripting.getRegisteredContentScripts();
-  assert.deepEqual(
-    registered[0].excludeMatches.sort(),
-    TARGETS.map((t) => t.pattern).sort()
-  );
-
-  // updateContentScripts must have been called (delta path), not full
-  // unregister + register.
-  const updates = stub.calls.entries.filter((c) => c.api === 'scripting.updateContentScripts');
-  const unregs = stub.calls.entries.filter((c) => c.api === 'scripting.unregisterContentScripts');
-  assert.equal(updates.length, 1, 'expected exactly one updateContentScripts call');
-  assert.equal(unregs.length, 0, 'must not have torn down the registration');
-});
 
 test('3. allowlist remove on open allowlisted YT tab re-injects without page reload', async () => {
   const { stub, sync, allowlist } = setupHarness({
@@ -128,49 +203,84 @@ test('3. allowlist remove on open allowlisted YT tab re-injects without page rel
   assert.deepEqual(injects[0].target, { tabId: 1 });
 });
 
-test('4. two YT tabs, allowlist toggle on one — both must reflect the new excludeMatches', async () => {
+  test(`4 (${mode}). two YT tabs, allowlist toggle on one — both must reflect the new excludeMatches`, async () => {
+    const { stub, sync, allowlist } = setupHarness({
+      tabs: [
+        { id: 1, url: 'https://www.youtube.com/' },
+        { id: 2, url: 'https://music.youtube.com/' },
+      ],
+      isFeatureEnabled,
+    });
+    await sync.syncRegistration();
+    stub.calls.clear();
+
+    allowlist.current.add('youtube.com');
+    await sync.syncRegistration();
+
+    // excludeMatches is per-registration, not per-tab — both tabs share state.
+    const registered = await stub.scripting.getRegisteredContentScripts();
+    assert.deepEqual(
+      registered[0].excludeMatches.sort(),
+      TARGETS.map((t) => t.pattern).sort()
+    );
+  });
+
+  test(`5 (${mode}). music.youtube.com allowlist isolates: www.youtube.com still receives shield`, async () => {
+    const { stub, sync } = setupHarness({
+      allowlist: ['music.youtube.com'],
+      tabs: [
+        { id: 1, url: 'https://www.youtube.com/' },
+        { id: 2, url: 'https://music.youtube.com/' },
+      ],
+      isFeatureEnabled,
+    });
+    await sync.syncRegistration();
+
+    const registered = await stub.scripting.getRegisteredContentScripts();
+    assert.deepEqual(
+      registered[0].excludeMatches,
+      ['*://music.youtube.com/*'],
+      'only music.youtube.com pattern should be excluded'
+    );
+
+    // music tab must not be injected; www tab must.
+    const targetTabIds = injectedTabIds(stub);
+    assert.ok(targetTabIds.includes(1), 'www tab must be injected');
+    assert.ok(!targetTabIds.includes(2), 'music tab must not be injected');
+  });
+}
+
+test('4b (flag on): two YT tabs, allowlist toggle on one — only the tab that changed state is touched', async () => {
+  // §7's #4 is about *per-tab* targeting, which the shared-registration case
+  // above cannot show: allowlisting "youtube.com" covers both tabs. Toggle the
+  // music subdomain only, with the flag on, and watch which tab is injected.
   const { stub, sync, allowlist } = setupHarness({
     tabs: [
       { id: 1, url: 'https://www.youtube.com/' },
       { id: 2, url: 'https://music.youtube.com/' },
     ],
+    isFeatureEnabled: SHIELD_ON,
   });
   await sync.syncRegistration();
+  assert.deepEqual(injectedTabIds(stub), [1, 2], 'both tabs shielded on the fresh registration');
   stub.calls.clear();
 
-  allowlist.current.add('youtube.com');
+  allowlist.current.add('music.youtube.com');
   await sync.syncRegistration();
 
-  // excludeMatches is per-registration, not per-tab — both tabs share state.
-  const registered = await stub.scripting.getRegisteredContentScripts();
-  assert.deepEqual(
-    registered[0].excludeMatches.sort(),
-    TARGETS.map((t) => t.pattern).sort()
-  );
-});
+  let registered = await stub.scripting.getRegisteredContentScripts();
+  assert.deepEqual(registered[0].excludeMatches, ['*://music.youtube.com/*']);
+  assert.deepEqual(injectedTabIds(stub), [1],
+    'the allowlisted tab must not be injected; the other must still be reachable');
 
-test('5. music.youtube.com allowlist isolates: www.youtube.com still receives shield', async () => {
-  const { stub, sync } = setupHarness({
-    allowlist: ['music.youtube.com'],
-    tabs: [
-      { id: 1, url: 'https://www.youtube.com/' },
-      { id: 2, url: 'https://music.youtube.com/' },
-    ],
-  });
+  stub.calls.clear();
+  allowlist.current.delete('music.youtube.com');
   await sync.syncRegistration();
 
-  const registered = await stub.scripting.getRegisteredContentScripts();
-  assert.deepEqual(
-    registered[0].excludeMatches,
-    ['*://music.youtube.com/*'],
-    'only music.youtube.com pattern should be excluded'
-  );
-
-  // music tab must not be injected; www tab must.
-  const injects = execScriptCalls(stub);
-  const targetTabIds = injects.map((c) => c.target.tabId);
-  assert.ok(targetTabIds.includes(1), 'www tab must be injected');
-  assert.ok(!targetTabIds.includes(2), 'music tab must not be injected');
+  registered = await stub.scripting.getRegisteredContentScripts();
+  assert.deepEqual(registered[0].excludeMatches, []);
+  assert.deepEqual(injectedTabIds(stub), [1, 2],
+    'removing the entry must bring the music tab back without a reload');
 });
 
 test('6. SW restart simulation: with persistAcrossSessions=true, a re-registration with same shape is a no-op (shieldNoReinject on)', async () => {
@@ -272,12 +382,180 @@ test('5.18: the flag is read on every sync, not captured when the module is crea
   flag.current = true;
   stub.calls.clear();
   await sync.syncRegistration();
+  // §7.9 — the first sync after the flag comes on still sweeps, and marks the
+  // extension life as swept. Nothing had marked it: Rule 2 keeps the flag-off
+  // path free of storage writes, so the syncs before this one left no trace,
+  // and the conservative answer to "has this life been swept?" is no. One
+  // redundant pass per flag flip, in exchange for never skipping a real one.
+  assert.deepEqual(injectedTabIds(stub), [1], 'the first flag-on sync sweeps and marks the life');
+
+  stub.calls.clear();
+  await sync.syncRegistration();
   assert.equal(execScriptCalls(stub).length, 0, 'flag on at sync time: no re-injection');
 
   flag.current = false;
   stub.calls.clear();
   await sync.syncRegistration();
   assert.equal(execScriptCalls(stub).length, 1, 'flag off again: re-injection resumes');
+});
+
+// ---------------------------------------------------------------------------
+// §7.9 — the same-registration branch is the only repair path for a YouTube
+// document the persisted registration never actually reached, and with
+// `shieldNoReinject` on it was removed outright. `registerContentScripts` and
+// `injectIntoOpenTabs` are the only two ways the shield ever enters a page, so
+// when both are skipped the tab stays unshielded until the user navigates:
+// ads playing with the extension enabled and the popup saying the site is not
+// allowlisted. Repair is now bounded, so §5.18's win survives (test 6 and
+// "a new worker in the same extension life", below, pin that).
+// ---------------------------------------------------------------------------
+
+test('7.9 (flag on): a tab whose injection was swallowed is repaired on the next sync', async () => {
+  const { stub, sync, faults } = setupHarness({
+    tabs: [
+      { id: 1, url: 'https://www.youtube.com/' },
+      { id: 2, url: 'https://music.youtube.com/' },
+    ],
+    isFeatureEnabled: SHIELD_ON,
+    // Tab 1 is mid-navigation when the first sync runs — the real shape of
+    // bullseye #1, "fresh install with a YouTube tab already open".
+    failInject: (injection) => injection.target.tabId === 1,
+  });
+
+  await sync.syncRegistration();
+  assert.deepEqual(injectedTabIds(stub), [1, 2], 'both were attempted');
+
+  faults.inject = null; // the transient condition clears
+  stub.calls.clear();
+  await sync.syncRegistration();
+
+  assert.deepEqual(injectedTabIds(stub), [1],
+    'the tab the failed injection missed must be repaired, and only that tab');
+
+  stub.calls.clear();
+  await sync.syncRegistration();
+  assert.equal(execScriptCalls(stub).length, 0,
+    'once repaired, §5.18 holds again: no re-injection on a clean wake');
+});
+
+test('7.9 (flag on): a failed tabs.query makes the next sync sweep rather than skip', async () => {
+  const { stub, sync, faults } = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: SHIELD_ON,
+    failQuery: true,
+  });
+
+  await sync.syncRegistration();
+  assert.equal(execScriptCalls(stub).length, 0, 'the query failed, so no tab was reached');
+
+  faults.query = false;
+  stub.calls.clear();
+  await sync.syncRegistration();
+
+  assert.deepEqual(injectedTabIds(stub), [1],
+    'a query failure hides which tabs were missed, so the next sync sweeps');
+});
+
+test('7.9 (flag on): a tab whose frame list could not be read is repaired', async () => {
+  // A getAllFrames rejection degrades to the tab-URL path, which reaches the
+  // top frame only — the sub-frames the registration covers are missed.
+  const { stub, sync, faults } = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: SHIELD_ON,
+    failFrames: (tabId) => tabId === 1,
+  });
+
+  await sync.syncRegistration();
+  stub.calls.clear();
+
+  faults.frames = null;
+  stub.webNavigation._setFrames(1, [
+    { frameId: 0, url: 'https://www.youtube.com/' },
+    { frameId: 7, url: 'https://www.youtube.com/embed/x' },
+  ]);
+  await sync.syncRegistration();
+
+  const frameIds = execScriptCalls(stub).map((c) => c.target.frameIds?.[0]).sort();
+  assert.deepEqual(frameIds, [0, 7], 'both frames must be reached on the repair pass');
+});
+
+test('7.9 (flag on): the first sync of a new extension life sweeps the open tabs', async () => {
+  const first = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: SHIELD_ON,
+  });
+  await first.sync.syncRegistration();
+  first.stub.calls.clear();
+
+  // The extension is disabled and re-enabled (or updated, or its process
+  // killed): Chrome keeps the persisted registration, `storage.session` is
+  // cleared, and a tab may have loaded during the gap with no registration in
+  // force at all. `sameRegistration` is true, so nothing else would touch it.
+  await first.stub.storage.session.clear();
+  const next = setupHarness({ stub: first.stub, isFeatureEnabled: SHIELD_ON });
+
+  await next.sync.syncRegistration();
+
+  assert.deepEqual(injectedTabIds(next.stub), [1],
+    'a document loaded while no registration was in force must be repaired');
+});
+
+test('7.9 (flag on, didn\'t re-break §5.18): a new worker in the same extension life does not sweep', async () => {
+  const first = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+    isFeatureEnabled: SHIELD_ON,
+  });
+  await first.sync.syncRegistration();
+  first.stub.calls.clear();
+
+  // Worker killed and woken: the module's state is gone, `storage.session`
+  // survives. This is the every-wake case §5.18 exists to remove, and it must
+  // stay removed — otherwise the repair has simply undone the fix.
+  const next = setupHarness({ stub: first.stub, isFeatureEnabled: SHIELD_ON });
+  await next.sync.syncRegistration();
+
+  assert.equal(execScriptCalls(next.stub).length, 0,
+    'a persisted registration must not be re-evaluated in every open tab on every wake');
+});
+
+test('7.9 (flag on): a repair id for a tab that has closed is dropped, not retried forever', async () => {
+  const { stub, sync, faults } = setupHarness({
+    tabs: [
+      { id: 1, url: 'https://www.youtube.com/' },
+      { id: 2, url: 'https://www.youtube.com/watch?v=x' },
+    ],
+    isFeatureEnabled: SHIELD_ON,
+    failInject: (injection) => injection.target.tabId === 2,
+  });
+  await sync.syncRegistration();
+
+  faults.inject = null;
+  stub.tabs._removeTab(2); // the user closes the tab that was missed
+  stub.calls.clear();
+  await sync.syncRegistration();
+  assert.equal(execScriptCalls(stub).length, 0, 'a closed tab cannot be repaired');
+
+  stub.calls.clear();
+  await sync.syncRegistration();
+  const queries = stub.calls.entries.filter((c) => c.api === 'tabs.query');
+  assert.deepEqual(queries, [],
+    'the stale id must have been dropped, so a later wake costs not even a tab query');
+});
+
+test('6c (flag off): the whole path reads and writes no session storage', async () => {
+  // Rule 2: with the flag off the path must be byte-for-byte what shipped, so
+  // the extension-life marker must not be written on any sync — not just not
+  // read on the second one.
+  const { stub, sync } = setupHarness({
+    tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
+  });
+  await sync.syncRegistration();
+  await sync.syncRegistration();
+
+  const storageCalls = stub.calls.entries.filter((c) => String(c.api).startsWith('storage.'));
+  assert.deepEqual(storageCalls, [], 'flag off must touch no storage at all');
+  assert.deepEqual(injectedTabIds(stub), [1, 1],
+    'and must still inject on both syncs, as it does today');
 });
 
 test('7. concurrent sync calls are sequenced, not raced', async () => {

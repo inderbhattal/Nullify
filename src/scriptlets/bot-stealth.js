@@ -1,4 +1,4 @@
-import { maskNative } from './shared-utils.js';
+import { defineNavigatorValue, maskNative } from './shared-utils.js';
 
 /**
  * bot-stealth.js
@@ -21,23 +21,6 @@ const GPU_BY_PERSONA = {
     renderer: 'Mesa DRI Intel(R) UHD Graphics 620 (KBL GT2)',
   },
 };
-
-function defineGetter(target, key, getter) {
-  try {
-    Object.defineProperty(target, key, {
-      configurable: true,
-      get: getter,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function defineNavigatorValue(key, value) {
-  if (defineGetter(Navigator.prototype, key, () => value)) return;
-  defineGetter(navigator, key, () => value);
-}
 
 // Wrappers we installed. A WeakSet is invisible to the page, unlike the old
 // `__nullifyPatched` own property (`Object.keys(getParameter)` revealed it).

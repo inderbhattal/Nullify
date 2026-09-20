@@ -1,21 +1,5 @@
 import { buildNavigatorPersona, detectChromeMajor } from '../shared/personas.js';
-
-function defineGetter(target, key, getter) {
-  try {
-    Object.defineProperty(target, key, {
-      configurable: true,
-      get: getter,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function defineNavigatorValue(key, value) {
-  if (defineGetter(Navigator.prototype, key, () => value)) return;
-  defineGetter(navigator, key, () => value);
-}
+import { defineNavigatorValue } from './shared-utils.js';
 
 // Module-scope guard. A global flag was page-writable — one inline script
 // setting it disabled the scriptlet — and enumerable via Object.keys(window).

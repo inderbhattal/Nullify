@@ -26,12 +26,15 @@
  * covered by the same comparison in `tests/youtube-shield.test.mjs`
  * (`DETECTOR_SNIPPET`).
  *
- * Out of scope (recorded in the plan, not fixed here): the local `defineGetter`
- * helpers in bot-stealth.js and persona-spoof.js install arrow-function
- * getters. Arrows carry no `prototype`, so §7.8's leak is not there, but they
- * are not masked (`name` is `''` and the source is the arrow's) and they land
- * non-enumerable where a WebIDL attribute is enumerable — the same class of
- * leak, a different fix, and persona-spoof.js is a different file's concern.
+ * §7.10 adds the navigator spoofs to the same treatment. bot-stealth.js and
+ * persona-spoof.js each carried a byte-identical local `defineGetter` that
+ * installed an *arrow* getter: no own `prototype`, so §7.8's leak was genuinely
+ * absent, but an empty `name` and the arrow's own source where a native getter
+ * reports `get <prop>` and `[native code]`. Both now go through one shared
+ * `defineNativeGetter`, which is exercised below both end to end (every surface
+ * the two scriptlets spoof) and directly (the cases the end-to-end sweep cannot
+ * reach: a property the platform does not have, and the prototype-chain lookup
+ * the locked-prototype fallback depends on).
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -47,11 +50,36 @@ class WebGLRenderingContextStub {
 }
 globalThis.WebGLRenderingContext = WebGLRenderingContextStub;
 
-globalThis.Navigator = class Navigator {};
+// A WebIDL attribute is an *enumerable* configurable accessor; a class getter
+// is not enumerable. Match the platform so "the descriptor shape does not
+// change" is actually being tested.
+function asIdlAttributes(proto, props) {
+  for (const prop of props) {
+    const desc = Object.getOwnPropertyDescriptor(proto, prop);
+    Object.defineProperty(proto, prop, { ...desc, enumerable: true });
+  }
+}
+
+// `Navigator.prototype` as the platform builds it. The empty `class Navigator
+// {}` the older scriptlet suites use cannot show any of this: with no native
+// accessor there is nothing for a spoofed one to be told apart from, and
+// `Object.defineProperty` has no existing attributes to preserve.
+class NavigatorStub {
+  get userAgent() { return 'Mozilla/5.0 (X11; Linux x86_64) RealBrowser/1.0'; }
+  get appVersion() { return '5.0 (X11; Linux x86_64) RealBrowser/1.0'; }
+  get platform() { return 'Linux x86_64'; }
+  get webdriver() { return true; }
+  get languages() { return []; }
+  get userAgentData() { return { brands: [], mobile: false, platform: 'Linux' }; }
+}
+asIdlAttributes(NavigatorStub.prototype, [
+  'userAgent', 'appVersion', 'platform', 'webdriver', 'languages', 'userAgentData',
+]);
+globalThis.Navigator = NavigatorStub;
 // Node ships a getter-only `navigator` global; replace it wholesale.
 Object.defineProperty(globalThis, 'navigator', {
   configurable: true,
-  value: new globalThis.Navigator(),
+  value: new NavigatorStub(),
 });
 
 class HTMLElementStub {
@@ -61,13 +89,7 @@ class HTMLElementStub {
   get offsetWidth() { return 0; }
   get offsetParent() { return null; }
 }
-// A WebIDL attribute is an *enumerable* configurable accessor; a class getter
-// is not enumerable. Match the platform so "the descriptor shape does not
-// change" is actually being tested.
-for (const prop of ['offsetHeight', 'offsetWidth', 'offsetParent']) {
-  const desc = Object.getOwnPropertyDescriptor(HTMLElementStub.prototype, prop);
-  Object.defineProperty(HTMLElementStub.prototype, prop, { ...desc, enumerable: true });
-}
+asIdlAttributes(HTMLElementStub.prototype, ['offsetHeight', 'offsetWidth', 'offsetParent']);
 globalThis.HTMLElement = HTMLElementStub;
 globalThis.document = { body: { tagName: 'BODY' } };
 
@@ -78,10 +100,24 @@ globalThis.getComputedStyle = ({
   },
 }).getComputedStyle;
 
-const { maskNative, proxyApply, wrapInstanceGetter } =
+const { defineNativeGetter, maskNative, proxyApply, wrapInstanceGetter } =
   await import('../src/scriptlets/shared-utils.js');
 const { botStealth } = await import('../src/scriptlets/bot-stealth.js');
 const { spoofCss } = await import('../src/scriptlets/spoof-css.js');
+const { personaSpoof } = await import('../src/scriptlets/persona-spoof.js');
+
+// Both navigator scriptlets carry a module-level "already applied" guard, so
+// they are applied once here rather than inside a test — otherwise every later
+// test would silently depend on which test ran first. The natives they replace
+// are captured before they run.
+const NATIVE_GET_PARAMETER = WebGLRenderingContextStub.prototype.getParameter;
+const NATIVE_NAVIGATOR = new Map(
+  Object.getOwnPropertyNames(NavigatorStub.prototype)
+    .filter((prop) => prop !== 'constructor')
+    .map((prop) => [prop, Object.getOwnPropertyDescriptor(NavigatorStub.prototype, prop)]),
+);
+botStealth('windows');
+personaSpoof('windows');
 
 // --- Generic shape assertions ----------------------------------------------
 
@@ -210,10 +246,7 @@ test('7.8 (pin): maskNative leaves a method-syntax wrapper indistinguishable', (
 // --- the two scriptlet call sites ------------------------------------------
 
 test('7.8: bot-stealth\'s WebGL wrapper is shaped like the native getParameter', () => {
-  const native = WebGLRenderingContextStub.prototype.getParameter;
-
-  botStealth('windows');
-
+  const native = NATIVE_GET_PARAMETER;
   const wrapped = WebGLRenderingContextStub.prototype.getParameter;
   assert.notEqual(wrapped, native, 'the GPU spoof must be installed');
   assertIndistinguishable(wrapped, native, 'WebGLRenderingContext.prototype.getParameter');
@@ -221,6 +254,97 @@ test('7.8: bot-stealth\'s WebGL wrapper is shaped like the native getParameter',
   const ctx = new WebGLRenderingContextStub();
   assert.equal(wrapped.call(ctx, 37445), 'Google Inc. (Intel)', 'the vendor spoof must still answer');
   assert.equal(wrapped.call(ctx, 1), 'real:1', 'an unspoofed parameter must still reach the original');
+});
+
+// --- §7.10: the navigator spoofs ------------------------------------------
+//
+// bot-stealth.js and persona-spoof.js each carried a byte-identical local
+// `defineGetter` that installed an *arrow* getter with a partial descriptor.
+// Arrows have no `prototype`, so §7.8's leak is genuinely absent — but the
+// accessor still reported an empty `name` and its own source where a native
+// reports `get <prop>` and `[native code]`, on `navigator.userAgent`,
+// `.webdriver` and the four other surfaces an anti-automation check reads
+// first. Everything is derived from the before/after descriptors rather than
+// a hard-coded list, so a surface added to either scriptlet is covered here
+// the day it is added.
+
+test('7.10: every navigator surface the scriptlets spoof stays shaped like the native', () => {
+  // Non-vacuity: if the spoofs stopped applying, the loop below would have
+  // nothing to check and would pass.
+  for (const prop of ['userAgent', 'platform', 'webdriver']) {
+    assert.notEqual(
+      Object.getOwnPropertyDescriptor(NavigatorStub.prototype, prop).get,
+      NATIVE_NAVIGATOR.get(prop).get,
+      `${prop} must actually be spoofed for this test to mean anything`,
+    );
+  }
+
+  let checked = 0;
+  for (const [prop, native] of NATIVE_NAVIGATOR) {
+    const after = Object.getOwnPropertyDescriptor(NavigatorStub.prototype, prop);
+    if (after.get === native.get) continue; // this surface is not spoofed
+    checked += 1;
+    assertIndistinguishable(after.get, native.get, `get Navigator.prototype.${prop}`);
+    assertAccessorDescriptor(
+      NavigatorStub.prototype, prop, native, `get Navigator.prototype.${prop}`,
+    );
+  }
+  assert.ok(checked >= 6, `expected every spoofed surface to be checked; saw ${checked}`);
+
+  // The spoofs must land on the prototype: a real browser's `navigator` has no
+  // own properties at all, so one appearing there is the §4.4 instance leak.
+  assert.deepEqual(Object.getOwnPropertyNames(navigator), [],
+    'nothing may land as an own property of the navigator instance');
+});
+
+test('7.10: defineNativeGetter takes the descriptor from the prototype chain, not the own slot', () => {
+  // The locked-prototype fallback defines on the instance, whose own
+  // descriptor list is empty — the native to copy lives on the prototype. Read
+  // only the own slot and `enumerable` silently defaults to false.
+  const proto = {};
+  const writes = [];
+  Object.defineProperty(proto, 'thing', {
+    get() { return 'native'; },
+    set(v) { writes.push(v); },
+    enumerable: true,
+    configurable: true,
+  });
+  const native = Object.getOwnPropertyDescriptor(proto, 'thing');
+  const instance = Object.create(proto);
+
+  assert.equal(defineNativeGetter(instance, 'thing', () => 'spoofed'), true);
+
+  const desc = Object.getOwnPropertyDescriptor(instance, 'thing');
+  assert.equal(instance.thing, 'spoofed', 'the spoof must answer');
+  assert.equal(desc.enumerable, true,
+    'enumerability must come from the prototype, not default to false');
+  assert.equal(desc.configurable, true);
+  assert.equal(desc.set, native.set, 'the native setter must be carried over, not dropped');
+  instance.thing = 'written';
+  assert.deepEqual(writes, ['written'], 'and must still receive writes');
+  assertIndistinguishable(desc.get, native.get, 'get instance.thing');
+});
+
+test('7.10: defineNativeGetter gives a property the platform lacks the shape one would have', () => {
+  const target = {};
+
+  assert.equal(defineNativeGetter(target, 'invented', () => 7), true);
+
+  const desc = Object.getOwnPropertyDescriptor(target, 'invented');
+  assert.equal(target.invented, 7, 'the spoof must answer');
+  assert.equal(desc.enumerable, true, 'a WebIDL attribute is enumerable');
+  assert.equal(desc.configurable, true, 'and configurable');
+  assert.equal(desc.get.name, 'get invented', 'named the way the platform names a getter');
+  assert.equal(desc.get.length, 0);
+  assert.equal(Object.prototype.hasOwnProperty.call(desc.get, 'prototype'), false,
+    'still method syntax — no own prototype (§7.8)');
+  assert.throws(() => new desc.get(), TypeError, 'and not constructible');
+});
+
+test('7.10: defineNativeGetter reports failure rather than throwing on a locked target', () => {
+  const target = Object.freeze({});
+  assert.equal(defineNativeGetter(target, 'nope', () => 1), false,
+    'a frozen target must yield false, which is what drives the instance fallback');
 });
 
 test('7.8: spoof-css\'s wrappers are shaped like the natives they replace', () => {

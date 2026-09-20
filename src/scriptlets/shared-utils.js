@@ -409,6 +409,10 @@ function installToStringMask() {
 /**
  * Make `wrapper` report `native`'s source, name and arity.
  * Returns `wrapper` so it can be used inline.
+ *
+ * `wrapper` must be built with method syntax (`({ m() {…} }).m`): an ordinary
+ * function's own `prototype` is non-configurable, so this helper cannot remove
+ * it, and a native method or getter has none (§7.8).
  */
 export function maskNative(wrapper, native) {
   if (typeof wrapper !== 'function' || typeof native !== 'function') return wrapper;
@@ -484,6 +488,80 @@ export function wrapInstanceGetter(proto, prop, transform) {
     return false;
   }
   return true;
+}
+
+/** `Object.getOwnPropertyDescriptor`, but walking the prototype chain. */
+function findPropertyDescriptor(target, prop) {
+  try {
+    for (let o = target; o !== null && o !== undefined; o = Object.getPrototypeOf(o)) {
+      const desc = Object.getOwnPropertyDescriptor(o, prop);
+      if (desc !== undefined) return desc;
+    }
+  } catch { /* exotic or revoked target */ }
+  return undefined;
+}
+
+/**
+ * Define `prop` on `target` as a getter a page cannot tell from the platform's.
+ *
+ * §7.10 — bot-stealth.js and persona-spoof.js each had their own copy of this,
+ * installing an arrow getter with a partial descriptor. Two things gave those
+ * away, both on surfaces an anti-automation check reads first: an arrow reports
+ * its own source and an empty `name`, where a native getter reports
+ * `[native code]` and `get <prop>`. A third only bites sometimes, which is why
+ * it is easy to get wrong: `Object.defineProperty` preserves the attributes it
+ * is not given only when the property *already exists*, so replacing
+ * `navigator.userAgent` keeps its `enumerable: true`, but defining a property
+ * the platform does not have — or defining one on the instance, which is what
+ * the locked-prototype fallback does — silently lands non-enumerable where
+ * every WebIDL attribute is enumerable. The native descriptor is therefore
+ * copied from wherever it lives on the chain rather than assumed.
+ *
+ * @param {object} target Where to define it. A prototype for preference: an
+ *   own property on an instance is itself visible to a page (§4.4).
+ * @param {string} prop
+ * @param {() => any} read Called on every get.
+ * @returns {boolean} whether the definition was installed.
+ */
+export function defineNativeGetter(target, prop, read) {
+  const native = findPropertyDescriptor(target, prop);
+  // Method syntax, not an arrow: §7.8, and `maskNative` needs a real function
+  // to hang the name and the source off.
+  const getter = ({
+    get() { return read(); },
+  }).get;
+  if (typeof native?.get === 'function') {
+    maskNative(getter, native.get);
+  } else {
+    // Nothing native to copy from — name it the way the platform would.
+    try {
+      Object.defineProperty(getter, 'name', { value: `get ${prop}`, configurable: true });
+    } catch { /* frozen */ }
+  }
+  try {
+    Object.defineProperty(target, prop, {
+      get: getter,
+      set: native?.set,
+      enumerable: native?.enumerable ?? true,
+      configurable: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spoof `navigator[key]` to a constant.
+ *
+ * `Navigator.prototype` first, so the `navigator` instance keeps the empty own
+ * property list a real browser has. The instance is the fallback for a locked
+ * prototype: the own property it leaves is a tell of its own, but a spoof that
+ * does not apply is worse.
+ */
+export function defineNavigatorValue(key, value) {
+  if (defineNativeGetter(Navigator.prototype, key, () => value)) return true;
+  return defineNativeGetter(navigator, key, () => value);
 }
 
 // ---------------------------------------------------------------------------

@@ -241,6 +241,7 @@ const FEATURE_DEFAULTS = Object.freeze({
   refreshCadenceV2: false, // §4.5 — A2a: Expires-driven refresh cadence
   rulesetDeltaApply: false, // §5.1 — A2b: apply only the static-ruleset delta
   privacyRulesDiff: false, // §5.2 — A2c: write only the privacy rules that changed
+  singleCssInjection: false, // §5.11 — A2f: report the early CSS so the content script can skip its copy
 });
 let cachedFeatureFlags = { ...FEATURE_DEFAULTS };
 let _featureFlagsPromise = null;
@@ -2794,6 +2795,8 @@ function schedulePersistTabStats() {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabStats.delete(tabId);
+  clearEarlyCssForTab(tabId); // §5.11
+
   // Delete again after the restore: closing a tab is one of the events that
   // wakes a terminated worker, and the restore would otherwise resurrect the
   // closed tab's entry from storage before the write-back (§4.14).
@@ -4560,6 +4563,14 @@ async function handleMessage(message, sender) {
           : cachedGenericProceduralRules,
       };
 
+      // §5.11 (A2f) — flag `singleCssInjection`. Present only under the flag,
+      // so with it off the reply is byte-for-byte what it was and the content
+      // script injects its own pair exactly as before.
+      if (isFeatureEnabled('singleCssInjection')) {
+        responseData.earlyCssApplied =
+          isEarlyCssApplied(sender.tab?.id, sender.frameId || 0, sender.url);
+      }
+
       if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
         try {
           // Base64, not the raw Uint8Array: runtime messages are JSON-
@@ -5065,6 +5076,59 @@ function isHostnameAllowedCached(hostname) {
  * Reusable core injection logic.
  * Ensures CSS is injected as early as possible.
  */
+// ---------------------------------------------------------------------------
+// §5.11 (A2f) — flag `singleCssInjection`. `performEarlyInjection` inserts the
+// page's cosmetic CSS as a user-origin sheet, and the content script inserted
+// the same text again as a `<style>` pair: two copies in every frame,
+// including third-party ad frames about to be blocked. GET_INIT_DATA now
+// reports whether this frame's user-origin sheet actually landed, and the
+// content script skips its pair when it did.
+//
+// Everything here is shaped by one asymmetry: an extension's user-origin
+// sheet is NOT visible in `document.styleSheets`, so the content script
+// cannot verify the claim, and `cachedGenericCss` reaches the page only
+// through this insertCSS. Reporting `true` wrongly therefore does not cost a
+// duplicate sheet — it costs the frame ALL of its cosmetic CSS. So:
+//   - the record is made only in the FULFILLED branch of the insertCSS (the
+//     production call swallows rejections, and Chrome rejects for a removed
+//     frame, a closed tab or a restricted page);
+//   - it is keyed per frame, because the content script runs in every frame
+//     and GET_INIT_DATA answers sub-frames;
+//   - it stores the document URL it was made for, and GET_INIT_DATA matches
+//     it against `sender.url`. A document_start content script can ask before
+//     the worker has processed that frame's `onCommitted` — both wake the
+//     worker and the order is not guaranteed — so a bare boolean could hand a
+//     new document the previous one's `true`, whose sheet died with it.
+// Every failure mode above resolves to `false`, i.e. one duplicated sheet in
+// that frame, which is exactly what shipped before this flag.
+// ---------------------------------------------------------------------------
+const MAX_EARLY_CSS_FRAMES = 200;
+const earlyCssFrames = new Map(); // `${tabId}:${frameId}` -> document URL
+
+const earlyCssKey = (tabId, frameId) => `${tabId}:${frameId}`;
+
+function markEarlyCssApplied(tabId, frameId, urlStr) {
+  const key = earlyCssKey(tabId, frameId);
+  // Bounded: a page that opens frames without end must not grow this map.
+  // Evicting a live record only ever costs a duplicated sheet.
+  if (!earlyCssFrames.has(key) && earlyCssFrames.size >= MAX_EARLY_CSS_FRAMES) {
+    earlyCssFrames.delete(earlyCssFrames.keys().next().value);
+  }
+  earlyCssFrames.set(key, urlStr);
+}
+
+function isEarlyCssApplied(tabId, frameId, urlStr) {
+  return typeof urlStr === 'string' &&
+    earlyCssFrames.get(earlyCssKey(tabId, frameId)) === urlStr;
+}
+
+function clearEarlyCssForTab(tabId) {
+  const prefix = `${tabId}:`;
+  for (const key of earlyCssFrames.keys()) {
+    if (key.startsWith(prefix)) earlyCssFrames.delete(key);
+  }
+}
+
 async function performEarlyInjection(tabId, frameId, urlStr) {
   if (!urlStr?.startsWith('http')) return;
   let url;
@@ -5102,11 +5166,19 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
   ].filter(Boolean).join('\n');
 
   if (cssText) {
+    // §5.11 — `.then(onFulfilled, onRejected)` rather than `.catch`: the
+    // rejection stays swallowed exactly as before, but the record is made
+    // only on the fulfilled path. An awaited `.catch(() => {})` resolves for
+    // a failed injection too, and a record placed after it would report
+    // `true` for a frame that has no CSS.
     await chrome.scripting.insertCSS({
       target: { tabId, frameIds: [frameId] },
       css: cssText,
       origin: 'USER',
-    }).catch(() => { });
+    }).then(
+      () => { markEarlyCssApplied(tabId, frameId, urlStr); },
+      () => { }
+    );
   }
 }
 
@@ -5138,7 +5210,12 @@ async function handleBeforeNavigate(details) {
  * Stage 2: onCommitted (Reliability fallback)
  */
 async function handleCommitted(details) {
-  await performEarlyInjection(details.tabId, details.frameId || 0, details.url);
+  const frameId = details.frameId || 0;
+  // §5.11 — a commit means this frame is showing a NEW document, whose
+  // user-origin sheet does not exist yet. Drop the previous document's record
+  // before re-injecting so nothing can read it in between.
+  earlyCssFrames.delete(earlyCssKey(details.tabId, frameId));
+  await performEarlyInjection(details.tabId, frameId, details.url);
 }
 
 // Listener bodies route failures to reportError (§5.6): a persistent
@@ -5235,6 +5312,8 @@ export const __testHooks = {
   checkFilterListUpdates,
   getActiveRuleDataVersion: () => activeRuleDataVersion,
   performEarlyInjection,
+  earlyCssRecordCount: () => earlyCssFrames.size,
+  MAX_EARLY_CSS_FRAMES,
   handleBeforeNavigate,
   handleCommitted,
   db,

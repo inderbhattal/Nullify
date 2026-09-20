@@ -794,3 +794,209 @@ test("5.5 (didn't re-break): an ordinary navigation still warms the cache and in
 
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.11 (A2f, flag `singleCssInjection`) — the same CSS was
+// injected twice into every frame: once by `performEarlyInjection` as a
+// user-origin sheet, once by the content script as a `<style>` pair. The SW
+// half reports, per frame, whether its own injection actually landed, and
+// Track C's content half skips its pair when the answer is strictly `true`.
+//
+// The whole design rests on never reporting a true that is not real: an
+// extension's user-origin sheet is not visible in `document.styleSheets`, so
+// the content script cannot check, and `cachedGenericCss` reaches the page
+// ONLY through that one insertCSS — a wrong `true` turns "a duplicate sheet"
+// into "no cosmetic CSS at all" for that frame. So the record is made only in
+// the fulfilled branch of the un-swallowed insertCSS, it is keyed per frame
+// rather than per tab (GET_INIT_DATA answers sub-frames too), and it is tied
+// to the document it was made for.
+// ---------------------------------------------------------------------------
+
+const CSS_FLAG_ON = { featureFlags: { singleCssInjection: true } };
+const PAGE_URL = 'https://example.com/';
+const FRAME_URL = 'https://example.com/frame';
+
+/** A content-script sender for one frame of one tab. */
+function frameSender(tabId, frameId, url) {
+  return { url, tab: { id: tabId, url }, frameId };
+}
+
+const initData = (chrome, tabId, frameId, url) => chrome.runtime.sendMessage(
+  { type: 'GET_INIT_DATA', payload: {} }, frameSender(tabId, frameId, url));
+
+test('5.11: GET_INIT_DATA reports earlyCssApplied only after a successful insertCSS for that frame', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: CSS_FLAG_ON, awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  // Before the frame commits, nothing has been injected into it.
+  const before = await initData(chrome, 1, 0, PAGE_URL);
+  assert.equal(before.earlyCssApplied, false,
+    'a frame with no user-origin sheet yet must be told to inject its own');
+
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  assert.equal(chrome.calls.filter((c) => c.api === 'scripting.insertCSS').length, 1,
+    'precondition: the early injection happened');
+
+  const after = await initData(chrome, 1, 0, PAGE_URL);
+  assert.equal(after.earlyCssApplied, true,
+    'once the sheet is in, the content script must not add a second copy');
+  assert.match(after.cssText || '', /\.site-ad/,
+    'the reply still carries the CSS itself — the content script needs it for the procedural path');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.11: a frame whose insertCSS failed is never reported as applied', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: CSS_FLAG_ON, awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  // Chrome rejects for a frame that is gone, a closed tab or a restricted
+  // page. The production call swallows that rejection, so a record placed
+  // after the swallow would report `true` for a frame with no CSS at all.
+  const origInsertCSS = chrome.scripting.insertCSS;
+  chrome.scripting.insertCSS = async () => { throw new Error('Frame with ID 0 was removed.'); };
+
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  chrome.scripting.insertCSS = origInsertCSS;
+
+  const res = await initData(chrome, 1, 0, PAGE_URL);
+  assert.equal(res.earlyCssApplied, false,
+    'a failed injection must report false: this is the one direction that loses CSS instead of duplicating it');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.11: the record is per frame, not per tab', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: CSS_FLAG_ON, awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  // The top frame commits; the sub-frame has not been injected into.
+  // Deliberately the SAME url in both frames — a same-URL iframe is the case
+  // that isolates the KEY: with a per-tab key the sub-frame would match the
+  // parent's record and be told a sheet exists that it never received.
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+
+  const top = await initData(chrome, 1, 0, PAGE_URL);
+  const sub = await initData(chrome, 1, 3, PAGE_URL);
+  assert.equal(top.earlyCssApplied, true);
+  assert.equal(sub.earlyCssApplied, false,
+    'a sub-frame must not inherit its parent\'s injection — the content script runs in all frames');
+
+  // And once the sub-frame commits, it reports for itself.
+  await hooks.handleCommitted({ tabId: 1, frameId: 3, url: PAGE_URL });
+  assert.equal((await initData(chrome, 1, 3, PAGE_URL)).earlyCssApplied, true);
+  // A different tab's frame 0 is still its own frame.
+  assert.equal((await initData(chrome, 2, 0, PAGE_URL)).earlyCssApplied, false,
+    'another tab must not inherit it either');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.11: a new document in the same frame does not inherit the previous one\'s record', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: CSS_FLAG_ON, awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  assert.equal((await initData(chrome, 1, 0, PAGE_URL)).earlyCssApplied, true, 'precondition');
+
+  // The frame navigates. A document_start content script can ask before the
+  // worker has processed that frame's onCommitted — both wake the worker and
+  // the order is not guaranteed — so the record must not be consumable by a
+  // document it was not made for. A user-origin sheet does not survive the
+  // navigation, so reporting the old `true` here would leave the new document
+  // with no cosmetic CSS at all.
+  const next = await initData(chrome, 1, 0, 'https://example.com/other');
+  assert.equal(next.earlyCssApplied, false,
+    'a record must belong to one document; the next one starts with no sheet');
+
+  // And once that document commits, it gets its own record.
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: 'https://example.com/other' });
+  assert.equal((await initData(chrome, 1, 0, 'https://example.com/other')).earlyCssApplied, true);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.11: closing a tab drops its records and the map stays bounded', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: CSS_FLAG_ON, awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  await hooks.handleCommitted({ tabId: 1, frameId: 3, url: FRAME_URL });
+  await hooks.handleCommitted({ tabId: 2, frameId: 0, url: PAGE_URL });
+  assert.equal(hooks.earlyCssRecordCount(), 3);
+
+  chrome.tabs.onRemoved._fire(1);
+  assert.equal(hooks.earlyCssRecordCount(), 1, 'both of the closed tab\'s frames go');
+  assert.equal((await initData(chrome, 2, 0, PAGE_URL)).earlyCssApplied, true,
+    'and the surviving tab keeps its own');
+
+  // Bounded: a page that creates frames without end cannot grow the map.
+  for (let frameId = 100; frameId < 100 + hooks.MAX_EARLY_CSS_FRAMES + 50; frameId++) {
+    await hooks.handleCommitted({ tabId: 3, frameId, url: FRAME_URL });
+  }
+  assert.ok(hooks.earlyCssRecordCount() <= hooks.MAX_EARLY_CSS_FRAMES,
+    `the map must stay bounded, got ${hooks.earlyCssRecordCount()}`);
+  // Eviction can only ever lose a `true`, which costs a duplicate sheet.
+  assert.equal((await initData(chrome, 3, 100, FRAME_URL)).earlyCssApplied, false,
+    'an evicted record reports false — duplicate CSS, never missing CSS');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.11 (flag off): the reply is unchanged and the content script still injects', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+  assert.equal(hooks.FEATURE_DEFAULTS.singleCssInjection, false,
+    'default OFF in the release that introduces it');
+
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  assert.equal(chrome.calls.filter((c) => c.api === 'scripting.insertCSS').length, 1,
+    'the early injection is unconditional — the flag only changes what is reported');
+
+  const res = await initData(chrome, 1, 0, PAGE_URL);
+  assert.equal('earlyCssApplied' in res, false,
+    'with the flag off the reply carries no such field, exactly as before');
+  assert.match(res.cssText || '', /\.site-ad/, 'and the content script gets the CSS to inject itself');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.11: a reload of the same URL does not inherit the previous document\'s record', async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    seed: CSS_FLAG_ON, awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  await hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  assert.equal((await initData(chrome, 1, 0, PAGE_URL)).earlyCssApplied, true, 'precondition');
+
+  // F5. The URL is identical, so matching the document URL alone cannot tell
+  // the new document from the old one — the record has to be dropped when the
+  // frame commits, before the new sheet exists. Hold the injection so the
+  // question is asked inside exactly that window.
+  let releaseInsert;
+  const insertGate = new Promise((resolve) => { releaseInsert = resolve; });
+  const origInsertCSS = chrome.scripting.insertCSS.bind(chrome.scripting);
+  chrome.scripting.insertCSS = async (injection) => {
+    await insertGate;
+    return origInsertCSS(injection);
+  };
+
+  const reloading = hooks.handleCommitted({ tabId: 1, frameId: 0, url: PAGE_URL });
+  const duringReload = await initData(chrome, 1, 0, PAGE_URL);
+  assert.equal(duringReload.earlyCssApplied, false,
+    'a reload has no sheet until its own injection lands; the old document\'s record must already be gone');
+
+  releaseInsert();
+  await reloading;
+  chrome.scripting.insertCSS = origInsertCSS;
+  assert.equal((await initData(chrome, 1, 0, PAGE_URL)).earlyCssApplied, true,
+    'and once it lands, the reloaded document reports for itself');
+
+  hooks.cancelPendingStatsPersistForTest();
+});

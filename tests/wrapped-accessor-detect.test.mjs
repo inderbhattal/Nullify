@@ -383,7 +383,7 @@ test('7.8: spoof-css\'s wrappers are shaped like the natives they replace', () =
   assert.equal(wrappedGCS(match).display, 'block', 'the computed-style pair must still be spoofed');
 });
 
-// --- Masking that fails must say so ----------------------------------------
+// --- §9.19: masking that fails must say so ---------------------------------
 //
 // `maskNative` used to swallow a failed `Object.defineProperty` and hand the
 // wrapper back regardless, so a caller could install a function that still
@@ -396,7 +396,7 @@ test('7.8: spoof-css\'s wrappers are shaped like the natives they replace', () =
 // all — so every one of them deliberately ignores the result. The signal
 // exists so a future caller, and these tests, can see it.
 
-test('a wrapper that could not be masked is reported, not handed back', () => {
+test('9.19: a wrapper that could not be masked is reported, not handed back', () => {
   const native = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
   const wrapper = Object.freeze(({ get() { return 0; } }).get);
 
@@ -406,13 +406,13 @@ test('a wrapper that could not be masked is reported, not handed back', () => {
     'and the wrapper really is unmasked — the report is not spurious');
 });
 
-test('maskNative reports non-function arguments rather than returning them', () => {
+test('9.19: maskNative reports non-function arguments rather than returning them', () => {
   const native = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
   assert.equal(maskNative(null, native), null);
   assert.equal(maskNative(({ get() {} }).get, undefined), null);
 });
 
-test('proxyApply reports an assignment the owner silently ignored', () => {
+test('9.19: proxyApply reports an assignment the owner silently ignored', () => {
   // An assignment to a non-writable property throws only in strict mode; a
   // sloppy-mode realm — which is how the shield harness evaluates this module
   // — drops it silently, and an owner that traps `set` can drop it in any
@@ -426,7 +426,7 @@ test('proxyApply reports an assignment the owner silently ignored', () => {
   assert.equal(owner.m, target.m, 'and the original is still in place');
 });
 
-test('maskNative reports failure when the page has frozen Function.prototype', () => {
+test('9.19: maskNative reports failure when the page has frozen Function.prototype', () => {
   // The whole-bundle `Function.prototype.toString` proxy is what makes a
   // wrapper print as native code. A page that freezes `Function.prototype`
   // — a known anti-adblock move — defeats it for every wrapper at once, and

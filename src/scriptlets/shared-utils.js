@@ -403,12 +403,12 @@ function installToStringMask() {
   try {
     Function.prototype.toString = proxiedToString;
   } catch { /* frozen prototype — wrappers keep their own source */ }
-  // Read back rather than trusting the assignment. A frozen `Function.prototype`
-  // — a page can do that, and anti-adblock code does — throws here only in
-  // strict mode; evaluated as a classic script the assignment is dropped
-  // silently. This used to set `installedToString` on the next line either
-  // way, so the mask reported itself installed while every wrapper in the
-  // bundle went on printing its own source.
+  // §9.19 — read back rather than trusting the assignment. A frozen
+  // `Function.prototype` — a page can do that, and anti-adblock code does —
+  // throws here only in strict mode; evaluated as a classic script the
+  // assignment is dropped silently. This used to set `installedToString` on
+  // the next line either way, so the mask reported itself installed while
+  // every wrapper in the bundle went on printing its own source.
   if (Function.prototype.toString !== proxiedToString) return false;
   installedToString = proxiedToString;
   return true;
@@ -421,10 +421,10 @@ function installToStringMask() {
  * function's own `prototype` is non-configurable, so this helper cannot remove
  * it, and a native method or getter has none (§7.8).
  *
- * This used to swallow a failed `defineProperty` and hand the wrapper back
- * regardless, so a caller could install a function that still reports its own
- * `name`, or its own source when the page has frozen `Function.prototype`, and
- * believe it was hidden. No caller here can do anything useful with the
+ * §9.19 — this used to swallow a failed `defineProperty` and hand the wrapper
+ * back regardless, so a caller could install a function that still reports its
+ * own `name`, or its own source when the page has frozen `Function.prototype`,
+ * and believe it was hidden. No caller here can do anything useful with the
  * failure — an unmasked wrapper still intercepts, it is merely detectable,
  * which beats not intercepting at all — so they all ignore the result
  * deliberately rather than by accident. The signal is for the tests, and for a
@@ -478,9 +478,9 @@ export function proxyApply(owner, prop, handler) {
   } catch {
     return null;
   }
-  // Read back: an assignment to a non-writable property throws only in strict
-  // mode, and an owner that traps `set` can drop it in any mode. Either way
-  // nothing was installed, so reporting success would be a lie.
+  // §9.19 — read back: an assignment to a non-writable property throws only in
+  // strict mode, and an owner that traps `set` can drop it in any mode. Either
+  // way nothing was installed, so reporting success would be a lie.
   if (owner[prop] !== proxied) return null;
   return fn;
 }

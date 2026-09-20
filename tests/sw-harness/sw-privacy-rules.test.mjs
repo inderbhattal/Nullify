@@ -354,3 +354,36 @@ for (const [mode, seed] of [['flag off', {}], ['flag on', FLAG_ON]]) {
     hooks.cancelPendingStatsPersistForTest();
   });
 }
+
+// ---------------------------------------------------------------------------
+// §7.9 — UPDATE_SETTINGS is a partial merge by design (§5.33 removed the
+// whole-object writer precisely so two UI surfaces could not clobber each
+// other), but the merge itself was a read-modify-write outside any lock, so
+// two writes of DIFFERENT keys at once lost one of them: `stealthPersona`
+// came back `undefined` — the choice discarded outright, with no error.
+// ---------------------------------------------------------------------------
+
+for (const [mode, seed] of [['flag off', {}], ['flag on', FLAG_ON]]) {
+  test(`7.9: two settings keys written at once both survive (${mode})`, async () => {
+    const { chrome, hooks } = await loadServiceWorker({ seed, awaitReady: true });
+
+    const [resA, resB] = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'UPDATE_SETTINGS', payload: { stealthPersona: 'windows' } }),
+      chrome.runtime.sendMessage({ type: 'UPDATE_SETTINGS', payload: { cacheProtection: false } }),
+    ]);
+
+    assert.equal(resA.ok, true);
+    assert.equal(resB.ok, true);
+    const stored = chrome.storage.local._data().settings;
+    assert.deepEqual([stored.stealthPersona, stored.cacheProtection], ['windows', false],
+      `both writes must survive the read-modify-write, got: ${JSON.stringify(stored)}`);
+    // And DNR agrees with the settled settings, not with either half of them.
+    assert.equal(chrome.declarativeNetRequest._dynamic.has(PERSONA_RULE_ID), true,
+      'the persona the user chose must be live');
+    assert.equal(chrome.declarativeNetRequest._dynamic.has(CACHE_RULE_ID), false,
+      'and the cache rule the user turned off must be gone');
+    assert.equal(stored.enabled, true, 'untouched keys must survive both merges');
+
+    hooks.cancelPendingStatsPersistForTest();
+  });
+}

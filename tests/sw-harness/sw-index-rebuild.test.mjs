@@ -668,3 +668,45 @@ test('7.9: a boot and both appliers in flight at once all settle', { timeout: 10
 
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// §7.9 — SET_RULESET_ENABLED read the whole enabledRulesets map, changed one
+// key in its own copy and wrote the map back, all outside any lock. Two
+// toggles of DIFFERENT lists at once therefore lost one of them: the later
+// write clobbered the earlier one's key and the user's click came back on by
+// itself, with no error and nothing to indicate it. The allowlist and
+// user-filter writers have done their read-modify-write inside their chained
+// op since §4.6/§4.7 (`addAllowlistDomains`, `appendUserFilterLine`); this
+// path and UPDATE_SETTINGS were the two that never got it.
+// ---------------------------------------------------------------------------
+
+for (const [mode, seed] of [['flag off', {}], ['flag on', DELTA_ON]]) {
+  test(`7.9: two lists turned off at once both stay off (${mode})`, async () => {
+    const { chrome, hooks } = await loadServiceWorker({ seed, awaitReady: true });
+    const dnr = chrome.declarativeNetRequest;
+    assert.equal(dnr._staticEnabled.has('annoyances') && dnr._staticEnabled.has('malware'), true,
+      'precondition: both lists start enabled');
+
+    const [resA, resB] = await Promise.all([
+      chrome.runtime.sendMessage({
+        type: 'SET_RULESET_ENABLED', payload: { rulesetId: 'annoyances', enabled: false },
+      }),
+      chrome.runtime.sendMessage({
+        type: 'SET_RULESET_ENABLED', payload: { rulesetId: 'malware', enabled: false },
+      }),
+    ]);
+
+    assert.equal(resA.ok, true);
+    assert.equal(resB.ok, true);
+    const stored = chrome.storage.local._data().enabledRulesets;
+    assert.deepEqual([stored.annoyances, stored.malware], [false, false],
+      `both toggles must survive the read-modify-write, got: ${JSON.stringify(stored)}`);
+    assert.equal(dnr._staticEnabled.has('annoyances'), false,
+      'and a list the user turned off must actually be off in Chrome');
+    assert.equal(dnr._staticEnabled.has('malware'), false);
+    // The reply each caller got must not claim a list is on that is off.
+    assert.equal(resB.enabledMap.malware, false);
+
+    hooks.cancelPendingStatsPersistForTest();
+  });
+}

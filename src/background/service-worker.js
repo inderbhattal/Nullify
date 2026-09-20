@@ -3907,17 +3907,30 @@ function scheduleActiveIndexRebuild() {
   return _rebuildIndexPromise;
 }
 
-/** Enable or disable a static ruleset (or group) by ID. */
-async function setRulesetEnabled(rulesetId, enabled) {
-  const meta = normalizeEnabledRulesetsMap(
-    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
-  );
-  meta[rulesetId] = enabled;
-  await setStorage(StorageKeys.ENABLED_RULESETS, meta);
+/**
+ * Enable or disable a static ruleset (or group) by ID. Serialized store +
+ * apply, the shape `setAndApplyUserFilters` uses.
+ *
+ * §7.9 — the read-modify-write below used to sit outside the chain, so two
+ * toggles of DIFFERENT lists at once lost one of them: each read the whole
+ * map, changed its own key in its own copy, and the later write clobbered the
+ * earlier one's. The user's click came back on by itself, with no error.
+ * Inside the op it reads the map after the previous toggle has written it.
+ * Calls `_applyRulesetsNow` rather than `applyRulesets` because this IS the
+ * ruleset op — going through the wrapper would make the chain await itself.
+ */
+function setRulesetEnabled(rulesetId, enabled) {
+  return enqueueRulesetOp(async () => {
+    const meta = normalizeEnabledRulesetsMap(
+      (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
+    );
+    meta[rulesetId] = enabled;
+    await setStorage(StorageKeys.ENABLED_RULESETS, meta);
 
-  const enabledMap = await applyRulesets();
-  scheduleActiveIndexRebuild();
-  return enabledMap;
+    const enabledMap = await _applyRulesetsNow();
+    scheduleActiveIndexRebuild();
+    return enabledMap;
+  });
 }
 
 async function getEffectiveEnabledRulesetsMap() {
@@ -4574,11 +4587,21 @@ async function handleMessage(message, sender) {
       // comment explaining that it deliberately does not use it), and a
       // replace composed from one tab's possibly-stale DOM silently clobbers
       // concurrent edits made in the other surface.
-      const current = (await getStorage(StorageKeys.SETTINGS)) || {};
-      const merged = { ...current, ...(payload || {}) };
-      await setStorage(StorageKeys.SETTINGS, merged);
-      cachedSettings = merged;
-      await applyPrivacySettings();
+      // §7.9 — the merge is a read-modify-write and used to run outside the
+      // chain, so two writes of DIFFERENT keys at once lost one of them
+      // (`stealthPersona` came back undefined, the choice discarded, with no
+      // error). Serialized store + apply, the shape setAndApplyUserFilters
+      // uses; `_applyPrivacySettingsNow` because this IS the privacy op.
+      // The read stays strict: a failed read must not merge onto `{}` and
+      // write that over the user's settings (§3.1).
+      const merged = await enqueuePrivacyOp(async () => {
+        const current = (await getStorage(StorageKeys.SETTINGS)) || {};
+        const next = { ...current, ...(payload || {}) };
+        await setStorage(StorageKeys.SETTINGS, next);
+        cachedSettings = next;
+        await _applyPrivacySettingsNow();
+        return next;
+      });
       await refreshAllBadges();
       return { ok: true, settings: merged };
     }

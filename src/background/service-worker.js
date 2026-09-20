@@ -4032,6 +4032,14 @@ const scriptletDiagnostics = {
   unknown: new Map(),           // name -> misses observed in pages
   refusedUntrusted: new Map(),  // name -> specs refused by the trust gate
 };
+// REVIEW-2026-09 §5.4 — CHECK_SEMANTIC_AD counters. `attempted` counts texts
+// that passed validation and reached the engine call; `refused` counts the
+// ones the cap turned away. Plain totals, not per-key maps: the text itself is
+// renderer-controlled and must never become a diagnostic key. `refused`
+// climbing is the only signal that something is sending oversized text, which
+// is otherwise a silent defence.
+let semanticChecksAttempted = 0;
+let semanticChecksRefused = 0;
 
 function bumpScriptletDiagnostic(map, name, count) {
   const key = typeof name === 'string' ? name.slice(0, 100) : String(name).slice(0, 100);
@@ -4048,6 +4056,8 @@ function scriptletDiagnosticsSnapshot() {
     unknownTotal: total(scriptletDiagnostics.unknown),
     refusedUntrusted: toObject(scriptletDiagnostics.refusedUntrusted),
     refusedUntrustedTotal: total(scriptletDiagnostics.refusedUntrusted),
+    semanticChecksAttempted,
+    semanticChecksRefused,
   };
 }
 
@@ -4313,6 +4323,10 @@ function utf8ByteLength(text) {
 // a count per observer batch; anything past this is a compromised renderer
 // inflating the badge, not a page with a million ad slots.
 const MAX_CONTENT_BLOCKED_COUNT = 1_000;
+// §5.4 — UTF-16 units, the unit `String.length` counts. The Rust cap is
+// 4096 BYTES and one UTF-16 unit is at most 3 UTF-8 bytes, so 1024 here can
+// never produce a string the Rust side refuses (lib.rs asserts this).
+const MAX_SEMANTIC_TEXT_LENGTH = 1024;
 
 // ---------------------------------------------------------------------------
 // Sender privilege classes (REVIEW.md §2.3, REVIEW-2026-07 §6 row 2.3).
@@ -4724,8 +4738,22 @@ async function handleMessage(message, sender) {
     // anonymized, and no surface displayed either.
 
     case 'CHECK_SEMANTIC_AD': {
-      const { text } = payload;
-      if (!text) return { isAd: false };
+      // §5.4 — renderer-supplied text, and this type is SENDER_ANY. The cap
+      // belongs HERE rather than only in Rust: wasm-bindgen copies the whole
+      // string into linear memory BEFORE `is_semantic_ad` runs, so the Rust
+      // cap (MAX_SEMANTIC_TEXT_BYTES) refuses the scan but cannot prevent the
+      // copy or the permanent heap growth it causes. The content engine never
+      // sends more than 400 characters (cosmetic-engine.js:1084), so this is
+      // 2.5x the largest legitimate payload; 1024 UTF-16 units is at most
+      // 3072 UTF-8 bytes, so nothing forwarded here can hit the 4096-byte
+      // Rust cap. Refused quietly with `false`, never an error: a renderer
+      // must not be able to turn this into an error-report entry per call.
+      const text = payload?.text;
+      if (typeof text !== 'string' || text.length === 0 || text.length > MAX_SEMANTIC_TEXT_LENGTH) {
+        semanticChecksRefused++;
+        return { isAd: false };
+      }
+      semanticChecksAttempted++;
       return { isAd: wasmReady ? is_semantic_ad(text) : false };
     }
 
@@ -5055,10 +5083,12 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
 
   if (isHostnameAllowedCached(hostname)) return;
 
+  // §5.5 — no setCachedDomainRules here. getCosmeticBundleForPage caches the
+  // bundle itself, gated on the rebuild generation; re-seeding it from out
+  // here overrode that gate and kept exactly the bundles it had refused.
   let bundle = domainRulesCache.get(hostname);
   if (!bundle) {
     bundle = await getCosmeticBundleForPage(hostname);
-    setCachedDomainRules(hostname, bundle);
   }
 
   // Re-check after the awaits — the user may have allowlisted the site while
@@ -5098,9 +5128,9 @@ async function handleBeforeNavigate(details) {
     resetTabStats(details.tabId, details.url);
   }
 
+  // §5.5 — the pre-warm is the lookup's own gated cache write; see above.
   if (!domainRulesCache.has(hostname)) {
-    const bundle = await getCosmeticBundleForPage(hostname);
-    setCachedDomainRules(hostname, bundle);
+    await getCosmeticBundleForPage(hostname);
   }
 }
 
@@ -5194,6 +5224,7 @@ export const __testHooks = {
   },
   // Cosmetic index / navigation
   getCosmeticBundleForPage,
+  hasCachedDomainRules: (hostname) => domainRulesCache.has(hostname),
   buildPageBundle,
   queueActiveIndexRebuild,
   isActiveIndexRebuildInFlight,

@@ -1,19 +1,27 @@
 /**
  * Regression tests for the service-worker security pass:
- *  §2.3 (REVIEW.md) — privileged message types must require an extension-page
+ * Section numbers collide across the review documents, so each is qualified
+ * on first use here and bare afterwards.
+ *
+ *  REVIEW.md §2.3 — privileged message types must require an extension-page
  *        sender; `sender.id === chrome.runtime.id` also holds for content
  *        scripts in arbitrary pages and is not a privilege boundary.
- *  §4.13 — CONTENT_BLOCKED payloads are renderer-controlled and must be
- *        validated before they reach stats or the logger broadcast.
- *  §4.24 — boot key seeded non-configurable; strict registry verification.
- *  §4.25 — packed builds have no onRuleMatchedDebug; the SW must expose
- *        `networkStatsAvailable` so the UI can label counters honestly.
- *  §5.3 — IS_SITE_ALLOWED and GET_TAB_STATS were SENDER_ANY with only
- *        extension-page callers, so any renderer could ask whether an
+ *  REVIEW-2026-07 §4.13 — CONTENT_BLOCKED payloads are renderer-controlled and
+ *        must be validated before they reach stats or the logger broadcast.
+ *  REVIEW-2026-07 §4.24 — boot key seeded non-configurable; strict registry
+ *        verification.
+ *  REVIEW-2026-07 §4.25 — packed builds have no onRuleMatchedDebug; the SW must
+ *        expose `networkStatsAvailable` so the UI can label counters honestly.
+ *  REVIEW-2026-07 §5.4 — GET_TAB_STATS honored payload.tabId only for extension
+ *        pages; subsumed by REVIEW-2026-09 §5.3, which refuses the renderer at
+ *        the gate. (Not the same finding as REVIEW-2026-09 §5.4 below.)
+ *  REVIEW-2026-07 §5.5 — RUN_SCRIPTLETS / GET_SCRIPTLET_RULES are deleted (dead
+ *        attack surface).
+ *  REVIEW-2026-09 §5.3 — IS_SITE_ALLOWED and GET_TAB_STATS were SENDER_ANY with
+ *        only extension-page callers, so any renderer could ask whether an
  *        arbitrary hostname was allowlisted.
- *  §5.4 — GET_TAB_STATS honored payload.tabId only for extension pages;
- *        subsumed by §5.3, which refuses the renderer at the gate.
- *  §5.5 — RUN_SCRIPTLETS / GET_SCRIPTLET_RULES are deleted (dead attack surface).
+ *  REVIEW-2026-09 §5.4 — CHECK_SEMANTIC_AD accepted unbounded renderer text and
+ *        handed it straight to WASM.
  */
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -476,6 +484,102 @@ test('4.24: verifyScriptletRegistry refuses page-controlled registry shapes', as
     writable: false, configurable: false, enumerable: false,
   });
   assert.equal(verify(goodKey), true);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.4 — CHECK_SEMANTIC_AD is answerable to any renderer and
+// passed whatever text it was given straight to `is_semantic_ad`. 64 MB of `x`
+// held the worker for ~684 ms and left a permanent linear-memory high-water
+// mark behind. The cap has to live HERE, in the handler: wasm-bindgen copies
+// the whole string into linear memory BEFORE the export runs, so the Rust-side
+// cap (42a7ac3) refuses the scan but cannot prevent the copy or the growth.
+//
+// The content engine never sends more than 400 characters
+// (cosmetic-engine.js:1084 refuses above that), so 1024 UTF-16 units is 2.5x
+// the largest legitimate payload and only a bypassed renderer exceeds it.
+// ---------------------------------------------------------------------------
+
+const SEMANTIC_TEXT_CAP = 1024;
+
+test('5.4: CHECK_SEMANTIC_AD refuses over-long text without reaching the engine', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const fresh = hooks.scriptletDiagnosticsSnapshot();
+  assert.equal(fresh.semanticChecksAttempted, 0, 'precondition: nothing checked yet');
+  assert.equal(fresh.semanticChecksRefused, 0);
+
+  // Leading keyword: a text the scanner WOULD call an ad, so "false" is proof
+  // it never ran rather than proof the scan found nothing.
+  const oversized = `sponsored ${'x'.repeat(2 * 1024 * 1024)}`;
+  const res = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: oversized } }, contentScriptSender());
+
+  assert.equal(res.isAd, false, 'an oversized text is refused, not scanned');
+  assert.equal(res.error, undefined, 'and refused quietly — this is a renderer-reachable type');
+  const after = hooks.scriptletDiagnosticsSnapshot();
+  assert.equal(after.semanticChecksAttempted, 0,
+    'the text must never reach the engine call: that is where wasm-bindgen copies it into linear memory');
+  assert.equal(after.semanticChecksRefused, 1, 'and the refusal must be visible in diagnostics');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.4: the cap is 1024 UTF-16 units, counted the way the Rust side assumes', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const atCap = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: 'x'.repeat(SEMANTIC_TEXT_CAP) } },
+    contentScriptSender());
+  assert.equal(atCap.isAd, false);
+  assert.equal(hooks.scriptletDiagnosticsSnapshot().semanticChecksAttempted, 1,
+    'exactly at the cap must still be checked');
+
+  const overCap = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: 'x'.repeat(SEMANTIC_TEXT_CAP + 1) } },
+    contentScriptSender());
+  assert.equal(overCap.isAd, false);
+  assert.equal(hooks.scriptletDiagnosticsSnapshot().semanticChecksAttempted, 1,
+    'one unit over the cap must not be');
+
+  // UTF-16 units, not code points: the Rust cap is 4096 BYTES, and 1024 UTF-16
+  // units is at most 3072 UTF-8 bytes, so nothing this forwards can be refused
+  // there. A 3-byte character per unit is the worst case.
+  const worstCase = '\u4e2d'.repeat(SEMANTIC_TEXT_CAP);
+  assert.equal(worstCase.length, SEMANTIC_TEXT_CAP, 'one UTF-16 unit each');
+  assert.equal(new TextEncoder().encode(worstCase).length, 3 * SEMANTIC_TEXT_CAP,
+    'three UTF-8 bytes each — the worst case the Rust 4096-byte cap must still accept');
+  const cjk = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: worstCase } }, contentScriptSender());
+  assert.equal(cjk.isAd, false);
+  assert.equal(hooks.scriptletDiagnosticsSnapshot().semanticChecksAttempted, 2,
+    'the worst-case-byte text is still under the cap and must be forwarded');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test("5.4 (didn't re-break): a normal engine payload is still checked", async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  // What cosmetic-engine.js actually sends: at most 400 characters.
+  const realistic = 'Sponsored content you might like '.repeat(12).slice(0, 400);
+  assert.ok(realistic.length <= 400);
+  const res = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: realistic } }, contentScriptSender());
+
+  assert.equal(res.error, undefined);
+  assert.equal(res.isAd, false, 'WASM is down in the harness, so the answer is the fallback');
+  const snap = hooks.scriptletDiagnosticsSnapshot();
+  assert.equal(snap.semanticChecksAttempted, 1, 'a legitimate payload must still reach the engine call');
+  assert.equal(snap.semanticChecksRefused, 0, 'and must not be counted as refused');
+
+  // Empty and malformed payloads stay refusals, and must not throw: this type
+  // is renderer-reachable, so a missing payload must not become an error log.
+  for (const payload of [{}, { text: '' }, { text: 42 }, undefined]) {
+    const bad = await chrome.runtime.sendMessage({ type: 'CHECK_SEMANTIC_AD', payload }, contentScriptSender());
+    assert.deepEqual(bad, { isAd: false }, `payload ${JSON.stringify(payload)} must be a quiet false`);
+  }
 
   hooks.cancelPendingStatsPersistForTest();
 });

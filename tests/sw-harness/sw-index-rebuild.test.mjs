@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { drainTicks, loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
+import { drainTicks, loadServiceWorker, samplePackagedSources, waitFor } from './sw-loader.mjs';
 
 const SW_PATH = new URL('../../src/background/service-worker.js', import.meta.url);
 
@@ -710,3 +710,87 @@ for (const [mode, seed] of [['flag off', {}], ['flag on', DELTA_ON]]) {
     hooks.cancelPendingStatsPersistForTest();
   });
 }
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.5 — the navigation handlers re-seeded the memory cache
+// unconditionally. REVIEW-2026-07 §5.4 gated the `setCachedDomainRules` inside
+// `getCosmeticBundleForPage` on the rebuild generation, precisely so a bundle
+// computed against half-cleared stores is never kept; both navigation callers
+// then took the returned bundle and cached it anyway, overriding that
+// decision. The window is narrow — a lookup that resolves after the rebuild's
+// own `domainRulesCache.clear()` — but in it every later page load for that
+// hostname is served a bundle built from a half-cleared index, until the next
+// rebuild or worker death.
+// ---------------------------------------------------------------------------
+
+// Both navigation callers had the ungated write, and they are separate code
+// paths: onBeforeNavigate pre-warms, onCommitted injects. Drive each through
+// the same window, or deleting only one of the two passes the suite.
+const NAVIGATION_CALLERS = [
+  ['onBeforeNavigate', (hooks) => hooks.handleBeforeNavigate({
+    tabId: 1, frameId: 0, url: 'https://example.com/',
+  })],
+  ['onCommitted/performEarlyInjection', (hooks) => hooks.performEarlyInjection(
+    1, 0, 'https://example.com/',
+  )],
+];
+
+for (const [caller, navigate] of NAVIGATION_CALLERS) {
+  test(`5.5: a navigation during an in-flight rebuild leaves no cache entry (${caller})`, async () => {
+    const { hooks } = await loadServiceWorker({
+      awaitReady: true, packagedSources: samplePackagedSources(),
+    });
+    const db = hooks.db;
+    assert.equal(hooks.hasCachedDomainRules('example.com'), false, 'precondition: nothing cached');
+
+    // Park the navigation's lookup mid-read, so it resolves AFTER a rebuild
+    // has cleared the cache — the exact ordering the gate exists to catch.
+    let releaseLookup;
+    const lookupGate = new Promise((resolve) => { releaseLookup = resolve; });
+    let parked = 0;
+    const origGetCosmeticRules = db.getCosmeticRules.bind(db);
+    db.getCosmeticRules = async (domain) => {
+      parked++;
+      await lookupGate;
+      return origGetCosmeticRules(domain);
+    };
+
+    const navigating = navigate(hooks);
+    assert.equal(await waitFor(() => parked > 0), true, 'the lookup must be in flight');
+
+    // A full rebuild runs and completes while the lookup is parked: it bumps
+    // the generation and empties domainRulesCache on its way out.
+    await hooks.queueActiveIndexRebuild();
+
+    releaseLookup();
+    await navigating;
+    db.getCosmeticRules = origGetCosmeticRules;
+
+    assert.equal(hooks.hasCachedDomainRules('example.com'), false,
+      'a bundle the gated setter refused to keep must not be cached by its caller either');
+
+    hooks.cancelPendingStatsPersistForTest();
+  });
+}
+
+test("5.5 (didn't re-break): an ordinary navigation still warms the cache and injects", async () => {
+  const { chrome, hooks } = await loadServiceWorker({
+    awaitReady: true, packagedSources: samplePackagedSources(),
+  });
+
+  // onBeforeNavigate pre-warms so GET_INIT_DATA skips IndexedDB. With no
+  // rebuild in flight the gated setter inside getCosmeticBundleForPage owns
+  // that, and deleting the callers' own writes must not cost the warm-up.
+  await hooks.handleBeforeNavigate({ tabId: 1, frameId: 0, url: 'https://example.com/' });
+  assert.equal(hooks.hasCachedDomainRules('example.com'), true,
+    'a quiet navigation must still leave the bundle cached');
+
+  // And the injection path still gets real rules for the page.
+  await hooks.performEarlyInjection(1, 0, 'https://example.com/');
+  const injected = chrome.calls.filter((call) => call.api === 'scripting.insertCSS');
+  assert.equal(injected.length, 1, 'the early injection must still happen');
+  const bundle = await hooks.getCosmeticBundleForPage('example.com');
+  assert.match(bundle.cssText || '', /\.site-ad/, 'and it carries this site\'s rules');
+
+  hooks.cancelPendingStatsPersistForTest();
+});

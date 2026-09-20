@@ -29,8 +29,28 @@ fn public_suffixes() -> &'static HashSet<&'static str> {
     psl_generated::public_suffixes_generated()
 }
 
+/// REVIEW-2026-09 §5.12 — the list's three rules, in the order the PSL
+/// algorithm states them, matching `isPublicSuffix` in `src/shared/psl.js`.
+/// Membership alone was one label too permissive about ancestry under a
+/// wildcard base: `*.ck` makes `foo.ck` a suffix, and the JS side has said so
+/// since the generated tables landed.
 fn is_public_suffix(host: &str) -> bool {
-    host.is_empty() || public_suffixes().contains(host)
+    if host.is_empty() {
+        return true;
+    }
+    // An exception (`!www.ck`) wins outright: it names something a wildcard
+    // would otherwise cover and the list excepts back out.
+    if psl_generated::suffix_exceptions_generated().contains(host) {
+        return false;
+    }
+    if public_suffixes().contains(host) {
+        return true;
+    }
+    // A wildcard is exactly one label deep: `*.ck` covers `foo.ck` and stops.
+    match host.find('.') {
+        Some(idx) => psl_generated::wildcard_suffixes_generated().contains(&host[idx + 1..]),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3226,6 +3246,31 @@ mod tests {
         let tld = AllowlistMatcher::new("co.uk");
         assert!(tld.check("co.uk")); // exact only
         assert!(!tld.check("bbc.co.uk")); // never blankets the TLD
+    }
+
+    // REVIEW-2026-09 §5.12 (B3). Membership alone made the matcher one label
+    // more permissive about ancestry under a wildcard base than the JS side:
+    // `*.ck` is in the list, `foo.ck` is not, so the walk used to step through
+    // `foo.ck` and could reach an allowlist entry at `ck`. The exception rule
+    // has to be checked before membership, or `!www.ck` never wins.
+    #[test]
+    fn is_public_suffix_follows_the_lists_wildcard_and_exception_rules() {
+        assert!(is_public_suffix("ck")); // the wildcard base is a plain entry too
+        assert!(is_public_suffix("foo.ck")); // `*.ck`
+        assert!(!is_public_suffix("www.ck")); // `!www.ck` excepts it back out
+        assert!(!is_public_suffix("deep.foo.ck")); // a wildcard is one label deep
+
+        assert!(is_public_suffix("sch.uk")); // wildcard base, emitted as a plain entry
+        assert!(is_public_suffix("anyschool.sch.uk"));
+        assert!(!is_public_suffix("example.com"));
+        assert!(is_public_suffix("")); // the walk's terminator
+
+        // The walk must stop at a name a wildcard covers, so an entry at the
+        // base can never blanket everything under it.
+        let m = AllowlistMatcher::new("ck");
+        assert!(m.check("ck")); // exact membership still matches
+        assert!(!m.check("foo.ck"));
+        assert!(!m.check("deep.foo.ck"));
     }
 
     #[test]

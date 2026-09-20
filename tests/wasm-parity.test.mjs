@@ -822,3 +822,59 @@ test('5.4 (didn\'t re-break): text within the cap is classified as before, up to
   assert.equal(widest.length, 1024);
   assert.equal(wasm.is_semantic_ad(widest), true, '1024 three-byte characters');
 });
+
+// ---------------------------------------------------------------------------
+// §5.12 — the two suffix implementations must agree, not merely share a table
+// ---------------------------------------------------------------------------
+
+test('5.12: JS and Rust agree on every wildcard base and exception', { skip }, async () => {
+  // The generated tables are compared entry-for-entry in psl.test.mjs. This is
+  // the other half: the ALGORITHM reading them. Until B3 the Rust side answered
+  // from plain membership, so it disagreed for names one label under a wildcard
+  // base — reachable only here, because `is_public_suffix` is private and the
+  // allowlist matcher is the only export that consults it.
+  const { isPublicSuffix } = await import('../src/shared/psl.js');
+  // The tables stay module-private (a mutable Set of security data is not an
+  // export), so read them out of the generated source the way psl.test.mjs
+  // does rather than widening the module's surface for a test.
+  const source = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/shared/psl.js'), 'utf8');
+  const table = (name) => {
+    const m = new RegExp(`${name}\\s*=\\s*\`([^\`]*)\``, 's').exec(source);
+    assert.ok(m, `${name} not found in psl.js`);
+    return m[1].split('\n').map((l) => l.trim()).filter(Boolean);
+  };
+  const wildcards = table('WILDCARD_SUFFIX_DATA');
+  const exceptions = table('SUFFIX_EXCEPTION_DATA');
+  assert.ok(wildcards.length > 0 && exceptions.length > 0, 'both tables must be non-empty');
+
+  // One uniform probe for both tables. `is_public_suffix` is private and the
+  // allowlist matcher is the only export that consults it, so ask the question
+  // the matcher answers: an allowlist entry AT a name covers a child of that
+  // name only if the name is registrable. If the name is a public suffix the
+  // walk stops there and the child is not covered.
+  //   suffix      => check('x.' + H) === false
+  //   registrable => check('x.' + H) === true
+  // The first probe written here used the PARENT as the entry, which is wrong
+  // for an exception: `!city.kawasaki.jp` sits under the wildcard base
+  // `kawasaki.jp`, which IS a suffix, so the walk correctly stopped one level
+  // up and the test failed against correct code.
+  const rustSaysSuffix = (host) => {
+    const m = new wasm.AllowlistMatcher(host);
+    try {
+      return m.check(`nullifyprobe.${host}`) === false;
+    } finally {
+      m.free?.();
+    }
+  };
+
+  for (const base of wildcards) {
+    const child = `nullifytest.${base}`;
+    assert.equal(isPublicSuffix(child), true, `JS: ${child} is under the wildcard ${base}`);
+    assert.equal(rustSaysSuffix(child), true, `Rust must also treat ${child} as a suffix (wildcard ${base})`);
+  }
+  for (const host of exceptions) {
+    assert.equal(isPublicSuffix(host), false, `JS: ${host} is excepted back out`);
+    assert.equal(rustSaysSuffix(host), false, `Rust must also treat ${host} as registrable`);
+  }
+});

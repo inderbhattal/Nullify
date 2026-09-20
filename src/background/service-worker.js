@@ -1161,9 +1161,20 @@ async function isRuleIndexInterrupted() {
 }
 
 async function rebuildActiveRuleIndexFromStoredSources() {
-  const enabledMap = normalizeEnabledRulesetsMap(
-    await getStorageOrDefault(StorageKeys.ENABLED_RULESETS, {})
-  );
+  // §7.4(b) — this read used to degrade to `{}`, and `{}` normalizes to
+  // "every list on", so one transient fault silently rebuilt the index WITH
+  // the lists the user had turned off and left them there until the next
+  // rebuild. Chrome's own enabled set is the better answer: it is what the
+  // user's last successful toggle actually applied.
+  let storedEnabledRulesets;
+  try {
+    storedEnabledRulesets = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('ruleIndex:enabledRulesetsRead', err);
+    storedEnabledRulesets = await getEffectiveEnabledRulesetsMap();
+  }
+  const enabledMap = normalizeEnabledRulesetsMap(storedEnabledRulesets);
   const storedSources = await db.getAllFilterSources();
   const sourceMap = new Map(storedSources.map((entry) => [entry.listId, entry]));
   const activeSources = REMOTE_FILTER_LIST_IDS
@@ -3800,9 +3811,23 @@ function applyRulesets() {
 }
 
 async function _applyRulesetsNow() {
-  const enabledMap = normalizeEnabledRulesetsMap(
-    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
-  );
+  // §7.4(c) — a failed read here used to reject out of `ensureBackgroundSetup`
+  // and be reported as a FATAL error for the whole background setup, for
+  // something narrow and recoverable. Skip the apply instead: static rulesets
+  // persist across worker lives, so leaving them alone keeps the user's last
+  // applied state, whereas degrading the read to `{}` would enable every list
+  // the user turned off — the §3.1 shape. The effective map is returned so the
+  // caller reports what Chrome is actually enforcing rather than what was
+  // asked for.
+  let storedEnabledRulesets;
+  try {
+    storedEnabledRulesets = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('applyRulesets:storageRead', err);
+    return getEffectiveEnabledRulesetsMap();
+  }
+  const enabledMap = normalizeEnabledRulesetsMap(storedEnabledRulesets);
 
   const manifestRulesetIds = getManifestRulesetIds();
   const enableRulesetIds = [];
@@ -4429,6 +4454,29 @@ const NEEDS_CRITICAL_CACHE = new Set([
   'GET_INIT_DATA',
 ]);
 
+/**
+ * §7.4(a) — one shared retry of the memory caches, not one per waiting
+ * message: a re-read also re-runs the §4.7 DNR allowlist reconcile, so four
+ * messages arriving together must not issue four of them. A retry that fails
+ * again is swallowed — the handler then answers from the caches as they are,
+ * exactly as it did before this gate existed.
+ */
+let _cacheRetryPromise = null;
+
+function retryMemoryCaches() {
+  if (!_cacheRetryPromise) {
+    _cacheRetryPromise = refreshMemoryCache()
+      .catch((err) => { reportError('refreshMemoryCache:retry', err); })
+      .finally(() => { _cacheRetryPromise = null; });
+  }
+  return _cacheRetryPromise;
+}
+
+async function whenCriticalCachesUsable() {
+  if (!_criticalReady && _criticalPromise) await _criticalPromise;
+  if (!allowlistCacheTrusted) await retryMemoryCaches();
+}
+
 /** True when the message came from one of our own extension pages. */
 function isExtensionPageSender(sender) {
   return typeof sender?.url === 'string' &&
@@ -4512,8 +4560,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // "not allowlisted" for a site the user has allowlisted.
   const needsCache = NEEDS_CRITICAL_CACHE.has(message.type);
 
-  const run = needsCache && !_criticalReady
-    ? _criticalPromise.then(() => handleMessage(message, sender))
+  // §7.4(a) — waiting for `_criticalPromise` is not enough on its own.
+  // `refreshMemoryCache` marks the allowlist cache untrusted when ITS read
+  // failed and deliberately leaves every cache as it was (§3.1), and nothing
+  // consulted that flag: on a worker that booted through a read fault
+  // `cachedAllowlist` is empty, so every site the user allowlisted answered
+  // "not allowlisted" — cosmetic CSS injected into a protected page and the
+  // shield injected into an allowlisted YouTube tab, for the life of the
+  // worker. Retry the read before answering.
+  const run = needsCache && !(_criticalReady && allowlistCacheTrusted)
+    ? whenCriticalCachesUsable().then(() => handleMessage(message, sender))
     : handleMessage(message, sender);
 
   run.then(sendResponse).catch((err) => {

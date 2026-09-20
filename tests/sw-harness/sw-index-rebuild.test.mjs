@@ -626,11 +626,23 @@ test('5.1: a failed snapshot AND a failed batch still reset the union', async ()
 test('7.9: an apply that fails does not wedge the queue for the worker life', async () => {
   const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
 
-  // applyRulesets reads ENABLED_RULESETS strictly, so a transient storage
-  // fault rejects the op...
-  const fired = chrome.storage.local._failNextRead((keys) => keys.includes('enabledRulesets'));
-  await assert.rejects(() => hooks.applyRulesets(), /unexpected error/i);
-  assert.equal(fired(), true, 'the fault must have landed on the apply, or this test exercised nothing');
+  // §7.4(c) made a StorageReadError here non-fatal and non-rejecting on
+  // purpose, so the fault has to be one the apply does NOT absorb: anything
+  // that is not a StorageReadError is rethrown, and that is what reaches the
+  // chain. A `chrome.storage.local.get` that throws outright is the cheapest.
+  const origGet = chrome.storage.local.get;
+  let faultFired = false;
+  chrome.storage.local.get = (keys, cb) => {
+    const list = Array.isArray(keys) ? keys : [keys];
+    if (!faultFired && list.includes('enabledRulesets')) {
+      faultFired = true;
+      throw new Error('storage backend unavailable');
+    }
+    return origGet(keys, cb);
+  };
+  await assert.rejects(() => hooks.applyRulesets(), /storage backend unavailable/);
+  chrome.storage.local.get = origGet;
+  assert.equal(faultFired, true, 'the fault must have landed on the apply, or this test exercised nothing');
 
   // ...and the queue must still accept work afterwards. A chain that kept the
   // rejection would reject every later apply, so the options toggle would be

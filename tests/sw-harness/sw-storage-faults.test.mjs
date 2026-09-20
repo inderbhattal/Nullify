@@ -428,3 +428,131 @@ test('4.14: a failed read answers with the StorageReadError code, not just its t
 
   hooks.cancelPendingStatsPersistForTest();
 });
+
+// ---------------------------------------------------------------------------
+// REMEDIATION-2026-09 §7.4 — the three A1 second-review follow-ups. §3.1 made
+// every failed read stop degrading to "empty"; these are the three places that
+// then had a correct-but-unhelpful answer to a failed read.
+// ---------------------------------------------------------------------------
+
+const readsEnabledRulesets = (keys) => keys.length === 1 && keys[0] === 'enabledRulesets';
+
+test('7.4(a): a critical-path message retries an untrusted cache instead of answering from it', async () => {
+  const stub = makeChromeStub();
+  // The boot's refreshMemoryCache read fails, so `cachedAllowlist` stays empty
+  // and the worker marks the cache untrusted. Nothing consulted that flag, so
+  // the next IS_SITE_ALLOWED answered "no" for a site the user protected.
+  const fired = stub.storage.local._failNextRead(readsAllowlistBulk);
+  const { chrome, hooks } = await loadServiceWorker({
+    stub, seed: { allowlist: [...SEEDED] }, awaitReady: true,
+  });
+  assert.equal(fired(), true, 'precondition: the boot read failed');
+  assert.equal(hooks.isAllowlistCacheTrusted(), false, 'precondition: the cache is untrusted');
+
+  const res = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'bank.example' } });
+
+  assert.equal(res.allowed, true,
+    'a site the user allowlisted must not read as unprotected because one read failed');
+  assert.equal(hooks.isAllowlistCacheTrusted(), true, 'and the retry restores trust');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.4(a): the retry is shared, not one per waiting message', async () => {
+  const stub = makeChromeStub();
+  const fired = stub.storage.local._failNextRead(readsAllowlistBulk);
+  const { chrome, hooks } = await loadServiceWorker({
+    stub, seed: { allowlist: [...SEEDED] }, awaitReady: true,
+  });
+  assert.equal(fired(), true);
+  assert.equal(hooks.isAllowlistCacheTrusted(), false);
+
+  const bulkReadsBefore = chrome.calls.filter(
+    (c) => c.api === 'storage.get' && readsAllowlistBulk(Array.isArray(c.keys) ? c.keys : [c.keys])).length;
+
+  // Four messages arrive at once against the same untrusted cache.
+  const answers = await Promise.all([
+    chrome.runtime.sendMessage({ type: 'IS_SITE_ALLOWED', payload: { domain: 'bank.example' } }),
+    chrome.runtime.sendMessage({ type: 'IS_SITE_ALLOWED', payload: { domain: 'mail.example' } }),
+    chrome.runtime.sendMessage({ type: 'GET_ALLOWLIST' }),
+    chrome.runtime.sendMessage({ type: 'IS_SITE_ALLOWED', payload: { domain: 'work.example' } }),
+  ]);
+
+  const bulkReadsAfter = chrome.calls.filter(
+    (c) => c.api === 'storage.get' && readsAllowlistBulk(Array.isArray(c.keys) ? c.keys : [c.keys])).length;
+  assert.equal(bulkReadsAfter - bulkReadsBefore, 1,
+    'four messages must share one retry, not issue four re-reads and four DNR reconciles');
+  assert.deepEqual([answers[0].allowed, answers[1].allowed, answers[3].allowed], [true, true, true]);
+  assert.deepEqual([...answers[2]].sort(), [...SEEDED].sort());
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.4(b): a failed enabledRulesets read does not rebuild the index with lists the user turned off', async () => {
+  // Two packaged lists with distinguishable selectors; the user has turned
+  // `annoyances` off. A failed read used to degrade to `{}`, which normalizes
+  // to "every list on", so the rebuild silently put the disabled list back.
+  const packaged = {
+    easylist: {
+      cosmetic: { generic: [], domainSpecific: { 'example.com': ['.easylist-ad'] }, exceptions: {}, genericExcludedDomains: [] },
+      scriptlets: [],
+    },
+    annoyances: {
+      cosmetic: { generic: [], domainSpecific: { 'example.com': ['.annoyance-banner'] }, exceptions: {}, genericExcludedDomains: [] },
+      scriptlets: [],
+    },
+  };
+  const { chrome, hooks } = await loadServiceWorker({
+    awaitReady: true,
+    packagedSources: packaged,
+    seed: { enabledRulesets: { annoyances: false } },
+  });
+
+  const fired = chrome.storage.local._failNextRead(readsEnabledRulesets);
+  await hooks.queueActiveIndexRebuild();
+  assert.equal(fired(), true, 'precondition: the rebuild\'s read failed');
+
+  const rules = await hooks.db.getCosmeticRules('example.com');
+  assert.ok(rules.includes('.easylist-ad'), 'the enabled list must still be in the index');
+  assert.equal(rules.includes('.annoyance-banner'), false,
+    'a list the user turned off must not come back because one read failed');
+  assert.ok(warningContexts(hooks).some((c) => String(c).includes('nabledRulesets')),
+    `the degraded read must be reported, got ${JSON.stringify(warningContexts(hooks))}`);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.4(c): a failed enabledRulesets read leaves the rulesets alone instead of failing the boot', async () => {
+  const stub = makeChromeStub();
+  const fired = stub.storage.local._failNextRead(readsEnabledRulesets);
+  const { chrome, hooks } = await loadServiceWorker({ stub, awaitReady: true });
+
+  assert.equal(fired(), true, 'precondition: applyRulesets\' read failed');
+  assert.deepEqual(unexpectedCriticals(hooks), [],
+    'a transient read fault must not be a fatal error for the whole background setup');
+  assert.ok(warningContexts(hooks).some((c) => String(c).includes('applyRulesets')),
+    `it must still be reported, got ${JSON.stringify(warningContexts(hooks))}`);
+
+  // Static rulesets persist across worker lives, so doing nothing leaves the
+  // previous state standing — which is the safe answer. What must NOT happen
+  // is an apply computed from "every list on".
+  const applies = chrome.calls.filter((c) => c.api === 'dnr.updateEnabledRulesets');
+  assert.deepEqual(applies, [],
+    'no apply may be issued from a map the worker could not read');
+
+  // The rest of the background setup still ran.
+  assert.ok(await chrome.alarms.get('filter-list-update'),
+    'the filter alarm must still be armed');
+
+  // And what it reports is what Chrome is enforcing, not the defaults: a
+  // failed read must never be answered with "every list on" (§3.1).
+  const fired2 = chrome.storage.local._failNextRead(readsEnabledRulesets);
+  const effective = await hooks.applyRulesets();
+  assert.equal(fired2(), true, 'precondition: the second read failed too');
+  assert.equal(effective.annoyances, false,
+    'nothing is enabled in Chrome, so nothing may be reported as enabled');
+  assert.equal(effective['system-unbreak'], true, 'except the one that is always on');
+
+  hooks.cancelPendingStatsPersistForTest();
+});

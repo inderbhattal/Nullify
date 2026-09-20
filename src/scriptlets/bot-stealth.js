@@ -30,10 +30,11 @@ function patchWebGL(proto, gpu) {
   if (!proto?.getParameter || patchedGetParameters.has(proto.getParameter)) return;
 
   const original = proto.getParameter;
-  // §7.8: method syntax, so the wrapper has no own `prototype`. A function
-  // expression has [[Construct]] and carries one; `getParameter` is a native
-  // method and has none, so `Object.getOwnPropertyNames(gl.getParameter)`
-  // named us even after the WeakSet and the mask below.
+  // REMEDIATION-2026-09 §7.8: method syntax, so the wrapper has no own
+  // `prototype`. A function expression has [[Construct]] and carries one;
+  // `getParameter` is a native method and has none, so
+  // `Object.getOwnPropertyNames(gl.getParameter)` named us even after the
+  // WeakSet and the mask below.
   const wrapped = ({
     getParameter(parameter) {
       if (parameter === 37445) return gpu.vendor;
@@ -42,13 +43,13 @@ function patchWebGL(proto, gpu) {
     },
   }).getParameter;
   patchedGetParameters.add(wrapped);
-  // §5.21: this used to assign an own `toString`, which merely moved the leak
-  // the WeakSet had just closed — `Object.keys(getParameter)` returned
-  // `["toString"]`, `getParameter.toString.toString()` dumped arrow-function
-  // source, and `getParameter.name` was `"wrapped"`. The shared helper routes
-  // everything through one `Function.prototype.toString` proxy keyed by a
-  // WeakMap and copies name/length via descriptors, so the wrapper carries no
-  // own properties at all.
+  // REVIEW-2026-08 §5.21: this used to assign an own `toString`, which merely
+  // moved the leak the WeakSet had just closed — `Object.keys(getParameter)`
+  // returned `["toString"]`, `getParameter.toString.toString()` dumped
+  // arrow-function source, and `getParameter.name` was `"wrapped"`. The shared
+  // helper routes everything through one `Function.prototype.toString` proxy
+  // keyed by a WeakMap and copies name/length via descriptors, so the wrapper
+  // carries no own properties at all.
   maskNative(wrapped, original);
   proto.getParameter = wrapped;
 }

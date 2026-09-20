@@ -665,3 +665,29 @@ test('5.17: the release checklist smoke-tests the lists that block navigations',
     new RegExp(`^#+ ${cited[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(readme),
     `the checklist cites a README heading "${cited[1]}" that README.md does not have`);
 });
+
+test('9.14: every CopyWebpackPlugin target is relative to output.path', async () => {
+  // An absolute `to:` is rewritten relative to output.path by
+  // copy-webpack-plugin, so `webpack --output-path <elsewhere>` still emitted
+  // into the repo's own dist/ — overwriting the WASM file a loaded unpacked
+  // extension is running, while dist/service-worker.js kept the old glue. It
+  // was invisible for as long as the two copies happened to be byte-identical.
+  const { default: config } = await import('../webpack.config.js');
+  const copyPlugins = (config.plugins || []).filter(
+    (p) => p?.constructor?.name === 'CopyPlugin' || p?.constructor?.name === 'CopyWebpackPlugin');
+  assert.ok(copyPlugins.length > 0, 'precondition: the config still copies files');
+
+  const patterns = copyPlugins.flatMap((p) => p.patterns || p.options?.patterns || []);
+  assert.ok(patterns.length > 0, 'precondition: the copy plugin still declares patterns');
+
+  for (const pattern of patterns) {
+    assert.equal(typeof pattern.to, 'string', 'a copy target must be a plain path');
+    assert.equal(
+      path.isAbsolute(pattern.to), false,
+      `copy target "${pattern.to}" is absolute — it will be resolved against output.path anyway, `
+      + 'so an out-of-tree build writes the repo dist/ instead');
+    assert.ok(
+      !pattern.to.split(path.sep).includes('..'),
+      `copy target "${pattern.to}" escapes output.path`);
+  }
+});

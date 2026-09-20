@@ -42,7 +42,12 @@ export default {
       patterns: [
         {
           from: path.resolve(__dirname, 'src/shared/wasm/nullify_core_bg.wasm'),
-          to: path.resolve(__dirname, 'dist/nullify_core_bg.wasm'),
+          // Relative, so it lands in `output.path` wherever that points. An
+          // absolute target is rewritten relative to output.path by
+          // copy-webpack-plugin, so `--output-path <elsewhere>` still wrote
+          // the repo's own dist/ — overwriting the WASM in a loaded unpacked
+          // extension while its dist/service-worker.js kept the old glue.
+          to: 'nullify_core_bg.wasm',
           noErrorOnMissing: false,
         },
       ],

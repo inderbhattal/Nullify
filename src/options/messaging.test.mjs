@@ -141,3 +141,30 @@ test('MAX_USER_FILTERS_BYTES tracks the value declared in the service worker', (
     'options/messaging.js and the service worker disagree on the user-filter cap',
   );
 });
+
+test('4.14: an {error, code} reply keeps the code on the thrown Error', async () => {
+  // src/options/status-format.js tells a failed storage read (which wrote
+  // nothing) from a failure after a write by the code alone — Chrome's message
+  // text is the same for both. Dropping it here makes that distinction
+  // unreachable and the "nothing was changed" line dead code.
+  nextResponse = { error: 'An unexpected error occurred', code: 'READ_FAILED' };
+  const err = await call('ALLOW_SITE', { domain: 'a.example' }).then(
+    () => null,
+    (caught) => caught,
+  );
+  assert.ok(err instanceof Error, 'an {error} reply must reject');
+  assert.equal(err.message, 'An unexpected error occurred');
+  assert.equal(err.code, 'READ_FAILED');
+});
+
+test('4.14: an {error} reply without a code leaves the Error uncoded', async () => {
+  nextResponse = { error: 'Rule with id 1 does not have a unique ID' };
+  const err = await call('ALLOW_SITE', { domain: 'a.example' }).catch((caught) => caught);
+  assert.equal(err.code, undefined, 'an uncoded failure must not be read as a storage fault');
+
+  // A non-string code is not forwarded either: `code` is a contract, not a
+  // passthrough for whatever a reply happens to carry.
+  nextResponse = { error: 'boom', code: 7 };
+  const numeric = await call('ALLOW_SITE', { domain: 'a.example' }).catch((caught) => caught);
+  assert.equal(numeric.code, undefined);
+});

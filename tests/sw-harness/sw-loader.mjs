@@ -11,9 +11,10 @@
  * fallback paths a packed build takes when WASM/network are unavailable —
  * and keeps tests offline.
  *
- * NOTE: the caller must ensure any timers the previous instance armed
- * (stats persist debounce) are cancelled via the test hooks before loading a
- * new instance, or a stale timer may write into the new stub's storage.
+ * NOTE: before loading a second instance on the same stub, retire the first
+ * with the returned `teardown()` (§7.9(d)). Chrome tears a worker down before
+ * the next one registers, but this stub keeps every listener and a stale
+ * stats-persist timer would write into the new life's storage.
  *
  * Options (REVIEW-2026-08 §7.2/§7.3 — the capabilities the three P0s needed):
  *   - `cold: true` holds `globalThis.fetch` open, so stage 0 of
@@ -106,7 +107,21 @@ export async function loadServiceWorker({
     await hooks.whenBackgroundSetupDone();
   }
 
-  return { chrome: chromeStub, idb: idbStub, sw, hooks, releaseCold: () => releaseCold() };
+  /**
+   * §7.9(d) — retire this worker before loading another on the same stub.
+   * Cancels the stats-persist debounce this file's NOTE warns about and drops
+   * the listeners this life registered, so the dead worker cannot handle
+   * events alongside the live one. Returns the number of listeners dropped.
+   */
+  const teardown = () => {
+    hooks?.cancelPendingStatsPersistForTest?.();
+    return chromeStub._clearListeners();
+  };
+
+  return {
+    chrome: chromeStub, idb: idbStub, sw, hooks, teardown,
+    releaseCold: () => releaseCold(),
+  };
 }
 
 /** Await `predicate()` becoming truthy across a bounded number of ticks. */

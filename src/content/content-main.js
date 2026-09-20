@@ -16,8 +16,19 @@ import { resolvePageRules } from '../shared/rule-transport.js';
 import { PROC_OP_REGEX } from '../shared/proc-ops.js';
 
 const hostname = normalizeHostname(location.hostname);
-const FRAME_STYLE_ID = '__nullify_frame_css__';
-const FRAME_EXCEPTION_STYLE_ID = '__nullify_exception_css__';
+// Per-document random tokens, not fixed names (§5.10, 2026-09): the ids were
+// `__nullify_frame_css__` / `__nullify_exception_css__` on every page, which
+// made `document.getElementById(…)` a one-line blocker probe and a handle for
+// removing the sheet. Rolled once per document and held in module scope so a
+// re-injection still replaces by id; the `n` keeps an id from starting with a
+// digit.
+// The two ids are one draw plus a suffix, not two draws: `injectStyle`
+// replaces by `getElementById`, so two equal draws would make the exception
+// sheet remove the hide sheet and the frame would lose its cosmetic CSS for
+// that page load. A page that can find one id can enumerate the other anyway.
+const randomStyleId = () => 'n' + Math.random().toString(36).slice(2, 10);
+const FRAME_STYLE_ID = randomStyleId();
+const FRAME_EXCEPTION_STYLE_ID = `${FRAME_STYLE_ID}x`;
 const WASM_ATTR = 'data-nullify-wasm';
 const YOUTUBE_HOSTNAMES = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com']);
 
@@ -86,15 +97,26 @@ async function main() {
     throw new Error(`GET_INIT_DATA failed: ${initRes.error}`);
   }
 
-  const { isAllowed, cssText, exceptionCss } = initRes || {};
+  const { isAllowed, cssText, exceptionCss, earlyCssApplied } = initRes || {};
 
   if (isAllowed === true) return;
 
   // Only now is the page known not to be allowlisted (§4.13).
   exposeYouTubeWasmUrl();
 
-  injectStyle(FRAME_STYLE_ID, cssText);
-  injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
+  // §5.11 (2026-09): `performEarlyInjection` has usually already inserted this
+  // same CSS as a user-origin sheet, so these two were a second copy of it in
+  // every frame. One field covers both sheets: that `insertCSS` carries the
+  // generic CSS, `bundle.cssText` and `bundle.exceptionCss` joined in that
+  // order, so skipping the pair can never strand a hide rule without its
+  // exception. Strictly `true` — the field is absent until the SW's
+  // `singleCssInjection` flag is on, and a reply that wins the race against
+  // the insertCSS reports false, which costs a duplicate in that window
+  // rather than a frame with no CSS at all.
+  if (earlyCssApplied !== true) {
+    injectStyle(FRAME_STYLE_ID, cssText);
+    injectStyle(FRAME_EXCEPTION_STYLE_ID, exceptionCss, true);
+  }
 
   // Prefers the base64 binary bundle, falls back to the JSON rules if it is
   // missing or undecodable — never lose procedural filtering over transport.

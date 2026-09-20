@@ -120,19 +120,25 @@ test('system-unbreak rule ids are unique', () => {
 // webpack.config.js — splitChunks must exclude content scripts (§5.51)
 // ---------------------------------------------------------------------------
 
-test('splitChunks excludes every bundle that cannot load a shared chunk', async () => {
+test('splitChunks is off: no bundle here can load a shared chunk', async () => {
   const { default: config } = await import('../webpack.config.js');
-  const chunksFn = config.optimization?.splitChunks?.chunks;
-  assert.equal(typeof chunksFn, 'function');
+  assert.equal(
+    config.optimization?.splitChunks, false,
+    'no entry can load a shared chunk — the SW, the content scripts and the '
+    + 'MAIN-world bundle have no chunk-loading runtime, and popup.html and '
+    + 'options.html each load exactly one script by name (§9.15)');
+});
 
-  // No chunk-loading runtime exists in the SW, content scripts, or the
-  // MAIN-world scriptlets bundle — a shared chunk would fail at load.
-  for (const name of ['service-worker', 'scriptlets-world', 'content', 'youtube-shield']) {
-    assert.equal(chunksFn({ name }), false, `${name} must not be split`);
-  }
-  // Extension pages have a document and can load shared chunks.
-  for (const name of ['popup', 'options']) {
-    assert.equal(chunksFn({ name }), true, `${name} may share chunks`);
+test('9.15: every HTML page loads exactly one script, so nothing can need a chunk', () => {
+  // This is the reason splitChunks must stay off, asserted against the pages
+  // themselves rather than against the config that serves them.
+  for (const page of ['src/popup/popup.html', 'src/options/options.html']) {
+    const html = fs.readFileSync(path.join(ROOT, page), 'utf8');
+    const srcs = [...html.matchAll(/<script[^>]*\bsrc="([^"]+)"/g)].map((m) => m[1]);
+    assert.equal(
+      srcs.length, 1,
+      `${page} loads ${srcs.length} scripts (${srcs.join(', ')}); splitChunks may be re-enabled `
+      + 'for these pages only if their HTML learns to load what webpack emits');
   }
 });
 
@@ -521,4 +527,173 @@ test('5.16: the release build validates the compiled rulesets after compiling th
   assert.notEqual(compileIdx, -1, 'build.yml must compile the rules');
   assert.notEqual(validateIdx, -1, 'build.yml must run tests/compiled-rulesets.test.mjs');
   assert.ok(validateIdx > compileIdx, 'the compiled-ruleset test must run after build:rules');
+});
+
+// ---------------------------------------------------------------------------
+// §5.17 — docs drift. Every number the README states about the code is
+// measured here from the code that backs it, so the next drift fails the
+// suite instead of surviving another release in prose.
+// ---------------------------------------------------------------------------
+
+test('5.17: the README scriptlet counts match the registry', async () => {
+  // The registry is the source of truth for both numbers: `REGISTRY.size`
+  // counts every dispatchable name (uBO aliases included) and the distinct
+  // values count the implementations behind them — several names share one
+  // (`no-fetch-if` is `prevent-fetch`, `trusted-rpnt` is `replace-node-text`).
+  globalThis.window = globalThis;
+  const { REGISTRY } = await import('../src/scriptlets/index.js');
+  const names = REGISTRY.size;
+  const implementations = new Set(REGISTRY.values()).size;
+
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const claim = readme.match(
+    /(\d+)\s+registry names \(uBO aliases included\) over (\d+)\s+implementations/);
+  assert.ok(claim, 'README must state the scriptlet registry counts');
+  assert.equal(Number(claim[1]), names, 'README registry-name count');
+  assert.equal(Number(claim[2]), implementations, 'README implementation count');
+  assert.ok(
+    !/30\+ scriptlets|30\+ uBO-compatible scriptlets|✅ 30\+/.test(readme),
+    'README still carries the stale "30+ scriptlets" claim');
+});
+
+test('5.17: the README ruleset counts match the manifest and the SW defaults', () => {
+  const manifest = readJson('manifest.json');
+  const resources = manifest.declarative_net_request?.rule_resources || [];
+  const declared = resources.length;
+  const manifestEnabled = resources.filter((r) => r.enabled === true).length;
+
+  // The runtime default is not the manifest's: `getDefaultEnabledRulesets`
+  // turns lists on by LIST id, and `RULESET_GROUPS` expands a sharded list
+  // into its shard ruleset ids.
+  const swSource = fs.readFileSync(
+    path.join(ROOT, 'src/background/service-worker.js'), 'utf8');
+  const defaultsBlock = swSource.match(
+    /function getDefaultEnabledRulesets\(\) \{\s*return \{([\s\S]*?)\};/);
+  assert.ok(defaultsBlock, 'getDefaultEnabledRulesets not found in service-worker.js');
+  const defaultOnListIds = [...defaultsBlock[1].matchAll(/'?([\w-]+)'?\s*:\s*true/g)]
+    .map((m) => m[1]);
+  assert.ok(defaultOnListIds.length > 0, 'getDefaultEnabledRulesets has no enabled lists');
+
+  const groupsBlock = swSource.match(/const RULESET_GROUPS = \{([\s\S]*?)\};/);
+  assert.ok(groupsBlock, 'RULESET_GROUPS not found in service-worker.js');
+  const groups = new Map(
+    [...groupsBlock[1].matchAll(/'([\w-]+)':\s*\[([^\]]*)\]/g)].map((m) => [
+      m[1],
+      [...m[2].matchAll(/'([\w-]+)'/g)].map((s) => s[1]),
+    ]));
+  const runtimeEnabled = new Set(
+    defaultOnListIds.flatMap((listId) => groups.get(listId) || [listId]));
+
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const claim = readme.match(
+    /(\d+) declared \/ (\d+) enabled in the manifest \/ (\d+) requested at runtime/);
+  assert.ok(claim, 'README must state the declared/enabled ruleset counts');
+  assert.equal(Number(claim[1]), declared, 'README declared-ruleset count');
+  assert.equal(Number(claim[2]), manifestEnabled, 'README manifest-enabled count');
+  assert.equal(Number(claim[3]), runtimeEnabled.size, 'README runtime-enabled count');
+});
+
+test('5.17: the release checklist points at the current review and the persona floor', () => {
+  const checklist = fs.readFileSync(
+    path.join(ROOT, 'docs/RELEASE_CHECKLIST.md'), 'utf8');
+
+  // docs/REVIEW.md is two review cycles behind; its P0s are closed and its
+  // numbering no longer matches anything a releaser can act on.
+  assert.ok(
+    !/docs\/REVIEW\.md/.test(checklist),
+    'the checklist still sends releasers to the superseded docs/REVIEW.md');
+  assert.match(checklist, /docs\/REVIEW-2026-09\.md/);
+  assert.match(checklist, /docs\/REMEDIATION-2026-09\.md/);
+
+  // The persona floor is a per-release manual bump; name the symbol that
+  // actually holds it so the line cannot rot into a stale path.
+  assert.match(checklist, /CHROME_MAJOR_FALLBACK/);
+  assert.match(checklist, /src\/shared\/personas\.js/);
+  const personas = fs.readFileSync(path.join(ROOT, 'src/shared/personas.js'), 'utf8');
+  assert.match(
+    personas, /export const CHROME_MAJOR_FALLBACK\b/,
+    'the checklist names a constant personas.js does not export');
+
+  // The PSL snapshot is the one vendored input with no SRI lock behind it.
+  assert.match(checklist, /scripts\/psl-source\/public_suffix_list\.dat/);
+});
+
+test('5.17: the release checklist smoke-tests the lists that block navigations', () => {
+  // A list blocks navigations when its rules carry `main_frame`. Two things in
+  // the build put it there: `SECURITY_LIST_IDS`, which gives the full type set
+  // to rules that name no type, and `$all`, which does the same on any list.
+  const buildSource = fs.readFileSync(path.join(ROOT, 'scripts/build-rules.mjs'), 'utf8');
+  const securityBlock = /const SECURITY_LIST_IDS = new Set\(\[([^\]]*)\]\)/.exec(buildSource);
+  assert.ok(securityBlock, 'SECURITY_LIST_IDS not found in build-rules.mjs');
+  const required = new Set([...securityBlock[1].matchAll(/'([\w-]+)'/g)].map((m) => m[1]));
+
+  // `$all` rules per snapshot, measured: anti-adblock 1,385 and malware 7,748,
+  // then a 14x gap down to ubo-filters at 94. A list in the thousands is one a
+  // user can walk into by typing a URL; the threshold sits inside that gap so a
+  // list that starts carrying `$all` in bulk after a refresh fails here.
+  const NAVIGATION_BLOCK_THRESHOLD = 1000;
+  const listsDir = path.join(ROOT, 'scripts/filter-lists');
+  for (const file of fs.readdirSync(listsDir).filter((f) => f.endsWith('.txt'))) {
+    let count = 0;
+    for (const raw of fs.readFileSync(path.join(listsDir, file), 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('!') || line.startsWith('[') || line.startsWith('@@')) continue;
+      if (/#[@?$%^]?#/.test(line)) continue;      // cosmetic/scriptlet, no DNR type
+      const optionsAt = line.lastIndexOf('$');
+      if (optionsAt < 0) continue;
+      if (line.slice(optionsAt + 1).split(',').some((o) => o.trim() === 'all')) count += 1;
+    }
+    if (count >= NAVIGATION_BLOCK_THRESHOLD) required.add(path.basename(file, '.txt'));
+  }
+  assert.ok(required.size > 0, 'no navigation-blocking list was identified — the scan found nothing');
+
+  const checklist = fs.readFileSync(path.join(ROOT, 'docs/RELEASE_CHECKLIST.md'), 'utf8');
+  const sections = checklist.split(/^## /m);
+  const navigationSection = sections.find((s) => /navigation/i.test(s.split('\n')[0]));
+  assert.ok(
+    navigationSection,
+    'no "## …navigation…" section: blocking the navigation to a listed host is the one filter-list '
+    + 'behaviour that changes what typing a URL does, and nothing automated exercises it in a real Chrome');
+
+  for (const id of required) {
+    assert.ok(
+      navigationSection.includes(id),
+      `${id} compiles rules that block main_frame but the checklist's navigation step never names it`);
+  }
+
+  // The step cites the README for the measured host counts rather than
+  // carrying its own copy; a cross-doc reference that rots is the §5.17 bug
+  // again, one document further out.
+  const cited = /README, "([^"]+)"/.exec(navigationSection);
+  assert.ok(cited, 'the navigation step must cite where the measured counts live');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  assert.ok(
+    new RegExp(`^#+ ${cited[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(readme),
+    `the checklist cites a README heading "${cited[1]}" that README.md does not have`);
+});
+
+test('9.14: every CopyWebpackPlugin target is relative to output.path', async () => {
+  // An absolute `to:` is rewritten relative to output.path by
+  // copy-webpack-plugin, so `webpack --output-path <elsewhere>` still emitted
+  // into the repo's own dist/ — overwriting the WASM file a loaded unpacked
+  // extension is running, while dist/service-worker.js kept the old glue. It
+  // was invisible for as long as the two copies happened to be byte-identical.
+  const { default: config } = await import('../webpack.config.js');
+  const copyPlugins = (config.plugins || []).filter(
+    (p) => p?.constructor?.name === 'CopyPlugin' || p?.constructor?.name === 'CopyWebpackPlugin');
+  assert.ok(copyPlugins.length > 0, 'precondition: the config still copies files');
+
+  const patterns = copyPlugins.flatMap((p) => p.patterns || p.options?.patterns || []);
+  assert.ok(patterns.length > 0, 'precondition: the copy plugin still declares patterns');
+
+  for (const pattern of patterns) {
+    assert.equal(typeof pattern.to, 'string', 'a copy target must be a plain path');
+    assert.equal(
+      path.isAbsolute(pattern.to), false,
+      `copy target "${pattern.to}" is absolute — it will be resolved against output.path anyway, `
+      + 'so an out-of-tree build writes the repo dist/ instead');
+    assert.ok(
+      !pattern.to.split(path.sep).includes('..'),
+      `copy target "${pattern.to}" escapes output.path`);
+  }
 });

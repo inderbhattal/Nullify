@@ -84,6 +84,7 @@ import {
   NATIVE_FUNCTIONAL_PSEUDO_CLASSES,
 } from '../shared/proc-ops.js';
 import { createYouTubeShieldSync } from './youtube-shield-sync.js';
+import { buildPersonas, detectChromeMajor } from '../shared/personas.js';
 import {
   COSMETIC_SELECTOR_DENYLIST,
   CORE_FILTER_SOURCE,
@@ -198,6 +199,11 @@ function getYouTubeShieldSync() {
     runtimeAssetPath,
     scriptId: YOUTUBE_SHIELD_SCRIPT_ID,
     targets: YOUTUBE_SHIELD_TARGETS,
+    // §5.18 (A2g) — the function, not its result: the module reads the flag
+    // once per sync, and this worker's cache fills after start-up and can
+    // change while the worker lives. F2 defaults this to `() => false`, so
+    // without this line the flag reads as true everywhere and changes nothing.
+    isFeatureEnabled,
   });
   return _youtubeShieldSync;
 }
@@ -239,6 +245,10 @@ const RULE_DATA_SCHEMA_VERSION = 4;
 // ---------------------------------------------------------------------------
 const FEATURE_DEFAULTS = Object.freeze({
   refreshCadenceV2: false, // §4.5 — A2a: Expires-driven refresh cadence
+  rulesetDeltaApply: false, // §5.1 — A2b: apply only the static-ruleset delta
+  privacyRulesDiff: false, // §5.2 — A2c: write only the privacy rules that changed
+  singleCssInjection: false, // §5.11 — A2f: report the early CSS so the content script can skip its copy
+  shieldNoReinject: false, // §5.18 — F2/A2g: do not re-inject an unchanged shield registration
 });
 let cachedFeatureFlags = { ...FEATURE_DEFAULTS };
 let _featureFlagsPromise = null;
@@ -543,6 +553,30 @@ async function computeBundledRuleDataVersion() {
 /**
  * Depth-aware scan for the first procedural operator in a selector string.
  */
+/**
+ * §7.5 — a selector whose argument never closed. The engine returns this and
+ * the plan is dropped; the worker used to slice anyway, which turned
+ * `div:has-text(Ad` into `:has-text(A)` — a different, perfectly valid rule
+ * (§5.20). Both copies run on the WASM-down path, so they have to agree.
+ */
+const MALFORMED = Symbol('malformed-procedural-selector');
+
+/**
+ * Build a css plan step, recording how the fragment attaches to the element
+ * the previous step produced (§4.12) — the engine's `makeCssStep`, which its
+ * executor already reads (`step.kind`). Plans built here carried no `kind` at
+ * all, so every continuation fell into the executor's compound branch and
+ * `div:has-text(x) span` matched a div that was itself a span.
+ */
+function makeCssStep(rawSelector) {
+  const trimmed = rawSelector.trim();
+  let kind = 'compound';
+  if (trimmed.startsWith('>')) kind = 'child';
+  else if (/^[+~]/.test(trimmed)) kind = 'sibling';
+  else if (/^\s/.test(rawSelector)) kind = 'descendant';
+  return { type: 'css', kind, selector: trimmed };
+}
+
 function extractFirstOp(selector) {
   let depth = 0;
 
@@ -567,8 +601,14 @@ function extractFirstOp(selector) {
           j++;
         }
 
+        // §7.5 — the argument never closed. Slicing anyway silently drops the
+        // last character and ships a different rule; fail closed instead.
+        if (d > 0) return MALFORMED;
+
         const arg = selector.slice(argStart, j - 1);
-        const rest = selector.slice(j).trimStart();
+        // §7.5/§4.12 — raw: the leading whitespace (or lack of it) is what
+        // distinguishes a descendant continuation from a compound one.
+        const rest = selector.slice(j);
         return { base, op, arg, rest };
       }
     }
@@ -584,12 +624,13 @@ function extractFirstOp(selector) {
         else if (selector[j] === ')') d--;
         j++;
       }
+      if (d > 0) return MALFORMED; // unterminated `:has(` etc — §7.5
       const inner = selector.slice(idx + pseudo.length, j - 1);
       if (isProceduralSelector(inner)) {
         const base = selector.slice(0, idx).trimEnd();
         const op = pseudo.slice(1, -1);
         const arg = inner;
-        const rest = selector.slice(j).trimStart();
+        const rest = selector.slice(j); // raw — §7.5/§4.12, see above
         return { base, op, arg, rest };
       }
     }
@@ -605,15 +646,17 @@ function parseProceduralPlan(selector) {
   const plan = [];
   let remaining = selector;
 
-  while (remaining) {
+  while (remaining && remaining.trim()) {
     const firstOp = extractFirstOp(remaining);
+    // §7.5 — one malformed step drops the whole rule, like the engine.
+    if (firstOp === MALFORMED) return null;
     if (!firstOp) {
-      plan.push({ type: 'css', selector: remaining.trim() });
+      plan.push(makeCssStep(remaining));
       break;
     }
-    
+
     if (firstOp.base) {
-      plan.push({ type: 'css', selector: firstOp.base });
+      plan.push(makeCssStep(firstOp.base));
     }
     
     // Canonical uBO name, like the engine's planner: `:-abp-has()` plans as
@@ -688,7 +731,10 @@ function classifyAndPlanSelectors(selectors) {
   const proceduralRules = [];
   for (const selector of cleanSelectors) {
     if (isProceduralSelector(selector)) {
-      proceduralRules.push({ selector, plan: parseProceduralPlan(selector) });
+      // §7.5 — a malformed selector yields no plan at all; drop the rule
+      // rather than ship `plan: null` or a truncated parse of it.
+      const plan = parseProceduralPlan(selector);
+      if (plan) proceduralRules.push({ selector, plan });
     } else {
       cssSelectors.push(selector);
     }
@@ -807,15 +853,12 @@ function hasInvalidUniversalUsage(selector) {
     }
 
     if (ch === '*' && bracketDepth === 0 && parenDepth === 0) {
-      // Universal selector (*) is invalid when preceded by alphanumeric/identifier chars
-      let prev = null;
-      for (let j = i - 1; j >= 0; j--) {
-        const pc = selector.charAt(j);
-        if (!/\s/.test(pc)) {
-          prev = pc;
-          break;
-        }
-      }
+      // §7.5 — `*` continues an identifier only when it IMMEDIATELY follows
+      // one, which is the rule Rust uses (2026-08 §4.35). Walking back past
+      // whitespace read `div *` — an ordinary descendant universal — as
+      // `div*` and refused it, so every list rule using one was dropped on
+      // the WASM-down path.
+      const prev = i > 0 ? selector.charAt(i - 1) : null;
       if (prev && /[A-Za-z0-9_\-)\]]/.test(prev)) {
         return true;
       }
@@ -1151,9 +1194,20 @@ async function isRuleIndexInterrupted() {
 }
 
 async function rebuildActiveRuleIndexFromStoredSources() {
-  const enabledMap = normalizeEnabledRulesetsMap(
-    await getStorageOrDefault(StorageKeys.ENABLED_RULESETS, {})
-  );
+  // §7.4(b) — this read used to degrade to `{}`, and `{}` normalizes to
+  // "every list on", so one transient fault silently rebuilt the index WITH
+  // the lists the user had turned off and left them there until the next
+  // rebuild. Chrome's own enabled set is the better answer: it is what the
+  // user's last successful toggle actually applied.
+  let storedEnabledRulesets;
+  try {
+    storedEnabledRulesets = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('ruleIndex:enabledRulesetsRead', err);
+    storedEnabledRulesets = await getEffectiveEnabledRulesetsMap();
+  }
+  const enabledMap = normalizeEnabledRulesetsMap(storedEnabledRulesets);
   const storedSources = await db.getAllFilterSources();
   const sourceMap = new Map(storedSources.map((entry) => [entry.listId, entry]));
   const activeSources = REMOTE_FILTER_LIST_IDS
@@ -1389,7 +1443,28 @@ async function mergePackagedSourcesOnUpdate(packaged) {
   }
 }
 
-async function ensureRuleDataReady() {
+// §5.2 (REVIEW-2026-09, A2c) — `onInstalled` and the module-load
+// `startInitialization()` both run the pass below, and on a fresh install they
+// interleave: both read an absent bloom filter before either writes one, so
+// the full active-index rebuild ran TWICE for one install (two
+// `ruleIndexState=building` writes). Memoize it for the worker's life, the
+// shape `_criticalPromise` uses. A rejection clears the memo so the next
+// caller retries rather than inheriting a failure; the lenient
+// StorageReadError branch inside deliberately keeps its result for this SW
+// life, which is what its own comment already promised.
+let _ruleDataReadyPromise = null;
+
+function ensureRuleDataReady() {
+  if (!_ruleDataReadyPromise) {
+    _ruleDataReadyPromise = runRuleDataReadyPass().catch((err) => {
+      _ruleDataReadyPromise = null;
+      throw err;
+    });
+  }
+  return _ruleDataReadyPromise;
+}
+
+async function runRuleDataReadyPass() {
   // The flags gate the merge below, and this is the first consumer on every
   // boot path (stage 1 runs before refreshMemoryCache).
   await ensureFeatureFlagsLoaded();
@@ -1671,6 +1746,29 @@ function enqueueAllowlistOp(op) {
   _allowlistOpChain = run.catch(() => {});
   return run;
 }
+
+/**
+ * §7.9 — the same serialization for the two DNR appliers. Both are reachable
+ * from `ensureBackgroundSetup` AND from a message handler, and both decide
+ * what to write from a snapshot they take themselves, so two overlapping runs
+ * invert "last toggle wins": the second run's snapshot can predate the first
+ * run's write, it therefore computes an empty delta and issues nothing, and
+ * the first run's older intent lands and stays until the next worker start.
+ * One chain each — they share no rule ids and must not wait on each other,
+ * and neither applier calls the other, so a chain can never await itself.
+ * Each op re-reads storage, so the last op enqueued applies the final state.
+ */
+function makeOpChain() {
+  let chain = Promise.resolve();
+  return (op) => {
+    const run = chain.catch(() => {}).then(op);
+    chain = run.catch(() => {});
+    return run;
+  };
+}
+
+const enqueueRulesetOp = makeOpChain();
+const enqueuePrivacyOp = makeOpChain();
 
 /**
  * Rebuild allowlist state atomically — ensures DNR rules, matcher, and
@@ -2065,7 +2163,16 @@ async function initializeDefaults() {
 // ---------------------------------------------------------------------------
 // Privacy settings
 // ---------------------------------------------------------------------------
-async function applyPrivacySettings() {
+// §7.9 — serialized: two concurrent UPDATE_SETTINGS otherwise let the second
+// run snapshot the dynamic rules before the first run's write lands, so it
+// diffs to nothing and the first run's older intent is final (measured with
+// `privacyRulesDiff` on: settings say the persona is off while rule 820000
+// keeps spoofing the UA). Internal: callers go through applyPrivacySettings.
+function applyPrivacySettings() {
+  return enqueuePrivacyOp(_applyPrivacySettingsNow);
+}
+
+async function _applyPrivacySettingsNow() {
   const settings = await getStorageOrDefault(StorageKeys.SETTINGS, {});
 
   // Block WebRTC IP leaks
@@ -2098,23 +2205,120 @@ async function applyPrivacySettings() {
     });
   }
 
+  // §5.2 (A2c) — flag `privacyRulesDiff`. Dynamic rules persist across worker
+  // lives, but the six writers below rewrote theirs on every start: six
+  // updateDynamicRules calls per wake on a profile where nothing had changed.
+  // With the flag on they only state their desired rules here and one diffed
+  // batch is issued at the end; with it off each writer issues exactly the
+  // call it issued before.
+  const plan = isFeatureEnabled('privacyRulesDiff') ? [] : null;
+
   // Update header stripping rules
-  await applyHeaderRules(settings.stripTrackingHeaders !== false);
+  await applyHeaderRules(settings.stripTrackingHeaders !== false, plan);
 
   // Upgrade insecure requests where possible.
-  await applyUpgradeSchemeRules(settings.upgradeInsecureRequests !== false);
+  await applyUpgradeSchemeRules(settings.upgradeInsecureRequests !== false, plan);
 
   // Update stealth rules (CSP stripping)
-  await applyStealthRules();
+  await applyStealthRules(plan);
 
   // Update persona rules
-  await applyPersonaRules(settings.stealthPersona || 'default');
+  await applyPersonaRules(settings.stealthPersona || 'default', plan);
 
   // Update cache protection rules
-  await applyCacheProtectionRules(settings.cacheProtection !== false);
+  await applyCacheProtectionRules(settings.cacheProtection !== false, plan);
 
   // Update referrer control rules
-  await applyReferrerControlRules(settings.referrerControl !== false);
+  await applyReferrerControlRules(settings.referrerControl !== false, plan);
+
+  if (plan) await commitPrivacyRulePlan(plan);
+}
+
+/**
+ * §5.2 — a privacy writer's one side effect. With a `plan` (flag on) the
+ * intent is collected for `commitPrivacyRulePlan`; without one the call is
+ * byte-for-byte the write the writer issued before, `addRules` key included
+ * only where it passed one.
+ */
+async function emitPrivacyRules(plan, removeRuleIds, addRules) {
+  if (plan) {
+    plan.push({ removeRuleIds, addRules: addRules || [] });
+    return;
+  }
+  await chrome.declarativeNetRequest.updateDynamicRules(
+    addRules ? { removeRuleIds, addRules } : { removeRuleIds }
+  );
+}
+
+/**
+ * §5.2 — compare rule bodies independently of key order: `getDynamicRules()`
+ * returns Chrome's ordering, not ours. Arrays keep their order — both sides
+ * are produced by the writers above, so an order difference is a real one.
+ */
+function stablePrivacyRuleJson(rule) {
+  return JSON.stringify(rule, (key, value) => (
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map((k) => [k, value[k]]))
+      : value
+  ));
+}
+
+/**
+ * §5.2 — one updateDynamicRules for the whole privacy band, carrying only the
+ * ids whose body differs from what Chrome already holds, plus the ids that
+ * must go. Steady state ⇒ no call at all. Removals apply before additions
+ * within a call, so an id that changed may appear in both lists.
+ *
+ * The comparison is deliberately exact: if a future Chrome returned a
+ * normalized rule that never compares equal, every start would write the
+ * whole band — today's behaviour — whereas a subset comparison could accept a
+ * stale rule left by an older release as equal and never replace it.
+ *
+ * `applyPrivacySettings` is also reached from UPDATE_SETTINGS, so a snapshot
+ * that cannot be read falls back to writing every privacy rule: skipping the
+ * write would leave the setting the user just toggled unapplied.
+ *
+ * Accepted with the flag: one batch is all-or-nothing, so a rule Chrome
+ * refuses now sheds the other five instead of only itself. These six bodies
+ * are code-defined constants, not compiled filter output, and the flag ships
+ * OFF for a release — but it is the reason to watch the first soak.
+ */
+async function commitPrivacyRulePlan(plan) {
+  const ownedIds = plan.flatMap((entry) => entry.removeRuleIds);
+  const desired = new Map();
+  for (const entry of plan) {
+    for (const rule of entry.addRules) desired.set(rule.id, rule);
+  }
+
+  const snapshot = await chrome.declarativeNetRequest.getDynamicRules().catch((err) => {
+    console.warn('[AdBlock] Could not read dynamic rules; writing every privacy rule:', err?.message || err);
+    return null;
+  });
+  if (!snapshot) {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: ownedIds,
+      addRules: [...desired.values()],
+    });
+    return;
+  }
+
+  const existing = new Map(snapshot.map((rule) => [rule.id, rule]));
+  const removeRuleIds = [];
+  const addRules = [];
+  for (const id of ownedIds) {
+    const wanted = desired.get(id);
+    const held = existing.get(id);
+    if (!wanted) {
+      if (held) removeRuleIds.push(id);
+      continue;
+    }
+    if (held && stablePrivacyRuleJson(held) === stablePrivacyRuleJson(wanted)) continue;
+    if (held) removeRuleIds.push(id);
+    addRules.push(wanted);
+  }
+
+  if (removeRuleIds.length === 0 && addRules.length === 0) return;
+  await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds, addRules });
 }
 
 const DNR_HEADER_RULES_START = 800_000;
@@ -2122,13 +2326,11 @@ const DNR_STEALTH_RULES_START = 810_000;
 const DNR_HTTPS_RULES_START = 815_000;
 
 /** Apply DNR rules to strip tracking headers (Referer, Set-Cookie). */
-async function applyHeaderRules(enabled) {
+async function applyHeaderRules(enabled, plan = null) {
   const ruleIds = [DNR_HEADER_RULES_START, DNR_HEADER_RULES_START + 1];
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: ruleIds,
-    });
+    await emitPrivacyRules(plan, ruleIds);
     return;
   }
 
@@ -2167,26 +2369,21 @@ async function applyHeaderRules(enabled) {
     }
   ];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: ruleIds,
-    addRules: rules,
-  });
+  await emitPrivacyRules(plan, ruleIds, rules);
 }
 
 /** Clear the legacy CSP-stripping rule. Enhanced stealth now runs in MAIN world. */
-async function applyStealthRules() {
+async function applyStealthRules(plan = null) {
   const ruleId = DNR_STEALTH_RULES_START;
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-  });
+  await emitPrivacyRules(plan, [ruleId]);
 }
 
 /** Upgrade HTTP requests to HTTPS. */
-async function applyUpgradeSchemeRules(enabled) {
+async function applyUpgradeSchemeRules(enabled, plan = null) {
   const ruleId = DNR_HTTPS_RULES_START;
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2200,37 +2397,30 @@ async function applyUpgradeSchemeRules(enabled) {
     }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
-const PERSONAS = {
-  windows: {
-    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    platform: 'Windows'
-  },
-  mac: {
-    ua: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    platform: 'macOS'
-  },
-  linux: {
-    ua: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    chUA: '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-    platform: 'Linux'
-  }
-};
-
-/** Apply DNR rules to spoof User-Agent and Client Hints. */
-async function applyPersonaRules(personaId) {
+/**
+ * Apply DNR rules to spoof User-Agent and Client Hints.
+ *
+ * §5.9 — the table used to be a literal here, frozen at Chrome 122, with a
+ * second copy in the MAIN-world persona-spoof scriptlet. A `user-agent` and
+ * `sec-ch-ua` claiming a two-year-old Chrome is a beacon rather than
+ * camouflage, and the two copies could disagree. Both now come from
+ * `src/shared/personas.js`, built from the running browser's major.
+ *
+ * Built HERE rather than at module scope on purpose: the major is then read
+ * when a rule is written, so a browser update is picked up by the next apply
+ * instead of being frozen at worker-evaluation time, and nothing has to stub
+ * `navigator` before this file is imported. `detectChromeMajor` never throws
+ * — start-up is not a place to discover a hostile navigator.
+ */
+async function applyPersonaRules(personaId, plan = null) {
   const ruleId = DNR_PERSONA_RULES_START;
-  const persona = PERSONAS[personaId];
+  const persona = buildPersonas(detectChromeMajor())[personaId];
 
   if (!persona || personaId === 'default') {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2249,18 +2439,15 @@ async function applyPersonaRules(personaId) {
     condition: { resourceTypes: ['main_frame', 'sub_frame', 'script', 'xmlhttprequest', 'other'] }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 /** Strip ETag and Last-Modified to prevent cache-based tracking. */
-async function applyCacheProtectionRules(enabled) {
+async function applyCacheProtectionRules(enabled, plan = null) {
   const ruleId = DNR_CACHE_RULES_START;
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2280,18 +2467,15 @@ async function applyCacheProtectionRules(enabled) {
     }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 /** Enforce strict Referrer-Policy. */
-async function applyReferrerControlRules(enabled) {
+async function applyReferrerControlRules(enabled, plan = null) {
   const ruleId = DNR_REFERRER_RULES_START;
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2307,10 +2491,7 @@ async function applyReferrerControlRules(enabled) {
     condition: { resourceTypes: ['main_frame', 'sub_frame'] }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 const DNR_PERSONA_RULES_START = 820_000;
@@ -2359,13 +2540,31 @@ async function scheduleFilterUpdateAlarm() {
   }
 }
 
-chrome.alarms.onAlarm.addListener(async (alarm) => {
+// §7.9(a) — an alarm is one of the events that WAKES a terminated worker, so
+// this listener used to run against a worker whose rule-data pass had not
+// happened yet: stage 1's packaged snapshot write and this refresh's downloads
+// interleaved, and whichever landed second overwrote the other — one refresh
+// cycle lost, and on an update boot that is the cycle whose whole job is to
+// replace the snapshot the update just rolled back. Gate on `_criticalPromise`
+// the way the message dispatcher does (§3.1): the work is deferred, never
+// dropped. The promise is returned so the harness can await the work; Chrome
+// ignores a listener's return value.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  const run = _criticalReady || !_criticalPromise
+    ? handleAlarm(alarm)
+    : _criticalPromise.then(() => handleAlarm(alarm));
+  // §5.6 — a listener body's failure is otherwise an unhandled rejection while
+  // GET_ERROR_REPORT goes on describing a healthy extension.
+  return run.catch((err) => reportError(`alarm:${alarm?.name}`, err));
+});
+
+async function handleAlarm(alarm) {
   if (alarm.name === ALARM_FILTER_UPDATE) {
     await checkFilterListUpdates({ force: false });
   } else if (alarm.name === ALARM_STATS_CLEANUP) {
     await cleanupTabStats();
   }
-});
+}
 
 async function cleanupTabStats() {
   const activeTabs = await chrome.tabs.query({});
@@ -2661,6 +2860,8 @@ function schedulePersistTabStats() {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabStats.delete(tabId);
+  clearEarlyCssForTab(tabId); // §5.11
+
   // Delete again after the restore: closing a tab is one of the events that
   // wakes a terminated worker, and the restore would otherwise resurrect the
   // closed tab's entry from storage before the write-back (§4.14).
@@ -3235,6 +3436,34 @@ const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = COSMETIC_SCOPE_OPTIONS;
  * and is visible to the user, where a mis-parsed one silently over-blocks or
  * (worse, for an `@@` line) silently disables blocking.
  */
+/**
+ * §7.3 — find the `$` that starts the option list the way the build parser's
+ * `splitPatternAndOptions` does, and for the same reasons: `$` is a regex
+ * anchor and appears inside option values, so `lastIndexOf('$')` mis-splits.
+ * Scan right to left, skip an escaped `\$`, and require the tail to look like
+ * an option list.
+ *
+ * The head is matched case-INSENSITIVELY, which is where this deliberately
+ * parts company with the build. `5.6: parseSimpleNetworkRule refuses every
+ * option it cannot express` pins `$Script, image` as a script+image rule
+ * ("like uBO's"), while the build's own head is lowercase-only and leaves
+ * `$SCRIPT` in the pattern. Both cannot be right; until that is decided the
+ * runtime keeps the behaviour its tests pin, and the divergence is pinned as
+ * well (`7.3: option-name case is the one divergence left`). Everything else
+ * here mirrors scripts/build-rules.mjs `splitPatternAndOptions` (Track D's).
+ */
+const SIMPLE_RULE_OPTION_LIST_HEAD = /^~?(?:[13]p|[a-z][a-z0-9-]*)(?:[=,]|$)/i;
+
+function splitSimpleRuleOptions(pattern) {
+  for (let i = pattern.length - 1; i >= 0; i--) {
+    if (pattern[i] !== '$' || (i > 0 && pattern[i - 1] === '\\')) continue;
+    const tail = pattern.slice(i + 1);
+    if (tail === '' || !SIMPLE_RULE_OPTION_LIST_HEAD.test(tail)) continue;
+    return [pattern.slice(0, i), tail];
+  }
+  return [pattern, ''];
+}
+
 function parseSimpleNetworkRule(line, id) {
   const isException = line.startsWith('@@');
   const pattern = isException ? line.slice(2) : line;
@@ -3242,15 +3471,23 @@ function parseSimpleNetworkRule(line, id) {
   if (!pattern || pattern.length < 3) return null;
   if (pattern.includes('##') || pattern.includes('#@#') || pattern.includes('##+js')) return null;
 
-  const dollarPos = pattern.lastIndexOf('$');
-  let urlFilter = pattern;
+  const [rawUrlFilter, optionsStr] = splitSimpleRuleOptions(pattern);
+  let urlFilter = rawUrlFilter;
   let resourceTypes = null;
 
-  if (dollarPos > 0) {
-    urlFilter = pattern.slice(0, dollarPos);
+  // §5.6 — a trailing `$` with nothing after it is an option list the user
+  // wrote and this parser could not read, so it keeps failing closed. The
+  // build leaves it in the pattern; being STRICTER than the build is always
+  // allowed, and `emit_runtime ⇒ emit_build` (§7.3) still holds.
+  if (!optionsStr && /(^|[^\\])\$$/.test(rawUrlFilter)) return null;
+
+  if (optionsStr) {
     const types = [];
 
-    for (const raw of pattern.slice(dollarPos + 1).split(',')) {
+    for (const raw of optionsStr.split(',')) {
+      // Lowercased: §5.6 pins option matching as case-insensitive. See the
+      // note on SIMPLE_RULE_OPTION_LIST_HEAD — the build disagrees, and that
+      // is the one §7.3 shape left open rather than silently decided here.
       const option = raw.trim().toLowerCase();
 
       // A cosmetic-scope option means the line is not a network rule at all.
@@ -3278,7 +3515,12 @@ function parseSimpleNetworkRule(line, id) {
   }
 
   urlFilter = urlFilter.trim();
-  if (!urlFilter) return null;
+  // §7.3 — a pattern made only of anchors and wildcards has no literal content
+  // to match on. `||$script` used to emit `urlFilter: "||"`, which matches
+  // nothing; the build refuses `||`, `|` and `^` outright. A bare `*` is the
+  // browser-wide form the build expresses by dropping the urlFilter entirely —
+  // refusing it here is the safe direction for a line the user typed.
+  if (!urlFilter || !/[^|^*]/.test(urlFilter)) return null;
 
   const condition = { urlFilter };
   if (resourceTypes) condition.resourceTypes = resourceTypes;
@@ -3493,7 +3735,10 @@ async function loadRulesetCountsFromBuild() {
 
 // Stability/safety lists first, then core blockers, then niche lists. Under
 // tight static-rule budgets we prioritize ad blocking before tracker blocking,
-// so every EasyList shard is attempted before any EasyPrivacy shard.
+// so every EasyList shard is attempted before any EasyPrivacy shard. §5.1 —
+// with `rulesetDeltaApply` on the sequential fallback orders only the shards
+// it still has to enable, so that holds among those: a shard Chrome already
+// has enabled is left alone rather than re-attempted in its priority slot.
 const RULESET_ENABLE_PRIORITY = [
   'system-unbreak',
   'ubo-unbreak',
@@ -3577,13 +3822,23 @@ function getManifestRulesetIds() {
  * Run the sequential priority fallback: disable everything, then enable
  * rulesets one at a time in priority order, stopping at Chrome's static rule
  * limit. Returns the list of IDs that could not be enabled.
+ *
+ * §5.1 — with `deltaOnly` (flag `rulesetDeltaApply`) the caller passes the
+ * delta against getEnabledRulesets() and there is no reset: only
+ * `disableRulesetIds` is disabled, so a ruleset that is already enabled is
+ * never touched and no wake passes through a moment with every list off.
  */
-async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds) {
+async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds, { deltaOnly = false } = {}) {
   // Reset our static rulesets so budget checks start from a clean slate.
+  const resetRulesetIds = deltaOnly
+    ? disableRulesetIds
+    : [...new Set(enableRulesetIds.concat(disableRulesetIds))];
   try {
-    await chrome.declarativeNetRequest.updateEnabledRulesets({
-      disableRulesetIds: [...new Set(enableRulesetIds.concat(disableRulesetIds))],
-    });
+    if (!deltaOnly || resetRulesetIds.length > 0) {
+      await chrome.declarativeNetRequest.updateEnabledRulesets({
+        disableRulesetIds: resetRulesetIds,
+      });
+    }
   } catch (resetErr) {
     console.warn('[AdBlock] Reset before sequential fallback failed:', resetErr);
   }
@@ -3618,10 +3873,35 @@ async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds) {
 }
 
 /** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
-async function applyRulesets() {
-  const enabledMap = normalizeEnabledRulesetsMap(
-    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
-  );
+// §7.9 — serialized: the options page flips a card optimistically and leaves
+// the control live, so a list clicked off and straight back on runs this twice
+// at once. Unserialized, the second run's getEnabledRulesets() snapshot can
+// predate the first run's write, the delta comes out empty, nothing is sent,
+// and the first run's disable is final — storage, the effective map and the
+// options toggle all say ON while the ruleset is OFF in Chrome. Internal:
+// callers go through applyRulesets.
+function applyRulesets() {
+  return enqueueRulesetOp(_applyRulesetsNow);
+}
+
+async function _applyRulesetsNow() {
+  // §7.4(c) — a failed read here used to reject out of `ensureBackgroundSetup`
+  // and be reported as a FATAL error for the whole background setup, for
+  // something narrow and recoverable. Skip the apply instead: static rulesets
+  // persist across worker lives, so leaving them alone keeps the user's last
+  // applied state, whereas degrading the read to `{}` would enable every list
+  // the user turned off — the §3.1 shape. The effective map is returned so the
+  // caller reports what Chrome is actually enforcing rather than what was
+  // asked for.
+  let storedEnabledRulesets;
+  try {
+    storedEnabledRulesets = (await getStorage(StorageKeys.ENABLED_RULESETS)) || {};
+  } catch (err) {
+    if (!(err instanceof StorageReadError)) throw err;
+    reportError('applyRulesets:storageRead', err);
+    return getEffectiveEnabledRulesetsMap();
+  }
+  const enabledMap = normalizeEnabledRulesetsMap(storedEnabledRulesets);
 
   const manifestRulesetIds = getManifestRulesetIds();
   const enableRulesetIds = [];
@@ -3653,12 +3933,39 @@ async function applyRulesets() {
     console.warn('[AdBlock] Skipping ruleset IDs not declared in manifest:', unknownRulesetIds.join(', '));
   }
 
+  // §5.1 — flag `rulesetDeltaApply`. The unconditional batch below re-sends
+  // every ruleset on every SW start, and while it keeps failing (the shared
+  // static pool stays short for as long as another DNR extension holds it)
+  // the sequential fallback reset — disabled — all of them first: a window of
+  // zero network blocking on every wake. Under the flag only the difference
+  // against what Chrome already has enabled is applied: no call at all on a
+  // steady-state wake, and nothing that is already enabled is ever touched.
+  // `toDisable` is drawn from `disableRulesetIds`, so it can only hold a list
+  // the user turned off: never `system-unbreak` (always wanted above), and
+  // `ubo-unbreak` only on the user's own toggle. A snapshot that cannot be
+  // read falls back to the unconditional batch — never skip an apply.
+  let deltaOnly = false;
+  let toEnable = enableRulesetIds;
+  let toDisable = disableRulesetIds;
+  if (isFeatureEnabled('rulesetDeltaApply')) {
+    try {
+      const alreadyEnabled = new Set(await chrome.declarativeNetRequest.getEnabledRulesets());
+      toEnable = enableRulesetIds.filter((id) => !alreadyEnabled.has(id));
+      toDisable = disableRulesetIds.filter((id) => alreadyEnabled.has(id));
+      deltaOnly = true;
+    } catch (snapshotErr) {
+      console.warn('[AdBlock] Could not read enabled rulesets; applying the full set:', snapshotErr?.message || snapshotErr);
+    }
+  }
+
   try {
     // 1. Try batch operation first (most efficient)
-    await chrome.declarativeNetRequest.updateEnabledRulesets({
-      enableRulesetIds,
-      disableRulesetIds,
-    });
+    if (!deltaOnly || toEnable.length > 0 || toDisable.length > 0) {
+      await chrome.declarativeNetRequest.updateEnabledRulesets({
+        enableRulesetIds: toEnable,
+        disableRulesetIds: toDisable,
+      });
+    }
   } catch (err) {
     // 2. Fall back to the sequential per-ruleset path for ANY error —
     // previously only rule-limit errors triggered the fallback, so a single
@@ -3670,7 +3977,7 @@ async function applyRulesets() {
       console.warn('[AdBlock] Batch enable failed; falling back to sequential loading:', err?.message || err);
     }
 
-    const skippedRulesetIds = await applyRulesetsSequentially(enableRulesetIds, disableRulesetIds);
+    const skippedRulesetIds = await applyRulesetsSequentially(toEnable, toDisable, { deltaOnly });
 
     if (skippedRulesetIds.length > 0) {
       console.warn('[AdBlock] Skipped rulesets during sequential fallback:', skippedRulesetIds.join(', '));
@@ -3723,17 +4030,30 @@ function scheduleActiveIndexRebuild() {
   return _rebuildIndexPromise;
 }
 
-/** Enable or disable a static ruleset (or group) by ID. */
-async function setRulesetEnabled(rulesetId, enabled) {
-  const meta = normalizeEnabledRulesetsMap(
-    (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
-  );
-  meta[rulesetId] = enabled;
-  await setStorage(StorageKeys.ENABLED_RULESETS, meta);
+/**
+ * Enable or disable a static ruleset (or group) by ID. Serialized store +
+ * apply, the shape `setAndApplyUserFilters` uses.
+ *
+ * §7.9 — the read-modify-write below used to sit outside the chain, so two
+ * toggles of DIFFERENT lists at once lost one of them: each read the whole
+ * map, changed its own key in its own copy, and the later write clobbered the
+ * earlier one's. The user's click came back on by itself, with no error.
+ * Inside the op it reads the map after the previous toggle has written it.
+ * Calls `_applyRulesetsNow` rather than `applyRulesets` because this IS the
+ * ruleset op — going through the wrapper would make the chain await itself.
+ */
+function setRulesetEnabled(rulesetId, enabled) {
+  return enqueueRulesetOp(async () => {
+    const meta = normalizeEnabledRulesetsMap(
+      (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
+    );
+    meta[rulesetId] = enabled;
+    await setStorage(StorageKeys.ENABLED_RULESETS, meta);
 
-  const enabledMap = await applyRulesets();
-  scheduleActiveIndexRebuild();
-  return enabledMap;
+    const enabledMap = await _applyRulesetsNow();
+    scheduleActiveIndexRebuild();
+    return enabledMap;
+  });
 }
 
 async function getEffectiveEnabledRulesetsMap() {
@@ -3835,6 +4155,14 @@ const scriptletDiagnostics = {
   unknown: new Map(),           // name -> misses observed in pages
   refusedUntrusted: new Map(),  // name -> specs refused by the trust gate
 };
+// REVIEW-2026-09 §5.4 — CHECK_SEMANTIC_AD counters. `attempted` counts texts
+// that passed validation and reached the engine call; `refused` counts the
+// ones the cap turned away. Plain totals, not per-key maps: the text itself is
+// renderer-controlled and must never become a diagnostic key. `refused`
+// climbing is the only signal that something is sending oversized text, which
+// is otherwise a silent defence.
+let semanticChecksAttempted = 0;
+let semanticChecksRefused = 0;
 
 function bumpScriptletDiagnostic(map, name, count) {
   const key = typeof name === 'string' ? name.slice(0, 100) : String(name).slice(0, 100);
@@ -3851,6 +4179,8 @@ function scriptletDiagnosticsSnapshot() {
     unknownTotal: total(scriptletDiagnostics.unknown),
     refusedUntrusted: toObject(scriptletDiagnostics.refusedUntrusted),
     refusedUntrustedTotal: total(scriptletDiagnostics.refusedUntrusted),
+    semanticChecksAttempted,
+    semanticChecksRefused,
   };
 }
 
@@ -4116,6 +4446,10 @@ function utf8ByteLength(text) {
 // a count per observer batch; anything past this is a compromised renderer
 // inflating the badge, not a page with a million ad slots.
 const MAX_CONTENT_BLOCKED_COUNT = 1_000;
+// §5.4 — UTF-16 units, the unit `String.length` counts. The Rust cap is
+// 4096 BYTES and one UTF-16 unit is at most 3 UTF-8 bytes, so 1024 here can
+// never produce a string the Rust side refuses (lib.rs asserts this).
+const MAX_SEMANTIC_TEXT_LENGTH = 1024;
 
 // ---------------------------------------------------------------------------
 // Sender privilege classes (REVIEW.md §2.3, REVIEW-2026-07 §6 row 2.3).
@@ -4145,10 +4479,8 @@ const SENDER_EXTENSION_PAGE = 'extension-page';   // extension pages only
 // whole-object writers and destructive operations with live, narrower
 // replacements (UPDATE_SETTINGS, ADD_ALLOWLIST_DOMAINS).
 const MESSAGE_SENDER_POLICY = {
-  // Content-script critical path + picker/stats reporting.
+  // Content-script critical path + picker/error reporting.
   GET_INIT_DATA: SENDER_ANY,          // §4.19: hostname derived from sender.url
-  IS_SITE_ALLOWED: SENDER_ANY,
-  GET_TAB_STATS: SENDER_ANY,          // §5.4: payload.tabId honored only for extension pages
   CONTENT_BLOCKED: SENDER_ANY,        // §4.13: payload validated in the handler
   APPEND_USER_FILTER: SENDER_ANY,     // element picker; single validated line
   REPORT_CONTENT_ERROR: SENDER_ANY,
@@ -4156,6 +4488,14 @@ const MESSAGE_SENDER_POLICY = {
 
   // Extension pages only — settings/allowlist/filter/ruleset writers, bulk
   // readers of user data, diagnostics, and destructive operations.
+  // §5.3 — these two were SENDER_ANY while only the popup ever called them
+  // (popup.js:92,133,194; re-verified by grep at HEAD across src/, not taken
+  // from the review). IS_SITE_ALLOWED answered for any hostname the caller
+  // named, so a compromised renderer had a yes/no oracle over the user's
+  // allowlist; GET_TAB_STATS needed the §5.4 guard to stop the same renderer
+  // enumerating tab ids and reading every open tab's URL.
+  IS_SITE_ALLOWED: SENDER_EXTENSION_PAGE,
+  GET_TAB_STATS: SENDER_EXTENSION_PAGE,
   GET_SETTINGS: SENDER_EXTENSION_PAGE,
   UPDATE_SETTINGS: SENDER_EXTENSION_PAGE,
   GET_ALLOWLIST: SENDER_EXTENSION_PAGE,
@@ -4187,6 +4527,29 @@ const NEEDS_CRITICAL_CACHE = new Set([
   'GET_DAILY_BLOCKED_TOTAL',
   'GET_INIT_DATA',
 ]);
+
+/**
+ * §7.4(a) — one shared retry of the memory caches, not one per waiting
+ * message: a re-read also re-runs the §4.7 DNR allowlist reconcile, so four
+ * messages arriving together must not issue four of them. A retry that fails
+ * again is swallowed — the handler then answers from the caches as they are,
+ * exactly as it did before this gate existed.
+ */
+let _cacheRetryPromise = null;
+
+function retryMemoryCaches() {
+  if (!_cacheRetryPromise) {
+    _cacheRetryPromise = refreshMemoryCache()
+      .catch((err) => { reportError('refreshMemoryCache:retry', err); })
+      .finally(() => { _cacheRetryPromise = null; });
+  }
+  return _cacheRetryPromise;
+}
+
+async function whenCriticalCachesUsable() {
+  if (!_criticalReady && _criticalPromise) await _criticalPromise;
+  if (!allowlistCacheTrusted) await retryMemoryCaches();
+}
 
 /** True when the message came from one of our own extension pages. */
 function isExtensionPageSender(sender) {
@@ -4236,6 +4599,17 @@ function resolveRequestHostname(sender, claimed) {
   return hostnameFromSenderUrl(sender.url) || claimedHostname;
 }
 
+/**
+ * §4.14 — the error reply shape. `code` is present only when the failure
+ * carried one (`StorageReadError.code === 'READ_FAILED'`), so the options page
+ * and the popup can say "nothing was changed" for exactly that failure and
+ * keep their own sentence for every other.
+ */
+function errorResponse(err) {
+  const message = err?.message || String(err);
+  return err?.code ? { error: message, code: err.code } : { error: message };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!sender || sender.id !== chrome.runtime.id) {
     sendResponse({ error: 'foreign sender rejected' });
@@ -4260,8 +4634,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // "not allowlisted" for a site the user has allowlisted.
   const needsCache = NEEDS_CRITICAL_CACHE.has(message.type);
 
-  const run = needsCache && !_criticalReady
-    ? _criticalPromise.then(() => handleMessage(message, sender))
+  // §7.4(a) — waiting for `_criticalPromise` is not enough on its own.
+  // `refreshMemoryCache` marks the allowlist cache untrusted when ITS read
+  // failed and deliberately leaves every cache as it was (§3.1), and nothing
+  // consulted that flag: on a worker that booted through a read fault
+  // `cachedAllowlist` is empty, so every site the user allowlisted answered
+  // "not allowlisted" — cosmetic CSS injected into a protected page and the
+  // shield injected into an allowlisted YouTube tab, for the life of the
+  // worker. Retry the read before answering.
+  const run = needsCache && !(_criticalReady && allowlistCacheTrusted)
+    ? whenCriticalCachesUsable().then(() => handleMessage(message, sender))
     : handleMessage(message, sender);
 
   run.then(sendResponse).catch((err) => {
@@ -4271,7 +4653,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // page got zero cosmetic rules. The response shape is the caller's
     // problem; the failure being *invisible* was ours.
     reportError(`message:${message.type}`, err);
-    sendResponse({ error: err.message });
+    // §4.14 — carry the error's `code` (StorageReadError's `READ_FAILED`) to
+    // the caller. Chrome's wording is the same for every failing API, so the
+    // code is the only way an extension page can tell "the read failed and
+    // nothing was written" from a failure that happened after a write landed.
+    sendResponse(errorResponse(err));
   });
   return true;
 });
@@ -4328,6 +4714,14 @@ async function handleMessage(message, sender) {
           : cachedGenericProceduralRules,
       };
 
+      // §5.11 (A2f) — flag `singleCssInjection`. Present only under the flag,
+      // so with it off the reply is byte-for-byte what it was and the content
+      // script injects its own pair exactly as before.
+      if (isFeatureEnabled('singleCssInjection')) {
+        responseData.earlyCssApplied =
+          isEarlyCssApplied(sender.tab?.id, sender.frameId || 0, sender.url);
+      }
+
       if (wasmReady && !isAllowed && cosmeticBundle.cosmeticRulesBinary) {
         try {
           // Base64, not the raw Uint8Array: runtime messages are JSON-
@@ -4352,13 +4746,15 @@ async function handleMessage(message, sender) {
       return responseData;
     }
     case 'GET_TAB_STATS': {
-      // §5.4 — honoring payload.tabId from any sender let a compromised
-      // renderer enumerate tab ids and read every open tab's URL. Only
-      // extension pages (no sender.tab, extension-origin sender.url) may ask
-      // about arbitrary tabs; content scripts get their own tab only.
-      const fromExtensionPage = !sender.tab && isExtensionPageSender(sender);
-      const tabId = fromExtensionPage ? payload?.tabId : sender.tab?.id;
-      return { ...normalizeTabStatsEntry(tabStats.get(tabId)), networkStatsAvailable };
+      // §5.4 honored payload.tabId only for extension pages, because a
+      // renderer could otherwise enumerate tab ids and read every open tab's
+      // URL. §5.3 moved this type to SENDER_EXTENSION_PAGE, so the gate above
+      // has already refused every renderer and the remaining callers are our
+      // own pages, which are entitled to ask about any tab. The old guard also
+      // required `!sender.tab`, which would have scoped an extension page
+      // opened in a TAB (the options page) to its own stats — not what an
+      // extension page asking for a tab id means.
+      return { ...normalizeTabStatsEntry(tabStats.get(payload?.tabId)), networkStatsAvailable };
     }
     case 'GET_DAILY_BLOCKED_TOTAL': {
       if (rollDailyBlockedTotalIfNeeded()) {
@@ -4375,11 +4771,21 @@ async function handleMessage(message, sender) {
       // comment explaining that it deliberately does not use it), and a
       // replace composed from one tab's possibly-stale DOM silently clobbers
       // concurrent edits made in the other surface.
-      const current = (await getStorage(StorageKeys.SETTINGS)) || {};
-      const merged = { ...current, ...(payload || {}) };
-      await setStorage(StorageKeys.SETTINGS, merged);
-      cachedSettings = merged;
-      await applyPrivacySettings();
+      // §7.9 — the merge is a read-modify-write and used to run outside the
+      // chain, so two writes of DIFFERENT keys at once lost one of them
+      // (`stealthPersona` came back undefined, the choice discarded, with no
+      // error). Serialized store + apply, the shape setAndApplyUserFilters
+      // uses; `_applyPrivacySettingsNow` because this IS the privacy op.
+      // The read stays strict: a failed read must not merge onto `{}` and
+      // write that over the user's settings (§3.1).
+      const merged = await enqueuePrivacyOp(async () => {
+        const current = (await getStorage(StorageKeys.SETTINGS)) || {};
+        const next = { ...current, ...(payload || {}) };
+        await setStorage(StorageKeys.SETTINGS, next);
+        cachedSettings = next;
+        await _applyPrivacySettingsNow();
+        return next;
+      });
       await refreshAllBadges();
       return { ok: true, settings: merged };
     }
@@ -4422,7 +4828,7 @@ async function handleMessage(message, sender) {
         const { allowlist, rejected } = await addAllowlistDomains(payload.domains);
         return { ok: true, allowlist, rejected };
       } catch (err) {
-        return { error: err?.message || String(err) };
+        return errorResponse(err);
       }
     }
     case 'IS_SITE_ALLOWED': {
@@ -4494,8 +4900,22 @@ async function handleMessage(message, sender) {
     // anonymized, and no surface displayed either.
 
     case 'CHECK_SEMANTIC_AD': {
-      const { text } = payload;
-      if (!text) return { isAd: false };
+      // §5.4 — renderer-supplied text, and this type is SENDER_ANY. The cap
+      // belongs HERE rather than only in Rust: wasm-bindgen copies the whole
+      // string into linear memory BEFORE `is_semantic_ad` runs, so the Rust
+      // cap (MAX_SEMANTIC_TEXT_BYTES) refuses the scan but cannot prevent the
+      // copy or the permanent heap growth it causes. The content engine never
+      // sends more than 400 characters (cosmetic-engine.js:1084), so this is
+      // 2.5x the largest legitimate payload; 1024 UTF-16 units is at most
+      // 3072 UTF-8 bytes, so nothing forwarded here can hit the 4096-byte
+      // Rust cap. Refused quietly with `false`, never an error: a renderer
+      // must not be able to turn this into an error-report entry per call.
+      const text = payload?.text;
+      if (typeof text !== 'string' || text.length === 0 || text.length > MAX_SEMANTIC_TEXT_LENGTH) {
+        semanticChecksRefused++;
+        return { isAd: false };
+      }
+      semanticChecksAttempted++;
       return { isAd: wasmReady ? is_semantic_ad(text) : false };
     }
 
@@ -4807,6 +5227,59 @@ function isHostnameAllowedCached(hostname) {
  * Reusable core injection logic.
  * Ensures CSS is injected as early as possible.
  */
+// ---------------------------------------------------------------------------
+// §5.11 (A2f) — flag `singleCssInjection`. `performEarlyInjection` inserts the
+// page's cosmetic CSS as a user-origin sheet, and the content script inserted
+// the same text again as a `<style>` pair: two copies in every frame,
+// including third-party ad frames about to be blocked. GET_INIT_DATA now
+// reports whether this frame's user-origin sheet actually landed, and the
+// content script skips its pair when it did.
+//
+// Everything here is shaped by one asymmetry: an extension's user-origin
+// sheet is NOT visible in `document.styleSheets`, so the content script
+// cannot verify the claim, and `cachedGenericCss` reaches the page only
+// through this insertCSS. Reporting `true` wrongly therefore does not cost a
+// duplicate sheet — it costs the frame ALL of its cosmetic CSS. So:
+//   - the record is made only in the FULFILLED branch of the insertCSS (the
+//     production call swallows rejections, and Chrome rejects for a removed
+//     frame, a closed tab or a restricted page);
+//   - it is keyed per frame, because the content script runs in every frame
+//     and GET_INIT_DATA answers sub-frames;
+//   - it stores the document URL it was made for, and GET_INIT_DATA matches
+//     it against `sender.url`. A document_start content script can ask before
+//     the worker has processed that frame's `onCommitted` — both wake the
+//     worker and the order is not guaranteed — so a bare boolean could hand a
+//     new document the previous one's `true`, whose sheet died with it.
+// Every failure mode above resolves to `false`, i.e. one duplicated sheet in
+// that frame, which is exactly what shipped before this flag.
+// ---------------------------------------------------------------------------
+const MAX_EARLY_CSS_FRAMES = 200;
+const earlyCssFrames = new Map(); // `${tabId}:${frameId}` -> document URL
+
+const earlyCssKey = (tabId, frameId) => `${tabId}:${frameId}`;
+
+function markEarlyCssApplied(tabId, frameId, urlStr) {
+  const key = earlyCssKey(tabId, frameId);
+  // Bounded: a page that opens frames without end must not grow this map.
+  // Evicting a live record only ever costs a duplicated sheet.
+  if (!earlyCssFrames.has(key) && earlyCssFrames.size >= MAX_EARLY_CSS_FRAMES) {
+    earlyCssFrames.delete(earlyCssFrames.keys().next().value);
+  }
+  earlyCssFrames.set(key, urlStr);
+}
+
+function isEarlyCssApplied(tabId, frameId, urlStr) {
+  return typeof urlStr === 'string' &&
+    earlyCssFrames.get(earlyCssKey(tabId, frameId)) === urlStr;
+}
+
+function clearEarlyCssForTab(tabId) {
+  const prefix = `${tabId}:`;
+  for (const key of earlyCssFrames.keys()) {
+    if (key.startsWith(prefix)) earlyCssFrames.delete(key);
+  }
+}
+
 async function performEarlyInjection(tabId, frameId, urlStr) {
   if (!urlStr?.startsWith('http')) return;
   let url;
@@ -4825,10 +5298,12 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
 
   if (isHostnameAllowedCached(hostname)) return;
 
+  // §5.5 — no setCachedDomainRules here. getCosmeticBundleForPage caches the
+  // bundle itself, gated on the rebuild generation; re-seeding it from out
+  // here overrode that gate and kept exactly the bundles it had refused.
   let bundle = domainRulesCache.get(hostname);
   if (!bundle) {
     bundle = await getCosmeticBundleForPage(hostname);
-    setCachedDomainRules(hostname, bundle);
   }
 
   // Re-check after the awaits — the user may have allowlisted the site while
@@ -4842,11 +5317,19 @@ async function performEarlyInjection(tabId, frameId, urlStr) {
   ].filter(Boolean).join('\n');
 
   if (cssText) {
+    // §5.11 — `.then(onFulfilled, onRejected)` rather than `.catch`: the
+    // rejection stays swallowed exactly as before, but the record is made
+    // only on the fulfilled path. An awaited `.catch(() => {})` resolves for
+    // a failed injection too, and a record placed after it would report
+    // `true` for a frame that has no CSS.
     await chrome.scripting.insertCSS({
       target: { tabId, frameIds: [frameId] },
       css: cssText,
       origin: 'USER',
-    }).catch(() => { });
+    }).then(
+      () => { markEarlyCssApplied(tabId, frameId, urlStr); },
+      () => { }
+    );
   }
 }
 
@@ -4868,9 +5351,9 @@ async function handleBeforeNavigate(details) {
     resetTabStats(details.tabId, details.url);
   }
 
+  // §5.5 — the pre-warm is the lookup's own gated cache write; see above.
   if (!domainRulesCache.has(hostname)) {
-    const bundle = await getCosmeticBundleForPage(hostname);
-    setCachedDomainRules(hostname, bundle);
+    await getCosmeticBundleForPage(hostname);
   }
 }
 
@@ -4878,7 +5361,12 @@ async function handleBeforeNavigate(details) {
  * Stage 2: onCommitted (Reliability fallback)
  */
 async function handleCommitted(details) {
-  await performEarlyInjection(details.tabId, details.frameId || 0, details.url);
+  const frameId = details.frameId || 0;
+  // §5.11 — a commit means this frame is showing a NEW document, whose
+  // user-origin sheet does not exist yet. Drop the previous document's record
+  // before re-injecting so nothing can read it in between.
+  earlyCssFrames.delete(earlyCssKey(details.tabId, frameId));
+  await performEarlyInjection(details.tabId, frameId, details.url);
 }
 
 // Listener bodies route failures to reportError (§5.6): a persistent
@@ -4901,7 +5389,8 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 export const __testHooks = {
   whenCriticalReady: () => _criticalPromise || Promise.resolve(),
   whenBackgroundSetupDone: () => _backgroundSetupPromise || Promise.resolve(),
-  // Alarms / rulesets
+  // Rule data / alarms / rulesets
+  ensureRuleDataReady,
   scheduleFilterUpdateAlarm,
   applyRulesets,
   CONFIG,
@@ -4963,6 +5452,7 @@ export const __testHooks = {
   },
   // Cosmetic index / navigation
   getCosmeticBundleForPage,
+  hasCachedDomainRules: (hostname) => domainRulesCache.has(hostname),
   buildPageBundle,
   queueActiveIndexRebuild,
   isActiveIndexRebuildInFlight,
@@ -4973,6 +5463,8 @@ export const __testHooks = {
   checkFilterListUpdates,
   getActiveRuleDataVersion: () => activeRuleDataVersion,
   performEarlyInjection,
+  earlyCssRecordCount: () => earlyCssFrames.size,
+  MAX_EARLY_CSS_FRAMES,
   handleBeforeNavigate,
   handleCommitted,
   db,

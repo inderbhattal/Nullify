@@ -1,6 +1,17 @@
 /**
  * Regression suite for the MAIN-world YouTube shield content script
- * (src/content/youtube-shield.js), covering docs/REVIEW-2026-07.md:
+ * (src/content/youtube-shield.js).
+ *
+ * It began as the two docs/REVIEW-2026-07.md findings below and has since
+ * grown to span four documents. Section numbers are reused across them with
+ * *different* content — REVIEW-2026-07 §4.12 is about combinator semantics,
+ * REVIEW-2026-08 §4.12 is this file's idempotency guard — so each number is
+ * qualified with its document on first use here and left bare afterwards:
+ *
+ *   REVIEW-2026-07 §4.30, §5.32 · REVIEW-2026-08 §4.12, §4.25 ·
+ *   REVIEW-2026-09 §4.4 · REMEDIATION-2026-09 §7.8
+ *
+ * From docs/REVIEW-2026-07.md:
  *
  *   §4.30 — the ytcfg.set wrapper ran once synchronously at document_start,
  *           before the page defines window.ytcfg, so the poison branch never
@@ -40,8 +51,9 @@ async function shieldBody() {
 // The shield imports `proxyApply`/`wrapInstanceGetter` (and through them the
 // bundle-wide `Function.prototype.toString` mask) from shared-utils.js, which
 // webpack inlines into the youtube-shield chunk. The harness evaluates the
-// real module source, exports stripped, ahead of the IIFE — so the §4.4
-// detectors below run against the genuine masking rather than a stand-in.
+// real module source, exports stripped, ahead of the IIFE — so the
+// REVIEW-2026-09 §4.4 detectors below run against the genuine masking
+// rather than a stand-in.
 // shared-utils.js is import-free and side-effect-free at load, which is what
 // makes evaluating it as a script possible.
 let _sharedUtilsBody = null;
@@ -84,21 +96,22 @@ const injectionSource = (body, utils) => `{\n${IMPORT_STUBS}\n${utils}\n${body}\
 // *host* Function.prototype and never reach the vm realm's mask. In a real
 // page there is one realm and the two spellings are the same call.
 //
-// Own keys are recorded for the callable surfaces (a Proxy forwards them to
-// its native target) but not for the accessor functions: shared-utils'
-// `wrapInstanceGetter` builds those with a function expression, which carries
-// an own `prototype` a native getter lacks — a shared-utils concern, tracked
-// separately from this file.
+// Own keys are recorded for every surface, callable and accessor alike: a
+// Proxy forwards them to its native target, and since REMEDIATION-2026-09
+// §7.8 `wrapInstanceGetter` builds its accessor with method syntax, so neither
+// carries the own `prototype` a function expression would have. The generic
+// form of this comparison — every helper, every call site — is
+// tests/wrapped-accessor-detect.test.mjs.
 const DETECTOR_SNIPPET = `(() => {
-  const describe = (fn, withKeys) => (typeof fn === 'function' ? {
+  const describe = (fn) => (typeof fn === 'function' ? {
     name: fn.name,
     length: fn.length,
     source: Function.prototype.toString.call(fn),
-    ...(withKeys ? { ownKeys: Reflect.ownKeys(fn).map(String) } : {}),
+    ownKeys: Reflect.ownKeys(fn).map(String),
   } : null);
-  const callable = (fn) => describe(fn, true);
+  const callable = (fn) => describe(fn);
   const getter = (proto, prop) =>
-    describe(Object.getOwnPropertyDescriptor(proto, prop)?.get, false);
+    describe(Object.getOwnPropertyDescriptor(proto, prop)?.get);
   const xp = XMLHttpRequest.prototype;
   return JSON.stringify({
     'JSON.parse': callable(JSON.parse),
@@ -326,7 +339,8 @@ async function makeShieldHarness({
 }
 
 // ---------------------------------------------------------------------------
-// §4.12 — the idempotency guard must not be a page-operable kill switch
+// REVIEW-2026-08 §4.12 — the idempotency guard must not be a page-operable
+// kill switch
 // ---------------------------------------------------------------------------
 
 // Every interception layer the old writable-global guard could switch off.
@@ -735,7 +749,7 @@ test('§4.30 (didn\'t re-break): late injection with ytcfg already present still
 });
 
 // ---------------------------------------------------------------------------
-// §4.25 — the belt layer must poison the store YouTube actually reads
+// REVIEW-2026-08 §4.25 — the belt layer must poison the store YouTube reads
 //
 // The `config_` cases above are the harness's own invention (kept because they
 // are harmless). Real YouTube backs ytcfg with `ytcfg.data_` or, via

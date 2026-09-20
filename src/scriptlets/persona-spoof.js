@@ -1,53 +1,18 @@
-const PERSONAS = {
-  windows: {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    platform: 'Win32',
-    uaPlatform: 'Windows',
-    platformVersion: '15.0.0',
-  },
-  mac: {
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    platform: 'MacIntel',
-    uaPlatform: 'macOS',
-    platformVersion: '13.0.0',
-  },
-  linux: {
-    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    platform: 'Linux x86_64',
-    uaPlatform: 'Linux',
-    platformVersion: '6.0.0',
-  },
-};
-
-const BRANDS = [
-  { brand: 'Chromium', version: '122' },
-  { brand: 'Not(A:Brand', version: '24' },
-  { brand: 'Google Chrome', version: '122' },
-];
-
-function defineGetter(target, key, getter) {
-  try {
-    Object.defineProperty(target, key, {
-      configurable: true,
-      get: getter,
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function defineNavigatorValue(key, value) {
-  if (defineGetter(Navigator.prototype, key, () => value)) return;
-  defineGetter(navigator, key, () => value);
-}
+import { buildNavigatorPersona, detectChromeMajor } from '../shared/personas.js';
+import { defineNavigatorValue } from './shared-utils.js';
 
 // Module-scope guard. A global flag was page-writable — one inline script
 // setting it disabled the scriptlet — and enumerable via Object.keys(window).
 let appliedPersona = null;
 
 export function personaSpoof(personaId = 'default') {
-  const persona = PERSONAS[personaId];
+  // §5.9 — the persona table lived here as literals frozen at one Chrome
+  // major, which dates the claim instead of hiding it. The strings now come
+  // from the module the service worker's header rule is built from, carrying
+  // the major of the browser this page really runs in. Detected here rather
+  // than at module scope: the bundle loads in every frame that runs any
+  // scriptlet, this runs only when a persona is set.
+  const persona = buildNavigatorPersona(personaId, detectChromeMajor());
   if (!persona) return;
 
   if (appliedPersona === personaId) return;
@@ -67,7 +32,7 @@ export function personaSpoof(personaId = 'default') {
   };
 
   const spoofed = {
-    brands: BRANDS,
+    brands: persona.brands,
     mobile: false,
     platform: persona.uaPlatform,
     async getHighEntropyValues(hints = []) {
@@ -80,13 +45,13 @@ export function personaSpoof(personaId = 'default') {
       if (hintSet.has('architecture')) result.architecture = architectureMap[persona.platform] || 'x86';
       if (hintSet.has('bitness')) result.bitness = '64';
       if (hintSet.has('model')) result.model = '';
-      if (hintSet.has('uaFullVersion')) result.uaFullVersion = '122.0.0.0';
-      if (hintSet.has('fullVersionList')) result.fullVersionList = BRANDS;
+      if (hintSet.has('uaFullVersion')) result.uaFullVersion = persona.uaFullVersion;
+      if (hintSet.has('fullVersionList')) result.fullVersionList = persona.brands;
       return result;
     },
     toJSON() {
       return {
-        brands: BRANDS,
+        brands: persona.brands,
         mobile: false,
         platform: persona.uaPlatform,
       };

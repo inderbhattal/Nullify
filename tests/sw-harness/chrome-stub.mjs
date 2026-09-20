@@ -70,9 +70,9 @@ function serializeForBus(value, direction) {
   return JSON.parse(json);
 }
 
-function makeListenerEvent() {
+function makeListenerEvent(registry) {
   const listeners = new Set();
-  return {
+  const event = {
     addListener: (fn) => listeners.add(fn),
     removeListener: (fn) => listeners.delete(fn),
     hasListener: (fn) => listeners.has(fn),
@@ -86,6 +86,10 @@ function makeListenerEvent() {
     },
     _listeners: listeners,
   };
+  // §7.9(d) — every event registers itself so `_clearListeners` reaches a
+  // newly added one without anybody remembering to list it.
+  registry?.push(event);
+  return event;
 }
 
 /**
@@ -185,6 +189,7 @@ function validateDnrRuleSchema(rule) {
 
 export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
   const calls = new CallLog();
+  const listenerEvents = [];
 
   // ---- chrome.storage ----
   // Mirrors Chrome's dual API: promise-based when no callback is passed,
@@ -367,7 +372,7 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     async getAvailableStaticRuleCount() {
       return 30000;
     },
-    onRuleMatchedDebug: makeListenerEvent(),
+    onRuleMatchedDebug: makeListenerEvent(listenerEvents),
   };
 
   // ---- chrome.scripting ----
@@ -453,9 +458,9 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
       calls.push({ api: 'tabs.sendMessage', tabId, message, options });
       return undefined;
     },
-    onUpdated: makeListenerEvent(),
-    onRemoved: makeListenerEvent(),
-    onActivated: makeListenerEvent(),
+    onUpdated: makeListenerEvent(listenerEvents),
+    onRemoved: makeListenerEvent(listenerEvents),
+    onActivated: makeListenerEvent(listenerEvents),
     _addTab: (tab) => {
       const t = { id: tab.id ?? tabs._tabs.size + 1, url: tab.url, ...tab };
       tabs._tabs.set(t.id, t);
@@ -471,14 +476,14 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
       calls.push({ api: 'webNavigation.getAllFrames', tabId });
       return webNavigation._frames.get(tabId) || null;
     },
-    onBeforeNavigate: makeListenerEvent(),
-    onCommitted: makeListenerEvent(),
-    onCompleted: makeListenerEvent(),
+    onBeforeNavigate: makeListenerEvent(listenerEvents),
+    onCommitted: makeListenerEvent(listenerEvents),
+    onCompleted: makeListenerEvent(listenerEvents),
     _setFrames: (tabId, frames) => webNavigation._frames.set(tabId, frames),
   };
 
   // ---- chrome.runtime ----
-  const messageListeners = makeListenerEvent();
+  const messageListeners = makeListenerEvent(listenerEvents);
   const runtime = {
     id: extensionId,
     lastError: null,
@@ -489,9 +494,9 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
       declarative_net_request: { rule_resources: [] },
     }),
     getURL: (path) => `chrome-extension://${extensionId}/${path.replace(/^\//, '')}`,
-    onInstalled: makeListenerEvent(),
-    onStartup: makeListenerEvent(),
-    onSuspend: makeListenerEvent(),
+    onInstalled: makeListenerEvent(listenerEvents),
+    onStartup: makeListenerEvent(listenerEvents),
+    onSuspend: makeListenerEvent(listenerEvents),
     onMessage: messageListeners,
     // `senderOverrides` is a test-only extension: merged into the default
     // sender so tests can simulate content-script senders (sender.tab etc.).
@@ -537,7 +542,7 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     },
     async get(name) { return alarms._alarms.get(name) || null; },
     async clear(name) { return alarms._alarms.delete(name); },
-    onAlarm: makeListenerEvent(),
+    onAlarm: makeListenerEvent(listenerEvents),
   };
 
   // ---- chrome.contextMenus ----
@@ -566,7 +571,7 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
       runtime.lastError = null;
       if (cb) cb();
     },
-    onClicked: makeListenerEvent(),
+    onClicked: makeListenerEvent(listenerEvents),
   };
 
   // ---- chrome.action ----
@@ -622,6 +627,21 @@ export function makeChromeStub({ extensionId = 'nullify-test-id' } = {}) {
     privacy,
     // Test-only handles:
     calls,
+    /**
+     * §7.9(d) — drop every listener this stub is holding and return how many
+     * went. Chrome tears a worker down before the next one registers; this
+     * stub keeps listeners forever, so a two-life test that skips this has
+     * the dead life's handlers running alongside the live one's and doubling
+     * every call they make. `sw-loader.mjs`'s `teardown()` calls this.
+     */
+    _clearListeners() {
+      let removed = 0;
+      for (const event of listenerEvents) {
+        removed += event._listeners.size;
+        event._listeners.clear();
+      }
+      return removed;
+    },
     _matchesPattern: matchesPattern,
   };
 }

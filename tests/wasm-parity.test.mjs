@@ -709,3 +709,172 @@ test('3.3: WASM maps $to/$from/$method to the DNR fields the build emits', { ski
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// §5.4 — is_semantic_ad refuses oversized text
+// ---------------------------------------------------------------------------
+
+// CHECK_SEMANTIC_AD is answerable to any renderer, and `is_semantic_ad` used
+// to normalize and scan whatever it was handed: 64 MB of `x` held the worker
+// for ~800 ms and left three times the input behind in linear memory, which
+// never shrinks. The content engine never sends more than 400 characters.
+// Text over 4096 UTF-8 bytes is now refused before anything is allocated or
+// scanned — `false`, not an error: to the caller it is simply "not an ad".
+const SEMANTIC_CAP_BYTES = 4096;
+const SEMANTIC_KEYWORD = 'sponsored';
+const OVERSIZED_BYTES = 64 * 1024 * 1024;
+
+/** `length` UTF-8 bytes of filler carrying the keyword at the end or the front. */
+const adTextOf = (length, { keywordFirst = false, filler = 'x' } = {}) => {
+  const room = length - SEMANTIC_KEYWORD.length;
+  const fillerBytes = Buffer.byteLength(filler);
+  assert.equal(room % fillerBytes, 0, 'filler must tile the requested length exactly');
+  const padding = filler.repeat(room / fillerBytes);
+  const text = keywordFirst ? SEMANTIC_KEYWORD + padding : padding + SEMANTIC_KEYWORD;
+  assert.equal(Buffer.byteLength(text), length);
+  return text;
+};
+
+/**
+ * A private instance of the artifact. Linear memory never shrinks, so a 64 MB
+ * input must not be left behind in the instance every other test here shares,
+ * and growth is only a deterministic measure on a fresh one. The query string
+ * makes the glue a distinct module, hence a distinct instance.
+ */
+const privateInstance = async (tag) => {
+  const glue = await import(`${pathToFileURL(GLUE_PATH).href}?instance=${tag}`);
+  const raw = await glue.default({ module_or_path: fs.readFileSync(BYTES_PATH) });
+  return { glue, raw };
+};
+
+// What is timed is the export itself. The glue copies its argument into linear
+// memory before Rust sees it — a JS loop, ~100 ms for 64 MB, which only the
+// service worker's own cap avoids — so the buffer is filled natively and handed
+// over by the glue's own protocol: allocate, write, call; the callee frees it.
+test('5.4: is_semantic_ad on 64 MB returns in under 5 ms', { skip }, async () => {
+  const { raw } = await privateInstance('5.4-clock');
+  const callExport = (length, keyword) => {
+    const ptr = raw.__wbindgen_malloc(length, 1) >>> 0;
+    const view = new Uint8Array(raw.memory.buffer, ptr, length); // after malloc: growth detaches the buffer
+    view.fill(0x78); // 'x'
+    if (keyword) view.set(new TextEncoder().encode(keyword));
+    const t0 = performance.now();
+    const verdict = raw.is_semantic_ad(ptr, length);
+    return { verdict, ms: performance.now() - t0 };
+  };
+
+  // Control: the same call shape classifies an in-cap ad as one, so a fast
+  // answer below is a refusal and not a mis-call that read nothing.
+  assert.equal(callExport(SEMANTIC_CAP_BYTES, SEMANTIC_KEYWORD).verdict, 1, 'raw call protocol');
+
+  // The review's input. Best of three: one preempted attempt on a loaded
+  // machine must not fail the suite, and the scan cannot get under the bound on
+  // any attempt.
+  let best = Infinity;
+  for (let attempt = 0; attempt < 3 && best >= 5; attempt += 1) {
+    best = Math.min(best, callExport(OVERSIZED_BYTES, null).ms);
+  }
+  assert.ok(best < 5, `is_semantic_ad took ${best.toFixed(1)} ms on 64 MB (best attempt)`);
+});
+
+// The same 64 MB through the glue, as the service worker calls it, with text
+// the scanner WOULD call an ad — so the refusal is a verdict, not only a speed.
+// No clock here: the scan's normalized copy, grown by doubling, used to leave
+// 3× the input behind; a refusal leaves the glue's own copy-in and nothing else.
+test('5.4: refusing 64 MB of ad text allocates nothing beyond the glue\'s copy-in', { skip }, async () => {
+  const { glue, raw } = await privateInstance('5.4-memory');
+  const text = adTextOf(OVERSIZED_BYTES, { keywordFirst: true });
+  const before = raw.memory.buffer.byteLength;
+  const verdict = glue.is_semantic_ad(text);
+  const grown = raw.memory.buffer.byteLength - before;
+  assert.equal(verdict, false, 'oversized text is refused, whatever it contains');
+  assert.ok(grown >= OVERSIZED_BYTES, 'the measurement must have seen the copy-in');
+  assert.ok(
+    grown < 1.5 * OVERSIZED_BYTES,
+    `linear memory grew by ${(grown / OVERSIZED_BYTES).toFixed(2)}× the input`,
+  );
+});
+
+test('5.4: one byte over the cap is refused wherever the keyword sits, and the cap counts UTF-8 bytes', { skip }, () => {
+  const over = SEMANTIC_CAP_BYTES + 1;
+  assert.equal(wasm.is_semantic_ad(adTextOf(over)), false, 'keyword at the end');
+  // A refusal, not a scan of the first 4096 bytes.
+  assert.equal(wasm.is_semantic_ad(adTextOf(over, { keywordFirst: true })), false, 'keyword at the front');
+  // 2053 UTF-16 units, 4097 bytes: the cap is on what Rust receives.
+  const twoByte = adTextOf(over, { filler: 'é' });
+  assert.ok(twoByte.length < SEMANTIC_CAP_BYTES / 2 + SEMANTIC_KEYWORD.length);
+  assert.equal(wasm.is_semantic_ad(twoByte), false, 'two-byte filler');
+});
+
+test('5.4 (didn\'t re-break): text within the cap is classified as before, up to exactly 4096 bytes', { skip }, () => {
+  for (const ad of ['Sponsored', 'Promoted', 'Advertisement', 'Ads by Google', 'ANZEIGE', 'Publicité', 'Sponsorisé']) {
+    assert.equal(wasm.is_semantic_ad(ad), true, ad);
+  }
+  for (const notAd of ['', '   ', '— · —', 'Hello world', 'Read the full story']) {
+    assert.equal(wasm.is_semantic_ad(notAd), false, JSON.stringify(notAd));
+  }
+  // At the cap the text is still scanned — to its last byte.
+  assert.equal(wasm.is_semantic_ad(adTextOf(SEMANTIC_CAP_BYTES)), true, 'exactly 4096 bytes');
+  assert.equal(wasm.is_semantic_ad('x'.repeat(SEMANTIC_CAP_BYTES)), false, 'and only an ad is an ad');
+  // The widest text the service worker's own cap (1024 UTF-16 units) admits is
+  // three bytes a unit: the Rust cap must never refuse what that one forwards.
+  const widest = adTextOf(1015 * 3 + SEMANTIC_KEYWORD.length, { filler: 'あ' });
+  assert.equal(widest.length, 1024);
+  assert.equal(wasm.is_semantic_ad(widest), true, '1024 three-byte characters');
+});
+
+// ---------------------------------------------------------------------------
+// §5.12 — the two suffix implementations must agree, not merely share a table
+// ---------------------------------------------------------------------------
+
+test('5.12: JS and Rust agree on every wildcard base and exception', { skip }, async () => {
+  // The generated tables are compared entry-for-entry in psl.test.mjs. This is
+  // the other half: the ALGORITHM reading them. Until B3 the Rust side answered
+  // from plain membership, so it disagreed for names one label under a wildcard
+  // base — reachable only here, because `is_public_suffix` is private and the
+  // allowlist matcher is the only export that consults it.
+  const { isPublicSuffix } = await import('../src/shared/psl.js');
+  // The tables stay module-private (a mutable Set of security data is not an
+  // export), so read them out of the generated source the way psl.test.mjs
+  // does rather than widening the module's surface for a test.
+  const source = fs.readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/shared/psl.js'), 'utf8');
+  const table = (name) => {
+    const m = new RegExp(`${name}\\s*=\\s*\`([^\`]*)\``, 's').exec(source);
+    assert.ok(m, `${name} not found in psl.js`);
+    return m[1].split('\n').map((l) => l.trim()).filter(Boolean);
+  };
+  const wildcards = table('WILDCARD_SUFFIX_DATA');
+  const exceptions = table('SUFFIX_EXCEPTION_DATA');
+  assert.ok(wildcards.length > 0 && exceptions.length > 0, 'both tables must be non-empty');
+
+  // One uniform probe for both tables. `is_public_suffix` is private and the
+  // allowlist matcher is the only export that consults it, so ask the question
+  // the matcher answers: an allowlist entry AT a name covers a child of that
+  // name only if the name is registrable. If the name is a public suffix the
+  // walk stops there and the child is not covered.
+  //   suffix      => check('x.' + H) === false
+  //   registrable => check('x.' + H) === true
+  // The first probe written here used the PARENT as the entry, which is wrong
+  // for an exception: `!city.kawasaki.jp` sits under the wildcard base
+  // `kawasaki.jp`, which IS a suffix, so the walk correctly stopped one level
+  // up and the test failed against correct code.
+  const rustSaysSuffix = (host) => {
+    const m = new wasm.AllowlistMatcher(host);
+    try {
+      return m.check(`nullifyprobe.${host}`) === false;
+    } finally {
+      m.free?.();
+    }
+  };
+
+  for (const base of wildcards) {
+    const child = `nullifytest.${base}`;
+    assert.equal(isPublicSuffix(child), true, `JS: ${child} is under the wildcard ${base}`);
+    assert.equal(rustSaysSuffix(child), true, `Rust must also treat ${child} as a suffix (wildcard ${base})`);
+  }
+  for (const host of exceptions) {
+    assert.equal(isPublicSuffix(host), false, `JS: ${host} is excepted back out`);
+    assert.equal(rustSaysSuffix(host), false, `Rust must also treat ${host} as registrable`);
+  }
+});

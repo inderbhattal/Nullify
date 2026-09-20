@@ -177,3 +177,95 @@ test('malware.json blocks navigations (has a main_frame block)', { skip }, () =>
     'malware.json has no block rule covering main_frame',
   );
 });
+
+// ---------------------------------------------------------------------------
+// §5.17 — the two README figures that describe build products. Neither can be
+// checked on a clone, which is why both had rotted: "~65K+" was measured
+// against the manifest-enabled subset while claiming to describe the build,
+// and "42+ selectors" predates compiling generic selectors from the lists at
+// all.
+//
+// Both are stated as floors ("N+") and checked from BOTH sides: the floor has
+// to be true, and it has to still be informative. A floor of 65,000 against a
+// build of 136,168 is technically true and tells the reader nothing, which is
+// exactly how the old figure survived so long.
+// ---------------------------------------------------------------------------
+
+const README = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+const CLAIM_CEILING = 2; // a floor more than 2x below the truth has stopped informing
+const parseCount = (text) => Number(text.replace(/,/g, ''));
+
+/**
+ * `npm run build:sample-rules` writes a one-rule easylist and an empty malware
+ * shard into the same directory. The README figures describe a full build, so
+ * they cannot be checked against a sample one.
+ */
+function isSampleBuild() {
+  const easylist = resources.find((r) => r.id === 'easylist');
+  return !!easylist && loadRules(easylist).length < 10;
+}
+
+function assertWithinClaim(label, floor, actual) {
+  assert.ok(
+    actual >= floor,
+    `README claims ${label} of ${floor.toLocaleString()}+, but the build has ${actual.toLocaleString()} — `
+    + 'either the build lost rules or the claim was never true');
+  assert.ok(
+    actual < floor * CLAIM_CEILING,
+    `README claims ${label} of ${floor.toLocaleString()}+ but the build has ${actual.toLocaleString()}, `
+    + `more than ${CLAIM_CEILING}x the claim — the figure is stale enough to mislead; raise it`);
+}
+
+test('5.17: the README compiled-rule figures are measured over the declared rulesets', { skip }, () => {
+  if (isSampleBuild()) return;
+
+  let total = 0;
+  let manifestEnabled = 0;
+  const perFile = {};
+  for (const entry of resources) {
+    const count = loadRules(entry).length;
+    perFile[entry.id] = count;
+    total += count;
+    if (entry.enabled === true) manifestEnabled += count;
+  }
+
+  const claim = /([\d,]+)\+ rules across all (\d+) declared rulesets; ([\d,]+)\+ in the (\d+) the manifest enables/
+    .exec(README);
+  assert.ok(claim, 'README must state the compiled rule total and the manifest-enabled subtotal');
+
+  // The two counts in the sentence come from the manifest, so this row cannot
+  // drift from the "Static rulesets" row above it.
+  assert.equal(Number(claim[2]), resources.length, 'README declared-ruleset count');
+  assert.equal(
+    Number(claim[4]), resources.filter((r) => r.enabled === true).length,
+    'README manifest-enabled ruleset count');
+
+  assertWithinClaim('a compiled rule total', parseCount(claim[1]), total);
+  assertWithinClaim('a manifest-enabled rule subtotal', parseCount(claim[3]), manifestEnabled);
+
+  // `rules/ruleset-counts.json` is what the service worker loads into
+  // RULESET_RULE_COUNTS to decide which shards fit the static budget, so a
+  // drift here is a wrong budget decision, not just a wrong number.
+  const countsFile = path.join(RULES_DIR, 'ruleset-counts.json');
+  assert.ok(fs.existsSync(countsFile), 'ruleset-counts.json is missing from the build');
+  const counts = JSON.parse(fs.readFileSync(countsFile, 'utf8'));
+  for (const [id, count] of Object.entries(perFile)) {
+    assert.equal(counts[id], count, `ruleset-counts.json says ${id} has ${counts[id]} rules, but it has ${count}`);
+  }
+});
+
+test('5.17: the README generic-selector figure matches the compiled cosmetic rules', { skip }, () => {
+  if (isSampleBuild()) return;
+
+  const cosmeticFile = path.join(RULES_DIR, 'cosmetic-rules.json');
+  assert.ok(fs.existsSync(cosmeticFile), 'cosmetic-rules.json is missing from the build');
+  const cosmetic = JSON.parse(fs.readFileSync(cosmeticFile, 'utf8'));
+  assert.ok(Array.isArray(cosmetic.generic), 'cosmetic-rules.json has no generic selector array');
+
+  // Generic selectors only. `genericExcludedDomains` is a list of DOMAINS on
+  // which generic hiding is switched off, not selectors removed from the set,
+  // so subtracting it would not be a selector count at all.
+  const claim = /([\d,]+)\+ generic selectors compiled from the lists/.exec(README);
+  assert.ok(claim, 'README must state the bundled generic-selector count');
+  assertWithinClaim('a generic-selector count', parseCount(claim[1]), cosmetic.generic.length);
+});

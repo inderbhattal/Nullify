@@ -328,6 +328,77 @@ test('parseExpiresHeader: minutes, singular units, spacing and case', () => {
   assert.equal(parseExpiresHeader('! EXPIRES: 1 hour\n'), 60);
 });
 
+// --- plan §7.9(c): parseExpiresHeader must see the list's OWN header ---------
+//
+// The service worker scans the text `fetchAndExpand` returns, i.e. AFTER
+// `!#include` expansion. An include above the `! Expires:` line pushed the
+// header past the 50-line window (null → the 24 h default), and an included
+// file's own header, landing inside the window, was read as the list's.
+
+/** Serve `files` (basename -> text) through the fetch stub and expand `root.txt`. */
+function expandFiles(files) {
+  return withFetch(
+    (url) => Promise.resolve(textResponse(files[url.split('/').pop()], { url })),
+    () => fetchAndExpand('https://lists.example/root.txt'),
+  );
+}
+
+const SUB_RULES = Array.from({ length: 60 }, (_, i) => `sub${i}.example##.sub-rule`).join('\n');
+
+test('7.9(c): an !#include above the header no longer pushes it out of the scanned window', async () => {
+  const root = '[Adblock Plus 2.0]\n! Title: wrapper\n!#include sub.txt\n! Expires: 2 days\nexample.com##.top-rule\n';
+  const text = await expandFiles({ 'root.txt': root, 'sub.txt': SUB_RULES });
+
+  assert.equal(parseExpiresHeader(text), 2880, 'the top-level header must be read despite 60 included lines above it');
+  assert.equal(parseFilterList(text).cosmeticRules.length, 61, 'every rule, top-level and included, survives');
+  // The header is moved, not copied and not dropped: the same lines come out.
+  const expectedLines = root.replace('!#include sub.txt', SUB_RULES).split('\n').sort();
+  assert.deepEqual(text.split('\n').sort(), expectedLines);
+});
+
+test('7.9(c): an included file\'s header cannot override the top-level one', async () => {
+  const text = await expandFiles({
+    'root.txt': '[Adblock Plus 2.0]\n!#include sub.txt\n! Expires: 2 days\nexample.com##.top-rule\n',
+    'sub.txt': '! Title: sub-list\n! Expires: 3 days\nsub.example##.sub-rule\n',
+  });
+  assert.equal(parseExpiresHeader(text), 2880, 'the included "3 days" must not win over the list\'s own "2 days"');
+});
+
+test('7.9(c): an included file\'s header never stands in for a missing top-level one', async () => {
+  const text = await expandFiles({
+    'root.txt': '[Adblock Plus 2.0]\n! Title: no expires here\n!#include sub.txt\nexample.com##.top-rule\n',
+    'sub.txt': '! Title: sub-list\n! Expires: 3 days\nsub.example##.sub-rule\n',
+  });
+  assert.equal(parseExpiresHeader(text), null, 'a list without a header has no cadence of its own');
+  assert.equal(parseFilterList(text).cosmeticRules.length, 2, 'dropping the included header drops nothing else');
+});
+
+test('7.9(c): a nested include\'s header is dropped too', async () => {
+  const text = await expandFiles({
+    'root.txt': '!#include mid.txt\n! Expires: 2 days\n',
+    'mid.txt': '! Expires: 3 days\n!#include leaf.txt\n',
+    'leaf.txt': '! Expires: 4 days\nleaf.example##.leaf-rule\n',
+  });
+  assert.equal(parseExpiresHeader(text), 2880);
+  assert.equal(parseFilterList(text).cosmeticRules.length, 1);
+});
+
+test('7.9(c) (didn\'t re-break): a header above its includes is read as before', async () => {
+  const text = await expandFiles({
+    'root.txt': '[Adblock Plus 2.0]\n! Title: wrapper\n! Expires: 2 days\n!#include sub.txt\nexample.com##.top-rule\n',
+    'sub.txt': '! Title: sub-list\n! Expires: 3 days\nsub.example##.sub-rule\n',
+  });
+  assert.equal(parseExpiresHeader(text), 2880);
+  assert.equal(parseFilterList(text).cosmeticRules.length, 2);
+});
+
+test('7.9(c) (didn\'t re-break): a list without includes expands byte-for-byte as before', async () => {
+  const root = '[Adblock Plus 2.0]\n! Title: plain\n! Expires: 8 hours\nexample.com##.top-rule\n! Expires: 1 hour\n';
+  const text = await expandFiles({ 'root.txt': root });
+  assert.equal(text, root, 'no include, no reordering, no dropped line');
+  assert.equal(parseExpiresHeader(text), 480, 'the first header still wins');
+});
+
 test('parseExpiresHeader: absent, malformed, or past the 50-line header window -> null', () => {
   assert.equal(parseExpiresHeader('! Title: nothing here\n||ads.example^\n'), null);
   assert.equal(parseExpiresHeader('! Expires: soon\n'), null);

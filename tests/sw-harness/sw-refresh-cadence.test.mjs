@@ -103,7 +103,6 @@ async function bootThenUpdate({ flagOn, meta }) {
       scriptlets: [],
     },
   });
-  first.hooks.cancelPendingStatsPersistForTest();
   await stub.storage.local.set({
     filterListsMeta: meta ? { easylist: meta(first.hooks) } : {},
     // The bundled version the previous release wrote; the new bundle hashes
@@ -112,11 +111,14 @@ async function bootThenUpdate({ flagOn, meta }) {
   });
 
   // Chrome tears the old worker down before the new one registers; the stub
-  // keeps every listener, so drop the first life's or its install handler
-  // would run alongside the second's and double every call it makes.
-  for (const event of [stub.runtime.onInstalled, stub.runtime.onMessage, stub.alarms.onAlarm]) {
-    event._listeners.clear();
-  }
+  // keeps every listener, so retire the first life (§7.9(d)) or its install
+  // handler would run alongside the second's and double every call it makes.
+  // `teardown` also cancels the stats-persist debounce, which would otherwise
+  // write the first life's stats into the second life's storage.
+  const dropped = first.teardown();
+  assert.ok(dropped > 0, 'the first life must have had listeners to drop');
+  assert.equal(stub.runtime.onInstalled._listeners.size, 0,
+    'the dead life must not handle the update boot alongside the live one');
 
   const callsBefore = stub.calls.entries.length;
   const second = await loadServiceWorker({

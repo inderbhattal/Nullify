@@ -166,3 +166,76 @@ export function describeUpdateResult(response, nameFor = (id) => id) {
     detail: [],
   };
 }
+
+// ---------------------------------------------------------------------------
+// Storage faults (§4.14 / §7.4 of REMEDIATION-2026-09)
+// ---------------------------------------------------------------------------
+
+/**
+ * The `code` src/shared/storage.js puts on `StorageReadError`. Since v4.8.0 a
+ * read that fails no longer degrades to `{}`, so the writers that read before
+ * they write — ALLOW_SITE, DISALLOW_SITE, ADD_ALLOWLIST_DOMAINS,
+ * APPEND_USER_FILTER, SET_USER_FILTERS, UPDATE_SETTINGS — answer `{error}` and
+ * write nothing. The worker forwards the code and `messaging.js` puts it back
+ * on the Error, so the page can tell that one failure apart from every other.
+ */
+export const STORAGE_READ_FAULT_CODE = 'READ_FAILED';
+
+export const STORAGE_READ_FAULT_MESSAGE =
+  'Could not read saved settings — nothing was changed; try again';
+
+export const FILTERS_NOT_LOADED_MESSAGE =
+  'Could not load your filters — editing is disabled so nothing overwrites them';
+
+/**
+ * True only for a failure the worker identified as a failed storage read.
+ * Chrome's wording ("An unexpected error occurred") is not the signal: the same
+ * sentence comes out of every chrome.* API, and claiming "nothing was changed"
+ * for, say, a DNR failure would be a lie — those writers persist first and
+ * rebuild rules after.
+ */
+export function isStorageReadFault(err) {
+  return err instanceof Error && err.code === STORAGE_READ_FAULT_CODE;
+}
+
+/**
+ * Status for a failed write. A read fault gets the one sentence that is true
+ * of every such failure; anything else keeps the caller's own sentence, which
+ * names what it was doing and shows Chrome's text.
+ */
+export function describeWriteFailure(err, fallbackMessage) {
+  return {
+    message: isStorageReadFault(err) ? `✗ ${STORAGE_READ_FAULT_MESSAGE}` : fallbackMessage,
+    type: 'error',
+  };
+}
+
+/**
+ * What the My Filters editor should show for a `GET_USER_FILTERS` reply.
+ *
+ * `{ok: false}` must not leave an empty, saveable textarea: Save writes what
+ * the box holds, so saving after a failed load would replace the user's stored
+ * filters with an empty string — the §3.1 data loss, re-entered through the
+ * UI. The editor stays locked until a load succeeds, and the status offers a
+ * retry. A load that succeeded and found nothing is not a fault: an empty
+ * filter list is editable.
+ */
+export function filtersEditorState(reply) {
+  if (reply?.ok) {
+    return {
+      loaded: true,
+      filters: typeof reply.filters === 'string' ? reply.filters : '',
+      status: null,
+    };
+  }
+  const reason = reply?.error?.message ? String(reply.error.message) : 'unknown error';
+  return {
+    loaded: false,
+    filters: '',
+    status: {
+      message: `✗ ${FILTERS_NOT_LOADED_MESSAGE}: ${reason}`,
+      type: 'error',
+      retry: true,
+    },
+  };
+}

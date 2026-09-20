@@ -130,3 +130,33 @@ test('4.8: accepts registrable domains, subdomains, and IPv4 literals', () => {
   assert.equal(isValidAllowlistDomain('192.168.1.1'), true);
   assert.equal(isValidAllowlistDomain('xn--bcher-kva.example'), true);
 });
+
+// ---------------------------------------------------------------------------
+// isValidAllowlistDomain (REVIEW-2026-09 §5.12) — the curated list admitted
+// common second-level ccTLD suffixes as ordinary domains, so an import line
+// or a typo yielded `||co.th^` + allowAllRequests over the whole hierarchy.
+// ---------------------------------------------------------------------------
+
+test('5.12: common second-level ccTLD suffixes are not allowlistable', () => {
+  for (const suffix of [
+    'co.th', 'co.id', 'com.my', 'com.ph', 'com.vn', 'com.pk',
+    'com.ng', 'com.sa', 'co.ke', 'com.pe', 'com.co',
+  ]) {
+    assert.equal(isValidAllowlistDomain(suffix), false, `${suffix} must not be allowlistable`);
+  }
+  // Blogger's user blogs live one label below `blogspot.com`, which is in the
+  // list's PRIVATE section; the curated table carries it for the same reason
+  // it already carried `github.io`.
+  assert.equal(isValidAllowlistDomain('blogspot.com'), false);
+  // Decided the other way, deliberately: `wordpress.com` is in no section of
+  // the Public Suffix List, and its apex is a real browsable site a user may
+  // want to allowlist. Making it unallowlistable would be a regression in the
+  // opposite direction, so it stays an ordinary domain (see the curated
+  // PRIVATE block in scripts/generate-psl.mjs).
+  assert.equal(isValidAllowlistDomain('wordpress.com'), true);
+  // The names *below* those suffixes stay allowlistable — the fix must not
+  // swallow the registrable domain with the suffix.
+  assert.equal(isValidAllowlistDomain('example.co.th'), true);
+  assert.equal(isValidAllowlistDomain('mybucket.s3.amazonaws.com'), true);
+  assert.equal(isValidAllowlistDomain('myblog.blogspot.com'), true);
+});

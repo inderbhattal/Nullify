@@ -1,0 +1,9 @@
+{
+  "public_suffix_list": {
+    "url": "https://publicsuffix.org/list/public_suffix_list.dat",
+    "sha384": "sha384-mtchv1pHlV215aLTvjV4A+k6/ksg67wxnGsj0wkrP+6ijaVMTaWDe526nrBYjRU9",
+    "version": "2026-09-18_18-42-54_UTC",
+    "commit": "ff02362b20e273fbcc66405b9b3c21e5dd3e4367",
+    "fetchedAt": "2026-09-20T05:02:43.732801Z"
+  }
+}

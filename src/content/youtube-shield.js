@@ -425,9 +425,10 @@ import { proxyApply, wrapInstanceGetter } from '../scriptlets/shared-utils.js';
       updateWasmState('ready');
       console.info(`[Nullify] YouTube WASM ready (${wasmSource || 'unknown'})`);
       try {
-        // Same store resolution as the synchronous belt layer (§4.25) — the
-        // old `window.ytcfg?.config_` check never matched a real page, so the
-        // extra flags WASM covers were never applied to the live config.
+        // Same store resolution as the synchronous belt layer (REVIEW-2026-08
+        // §4.25) — the old `window.ytcfg?.config_` check never matched a real
+        // page, so the extra flags WASM covers were never applied to the live
+        // config.
         poisonCfgStores(window.ytcfg);
       } catch {
         // Ignore late config poisoning failures.

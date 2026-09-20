@@ -1,21 +1,36 @@
 /**
  * Regression tests for the service-worker security pass:
- *  §2.3 (REVIEW.md) — privileged message types must require an extension-page
+ * Section numbers collide across the review documents, so each is qualified
+ * on first use here and bare afterwards.
+ *
+ *  REVIEW.md §2.3 — privileged message types must require an extension-page
  *        sender; `sender.id === chrome.runtime.id` also holds for content
  *        scripts in arbitrary pages and is not a privilege boundary.
- *  §4.13 — CONTENT_BLOCKED payloads are renderer-controlled and must be
- *        validated before they reach stats or the logger broadcast.
- *  §4.24 — boot key seeded non-configurable; strict registry verification.
- *  §4.25 — packed builds have no onRuleMatchedDebug; the SW must expose
- *        `networkStatsAvailable` so the UI can label counters honestly.
- *  §5.4 — GET_TAB_STATS honors payload.tabId only for extension pages.
- *  §5.5 — RUN_SCRIPTLETS / GET_SCRIPTLET_RULES are deleted (dead attack surface).
+ *  REVIEW-2026-07 §4.13 — CONTENT_BLOCKED payloads are renderer-controlled and
+ *        must be validated before they reach stats or the logger broadcast.
+ *  REVIEW-2026-07 §4.24 — boot key seeded non-configurable; strict registry
+ *        verification.
+ *  REVIEW-2026-07 §4.25 — packed builds have no onRuleMatchedDebug; the SW must
+ *        expose `networkStatsAvailable` so the UI can label counters honestly.
+ *  REVIEW-2026-07 §5.4 — GET_TAB_STATS honored payload.tabId only for extension
+ *        pages; subsumed by REVIEW-2026-09 §5.3, which refuses the renderer at
+ *        the gate. (Not the same finding as REVIEW-2026-09 §5.4 below.)
+ *  REVIEW-2026-07 §5.5 — RUN_SCRIPTLETS / GET_SCRIPTLET_RULES are deleted (dead
+ *        attack surface).
+ *  REVIEW-2026-09 §5.3 — IS_SITE_ALLOWED and GET_TAB_STATS were SENDER_ANY with
+ *        only extension-page callers, so any renderer could ask whether an
+ *        arbitrary hostname was allowlisted.
+ *  REVIEW-2026-09 §5.4 — CHECK_SEMANTIC_AD accepted unbounded renderer text and
+ *        handed it straight to WASM.
  */
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { makeChromeStub } from './chrome-stub.mjs';
 import { loadServiceWorker } from './sw-loader.mjs';
+
+const SW_PATH = new URL('../../src/background/service-worker.js', import.meta.url);
 
 /** Sender shape of our content script running in an arbitrary web page. */
 function contentScriptSender(tabId = 7, url = 'https://evil.example/page') {
@@ -135,31 +150,112 @@ test('2.3: unknown message types fail closed for content-script senders', async 
 });
 
 // ---------------------------------------------------------------------------
-// §5.4 — GET_TAB_STATS tabId scoping
+// §5.3 — IS_SITE_ALLOWED and GET_TAB_STATS are extension-page only
+//
+// Both were SENDER_ANY while only the popup ever called them (verified by
+// grep at HEAD across src/: popup.js:92,133,194 and nothing else). A content
+// script on any page could therefore ask IS_SITE_ALLOWED about ANY hostname
+// and get a straight yes/no — an allowlist-membership oracle over the user's
+// browsing, readable from a compromised renderer. GET_TAB_STATS carried the
+// §5.4 guard (payload.tabId honored only for extension pages) to keep the
+// same renderer from enumerating tab ids and reading every open tab's URL;
+// refusing the renderer at the gate subsumes that guard.
 // ---------------------------------------------------------------------------
 
-test('5.4: a content script cannot read another tab\'s stats/URL via payload.tabId', async () => {
+/**
+ * The sender policy as the worker declares it. Read out of the source rather
+ * than re-declared here, so this test cannot drift into asserting against its
+ * own copy of the table (the sw-dnr-bands.test.mjs convention).
+ */
+async function senderPolicyFromSource() {
+  const source = await readFile(SW_PATH, 'utf8');
+  const match = /const MESSAGE_SENDER_POLICY = \{([\s\S]*?)\n\};/.exec(source);
+  assert.ok(match, 'service-worker.js must define MESSAGE_SENDER_POLICY');
+  const table = {};
+  for (const [, type, value] of match[1].matchAll(/^\s*(\w+):\s*(SENDER_\w+)/gm)) {
+    table[type] = value;
+  }
+  return table;
+}
+
+test('5.3: IS_SITE_ALLOWED and GET_TAB_STATS refuse a content-script sender', async () => {
   const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
 
+  // The user has allowlisted their bank; a page on evil.example must not be
+  // able to learn that, nor read the bank tab's URL.
+  await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: 'secret-bank.example' } });
   hooks.tabStats.set(1, { blocked: 42, trackers: 9, url: 'https://secret-bank.example/account' });
   hooks.tabStats.set(7, { blocked: 3, trackers: 1, url: 'https://evil.example/page' });
 
-  const res = await chrome.runtime.sendMessage(
+  const allowed = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'secret-bank.example' } },
+    contentScriptSender(7));
+  assert.match(allowed.error || '', /extension-page sender required/,
+    `the allowlist oracle must be closed, got ${JSON.stringify(allowed)}`);
+  assert.equal(allowed.allowed, undefined, 'and must not answer the question at all');
+
+  const stats = await chrome.runtime.sendMessage(
     { type: 'GET_TAB_STATS', payload: { tabId: 1 } },
-    contentScriptSender(7)
-  );
-
-  assert.equal(res.url, 'https://evil.example/page',
-    'content script must only ever see its own tab');
-  assert.equal(res.blocked, 3);
-
-  // Extension pages (popup: no sender.tab) still query arbitrary tabs.
-  const popupRes = await chrome.runtime.sendMessage(
-    { type: 'GET_TAB_STATS', payload: { tabId: 1 } });
-  assert.equal(popupRes.blocked, 42);
-  assert.equal(popupRes.url, 'https://secret-bank.example/account');
+    contentScriptSender(7));
+  assert.match(stats.error || '', /extension-page sender required/,
+    `tab stats must be closed to renderers, got ${JSON.stringify(stats)}`);
+  assert.equal(stats.url, undefined, 'no tab URL may come back, not even its own');
 
   hooks.clearInMemoryStatsForTest();
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.3 (didn\'t re-break): an extension-page sender still gets the answer', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: 'secret-bank.example' } });
+  hooks.tabStats.set(1, { blocked: 42, trackers: 9, url: 'https://secret-bank.example/account' });
+
+  // The popup's three calls (popup.js:92,133,194): no sender.tab, extension
+  // origin. It asks about a hostname and a tab id that are not its own.
+  const allowed = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'secret-bank.example' } });
+  assert.equal(allowed.allowed, true, 'the popup still reads the allowlist');
+  const notAllowed = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'other.example' } });
+  assert.equal(notAllowed.allowed, false, 'and still gets a real answer, not a blanket yes');
+
+  // §5.4 — an extension page may still ask about an arbitrary tab; that is
+  // the whole point of the popup's stats panel.
+  const stats = await chrome.runtime.sendMessage(
+    { type: 'GET_TAB_STATS', payload: { tabId: 1 } });
+  assert.equal(stats.blocked, 42);
+  assert.equal(stats.url, 'https://secret-bank.example/account');
+
+  hooks.clearInMemoryStatsForTest();
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.3: the renderer-reachable set is exactly the content-script critical path', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  const policy = await senderPolicyFromSource();
+
+  const reachable = Object.keys(policy).filter((type) => policy[type] === 'SENDER_ANY').sort();
+  assert.deepEqual(reachable, [
+    'APPEND_USER_FILTER', 'CHECK_SEMANTIC_AD', 'CONTENT_BLOCKED',
+    'GET_INIT_DATA', 'REPORT_CONTENT_ERROR',
+  ], 'widening the renderer-reachable surface is a decision, not an accident');
+
+  // The table is only a claim; the gate is what enforces it. Every type the
+  // table calls reachable must actually pass the gate, and the two this
+  // change moved must not.
+  for (const type of reachable) {
+    const res = await chrome.runtime.sendMessage({ type, payload: {} }, contentScriptSender());
+    assert.doesNotMatch(String(res?.error ?? ''), /extension-page sender required/,
+      `${type} is declared SENDER_ANY but the gate refused it`);
+  }
+  for (const type of ['IS_SITE_ALLOWED', 'GET_TAB_STATS']) {
+    assert.equal(policy[type], 'SENDER_EXTENSION_PAGE', `${type} must be declared extension-page only`);
+    const res = await chrome.runtime.sendMessage({ type, payload: {} }, contentScriptSender());
+    assert.match(res.error || '', /extension-page sender required/,
+      `${type} is declared extension-page only but the gate let it through`);
+  }
+
   hooks.cancelPendingStatsPersistForTest();
 });
 
@@ -388,6 +484,102 @@ test('4.24: verifyScriptletRegistry refuses page-controlled registry shapes', as
     writable: false, configurable: false, enumerable: false,
   });
   assert.equal(verify(goodKey), true);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// REVIEW-2026-09 §5.4 — CHECK_SEMANTIC_AD is answerable to any renderer and
+// passed whatever text it was given straight to `is_semantic_ad`. 64 MB of `x`
+// held the worker for ~684 ms and left a permanent linear-memory high-water
+// mark behind. The cap has to live HERE, in the handler: wasm-bindgen copies
+// the whole string into linear memory BEFORE the export runs, so the Rust-side
+// cap (42a7ac3) refuses the scan but cannot prevent the copy or the growth.
+//
+// The content engine never sends more than 400 characters
+// (cosmetic-engine.js:1084 refuses above that), so 1024 UTF-16 units is 2.5x
+// the largest legitimate payload and only a bypassed renderer exceeds it.
+// ---------------------------------------------------------------------------
+
+const SEMANTIC_TEXT_CAP = 1024;
+
+test('5.4: CHECK_SEMANTIC_AD refuses over-long text without reaching the engine', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const fresh = hooks.scriptletDiagnosticsSnapshot();
+  assert.equal(fresh.semanticChecksAttempted, 0, 'precondition: nothing checked yet');
+  assert.equal(fresh.semanticChecksRefused, 0);
+
+  // Leading keyword: a text the scanner WOULD call an ad, so "false" is proof
+  // it never ran rather than proof the scan found nothing.
+  const oversized = `sponsored ${'x'.repeat(2 * 1024 * 1024)}`;
+  const res = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: oversized } }, contentScriptSender());
+
+  assert.equal(res.isAd, false, 'an oversized text is refused, not scanned');
+  assert.equal(res.error, undefined, 'and refused quietly — this is a renderer-reachable type');
+  const after = hooks.scriptletDiagnosticsSnapshot();
+  assert.equal(after.semanticChecksAttempted, 0,
+    'the text must never reach the engine call: that is where wasm-bindgen copies it into linear memory');
+  assert.equal(after.semanticChecksRefused, 1, 'and the refusal must be visible in diagnostics');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.4: the cap is 1024 UTF-16 units, counted the way the Rust side assumes', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  const atCap = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: 'x'.repeat(SEMANTIC_TEXT_CAP) } },
+    contentScriptSender());
+  assert.equal(atCap.isAd, false);
+  assert.equal(hooks.scriptletDiagnosticsSnapshot().semanticChecksAttempted, 1,
+    'exactly at the cap must still be checked');
+
+  const overCap = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: 'x'.repeat(SEMANTIC_TEXT_CAP + 1) } },
+    contentScriptSender());
+  assert.equal(overCap.isAd, false);
+  assert.equal(hooks.scriptletDiagnosticsSnapshot().semanticChecksAttempted, 1,
+    'one unit over the cap must not be');
+
+  // UTF-16 units, not code points: the Rust cap is 4096 BYTES, and 1024 UTF-16
+  // units is at most 3072 UTF-8 bytes, so nothing this forwards can be refused
+  // there. A 3-byte character per unit is the worst case.
+  const worstCase = '\u4e2d'.repeat(SEMANTIC_TEXT_CAP);
+  assert.equal(worstCase.length, SEMANTIC_TEXT_CAP, 'one UTF-16 unit each');
+  assert.equal(new TextEncoder().encode(worstCase).length, 3 * SEMANTIC_TEXT_CAP,
+    'three UTF-8 bytes each — the worst case the Rust 4096-byte cap must still accept');
+  const cjk = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: worstCase } }, contentScriptSender());
+  assert.equal(cjk.isAd, false);
+  assert.equal(hooks.scriptletDiagnosticsSnapshot().semanticChecksAttempted, 2,
+    'the worst-case-byte text is still under the cap and must be forwarded');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test("5.4 (didn't re-break): a normal engine payload is still checked", async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  // What cosmetic-engine.js actually sends: at most 400 characters.
+  const realistic = 'Sponsored content you might like '.repeat(12).slice(0, 400);
+  assert.ok(realistic.length <= 400);
+  const res = await chrome.runtime.sendMessage(
+    { type: 'CHECK_SEMANTIC_AD', payload: { text: realistic } }, contentScriptSender());
+
+  assert.equal(res.error, undefined);
+  assert.equal(res.isAd, false, 'WASM is down in the harness, so the answer is the fallback');
+  const snap = hooks.scriptletDiagnosticsSnapshot();
+  assert.equal(snap.semanticChecksAttempted, 1, 'a legitimate payload must still reach the engine call');
+  assert.equal(snap.semanticChecksRefused, 0, 'and must not be counted as refused');
+
+  // Empty and malformed payloads stay refusals, and must not throw: this type
+  // is renderer-reachable, so a missing payload must not become an error log.
+  for (const payload of [{}, { text: '' }, { text: 42 }, undefined]) {
+    const bad = await chrome.runtime.sendMessage({ type: 'CHECK_SEMANTIC_AD', payload }, contentScriptSender());
+    assert.deepEqual(bad, { isAd: false }, `payload ${JSON.stringify(payload)} must be a quiet false`);
+  }
 
   hooks.cancelPendingStatsPersistForTest();
 });

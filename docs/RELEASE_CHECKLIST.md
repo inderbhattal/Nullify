@@ -20,9 +20,19 @@ and the operator's name + date filled in.
 - [ ] `npm test` passes locally
 - [ ] `npm run lint` passes locally
 - [ ] CI green on the tagged commit (test.yml + build.yml)
-- [ ] `docs/REVIEW.md` and `docs/IMPLEMENTATION.md` reviewed for any
+- [ ] `docs/REVIEW-2026-09.md` and `docs/IMPLEMENTATION.md` reviewed for any
       newly-applicable items since the last release
-- [ ] No P0 from `docs/REVIEW.md` regressed in this cycle
+- [ ] No P0 from `docs/REVIEW-2026-09.md` §3 regressed in this cycle
+- [ ] Every item this release claims from `docs/REMEDIATION-2026-09.md` is
+      landed, and the ones it does not claim are still listed there
+- [ ] `CHROME_MAJOR_FALLBACK` in `src/shared/personas.js` bumped to the
+      current stable Chrome major. It is the persona reported when the
+      browser's own version cannot be read, so a stale value is a
+      fingerprint that says "this profile is not what it claims".
+- [ ] *(once the PSL vendoring lands)* `scripts/psl-source/public_suffix_list.dat`
+      refreshed if it is more than a quarter old — check the date in its
+      header line, then regenerate with `node scripts/generate-psl.mjs`. It
+      is the one vendored input with no SRI lock behind it.
 
 ## Manual smoke — fresh install
 
@@ -76,12 +86,65 @@ These are the scenarios the unit harness cannot reach.
 - [ ] Compose a new email. Compose pane renders correctly.
 - [ ] Open a thread. Message body and reply box visible.
 
-## Anti-adblock check
+## Security lists — the navigation block
 
-- [ ] Visit a known anti-adblock-shielded site (e.g. one of the targets
-      in `rules/anti-adblock.json` source). The site loads; if it shows
-      an anti-adblock prompt, it's *expected to be bypassed* — not
-      shown to the user.
+`$all` compiles to a block over every resource type *including*
+`main_frame`, so a host on `anti-adblock` (uAssets' badware.txt) or on
+`malware` does not load with its subresources stripped — the navigation
+itself is refused. It is the one filter-list behaviour that changes what
+typing a URL does (README, "`$all` blocks the navigation", carries the
+measured host counts), and no automated test exercises it against a real
+Chrome. Both directions matter: the block must fire, and it must not fire
+on anything else.
+
+Pick a host from the build being shipped — the list rotates on every
+`npm run refresh:lists`, so do not reuse last release's:
+
+```bash
+grep -m1 -oP '^\|\|\K[^/^*]+(?=\^\$all$)' scripts/filter-lists/anti-adblock.txt
+```
+
+- [ ] **The block fires:** type `http://<that host>/` in the address bar.
+      Chrome shows its own error page (`ERR_BLOCKED_BY_CLIENT`) — not the
+      site, not a partly-rendered page, and no download begins.
+- [ ] **The allowlist still outranks it:** from the popup on that error
+      page, allow the site and reload — it loads. Then remove it again.
+      (`tests/build-artifacts.test.mjs` pins the priority band; this is the
+      live half of it.)
+- [ ] **No false positive:** with both lists enabled, `https://example.com/`
+      and the five reference sites above still load normally. A block that
+      fires too widely is worse than one that does not fire.
+- [ ] **Malware list:** its entries are mostly URL-specific rather than
+      whole-host, so check one *without navigating to it* — if the block had
+      regressed, navigating would actually fetch the file. From the
+      service-worker console, with a `||host/path^$all` URL taken from
+      `scripts/filter-lists/malware.txt`:
+
+          await chrome.declarativeNetRequest.testMatchOutcome({
+            url: 'https://<that URL>',
+            type: 'main_frame',
+            initiator: 'https://example.com',
+          })
+
+      `matchedRules` is non-empty. (`testMatchOutcome` needs the
+      `declarativeNetRequestFeedback` permission, which the manifest holds,
+      and an unpacked load — which is how this smoke runs.)
+
+## Anti-adblock walls
+
+Not the list above: `anti-adblock` is an id kept for compatibility, its
+source is badware.txt and the UI calls it "uBO Badware Risks". Walls that
+demand you switch the blocker off are handled by the scriptlets —
+`abort-on-property-read` and friends. Pick a target from the build:
+
+```bash
+grep -hoP '^[a-z0-9.-]+(?=##\+js\(aopr,)' scripts/filter-lists/*.txt | head -5
+```
+
+- [ ] Visit one of those domains. No "disable your ad blocker"
+      interstitial; the page's own content renders.
+- [ ] In that page's console, `window.__adblockScriptlets` is defined — so a
+      clean page means the bypass ran, not that the site dropped its wall.
 
 ## Settings & UI
 
@@ -128,7 +191,7 @@ By ticking the boxes above, I confirm Nullify vX.Y.Z is safe to ship.
 ## Failure-mode log
 
 If any item failed, do NOT tag the release. File issues against the
-relevant items in `docs/REVIEW.md` / `docs/IMPLEMENTATION.md`. Notes:
+relevant items in `docs/REVIEW-2026-09.md` / `docs/IMPLEMENTATION.md`. Notes:
 
 _______________________________________________________________________
 _______________________________________________________________________

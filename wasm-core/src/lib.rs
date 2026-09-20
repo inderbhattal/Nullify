@@ -29,8 +29,28 @@ fn public_suffixes() -> &'static HashSet<&'static str> {
     psl_generated::public_suffixes_generated()
 }
 
+/// REVIEW-2026-09 §5.12 — the list's three rules, in the order the PSL
+/// algorithm states them, matching `isPublicSuffix` in `src/shared/psl.js`.
+/// Membership alone was one label too permissive about ancestry under a
+/// wildcard base: `*.ck` makes `foo.ck` a suffix, and the JS side has said so
+/// since the generated tables landed.
 fn is_public_suffix(host: &str) -> bool {
-    host.is_empty() || public_suffixes().contains(host)
+    if host.is_empty() {
+        return true;
+    }
+    // An exception (`!www.ck`) wins outright: it names something a wildcard
+    // would otherwise cover and the list excepts back out.
+    if psl_generated::suffix_exceptions_generated().contains(host) {
+        return false;
+    }
+    if public_suffixes().contains(host) {
+        return true;
+    }
+    // A wildcard is exactly one label deep: `*.ck` covers `foo.ck` and stops.
+    match host.find('.') {
+        Some(idx) => psl_generated::wildcard_suffixes_generated().contains(&host[idx + 1..]),
+        None => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,6 +356,20 @@ const MAX_YT_PLAYER_BYTES: usize = 32 * 1024 * 1024;
 /// Total selector/scriptlet entries across all sources fed to the index
 /// compiler (the shipped corpus is ~45k selectors).
 const MAX_INDEX_INPUT_ENTRIES: usize = 1_000_000;
+/// Text handed to `is_semantic_ad` (REVIEW-2026-09 §5.4). The content engine
+/// never sends more than 400 characters, and the service worker's own cap of
+/// 1024 UTF-16 units is at most 3072 UTF-8 bytes, so nothing it forwards is
+/// refused here.
+const MAX_SEMANTIC_TEXT_BYTES: usize = 4096;
+/// The worker's cap, in UTF-16 units (`CHECK_SEMANTIC_AD`, service-worker.js).
+const SW_SEMANTIC_CAP_UTF16_UNITS: usize = 1024;
+// Module scope, NOT inside `#[cfg(test)]`: a const block in a test-only
+// function is evaluated only when the test target is compiled, so it gated
+// `cargo test` and not `wasm-pack build` — a cap lowered below the worker's
+// would have shipped. A BMP character is one UTF-16 unit and at most three
+// UTF-8 bytes; a supplementary one is two units and four bytes, i.e. two
+// bytes per unit. Three is therefore the worst case.
+const _: () = assert!(MAX_SEMANTIC_TEXT_BYTES >= SW_SEMANTIC_CAP_UTF16_UNITS * 3);
 
 /// Refuse an oversized input with a structured, machine-readable error.
 fn check_input_size(function: &str, unit: &str, actual: usize, max: usize) -> Result<(), String> {
@@ -3214,6 +3248,31 @@ mod tests {
         assert!(!tld.check("bbc.co.uk")); // never blankets the TLD
     }
 
+    // REVIEW-2026-09 §5.12 (B3). Membership alone made the matcher one label
+    // more permissive about ancestry under a wildcard base than the JS side:
+    // `*.ck` is in the list, `foo.ck` is not, so the walk used to step through
+    // `foo.ck` and could reach an allowlist entry at `ck`. The exception rule
+    // has to be checked before membership, or `!www.ck` never wins.
+    #[test]
+    fn is_public_suffix_follows_the_lists_wildcard_and_exception_rules() {
+        assert!(is_public_suffix("ck")); // the wildcard base is a plain entry too
+        assert!(is_public_suffix("foo.ck")); // `*.ck`
+        assert!(!is_public_suffix("www.ck")); // `!www.ck` excepts it back out
+        assert!(!is_public_suffix("deep.foo.ck")); // a wildcard is one label deep
+
+        assert!(is_public_suffix("sch.uk")); // wildcard base, emitted as a plain entry
+        assert!(is_public_suffix("anyschool.sch.uk"));
+        assert!(!is_public_suffix("example.com"));
+        assert!(is_public_suffix("")); // the walk's terminator
+
+        // The walk must stop at a name a wildcard covers, so an entry at the
+        // base can never blanket everything under it.
+        let m = AllowlistMatcher::new("ck");
+        assert!(m.check("ck")); // exact membership still matches
+        assert!(!m.check("foo.ck"));
+        assert!(!m.check("deep.foo.ck"));
+    }
+
     #[test]
     fn bloom_deserialize_rejects_corrupt_payloads_without_panicking() {
         // size == 0 would divide-by-zero in has(); short data would index OOB.
@@ -4823,6 +4882,62 @@ mod tests {
             assert_eq!(compiled.dropped_lines.len(), 1, "{line}");
         }
     }
+
+    /// `len` UTF-8 bytes of `filler` carrying an ad keyword last, or first.
+    fn semantic_ad_text(len: usize, keyword_first: bool, filler: &str) -> String {
+        let room = len - "sponsored".len();
+        assert_eq!(room % filler.len(), 0, "filler must tile the length exactly");
+        let padding = filler.repeat(room / filler.len());
+        let text = if keyword_first {
+            format!("sponsored{padding}")
+        } else {
+            format!("{padding}sponsored")
+        };
+        assert_eq!(text.len(), len);
+        text
+    }
+
+    // §5.4 — CHECK_SEMANTIC_AD is answerable to any renderer, and
+    // `is_semantic_ad` used to normalize and scan whatever it was handed:
+    // 64 MB of `x` held the worker for ~800 ms and left three times the input
+    // behind in linear memory. Text over the cap is refused outright — `false`,
+    // not an error — so an oversized text the scanner WOULD call an ad is the
+    // observable proof that it never ran.
+    #[test]
+    fn is_semantic_ad_refuses_oversized_input_without_scanning() {
+        let over = MAX_SEMANTIC_TEXT_BYTES + 1;
+        assert!(!is_semantic_ad(&semantic_ad_text(over, false, "x")));
+        // A refusal, not a scan of the first 4096 bytes.
+        assert!(!is_semantic_ad(&semantic_ad_text(over, true, "x")));
+        // Bytes, not characters: 2053 chars, 4097 bytes.
+        let two_byte = semantic_ad_text(over, false, "é");
+        assert!(two_byte.chars().count() < MAX_SEMANTIC_TEXT_BYTES);
+        assert!(!is_semantic_ad(&two_byte));
+        // Far over, as the review sent it.
+        assert!(!is_semantic_ad(&semantic_ad_text(1024 * 1024, true, "x")));
+    }
+
+    // §5.4 (didn't re-break) — text within the cap is classified as before,
+    // and at exactly the cap it is still scanned, to its last byte.
+    #[test]
+    fn is_semantic_ad_still_classifies_text_within_the_cap() {
+        for ad in ["Sponsored", "Promoted", "Ads by Google", "ANZEIGE", "Publicité"] {
+            assert!(is_semantic_ad(ad), "{ad}");
+        }
+        for not_ad in ["", "   ", "— · —", "Hello world", "Read the full story"] {
+            assert!(!is_semantic_ad(not_ad), "{not_ad:?}");
+        }
+        assert!(is_semantic_ad(&semantic_ad_text(MAX_SEMANTIC_TEXT_BYTES, false, "x")));
+        assert!(!is_semantic_ad(&"x".repeat(MAX_SEMANTIC_TEXT_BYTES)));
+
+        // The cap must never refuse what the service worker's own cap admits.
+        // The compile-time half of this lives at module scope beside the
+        // constant, so it gates `wasm-pack build` and not just `cargo test`.
+        const SW_CAP_UTF16_UNITS: usize = SW_SEMANTIC_CAP_UTF16_UNITS;
+        let widest = semantic_ad_text((SW_CAP_UTF16_UNITS - 9) * 3 + 9, false, "あ");
+        assert_eq!(widest.encode_utf16().count(), SW_CAP_UTF16_UNITS);
+        assert!(is_semantic_ad(&widest));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4860,6 +4975,12 @@ fn ad_keyword_ac() -> &'static AhoCorasick {
 
 #[wasm_bindgen]
 pub fn is_semantic_ad(text: &str) -> bool {
+    // §5.4: CHECK_SEMANTIC_AD is answerable to any renderer. Oversized text is
+    // refused before anything is allocated or scanned — a plain `false`, not
+    // an error: to the caller it is simply "not an ad".
+    if text.len() > MAX_SEMANTIC_TEXT_BYTES {
+        return false;
+    }
     // Normalize once, then do a single O(n) multi-pattern scan.
     let normalized: String = text
         .chars()

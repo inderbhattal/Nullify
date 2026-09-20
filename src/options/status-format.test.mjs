@@ -15,12 +15,18 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
+  FILTERS_NOT_LOADED_MESSAGE,
+  STORAGE_READ_FAULT_CODE,
+  STORAGE_READ_FAULT_MESSAGE,
   describeAllowlistImport,
   describeFilterApply,
   describeFilterImport,
   describeRejectedDomains,
   describeSkippedRules,
   describeUpdateResult,
+  describeWriteFailure,
+  filtersEditorState,
+  isStorageReadFault,
   skippedSuffix,
 } = await import('./status-format.js');
 
@@ -246,4 +252,77 @@ test('updatedLists entries may be ids or {id,name} objects; junk is dropped', ()
 test('an unknown list id falls back to the raw id rather than disappearing', () => {
   const out = describeUpdateResult({ ok: true, updatedLists: ['brand-new-list'] }, () => undefined);
   assert.match(out.message, /brand-new-list/);
+});
+
+// ---------------------------------------------------------------------------
+// §4.14 / §7.4 — storage-fault replies
+// ---------------------------------------------------------------------------
+
+// The shape `call()` produces from a `{error, code}` reply once the bus
+// forwards the worker's StorageReadError code.
+const readFault = () => Object.assign(new Error('An unexpected error occurred'), { code: 'READ_FAILED' });
+
+test('4.14: an identified read fault renders the "nothing was changed" line', () => {
+  assert.equal(STORAGE_READ_FAULT_CODE, 'READ_FAILED', 'the code src/shared/storage.js puts on StorageReadError');
+  assert.equal(isStorageReadFault(readFault()), true);
+
+  const out = describeWriteFailure(readFault(), '✗ Failed to save setting: An unexpected error occurred');
+  assert.equal(out.message, `✗ ${STORAGE_READ_FAULT_MESSAGE}`);
+  assert.equal(out.message, '✗ Could not read saved settings — nothing was changed; try again');
+  assert.equal(out.type, 'error');
+});
+
+test('4.14: any other failure keeps the caller\'s sentence — a later step can fail after the write', () => {
+  // ALLOW_SITE persists before it rebuilds DNR rules; UPDATE_SETTINGS before
+  // applyPrivacySettings. An {error} from those steps follows a completed
+  // write, so "nothing was changed" may only be claimed for a read fault.
+  const dnrFailure = new Error('Rule with id 1 does not have a unique ID');
+  assert.equal(isStorageReadFault(dnrFailure), false);
+  const out = describeWriteFailure(dnrFailure, '✗ Could not remove a.example: Rule with id 1 does not have a unique ID');
+  assert.equal(out.message, '✗ Could not remove a.example: Rule with id 1 does not have a unique ID');
+  assert.equal(out.type, 'error');
+
+  // Chrome's raw text alone is NOT the signal: the same words can come from
+  // any API, and the fallback message is what shows them.
+  const rawTextOnly = new Error('An unexpected error occurred');
+  assert.equal(isStorageReadFault(rawTextOnly), false);
+  assert.equal(describeWriteFailure(rawTextOnly, '✗ raw').message, '✗ raw');
+
+  // Other codes, a non-Error, and nothing at all.
+  assert.equal(isStorageReadFault(Object.assign(new Error('x'), { code: 'QUOTA' })), false);
+  assert.equal(isStorageReadFault('READ_FAILED'), false);
+  assert.equal(isStorageReadFault(undefined), false);
+  assert.equal(describeWriteFailure(undefined, '✗ fallback').message, '✗ fallback');
+});
+
+test('7.4: a failed GET_USER_FILTERS leaves the editor locked with every writer disabled', () => {
+  const out = filtersEditorState({ ok: false, error: new Error('An unexpected error occurred') });
+  assert.equal(out.loaded, false);
+  assert.equal(out.filters, '', 'nothing may be shown as "the filters" — but it must not be saveable either');
+  assert.equal(out.status.type, 'error');
+  assert.equal(out.status.retry, true, 'the user must be offered a retry');
+  assert.equal(out.status.message, `✗ ${FILTERS_NOT_LOADED_MESSAGE}: An unexpected error occurred`);
+  assert.match(out.status.message, /disabled/, 'the status says why the editor is locked');
+
+  // The same lock when the reply is a read fault, and when the error is opaque.
+  assert.equal(filtersEditorState({ ok: false, error: readFault() }).loaded, false);
+  const opaque = filtersEditorState({ ok: false, error: undefined });
+  assert.equal(opaque.loaded, false);
+  assert.equal(opaque.status.message, `✗ ${FILTERS_NOT_LOADED_MESSAGE}: unknown error`);
+});
+
+test('7.4: a successful load unlocks the editor with the stored text — including legitimately empty', () => {
+  const out = filtersEditorState({ ok: true, filters: 'example.com##.ad\n' });
+  assert.equal(out.loaded, true);
+  assert.equal(out.filters, 'example.com##.ad\n');
+  assert.equal(out.status, null);
+
+  const empty = filtersEditorState({ ok: true, filters: '' });
+  assert.equal(empty.loaded, true, 'a read that succeeded and found nothing is editable — that is not a fault');
+  assert.equal(empty.filters, '');
+
+  // A reply without a string `filters` (older SW, odd shape) is an empty editor, not a lock.
+  const odd = filtersEditorState({ ok: true, filters: undefined });
+  assert.equal(odd.loaded, true);
+  assert.equal(odd.filters, '');
 });

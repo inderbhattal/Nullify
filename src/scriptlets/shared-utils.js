@@ -384,7 +384,7 @@ let installedToString = null;
 function installToStringMask() {
   // Re-arm if page script (or a test harness) restored the pristine
   // `Function.prototype.toString` after we installed ours.
-  if (installedToString !== null && Function.prototype.toString === installedToString) return;
+  if (installedToString !== null && Function.prototype.toString === installedToString) return true;
   const nativeToString = nativeFunctionToString;
   const proxiedToString = new Proxy(nativeToString, {
     apply(target, thisArg, args) {
@@ -402,24 +402,51 @@ function installToStringMask() {
   nativeSources.set(proxiedToString, nativeToString);
   try {
     Function.prototype.toString = proxiedToString;
-    installedToString = proxiedToString;
   } catch { /* frozen prototype — wrappers keep their own source */ }
+  // §9.19 — read back rather than trusting the assignment. A frozen
+  // `Function.prototype` — a page can do that, and anti-adblock code does —
+  // throws here only in strict mode; evaluated as a classic script the
+  // assignment is dropped silently. This used to set `installedToString` on
+  // the next line either way, so the mask reported itself installed while
+  // every wrapper in the bundle went on printing its own source.
+  if (Function.prototype.toString !== proxiedToString) return false;
+  installedToString = proxiedToString;
+  return true;
 }
 
 /**
  * Make `wrapper` report `native`'s source, name and arity.
- * Returns `wrapper` so it can be used inline.
+ *
+ * `wrapper` must be built with method syntax (`({ m() {…} }).m`): an ordinary
+ * function's own `prototype` is non-configurable, so this helper cannot remove
+ * it, and a native method or getter has none (§7.8).
+ *
+ * §9.19 — this used to swallow a failed `defineProperty` and hand the wrapper
+ * back regardless, so a caller could install a function that still reports its
+ * own `name`, or its own source when the page has frozen `Function.prototype`,
+ * and believe it was hidden. No caller here can do anything useful with the
+ * failure — an unmasked wrapper still intercepts, it is merely detectable,
+ * which beats not intercepting at all — so they all ignore the result
+ * deliberately rather than by accident. The signal is for the tests, and for a
+ * caller that one day has a better answer than carrying on.
+ *
+ * @returns {Function|null} `wrapper`, so it can still be used inline — `null`
+ *   if it could not be fully masked.
  */
 export function maskNative(wrapper, native) {
-  if (typeof wrapper !== 'function' || typeof native !== 'function') return wrapper;
-  installToStringMask();
+  if (typeof wrapper !== 'function' || typeof native !== 'function') return null;
+  let masked = installToStringMask();
   nativeSources.set(wrapper, native);
   for (const key of ['name', 'length']) {
     const desc = Object.getOwnPropertyDescriptor(native, key);
     if (desc === undefined) continue;
-    try { Object.defineProperty(wrapper, key, desc); } catch { /* frozen */ }
+    try {
+      Object.defineProperty(wrapper, key, desc);
+    } catch {
+      masked = false; // a frozen wrapper keeps its own name and arity
+    }
   }
-  return wrapper;
+  return masked ? wrapper : null;
 }
 
 /**
@@ -445,12 +472,16 @@ export function proxyApply(owner, prop, handler) {
       });
     },
   });
-  maskNative(proxied, fn);
+  maskNative(proxied, fn); // best effort: an unmasked wrapper still intercepts
   try {
     owner[prop] = proxied;
   } catch {
     return null;
   }
+  // §9.19 — read back: an assignment to a non-writable property throws only in
+  // strict mode, and an owner that traps `set` can drop it in any mode. Either
+  // way nothing was installed, so reporting success would be a lie.
+  if (owner[prop] !== proxied) return null;
   return fn;
 }
 
@@ -468,16 +499,96 @@ export function wrapInstanceGetter(proto, prop, transform) {
   const desc = Object.getOwnPropertyDescriptor(proto, prop);
   if (desc?.get === undefined) return false;
   const nativeGetter = desc.get;
-  const getter = function () {
-    return transform(nativeGetter.call(this), this);
-  };
-  maskNative(getter, nativeGetter);
+  // §7.8: method syntax, not a function expression. A function expression has
+  // [[Construct]] and therefore an own `prototype`; a native getter has
+  // neither, so `Object.getOwnPropertyNames(desc.get)` told the page which
+  // accessors were wrapped — the leak §4.4 closed for the callables.
+  const getter = ({
+    get() {
+      return transform(nativeGetter.call(this), this);
+    },
+  }).get;
+  maskNative(getter, nativeGetter); // best effort: see maskNative
   try {
     Object.defineProperty(proto, prop, { ...desc, get: getter, configurable: true });
   } catch {
     return false;
   }
   return true;
+}
+
+/** `Object.getOwnPropertyDescriptor`, but walking the prototype chain. */
+function findPropertyDescriptor(target, prop) {
+  try {
+    for (let o = target; o !== null && o !== undefined; o = Object.getPrototypeOf(o)) {
+      const desc = Object.getOwnPropertyDescriptor(o, prop);
+      if (desc !== undefined) return desc;
+    }
+  } catch { /* exotic or revoked target */ }
+  return undefined;
+}
+
+/**
+ * Define `prop` on `target` as a getter a page cannot tell from the platform's.
+ *
+ * §9.6 — bot-stealth.js and persona-spoof.js each had their own copy of this,
+ * installing an arrow getter with a partial descriptor. Two things gave those
+ * away, both on surfaces an anti-automation check reads first: an arrow reports
+ * its own source and an empty `name`, where a native getter reports
+ * `[native code]` and `get <prop>`. A third only bites sometimes, which is why
+ * it is easy to get wrong: `Object.defineProperty` preserves the attributes it
+ * is not given only when the property *already exists*, so replacing
+ * `navigator.userAgent` keeps its `enumerable: true`, but defining a property
+ * the platform does not have — or defining one on the instance, which is what
+ * the locked-prototype fallback does — silently lands non-enumerable where
+ * every WebIDL attribute is enumerable. The native descriptor is therefore
+ * copied from wherever it lives on the chain rather than assumed.
+ *
+ * @param {object} target Where to define it. A prototype for preference: an
+ *   own property on an instance is itself visible to a page (§4.4).
+ * @param {string} prop
+ * @param {() => any} read Called on every get.
+ * @returns {boolean} whether the definition was installed.
+ */
+export function defineNativeGetter(target, prop, read) {
+  const native = findPropertyDescriptor(target, prop);
+  // Method syntax, not an arrow: §7.8, and `maskNative` needs a real function
+  // to hang the name and the source off.
+  const getter = ({
+    get() { return read(); },
+  }).get;
+  if (typeof native?.get === 'function') {
+    maskNative(getter, native.get); // best effort: see maskNative
+  } else {
+    // Nothing native to copy from — name it the way the platform would.
+    try {
+      Object.defineProperty(getter, 'name', { value: `get ${prop}`, configurable: true });
+    } catch { /* frozen */ }
+  }
+  try {
+    Object.defineProperty(target, prop, {
+      get: getter,
+      set: native?.set,
+      enumerable: native?.enumerable ?? true,
+      configurable: true,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spoof `navigator[key]` to a constant.
+ *
+ * `Navigator.prototype` first, so the `navigator` instance keeps the empty own
+ * property list a real browser has. The instance is the fallback for a locked
+ * prototype: the own property it leaves is a tell of its own, but a spoof that
+ * does not apply is worse.
+ */
+export function defineNavigatorValue(key, value) {
+  if (defineNativeGetter(Navigator.prototype, key, () => value)) return true;
+  return defineNativeGetter(navigator, key, () => value);
 }
 
 // ---------------------------------------------------------------------------

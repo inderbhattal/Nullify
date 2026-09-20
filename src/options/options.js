@@ -4,6 +4,7 @@
 
 import './options.css';
 
+import { FILTER_LIST_DESCRIPTIONS, FILTER_LIST_NAMES } from '../shared/filter-list-names.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
 import { call, MAX_USER_FILTERS_BYTES, utf8ByteLength } from './messaging.js';
 import {
@@ -11,21 +12,19 @@ import {
   describeFilterApply,
   describeFilterImport,
   describeUpdateResult,
+  describeWriteFailure,
+  filtersEditorState,
 } from './status-format.js';
 
 const $ = (id) => document.getElementById(id);
 
-const FILTER_LISTS = [
-  { id: 'easylist',     name: 'EasyList',        desc: 'The most widely used ad-blocking filter list' },
-  { id: 'easyprivacy',  name: 'EasyPrivacy',      desc: 'Tracker, analytics, and surveillance blocking' },
-  { id: 'annoyances',   name: 'Fanboy Annoyances', desc: 'Cookie notices, popups, social overlays' },
-  { id: 'ubo-cookie-annoyances', name: 'uBO Cookie Annoyances', desc: 'Surgically targets cookie consent and tracking notices' },
-  { id: 'malware',      name: 'Malware Blocklist', desc: 'Blocks malware and phishing URLs' },
-  { id: 'ubo-filters',  name: 'uBO Filters',       desc: 'uBlock Origin default filter list' },
-  { id: 'ubo-unbreak',  name: 'uBO Unbreak',       desc: 'Fixes over-blocking by other lists' },
-  { id: 'anti-adblock', name: 'Anti-Adblock',      desc: 'Anti-adblock and badware fixes from uBO' },
-  { id: 'ubo-quick-fixes', name: 'uBO Quick Fixes', desc: 'Same-day countermeasures, including the current YouTube ad bypass' },
-];
+// §5.17 — one card per row of the shared table, in its key order. The popup
+// reads the same table, so the two pages cannot name a list differently.
+const FILTER_LISTS = Object.entries(FILTER_LIST_NAMES).map(([id, name]) => ({
+  id,
+  name,
+  desc: FILTER_LIST_DESCRIPTIONS[id],
+}));
 
 // ---------------------------------------------------------------------------
 // Navigation
@@ -153,7 +152,8 @@ async function initFilterLists() {
       } catch (err) {
         // Revert the optimistic flip — the SW is authoritative.
         applyState({ [list.id]: prevState });
-        showListsStatus(`✗ ${list.name}: ${err.message}`, 'error');
+        const failed = describeWriteFailure(err, `✗ ${list.name}: ${err.message}`);
+        showListsStatus(failed.message, failed.type);
       }
     });
 
@@ -192,13 +192,45 @@ async function initFilterLists() {
 // ---------------------------------------------------------------------------
 // My Filters
 // ---------------------------------------------------------------------------
+/**
+ * §7.4 — lock or unlock the My Filters editor. Locked means the textarea and
+ * every control that writes are disabled and Retry is offered: the stored
+ * filters could not be read, and an empty editor must not be saveable over
+ * them. Export stays enabled — it exports nothing useful, but it writes
+ * nothing either.
+ */
+function setFiltersEditorEnabled(enabled) {
+  $('userFiltersArea').disabled = !enabled;
+  $('btnApplyFilters').disabled = !enabled;
+  $('btnImportFilters').disabled = !enabled;
+  $('btnRetryFilters').hidden = enabled;
+}
+
 async function initMyFilters() {
-  try {
-    const res = await call('GET_USER_FILTERS');
-    $('userFiltersArea').value = res?.filters || '';
-  } catch (err) {
-    showFilterStatus('✗ Failed to load filters: ' + err.message, 'error');
-  }
+  // §7.4 — Save writes whatever the textarea holds. A failed GET_USER_FILTERS
+  // used to leave it empty and fully editable, so one Save after a transient
+  // read fault replaced the user's stored filters with '' — the §3.1 data loss
+  // re-entered through the UI. Until a load succeeds the editor is locked and
+  // the status offers a retry.
+  const applyEditorState = (state) => {
+    $('userFiltersArea').value = state.filters;
+    setFiltersEditorEnabled(state.loaded);
+    if (state.status) {
+      showFilterStatus(state.status.message, state.status.type, state.status.retry ? ['Press Retry to load them again.'] : []);
+    }
+  };
+
+  const loadFilters = async () => {
+    try {
+      const res = await call('GET_USER_FILTERS');
+      applyEditorState(filtersEditorState({ ok: true, filters: res?.filters }));
+    } catch (err) {
+      applyEditorState(filtersEditorState({ ok: false, error: err }));
+    }
+  };
+
+  await loadFilters();
+  $('btnRetryFilters').addEventListener('click', loadFilters);
 
   // Resolves with the applied-status descriptor (see status-format.js) when
   // the SW accepted the filters, or `null` when it did not.
@@ -220,7 +252,8 @@ async function initMyFilters() {
       showFilterStatus(applied.message, applied.type, applied.detail);
       return applied;
     } catch (err) {
-      showFilterStatus('✗ Error: ' + err.message, 'error');
+      const failed = describeWriteFailure(err, '✗ Error: ' + err.message);
+      showFilterStatus(failed.message, failed.type);
       return null;
     }
   };
@@ -454,7 +487,8 @@ async function initAllowlist() {
         try {
           current = await fetchAllowlist();
         } catch (err) {
-          showAllowlistStatus('✗ Import aborted — could not read current allowlist: ' + err.message, 'error');
+          const failed = describeWriteFailure(err, '✗ Import aborted — could not read current allowlist: ' + err.message);
+          showAllowlistStatus(failed.message, failed.type);
           return;
         }
 
@@ -543,7 +577,8 @@ async function renderAllowlist(allowlistOverride) {
         const res = await call('DISALLOW_SITE', { domain });
         await renderAllowlist(res?.allowlist);
       } catch (err) {
-        showAllowlistStatus(`✗ Could not remove ${domain}: ${err.message}`, 'error');
+        const failed = describeWriteFailure(err, `✗ Could not remove ${domain}: ${err.message}`);
+        showAllowlistStatus(failed.message, failed.type);
       }
     });
     ul.appendChild(li);
@@ -602,7 +637,8 @@ async function initSettings() {
         const res = await call('UPDATE_SETTINGS', { [binding.key]: value });
         if (res?.settings) applySettingsToDom(res.settings);
       } catch (err) {
-        showSettingsStatus('✗ Failed to save setting: ' + err.message, 'error');
+        const failed = describeWriteFailure(err, '✗ Failed to save setting: ' + err.message);
+        showSettingsStatus(failed.message, failed.type);
         // Re-sync the control with the SW's authoritative state.
         try {
           applySettingsToDom((await call('GET_SETTINGS')) || {});

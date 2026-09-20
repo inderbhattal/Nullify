@@ -850,11 +850,15 @@ function parseOptions(optionsStr) {
     matchCase: false,
     popup: false,
     all: false,
+    // §5.6 — `document`/`doc` is the ONLY type the line names. Settled after
+    // the loop; networkFilterToDNR reads it on `@@` lines.
+    documentException: false,
     cosmeticScopeExceptions: [],
   };
 
   if (!optionsStr) return options;
 
+  let namesDocument = false;
   for (let opt of optionsStr.split(',')) {
     opt = opt.trim();
     const negated = opt.startsWith('~');
@@ -873,6 +877,7 @@ function parseOptions(optionsStr) {
         options.excludedResourceTypes.push(RESOURCE_TYPE_MAP[optName]);
       } else {
         options.resourceTypes.push(RESOURCE_TYPE_MAP[optName]);
+        if (optName === 'document' || optName === 'doc') namesDocument = true;
       }
     } else if (optName === 'third-party' || optName === '3p') {
       options.thirdParty = negated ? false : true;
@@ -997,6 +1002,17 @@ function parseOptions(optionsStr) {
       return null;
     }
   }
+
+  // §5.6 — on an exception, `$document` standing alone asks for more than its
+  // type (see the action in networkFilterToDNR). `$popup` pushes `main_frame`
+  // too and only ever meant "do not block this navigation"; a second type
+  // (`$document,subdocument`), a negated one or `$all` makes the line an
+  // ordinary typed allow.
+  options.documentException = namesDocument
+    && !options.popup
+    && !options.all
+    && options.excludedResourceTypes.length === 0
+    && options.resourceTypes.every((type) => type === 'main_frame');
 
   return options;
 }
@@ -1484,7 +1500,27 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
     excludedResourceTypes = [];
   }
 
-  if (resourceTypes.length > 0) {
+  // §5.6 — uBO's `@@…$document` switches filtering off for the whole matching
+  // page, not just for its navigation request. DNR's word for that is
+  // `allowAllRequests` on the frame, which Chrome accepts on main_frame and
+  // sub_frame only — the pair the runtime allowlist writes. Two shapes keep
+  // the plain `allow` they always had, because DNR would read them as
+  // something the author did not write:
+  //  - `$domain=`/`$from=` and `$1p`/`$3p`. uBO tests both against the page
+  //    itself; DNR tests them against whoever STARTED the navigation, so
+  //    `@@*$document,domain=x.com` would un-filter every page x.com links to,
+  //    and `$3p` — never true of a page in uBO — is true of every typed URL.
+  //    (`$to=`/`$denyallow=` are the frame's own host in both; they carry.)
+  //  - no pattern and no `$to=`: nothing names the page, so the rule would
+  //    switch the blocker off everywhere.
+  const allowsWholeFrame = exception && options.documentException
+    && (urlFilter !== null || regexFilter !== null || requestDomains.length > 0)
+    && initiatorDomains.length === 0 && excludedInitiatorDomains.length === 0
+    && options.thirdParty === null;
+
+  if (allowsWholeFrame) {
+    condition.resourceTypes = ['main_frame', 'sub_frame'];
+  } else if (resourceTypes.length > 0) {
     condition.resourceTypes = resourceTypes;
   } else if (conversionOptions.coverDocuments && !exception) {
     // A DNR condition with no resourceTypes matches every type EXCEPT
@@ -1525,7 +1561,9 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
 
   // Build action
   let action;
-  if (exception) {
+  if (allowsWholeFrame) {
+    action = { type: 'allowAllRequests' };
+  } else if (exception) {
     action = { type: 'allow' };
   } else if (options.redirect) {
     // Redirect to blank resource types
@@ -1557,6 +1595,8 @@ function networkFilterToDNR(parsed, conversionOptions = {}) {
   // $redirect= stubs sit one band above the blocks of the same importance so
   // a co-matching block cannot defeat them (see DNR_PRIORITY); $removeparam
   // stays in the block band so a co-matching block wins the tie.
+  // A `$document` exception's `allowAllRequests` (§5.6) is an exception like
+  // any other: same two allow bands, so an $important block still beats it.
   let rulePriority;
   if (exception) {
     rulePriority = options.important ? DNR_PRIORITY.IMPORTANT_ALLOW : DNR_PRIORITY.ALLOW;
@@ -2809,6 +2849,20 @@ async function main() {
   }
 }
 
+/**
+ * §5.14 — the production build's output must not depend on whether a WASM
+ * artifact happens to be present. With the artifact, filter-sources.json
+ * comes from `parse_filter_source`; without it, from the JS fallback — and
+ * when the files were simply absent nothing was even logged — so two
+ * developers could ship different bundles from the same snapshots. Refuse
+ * instead; CI always builds the artifact first (build.yml). The sample build
+ * packages fixtures without consulting the parser, so it is exempt.
+ */
+function assertRustParserAvailable(ready, { sampleMode = false } = {}) {
+  if (ready || sampleMode) return;
+  throw new Error('Rust parser unavailable — run `npm run build:wasm` before `npm run build:rules`');
+}
+
 async function buildFromVendoredLists(stagingDir) {
   let rustSourceParserReady = false;
   let parseFilterSourceWithRust = null;
@@ -2823,12 +2877,13 @@ async function buildFromVendoredLists(stagingDir) {
         parseFilterSourceWithRust = fn;
         rustSourceParserReady = true;
       } else {
-        console.warn('⚠️  WASM loaded but parse_filter_source export missing — using JS fallback. Rebuild wasm with `npm run build:wasm` if Rust parser is expected.');
+        console.warn('⚠️  WASM loaded but parse_filter_source export missing — the artifact is stale.');
       }
     }
   } catch (err) {
-    console.warn(`⚠️  Rust source parser unavailable, falling back to JS extraction: ${err.message}`);
+    console.warn(`⚠️  Rust source parser failed to load: ${err.message}`);
   }
+  assertRustParserAvailable(rustSourceParserReady, { sampleMode: SAMPLE_MODE });
 
   const allCosmeticRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.cosmetic));
   const allScriptletRules = JSON.parse(JSON.stringify(CORE_FILTER_SOURCE.scriptlets));
@@ -3049,6 +3104,7 @@ export {
   vendoredListPath,
   writeSampleOutputs,
   stampGeneratedAt,
+  assertRustParserAvailable,
   VENDORED_LISTS_DIR,
   RUNTIME_ALLOWLIST_PRIORITY,
   SYSTEM_UNBREAK_PRIORITY,

@@ -32,9 +32,19 @@
 
 import { PROC_OPS, PROC_OP_ALIASES, isProceduralSelector } from '../shared/proc-ops.js';
 
-const STYLE_ID = '__adblock_cosmetic_styles__';
-const EXCEPTION_STYLE_ID = '__adblock_exception_styles__';
-const ELEMENT_ATTR = '__adblock_hidden__';
+// Per-document random tokens, not fixed names (§5.10, 2026-09): the ids were
+// `__adblock_cosmetic_styles__` / `__adblock_exception_styles__` on every page,
+// which made `document.getElementById(…)` a one-line blocker probe. Rolled once
+// per document and held in module scope so a re-injection keeps the same ids;
+// the `n` keeps an id from starting with a digit.
+const randomStyleId = () => 'n' + Math.random().toString(36).slice(2, 10);
+const STYLE_ID = randomStyleId();
+const EXCEPTION_STYLE_ID = randomStyleId();
+// Hidden elements carry no marker attribute (§5.10, 2026-09). They used to be
+// stamped `__adblock_hidden__="1"`, and `_hideElement` read the stamp back as a
+// second dedupe: `document.querySelector('[__adblock_hidden__]')` detected the
+// blocker in one line, and a page that stamped its own ad containers had them
+// skipped as "already hidden". The `_hiddenElements` WeakSet is the only record.
 
 // Error tracking for content script diagnostics
 const _errorStats = { errors: 0, lastError: null, proceduralFailures: 0 };
@@ -363,8 +373,9 @@ export class CosmeticEngine {
     // own LRU map — mixing booleans into `_matchCache` type-confuses the op
     // WeakMaps and dodges eviction (§5.24).
     this._semanticCache = new Map(); // text prefix -> boolean verdict
-    // Synchronous dedupe markers — the rAF flush that stamps ELEMENT_ATTR
-    // never runs in hidden tabs, so counters must not depend on it (§5.27).
+    // Synchronous dedupe markers — the rAF flush never runs in hidden tabs,
+    // so counters must not depend on it (§5.27). Nothing on the page backs
+    // them up: the attribute the flush used to stamp is gone (§5.10).
     this._hiddenElements = new WeakSet();
     this._removedElements = new WeakSet();
     this._hasTextRules = false;     // any rule reads textContent (§5.28)
@@ -1327,15 +1338,15 @@ export class CosmeticEngine {
   // ---------------------------------------------------------------------------
 
   _hideElement(el, selector = 'unknown') {
-    if (!el || this._hiddenElements.has(el) || el.getAttribute?.(ELEMENT_ATTR)) return;
+    if (!el || this._hiddenElements.has(el)) return;
     // Never blanket-hide the page scaffolding — an op-first plan such as
     // `##:has-text(x)` seeds document.documentElement, and hiding it blanks
     // the entire page (§5.26).
     if (el === document.documentElement || el === document.head || el === document.body) return;
     if (this._exceptions.has(el.className) || this._isExcepted(el)) return;
 
-    // Mark synchronously: the rAF flush that stamps ELEMENT_ATTR never runs
-    // in hidden tabs, so dedupe must not wait for it (§5.27).
+    // Mark synchronously: the rAF flush never runs in hidden tabs, so dedupe
+    // must not wait for it (§5.27).
     this._hiddenElements.add(el);
     this._hideQueue.add(el);
     this._hiddenCount++;
@@ -1373,7 +1384,6 @@ export class CosmeticEngine {
       
       // Process hiding
       for (const target of this._hideQueue) {
-        target.setAttribute(ELEMENT_ATTR, '1');
         target.style.setProperty('display', 'none', 'important');
         target.style.setProperty('visibility', 'hidden', 'important');
       }

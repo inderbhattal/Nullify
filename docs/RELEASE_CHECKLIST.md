@@ -20,9 +20,19 @@ and the operator's name + date filled in.
 - [ ] `npm test` passes locally
 - [ ] `npm run lint` passes locally
 - [ ] CI green on the tagged commit (test.yml + build.yml)
-- [ ] `docs/REVIEW.md` and `docs/IMPLEMENTATION.md` reviewed for any
+- [ ] `docs/REVIEW-2026-09.md` and `docs/IMPLEMENTATION.md` reviewed for any
       newly-applicable items since the last release
-- [ ] No P0 from `docs/REVIEW.md` regressed in this cycle
+- [ ] No P0 from `docs/REVIEW-2026-09.md` §3 regressed in this cycle
+- [ ] Every item this release claims from `docs/REMEDIATION-2026-09.md` is
+      landed, and the ones it does not claim are still listed there
+- [ ] `CHROME_MAJOR_FALLBACK` in `src/shared/personas.js` bumped to the
+      current stable Chrome major. It is the persona reported when the
+      browser's own version cannot be read, so a stale value is a
+      fingerprint that says "this profile is not what it claims".
+- [ ] *(once the PSL vendoring lands)* `scripts/psl-source/public_suffix_list.dat`
+      refreshed if it is more than a quarter old — check the date in its
+      header line, then regenerate with `node scripts/generate-psl.mjs`. It
+      is the one vendored input with no SRI lock behind it.
 
 ## Manual smoke — fresh install
 
@@ -128,7 +138,7 @@ By ticking the boxes above, I confirm Nullify vX.Y.Z is safe to ship.
 ## Failure-mode log
 
 If any item failed, do NOT tag the release. File issues against the
-relevant items in `docs/REVIEW.md` / `docs/IMPLEMENTATION.md`. Notes:
+relevant items in `docs/REVIEW-2026-09.md` / `docs/IMPLEMENTATION.md`. Notes:
 
 _______________________________________________________________________
 _______________________________________________________________________

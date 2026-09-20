@@ -522,3 +522,92 @@ test('5.16: the release build validates the compiled rulesets after compiling th
   assert.notEqual(validateIdx, -1, 'build.yml must run tests/compiled-rulesets.test.mjs');
   assert.ok(validateIdx > compileIdx, 'the compiled-ruleset test must run after build:rules');
 });
+
+// ---------------------------------------------------------------------------
+// §5.17 — docs drift. Every number the README states about the code is
+// measured here from the code that backs it, so the next drift fails the
+// suite instead of surviving another release in prose.
+// ---------------------------------------------------------------------------
+
+test('5.17: the README scriptlet counts match the registry', async () => {
+  // The registry is the source of truth for both numbers: `REGISTRY.size`
+  // counts every dispatchable name (uBO aliases included) and the distinct
+  // values count the implementations behind them — several names share one
+  // (`no-fetch-if` is `prevent-fetch`, `trusted-rpnt` is `replace-node-text`).
+  globalThis.window = globalThis;
+  const { REGISTRY } = await import('../src/scriptlets/index.js');
+  const names = REGISTRY.size;
+  const implementations = new Set(REGISTRY.values()).size;
+
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const claim = readme.match(
+    /(\d+)\s+registry names \(uBO aliases included\) over (\d+)\s+implementations/);
+  assert.ok(claim, 'README must state the scriptlet registry counts');
+  assert.equal(Number(claim[1]), names, 'README registry-name count');
+  assert.equal(Number(claim[2]), implementations, 'README implementation count');
+  assert.ok(
+    !/30\+ scriptlets|30\+ uBO-compatible scriptlets|✅ 30\+/.test(readme),
+    'README still carries the stale "30+ scriptlets" claim');
+});
+
+test('5.17: the README ruleset counts match the manifest and the SW defaults', () => {
+  const manifest = readJson('manifest.json');
+  const resources = manifest.declarative_net_request?.rule_resources || [];
+  const declared = resources.length;
+  const manifestEnabled = resources.filter((r) => r.enabled === true).length;
+
+  // The runtime default is not the manifest's: `getDefaultEnabledRulesets`
+  // turns lists on by LIST id, and `RULESET_GROUPS` expands a sharded list
+  // into its shard ruleset ids.
+  const swSource = fs.readFileSync(
+    path.join(ROOT, 'src/background/service-worker.js'), 'utf8');
+  const defaultsBlock = swSource.match(
+    /function getDefaultEnabledRulesets\(\) \{\s*return \{([\s\S]*?)\};/);
+  assert.ok(defaultsBlock, 'getDefaultEnabledRulesets not found in service-worker.js');
+  const defaultOnListIds = [...defaultsBlock[1].matchAll(/'?([\w-]+)'?\s*:\s*true/g)]
+    .map((m) => m[1]);
+  assert.ok(defaultOnListIds.length > 0, 'getDefaultEnabledRulesets has no enabled lists');
+
+  const groupsBlock = swSource.match(/const RULESET_GROUPS = \{([\s\S]*?)\};/);
+  assert.ok(groupsBlock, 'RULESET_GROUPS not found in service-worker.js');
+  const groups = new Map(
+    [...groupsBlock[1].matchAll(/'([\w-]+)':\s*\[([^\]]*)\]/g)].map((m) => [
+      m[1],
+      [...m[2].matchAll(/'([\w-]+)'/g)].map((s) => s[1]),
+    ]));
+  const runtimeEnabled = new Set(
+    defaultOnListIds.flatMap((listId) => groups.get(listId) || [listId]));
+
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  const claim = readme.match(
+    /(\d+) declared \/ (\d+) enabled in the manifest \/ (\d+) requested at runtime/);
+  assert.ok(claim, 'README must state the declared/enabled ruleset counts');
+  assert.equal(Number(claim[1]), declared, 'README declared-ruleset count');
+  assert.equal(Number(claim[2]), manifestEnabled, 'README manifest-enabled count');
+  assert.equal(Number(claim[3]), runtimeEnabled.size, 'README runtime-enabled count');
+});
+
+test('5.17: the release checklist points at the current review and the persona floor', () => {
+  const checklist = fs.readFileSync(
+    path.join(ROOT, 'docs/RELEASE_CHECKLIST.md'), 'utf8');
+
+  // docs/REVIEW.md is two review cycles behind; its P0s are closed and its
+  // numbering no longer matches anything a releaser can act on.
+  assert.ok(
+    !/docs\/REVIEW\.md/.test(checklist),
+    'the checklist still sends releasers to the superseded docs/REVIEW.md');
+  assert.match(checklist, /docs\/REVIEW-2026-09\.md/);
+  assert.match(checklist, /docs\/REMEDIATION-2026-09\.md/);
+
+  // The persona floor is a per-release manual bump; name the symbol that
+  // actually holds it so the line cannot rot into a stale path.
+  assert.match(checklist, /CHROME_MAJOR_FALLBACK/);
+  assert.match(checklist, /src\/shared\/personas\.js/);
+  const personas = fs.readFileSync(path.join(ROOT, 'src/shared/personas.js'), 'utf8');
+  assert.match(
+    personas, /export const CHROME_MAJOR_FALLBACK\b/,
+    'the checklist names a constant personas.js does not export');
+
+  // The PSL snapshot is the one vendored input with no SRI lock behind it.
+  assert.match(checklist, /scripts\/psl-source\/public_suffix_list\.dat/);
+});

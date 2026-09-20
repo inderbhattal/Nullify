@@ -611,3 +611,57 @@ test('5.17: the release checklist points at the current review and the persona f
   // The PSL snapshot is the one vendored input with no SRI lock behind it.
   assert.match(checklist, /scripts\/psl-source\/public_suffix_list\.dat/);
 });
+
+test('5.17: the release checklist smoke-tests the lists that block navigations', () => {
+  // A list blocks navigations when its rules carry `main_frame`. Two things in
+  // the build put it there: `SECURITY_LIST_IDS`, which gives the full type set
+  // to rules that name no type, and `$all`, which does the same on any list.
+  const buildSource = fs.readFileSync(path.join(ROOT, 'scripts/build-rules.mjs'), 'utf8');
+  const securityBlock = /const SECURITY_LIST_IDS = new Set\(\[([^\]]*)\]\)/.exec(buildSource);
+  assert.ok(securityBlock, 'SECURITY_LIST_IDS not found in build-rules.mjs');
+  const required = new Set([...securityBlock[1].matchAll(/'([\w-]+)'/g)].map((m) => m[1]));
+
+  // `$all` rules per snapshot, measured: anti-adblock 1,385 and malware 7,748,
+  // then a 14x gap down to ubo-filters at 94. A list in the thousands is one a
+  // user can walk into by typing a URL; the threshold sits inside that gap so a
+  // list that starts carrying `$all` in bulk after a refresh fails here.
+  const NAVIGATION_BLOCK_THRESHOLD = 1000;
+  const listsDir = path.join(ROOT, 'scripts/filter-lists');
+  for (const file of fs.readdirSync(listsDir).filter((f) => f.endsWith('.txt'))) {
+    let count = 0;
+    for (const raw of fs.readFileSync(path.join(listsDir, file), 'utf8').split('\n')) {
+      const line = raw.trim();
+      if (!line || line.startsWith('!') || line.startsWith('[') || line.startsWith('@@')) continue;
+      if (/#[@?$%^]?#/.test(line)) continue;      // cosmetic/scriptlet, no DNR type
+      const optionsAt = line.lastIndexOf('$');
+      if (optionsAt < 0) continue;
+      if (line.slice(optionsAt + 1).split(',').some((o) => o.trim() === 'all')) count += 1;
+    }
+    if (count >= NAVIGATION_BLOCK_THRESHOLD) required.add(path.basename(file, '.txt'));
+  }
+  assert.ok(required.size > 0, 'no navigation-blocking list was identified — the scan found nothing');
+
+  const checklist = fs.readFileSync(path.join(ROOT, 'docs/RELEASE_CHECKLIST.md'), 'utf8');
+  const sections = checklist.split(/^## /m);
+  const navigationSection = sections.find((s) => /navigation/i.test(s.split('\n')[0]));
+  assert.ok(
+    navigationSection,
+    'no "## …navigation…" section: blocking the navigation to a listed host is the one filter-list '
+    + 'behaviour that changes what typing a URL does, and nothing automated exercises it in a real Chrome');
+
+  for (const id of required) {
+    assert.ok(
+      navigationSection.includes(id),
+      `${id} compiles rules that block main_frame but the checklist's navigation step never names it`);
+  }
+
+  // The step cites the README for the measured host counts rather than
+  // carrying its own copy; a cross-doc reference that rots is the §5.17 bug
+  // again, one document further out.
+  const cited = /README, "([^"]+)"/.exec(navigationSection);
+  assert.ok(cited, 'the navigation step must cite where the measured counts live');
+  const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+  assert.ok(
+    new RegExp(`^#+ ${cited[1].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'm').test(readme),
+    `the checklist cites a README heading "${cited[1]}" that README.md does not have`);
+});

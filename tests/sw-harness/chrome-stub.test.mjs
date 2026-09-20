@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { makeChromeStub } from './chrome-stub.mjs';
+import { loadServiceWorker } from './sw-loader.mjs';
 
 test('chrome-stub: storage round-trip + key shapes', async () => {
   const stub = makeChromeStub();
@@ -186,4 +187,71 @@ test('7.7: the stub rejects a requestMethods value Chrome rejects', async () => 
     addRules: [rule(1, { requestMethods: ['get', 'post'] }), rule(2, { excludedRequestMethods: ['other'] })],
   });
   assert.equal((await stub.declarativeNetRequest.getDynamicRules()).length, 2);
+});
+
+// REMEDIATION-2026-09 §7.9(d) — two-life tests were clearing listener sets by
+// hand, and only the three events they happened to think of. Chrome tears a
+// worker down before the next one registers; this stub keeps every listener
+// forever, so a dead life's handlers otherwise run alongside the live one's
+// and double every call they make.
+test('chrome-stub: _clearListeners drops every registered listener', () => {
+  const stub = makeChromeStub();
+  const events = [
+    stub.runtime.onInstalled, stub.runtime.onStartup, stub.runtime.onSuspend,
+    stub.runtime.onMessage, stub.alarms.onAlarm, stub.tabs.onUpdated,
+    stub.tabs.onRemoved, stub.tabs.onActivated, stub.webNavigation.onBeforeNavigate,
+    stub.webNavigation.onCommitted, stub.webNavigation.onCompleted,
+    stub.declarativeNetRequest.onRuleMatchedDebug, stub.contextMenus.onClicked,
+  ];
+  for (const event of events) event.addListener(() => {});
+  assert.ok(events.every((e) => e._listeners.size === 1), 'precondition: each event has a listener');
+
+  const removed = stub._clearListeners();
+
+  assert.equal(removed, events.length, 'every listener is accounted for in the return value');
+  for (const event of events) {
+    assert.equal(event._listeners.size, 0, 'and every set is empty');
+  }
+  // Still usable afterwards: a new life registers into the same stub.
+  stub.alarms.onAlarm.addListener(() => {});
+  assert.equal(stub.alarms.onAlarm._listeners.size, 1);
+});
+
+test('chrome-stub: _clearListeners reaches events this test did not name', () => {
+  // The registry is built where the events are, so a newly added event is
+  // cleared without anyone remembering to list it here.
+  const stub = makeChromeStub();
+  let named = 0;
+  for (const area of [stub.runtime, stub.alarms, stub.tabs, stub.webNavigation,
+    stub.declarativeNetRequest, stub.contextMenus]) {
+    for (const value of Object.values(area)) {
+      if (value && typeof value._fire === 'function') { value.addListener(() => {}); named++; }
+    }
+  }
+  assert.ok(named >= 13, `the stub should expose at least 13 events, found ${named}`);
+  assert.equal(stub._clearListeners(), named, 'all of them are in the registry');
+});
+
+test('sw-loader: teardown() cancels the stats-persist debounce as well as the listeners', async () => {
+  // The two hazards of reusing a stub for a second worker life are a dead
+  // life's listeners and its armed stats-persist timer, which would write the
+  // first life's stats into the second life's storage 1.5s later. `teardown`
+  // exists so a caller has to remember neither.
+  //
+  // Asserted through the hook rather than by waiting out the real 1.5s
+  // debounce: the wait would add a third of the suite's total runtime to pin
+  // one line, and the hook IS the cancellation path the worker exposes.
+  const first = await loadServiceWorker({ awaitReady: true });
+  let cancelled = 0;
+  const realCancel = first.hooks.cancelPendingStatsPersistForTest;
+  first.hooks.cancelPendingStatsPersistForTest = (...args) => {
+    cancelled++;
+    return realCancel.apply(first.hooks, args);
+  };
+
+  const dropped = first.teardown();
+
+  assert.equal(cancelled, 1, 'teardown must cancel the debounce, not only clear listeners');
+  assert.ok(dropped > 0, 'and it still reports the listeners it dropped');
+  assert.equal(first.chrome.alarms.onAlarm._listeners.size, 0);
 });

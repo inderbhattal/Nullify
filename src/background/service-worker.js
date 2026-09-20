@@ -2496,13 +2496,31 @@ async function scheduleFilterUpdateAlarm() {
   }
 }
 
-chrome.alarms.onAlarm.addListener(async (alarm) => {
+// §7.9(a) — an alarm is one of the events that WAKES a terminated worker, so
+// this listener used to run against a worker whose rule-data pass had not
+// happened yet: stage 1's packaged snapshot write and this refresh's downloads
+// interleaved, and whichever landed second overwrote the other — one refresh
+// cycle lost, and on an update boot that is the cycle whose whole job is to
+// replace the snapshot the update just rolled back. Gate on `_criticalPromise`
+// the way the message dispatcher does (§3.1): the work is deferred, never
+// dropped. The promise is returned so the harness can await the work; Chrome
+// ignores a listener's return value.
+chrome.alarms.onAlarm.addListener((alarm) => {
+  const run = _criticalReady || !_criticalPromise
+    ? handleAlarm(alarm)
+    : _criticalPromise.then(() => handleAlarm(alarm));
+  // §5.6 — a listener body's failure is otherwise an unhandled rejection while
+  // GET_ERROR_REPORT goes on describing a healthy extension.
+  return run.catch((err) => reportError(`alarm:${alarm?.name}`, err));
+});
+
+async function handleAlarm(alarm) {
   if (alarm.name === ALARM_FILTER_UPDATE) {
     await checkFilterListUpdates({ force: false });
   } else if (alarm.name === ALARM_STATS_CLEANUP) {
     await cleanupTabStats();
   }
-});
+}
 
 async function cleanupTabStats() {
   const activeTabs = await chrome.tabs.query({});

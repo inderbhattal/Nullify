@@ -240,6 +240,7 @@ const RULE_DATA_SCHEMA_VERSION = 4;
 const FEATURE_DEFAULTS = Object.freeze({
   refreshCadenceV2: false, // §4.5 — A2a: Expires-driven refresh cadence
   rulesetDeltaApply: false, // §5.1 — A2b: apply only the static-ruleset delta
+  privacyRulesDiff: false, // §5.2 — A2c: write only the privacy rules that changed
 });
 let cachedFeatureFlags = { ...FEATURE_DEFAULTS };
 let _featureFlagsPromise = null;
@@ -1390,7 +1391,28 @@ async function mergePackagedSourcesOnUpdate(packaged) {
   }
 }
 
-async function ensureRuleDataReady() {
+// §5.2 (REVIEW-2026-09, A2c) — `onInstalled` and the module-load
+// `startInitialization()` both run the pass below, and on a fresh install they
+// interleave: both read an absent bloom filter before either writes one, so
+// the full active-index rebuild ran TWICE for one install (two
+// `ruleIndexState=building` writes). Memoize it for the worker's life, the
+// shape `_criticalPromise` uses. A rejection clears the memo so the next
+// caller retries rather than inheriting a failure; the lenient
+// StorageReadError branch inside deliberately keeps its result for this SW
+// life, which is what its own comment already promised.
+let _ruleDataReadyPromise = null;
+
+function ensureRuleDataReady() {
+  if (!_ruleDataReadyPromise) {
+    _ruleDataReadyPromise = runRuleDataReadyPass().catch((err) => {
+      _ruleDataReadyPromise = null;
+      throw err;
+    });
+  }
+  return _ruleDataReadyPromise;
+}
+
+async function runRuleDataReadyPass() {
   // The flags gate the merge below, and this is the first consumer on every
   // boot path (stage 1 runs before refreshMemoryCache).
   await ensureFeatureFlagsLoaded();
@@ -2099,23 +2121,120 @@ async function applyPrivacySettings() {
     });
   }
 
+  // §5.2 (A2c) — flag `privacyRulesDiff`. Dynamic rules persist across worker
+  // lives, but the six writers below rewrote theirs on every start: six
+  // updateDynamicRules calls per wake on a profile where nothing had changed.
+  // With the flag on they only state their desired rules here and one diffed
+  // batch is issued at the end; with it off each writer issues exactly the
+  // call it issued before.
+  const plan = isFeatureEnabled('privacyRulesDiff') ? [] : null;
+
   // Update header stripping rules
-  await applyHeaderRules(settings.stripTrackingHeaders !== false);
+  await applyHeaderRules(settings.stripTrackingHeaders !== false, plan);
 
   // Upgrade insecure requests where possible.
-  await applyUpgradeSchemeRules(settings.upgradeInsecureRequests !== false);
+  await applyUpgradeSchemeRules(settings.upgradeInsecureRequests !== false, plan);
 
   // Update stealth rules (CSP stripping)
-  await applyStealthRules();
+  await applyStealthRules(plan);
 
   // Update persona rules
-  await applyPersonaRules(settings.stealthPersona || 'default');
+  await applyPersonaRules(settings.stealthPersona || 'default', plan);
 
   // Update cache protection rules
-  await applyCacheProtectionRules(settings.cacheProtection !== false);
+  await applyCacheProtectionRules(settings.cacheProtection !== false, plan);
 
   // Update referrer control rules
-  await applyReferrerControlRules(settings.referrerControl !== false);
+  await applyReferrerControlRules(settings.referrerControl !== false, plan);
+
+  if (plan) await commitPrivacyRulePlan(plan);
+}
+
+/**
+ * §5.2 — a privacy writer's one side effect. With a `plan` (flag on) the
+ * intent is collected for `commitPrivacyRulePlan`; without one the call is
+ * byte-for-byte the write the writer issued before, `addRules` key included
+ * only where it passed one.
+ */
+async function emitPrivacyRules(plan, removeRuleIds, addRules) {
+  if (plan) {
+    plan.push({ removeRuleIds, addRules: addRules || [] });
+    return;
+  }
+  await chrome.declarativeNetRequest.updateDynamicRules(
+    addRules ? { removeRuleIds, addRules } : { removeRuleIds }
+  );
+}
+
+/**
+ * §5.2 — compare rule bodies independently of key order: `getDynamicRules()`
+ * returns Chrome's ordering, not ours. Arrays keep their order — both sides
+ * are produced by the writers above, so an order difference is a real one.
+ */
+function stablePrivacyRuleJson(rule) {
+  return JSON.stringify(rule, (key, value) => (
+    value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map((k) => [k, value[k]]))
+      : value
+  ));
+}
+
+/**
+ * §5.2 — one updateDynamicRules for the whole privacy band, carrying only the
+ * ids whose body differs from what Chrome already holds, plus the ids that
+ * must go. Steady state ⇒ no call at all. Removals apply before additions
+ * within a call, so an id that changed may appear in both lists.
+ *
+ * The comparison is deliberately exact: if a future Chrome returned a
+ * normalized rule that never compares equal, every start would write the
+ * whole band — today's behaviour — whereas a subset comparison could accept a
+ * stale rule left by an older release as equal and never replace it.
+ *
+ * `applyPrivacySettings` is also reached from UPDATE_SETTINGS, so a snapshot
+ * that cannot be read falls back to writing every privacy rule: skipping the
+ * write would leave the setting the user just toggled unapplied.
+ *
+ * Accepted with the flag: one batch is all-or-nothing, so a rule Chrome
+ * refuses now sheds the other five instead of only itself. These six bodies
+ * are code-defined constants, not compiled filter output, and the flag ships
+ * OFF for a release — but it is the reason to watch the first soak.
+ */
+async function commitPrivacyRulePlan(plan) {
+  const ownedIds = plan.flatMap((entry) => entry.removeRuleIds);
+  const desired = new Map();
+  for (const entry of plan) {
+    for (const rule of entry.addRules) desired.set(rule.id, rule);
+  }
+
+  const snapshot = await chrome.declarativeNetRequest.getDynamicRules().catch((err) => {
+    console.warn('[AdBlock] Could not read dynamic rules; writing every privacy rule:', err?.message || err);
+    return null;
+  });
+  if (!snapshot) {
+    await chrome.declarativeNetRequest.updateDynamicRules({
+      removeRuleIds: ownedIds,
+      addRules: [...desired.values()],
+    });
+    return;
+  }
+
+  const existing = new Map(snapshot.map((rule) => [rule.id, rule]));
+  const removeRuleIds = [];
+  const addRules = [];
+  for (const id of ownedIds) {
+    const wanted = desired.get(id);
+    const held = existing.get(id);
+    if (!wanted) {
+      if (held) removeRuleIds.push(id);
+      continue;
+    }
+    if (held && stablePrivacyRuleJson(held) === stablePrivacyRuleJson(wanted)) continue;
+    if (held) removeRuleIds.push(id);
+    addRules.push(wanted);
+  }
+
+  if (removeRuleIds.length === 0 && addRules.length === 0) return;
+  await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds, addRules });
 }
 
 const DNR_HEADER_RULES_START = 800_000;
@@ -2123,13 +2242,11 @@ const DNR_STEALTH_RULES_START = 810_000;
 const DNR_HTTPS_RULES_START = 815_000;
 
 /** Apply DNR rules to strip tracking headers (Referer, Set-Cookie). */
-async function applyHeaderRules(enabled) {
+async function applyHeaderRules(enabled, plan = null) {
   const ruleIds = [DNR_HEADER_RULES_START, DNR_HEADER_RULES_START + 1];
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: ruleIds,
-    });
+    await emitPrivacyRules(plan, ruleIds);
     return;
   }
 
@@ -2168,26 +2285,21 @@ async function applyHeaderRules(enabled) {
     }
   ];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: ruleIds,
-    addRules: rules,
-  });
+  await emitPrivacyRules(plan, ruleIds, rules);
 }
 
 /** Clear the legacy CSP-stripping rule. Enhanced stealth now runs in MAIN world. */
-async function applyStealthRules() {
+async function applyStealthRules(plan = null) {
   const ruleId = DNR_STEALTH_RULES_START;
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-  });
+  await emitPrivacyRules(plan, [ruleId]);
 }
 
 /** Upgrade HTTP requests to HTTPS. */
-async function applyUpgradeSchemeRules(enabled) {
+async function applyUpgradeSchemeRules(enabled, plan = null) {
   const ruleId = DNR_HTTPS_RULES_START;
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2201,10 +2313,7 @@ async function applyUpgradeSchemeRules(enabled) {
     }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 const PERSONAS = {
@@ -2226,12 +2335,12 @@ const PERSONAS = {
 };
 
 /** Apply DNR rules to spoof User-Agent and Client Hints. */
-async function applyPersonaRules(personaId) {
+async function applyPersonaRules(personaId, plan = null) {
   const ruleId = DNR_PERSONA_RULES_START;
   const persona = PERSONAS[personaId];
 
   if (!persona || personaId === 'default') {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2250,18 +2359,15 @@ async function applyPersonaRules(personaId) {
     condition: { resourceTypes: ['main_frame', 'sub_frame', 'script', 'xmlhttprequest', 'other'] }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 /** Strip ETag and Last-Modified to prevent cache-based tracking. */
-async function applyCacheProtectionRules(enabled) {
+async function applyCacheProtectionRules(enabled, plan = null) {
   const ruleId = DNR_CACHE_RULES_START;
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2281,18 +2387,15 @@ async function applyCacheProtectionRules(enabled) {
     }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 /** Enforce strict Referrer-Policy. */
-async function applyReferrerControlRules(enabled) {
+async function applyReferrerControlRules(enabled, plan = null) {
   const ruleId = DNR_REFERRER_RULES_START;
 
   if (!enabled) {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
+    await emitPrivacyRules(plan, [ruleId]);
     return;
   }
 
@@ -2308,10 +2411,7 @@ async function applyReferrerControlRules(enabled) {
     condition: { resourceTypes: ['main_frame', 'sub_frame'] }
   }];
 
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: rules
-  });
+  await emitPrivacyRules(plan, [ruleId], rules);
 }
 
 const DNR_PERSONA_RULES_START = 820_000;
@@ -4954,7 +5054,8 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 export const __testHooks = {
   whenCriticalReady: () => _criticalPromise || Promise.resolve(),
   whenBackgroundSetupDone: () => _backgroundSetupPromise || Promise.resolve(),
-  // Alarms / rulesets
+  // Rule data / alarms / rulesets
+  ensureRuleDataReady,
   scheduleFilterUpdateAlarm,
   applyRulesets,
   CONFIG,

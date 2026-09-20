@@ -8,14 +8,21 @@
  *  §4.24 — boot key seeded non-configurable; strict registry verification.
  *  §4.25 — packed builds have no onRuleMatchedDebug; the SW must expose
  *        `networkStatsAvailable` so the UI can label counters honestly.
- *  §5.4 — GET_TAB_STATS honors payload.tabId only for extension pages.
+ *  §5.3 — IS_SITE_ALLOWED and GET_TAB_STATS were SENDER_ANY with only
+ *        extension-page callers, so any renderer could ask whether an
+ *        arbitrary hostname was allowlisted.
+ *  §5.4 — GET_TAB_STATS honored payload.tabId only for extension pages;
+ *        subsumed by §5.3, which refuses the renderer at the gate.
  *  §5.5 — RUN_SCRIPTLETS / GET_SCRIPTLET_RULES are deleted (dead attack surface).
  */
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import { makeChromeStub } from './chrome-stub.mjs';
 import { loadServiceWorker } from './sw-loader.mjs';
+
+const SW_PATH = new URL('../../src/background/service-worker.js', import.meta.url);
 
 /** Sender shape of our content script running in an arbitrary web page. */
 function contentScriptSender(tabId = 7, url = 'https://evil.example/page') {
@@ -135,31 +142,112 @@ test('2.3: unknown message types fail closed for content-script senders', async 
 });
 
 // ---------------------------------------------------------------------------
-// §5.4 — GET_TAB_STATS tabId scoping
+// §5.3 — IS_SITE_ALLOWED and GET_TAB_STATS are extension-page only
+//
+// Both were SENDER_ANY while only the popup ever called them (verified by
+// grep at HEAD across src/: popup.js:92,133,194 and nothing else). A content
+// script on any page could therefore ask IS_SITE_ALLOWED about ANY hostname
+// and get a straight yes/no — an allowlist-membership oracle over the user's
+// browsing, readable from a compromised renderer. GET_TAB_STATS carried the
+// §5.4 guard (payload.tabId honored only for extension pages) to keep the
+// same renderer from enumerating tab ids and reading every open tab's URL;
+// refusing the renderer at the gate subsumes that guard.
 // ---------------------------------------------------------------------------
 
-test('5.4: a content script cannot read another tab\'s stats/URL via payload.tabId', async () => {
+/**
+ * The sender policy as the worker declares it. Read out of the source rather
+ * than re-declared here, so this test cannot drift into asserting against its
+ * own copy of the table (the sw-dnr-bands.test.mjs convention).
+ */
+async function senderPolicyFromSource() {
+  const source = await readFile(SW_PATH, 'utf8');
+  const match = /const MESSAGE_SENDER_POLICY = \{([\s\S]*?)\n\};/.exec(source);
+  assert.ok(match, 'service-worker.js must define MESSAGE_SENDER_POLICY');
+  const table = {};
+  for (const [, type, value] of match[1].matchAll(/^\s*(\w+):\s*(SENDER_\w+)/gm)) {
+    table[type] = value;
+  }
+  return table;
+}
+
+test('5.3: IS_SITE_ALLOWED and GET_TAB_STATS refuse a content-script sender', async () => {
   const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
 
+  // The user has allowlisted their bank; a page on evil.example must not be
+  // able to learn that, nor read the bank tab's URL.
+  await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: 'secret-bank.example' } });
   hooks.tabStats.set(1, { blocked: 42, trackers: 9, url: 'https://secret-bank.example/account' });
   hooks.tabStats.set(7, { blocked: 3, trackers: 1, url: 'https://evil.example/page' });
 
-  const res = await chrome.runtime.sendMessage(
+  const allowed = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'secret-bank.example' } },
+    contentScriptSender(7));
+  assert.match(allowed.error || '', /extension-page sender required/,
+    `the allowlist oracle must be closed, got ${JSON.stringify(allowed)}`);
+  assert.equal(allowed.allowed, undefined, 'and must not answer the question at all');
+
+  const stats = await chrome.runtime.sendMessage(
     { type: 'GET_TAB_STATS', payload: { tabId: 1 } },
-    contentScriptSender(7)
-  );
-
-  assert.equal(res.url, 'https://evil.example/page',
-    'content script must only ever see its own tab');
-  assert.equal(res.blocked, 3);
-
-  // Extension pages (popup: no sender.tab) still query arbitrary tabs.
-  const popupRes = await chrome.runtime.sendMessage(
-    { type: 'GET_TAB_STATS', payload: { tabId: 1 } });
-  assert.equal(popupRes.blocked, 42);
-  assert.equal(popupRes.url, 'https://secret-bank.example/account');
+    contentScriptSender(7));
+  assert.match(stats.error || '', /extension-page sender required/,
+    `tab stats must be closed to renderers, got ${JSON.stringify(stats)}`);
+  assert.equal(stats.url, undefined, 'no tab URL may come back, not even its own');
 
   hooks.clearInMemoryStatsForTest();
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.3 (didn\'t re-break): an extension-page sender still gets the answer', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+
+  await chrome.runtime.sendMessage({ type: 'ALLOW_SITE', payload: { domain: 'secret-bank.example' } });
+  hooks.tabStats.set(1, { blocked: 42, trackers: 9, url: 'https://secret-bank.example/account' });
+
+  // The popup's three calls (popup.js:92,133,194): no sender.tab, extension
+  // origin. It asks about a hostname and a tab id that are not its own.
+  const allowed = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'secret-bank.example' } });
+  assert.equal(allowed.allowed, true, 'the popup still reads the allowlist');
+  const notAllowed = await chrome.runtime.sendMessage(
+    { type: 'IS_SITE_ALLOWED', payload: { domain: 'other.example' } });
+  assert.equal(notAllowed.allowed, false, 'and still gets a real answer, not a blanket yes');
+
+  // §5.4 — an extension page may still ask about an arbitrary tab; that is
+  // the whole point of the popup's stats panel.
+  const stats = await chrome.runtime.sendMessage(
+    { type: 'GET_TAB_STATS', payload: { tabId: 1 } });
+  assert.equal(stats.blocked, 42);
+  assert.equal(stats.url, 'https://secret-bank.example/account');
+
+  hooks.clearInMemoryStatsForTest();
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('5.3: the renderer-reachable set is exactly the content-script critical path', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ awaitReady: true });
+  const policy = await senderPolicyFromSource();
+
+  const reachable = Object.keys(policy).filter((type) => policy[type] === 'SENDER_ANY').sort();
+  assert.deepEqual(reachable, [
+    'APPEND_USER_FILTER', 'CHECK_SEMANTIC_AD', 'CONTENT_BLOCKED',
+    'GET_INIT_DATA', 'REPORT_CONTENT_ERROR',
+  ], 'widening the renderer-reachable surface is a decision, not an accident');
+
+  // The table is only a claim; the gate is what enforces it. Every type the
+  // table calls reachable must actually pass the gate, and the two this
+  // change moved must not.
+  for (const type of reachable) {
+    const res = await chrome.runtime.sendMessage({ type, payload: {} }, contentScriptSender());
+    assert.doesNotMatch(String(res?.error ?? ''), /extension-page sender required/,
+      `${type} is declared SENDER_ANY but the gate refused it`);
+  }
+  for (const type of ['IS_SITE_ALLOWED', 'GET_TAB_STATS']) {
+    assert.equal(policy[type], 'SENDER_EXTENSION_PAGE', `${type} must be declared extension-page only`);
+    const res = await chrome.runtime.sendMessage({ type, payload: {} }, contentScriptSender());
+    assert.match(res.error || '', /extension-page sender required/,
+      `${type} is declared extension-page only but the gate let it through`);
+  }
+
   hooks.cancelPendingStatsPersistForTest();
 });
 

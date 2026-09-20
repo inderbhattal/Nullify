@@ -4342,10 +4342,8 @@ const SENDER_EXTENSION_PAGE = 'extension-page';   // extension pages only
 // whole-object writers and destructive operations with live, narrower
 // replacements (UPDATE_SETTINGS, ADD_ALLOWLIST_DOMAINS).
 const MESSAGE_SENDER_POLICY = {
-  // Content-script critical path + picker/stats reporting.
+  // Content-script critical path + picker/error reporting.
   GET_INIT_DATA: SENDER_ANY,          // §4.19: hostname derived from sender.url
-  IS_SITE_ALLOWED: SENDER_ANY,
-  GET_TAB_STATS: SENDER_ANY,          // §5.4: payload.tabId honored only for extension pages
   CONTENT_BLOCKED: SENDER_ANY,        // §4.13: payload validated in the handler
   APPEND_USER_FILTER: SENDER_ANY,     // element picker; single validated line
   REPORT_CONTENT_ERROR: SENDER_ANY,
@@ -4353,6 +4351,14 @@ const MESSAGE_SENDER_POLICY = {
 
   // Extension pages only — settings/allowlist/filter/ruleset writers, bulk
   // readers of user data, diagnostics, and destructive operations.
+  // §5.3 — these two were SENDER_ANY while only the popup ever called them
+  // (popup.js:92,133,194; re-verified by grep at HEAD across src/, not taken
+  // from the review). IS_SITE_ALLOWED answered for any hostname the caller
+  // named, so a compromised renderer had a yes/no oracle over the user's
+  // allowlist; GET_TAB_STATS needed the §5.4 guard to stop the same renderer
+  // enumerating tab ids and reading every open tab's URL.
+  IS_SITE_ALLOWED: SENDER_EXTENSION_PAGE,
+  GET_TAB_STATS: SENDER_EXTENSION_PAGE,
   GET_SETTINGS: SENDER_EXTENSION_PAGE,
   UPDATE_SETTINGS: SENDER_EXTENSION_PAGE,
   GET_ALLOWLIST: SENDER_EXTENSION_PAGE,
@@ -4564,13 +4570,15 @@ async function handleMessage(message, sender) {
       return responseData;
     }
     case 'GET_TAB_STATS': {
-      // §5.4 — honoring payload.tabId from any sender let a compromised
-      // renderer enumerate tab ids and read every open tab's URL. Only
-      // extension pages (no sender.tab, extension-origin sender.url) may ask
-      // about arbitrary tabs; content scripts get their own tab only.
-      const fromExtensionPage = !sender.tab && isExtensionPageSender(sender);
-      const tabId = fromExtensionPage ? payload?.tabId : sender.tab?.id;
-      return { ...normalizeTabStatsEntry(tabStats.get(tabId)), networkStatsAvailable };
+      // §5.4 honored payload.tabId only for extension pages, because a
+      // renderer could otherwise enumerate tab ids and read every open tab's
+      // URL. §5.3 moved this type to SENDER_EXTENSION_PAGE, so the gate above
+      // has already refused every renderer and the remaining callers are our
+      // own pages, which are entitled to ask about any tab. The old guard also
+      // required `!sender.tab`, which would have scoped an extension page
+      // opened in a TAB (the options page) to its own stats — not what an
+      // extension page asking for a tab id means.
+      return { ...normalizeTabStatsEntry(tabStats.get(payload?.tabId)), networkStatsAvailable };
     }
     case 'GET_DAILY_BLOCKED_TOTAL': {
       if (rollDailyBlockedTotalIfNeeded()) {

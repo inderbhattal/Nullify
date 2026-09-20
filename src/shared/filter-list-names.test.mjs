@@ -109,3 +109,91 @@ test('5.17: the popup and the options page import the shared table instead of ca
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// The names themselves, pinned to the lists they name.
+//
+// PR #11 forgot a row; `9f42a08` then unified the two pages onto the options
+// page's wording, which spread that page's errors to the popup — `annoyances`
+// became "Fanboy Annoyances" (it is uAssets' own list, meant to be used
+// ALONGSIDE Fanboy's) and `anti-adblock` kept "Anti-Adblock" (its source is
+// badware.txt). A table of literals cannot catch that, because the literal and
+// the expectation are written by the same hand. So the expectation is taken
+// from the vendored snapshot's own `! Title:` header, and a second test proves
+// the snapshot really is the file that list id fetches.
+// ---------------------------------------------------------------------------
+
+const repoFile = (relative) => new URL(`../../${relative}`, import.meta.url);
+
+/** Abbreviations the display names are allowed to use, expanded before matching. */
+const NAME_ABBREVIATIONS = { ubo: 'ublock' };
+
+function significantWords(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')   // also drops the ₀ in "uBlock₀"
+    .split(' ')
+    .filter(Boolean)
+    .map((word) => NAME_ABBREVIATIONS[word] || word);
+}
+
+/** The `! Title:` header of a vendored snapshot, which is upstream's own name for it. */
+function snapshotTitle(listId) {
+  const text = fs.readFileSync(repoFile(`scripts/filter-lists/${listId}.txt`), 'utf8');
+  const header = /^!\s*Title:\s*(.+)$/m.exec(text);
+  assert.ok(header, `scripts/filter-lists/${listId}.txt has no "! Title:" header to check against`);
+  return header[1].trim();
+}
+
+/** id → url, from the two places that independently record it. */
+function sourceUrlsById() {
+  const swSource = fs.readFileSync(repoFile('src/background/service-worker.js'), 'utf8');
+  const block = /const REMOTE_FILTER_LISTS = \[([\s\S]*?)\n\];/.exec(swSource);
+  assert.ok(block, 'REMOTE_FILTER_LISTS not found in service-worker.js');
+  const worker = new Map(
+    [...block[1].matchAll(/\{\s*id:\s*'([\w-]+)',\s*url:\s*'([^']+)'\s*\}/g)]
+      .map((m) => [m[1], m[2]]));
+  assert.ok(worker.size > 0, 'REMOTE_FILTER_LISTS parsed to nothing');
+
+  const lock = JSON.parse(fs.readFileSync(repoFile('scripts/filter-lists.lock.json'), 'utf8'));
+  return { worker, lock };
+}
+
+// GitHub serves the same file under both spellings; the lock records the
+// redirected form it actually fetched.
+const canonicalUrl = (url) => url.replace('/refs/heads/', '/');
+
+test('5.17: every display name is drawn from its snapshot\'s "! Title:" header', () => {
+  const ids = Object.keys(FILTER_LIST_NAMES);
+  assert.ok(ids.length > 0, 'the name table is empty');
+
+  for (const id of ids) {
+    const title = snapshotTitle(id);
+    const titleWords = significantWords(title);
+    // A name word matches a title word if either is a prefix of the other, so
+    // "Risks"/"risks" and "URLs"/"URL" agree without a stemmer.
+    for (const word of significantWords(FILTER_LIST_NAMES[id])) {
+      assert.ok(
+        titleWords.some((t) => t.startsWith(word) || word.startsWith(t)),
+        `${id}: display name "${FILTER_LIST_NAMES[id]}" says "${word}", which is nowhere in the `
+        + `list's own title "${title}" — the name describes a different list`);
+    }
+  }
+});
+
+test('5.17: each named list\'s snapshot is the file its source URL is locked to', () => {
+  const { worker, lock } = sourceUrlsById();
+
+  for (const id of Object.keys(FILTER_LIST_NAMES)) {
+    const workerUrl = worker.get(id);
+    assert.ok(workerUrl, `${id} has a display name but no entry in REMOTE_FILTER_LISTS`);
+    assert.ok(lock[id]?.url, `${id} is not in scripts/filter-lists.lock.json`);
+    assert.equal(
+      canonicalUrl(lock[id].url), canonicalUrl(workerUrl),
+      `${id}: the worker fetches a different URL from the one the snapshot is locked to, so the `
+      + 'title the name is checked against describes the wrong list');
+    assert.ok(
+      fs.existsSync(repoFile(`scripts/filter-lists/${id}.txt`)),
+      `${id} has no vendored snapshot at scripts/filter-lists/${id}.txt`);
+  }
+});

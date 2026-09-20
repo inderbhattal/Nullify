@@ -15,6 +15,14 @@
  * Key order is display order on both pages. The built-in `system-unbreak`
  * ruleset (always on, no toggle) deliberately has no row.
  *
+ * Every name is checked against its list's own `! Title:` header in the
+ * vendored snapshot (`filter-list-names.test.mjs`), because a table of
+ * literals cannot be checked against itself. Two names were wrong when the
+ * two pages were merged: `annoyances` is uAssets' own annoyances list, meant
+ * to be used ALONGSIDE Fanboy's and AdGuard's, not Fanboy's own; and
+ * `anti-adblock` is a historical id for uBO's badware.txt, which is about
+ * sites that harm the user, not about anti-adblock walls.
+ *
  * Plain literals on purpose: a top-level `Object.freeze(...)` call is not
  * dropped for an unused export, so the popup — which imports only the names —
  * would bundle the descriptions as well.
@@ -23,12 +31,12 @@
 export const FILTER_LIST_NAMES = {
   easylist: 'EasyList',
   easyprivacy: 'EasyPrivacy',
-  annoyances: 'Fanboy Annoyances',
-  'ubo-cookie-annoyances': 'uBO Cookie Annoyances',
-  malware: 'Malware Blocklist',
+  annoyances: 'uBO Annoyances',
+  'ubo-cookie-annoyances': 'uBO Cookie Notices',
+  malware: 'Malicious URLs',
   'ubo-filters': 'uBO Filters',
   'ubo-unbreak': 'uBO Unbreak',
-  'anti-adblock': 'Anti-Adblock',
+  'anti-adblock': 'uBO Badware Risks',
   'ubo-quick-fixes': 'uBO Quick Fixes',
 };
 
@@ -36,11 +44,11 @@ export const FILTER_LIST_NAMES = {
 export const FILTER_LIST_DESCRIPTIONS = {
   easylist: 'The most widely used ad-blocking filter list',
   easyprivacy: 'Tracker, analytics, and surveillance blocking',
-  annoyances: 'Cookie notices, popups, social overlays',
-  'ubo-cookie-annoyances': 'Surgically targets cookie consent and tracking notices',
-  malware: 'Blocks malware and phishing URLs',
+  annoyances: 'Social widgets, overlays and in-page nags',
+  'ubo-cookie-annoyances': 'Cookie consent banners and tracking notices',
+  malware: 'Malicious URLs from URLhaus — blocks the navigation, not just subresources',
   'ubo-filters': 'uBlock Origin default filter list',
   'ubo-unbreak': 'Fixes over-blocking by other lists',
-  'anti-adblock': 'Anti-adblock and badware fixes from uBO',
+  'anti-adblock': 'Sites documented to push adware or steal credentials — most block the navigation, not just subresources',
   'ubo-quick-fixes': 'Same-day countermeasures, including the current YouTube ad bypass',
 };

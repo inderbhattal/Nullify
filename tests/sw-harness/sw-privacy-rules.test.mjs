@@ -22,7 +22,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { makeChromeStub } from './chrome-stub.mjs';
-import { loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
+import { drainTicks, loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
 
 const FLAG_ON = { featureFlags: { privacyRulesDiff: true } };
 
@@ -293,3 +293,64 @@ test("5.2 (didn't re-break): a rejected rule-data pass is not memoized", async (
   assert.equal(countStorage(chrome, 'storage.get', 'ruleDataVersion'), afterRetry,
     'a later caller in the same worker life reuses the pass that succeeded');
 });
+
+// ---------------------------------------------------------------------------
+// §7.9 — applyPrivacySettings was not serialized either, and it is reachable
+// from ensureBackgroundSetup and from UPDATE_SETTINGS. Two settings writes in
+// flight at once (popup and options, or two quick toggles) let the second run
+// take its getDynamicRules() snapshot before the first run's write lands: its
+// diff comes out empty, it issues nothing, and the first run's older intent is
+// final. Measured on the persona rule, the worst of the six — the options page
+// says the persona is off while DNR keeps spoofing a Windows Chrome UA on
+// every request for the rest of that worker's life. The flag-off path has the
+// weaker ordering-dependent version of the same bug.
+// ---------------------------------------------------------------------------
+
+for (const [mode, seed] of [['flag off', {}], ['flag on', FLAG_ON]]) {
+  test(`7.9: two concurrent settings writes leave DNR agreeing with the last one (${mode})`, async () => {
+    const { chrome, hooks } = await loadServiceWorker({ seed, awaitReady: true });
+    const dnr = chrome.declarativeNetRequest;
+    assert.equal(dnr._dynamic.has(PERSONA_RULE_ID), false, 'precondition: no persona rule yet');
+
+    // Hold the first write that touches the persona rule, so the second run
+    // decides while it is outstanding. Released unconditionally below, so a
+    // serialized applier (which parks the second run before it writes) cannot
+    // deadlock this test.
+    let releaseFirstWrite;
+    const firstWriteGate = new Promise((resolve) => { releaseFirstWrite = resolve; });
+    let firstWriteHeld = false;
+    const origUpdate = dnr.updateDynamicRules.bind(dnr);
+    dnr.updateDynamicRules = async (options = {}) => {
+      const touchesPersona = (options.removeRuleIds || []).includes(PERSONA_RULE_ID)
+        || (options.addRules || []).some((rule) => rule.id === PERSONA_RULE_ID);
+      if (touchesPersona && !firstWriteHeld) {
+        firstWriteHeld = true;
+        await firstWriteGate;
+      }
+      return origUpdate(options);
+    };
+
+    const on = chrome.runtime.sendMessage({
+      type: 'UPDATE_SETTINGS', payload: { stealthPersona: 'windows' },
+    });
+    await drainTicks(5);
+    const off = chrome.runtime.sendMessage({
+      type: 'UPDATE_SETTINGS', payload: { stealthPersona: 'default' },
+    });
+    await drainTicks(5);
+    releaseFirstWrite();
+    const [onRes, offRes] = await Promise.all([on, off]);
+    await drainTicks(5);
+
+    assert.equal(onRes.ok, true);
+    assert.equal(offRes.ok, true);
+    assert.equal(firstWriteHeld, true,
+      'the first apply must have reached its persona write, or this test exercised nothing');
+    assert.equal(chrome.storage.local._data().settings.stealthPersona, 'default',
+      'precondition: storage holds the last write the user made');
+    assert.equal(dnr._dynamic.has(PERSONA_RULE_ID), false,
+      'a persona the user switched off must not keep spoofing the UA for the rest of the worker life');
+
+    hooks.cancelPendingStatsPersistForTest();
+  });
+}

@@ -1696,6 +1696,29 @@ function enqueueAllowlistOp(op) {
 }
 
 /**
+ * §7.9 — the same serialization for the two DNR appliers. Both are reachable
+ * from `ensureBackgroundSetup` AND from a message handler, and both decide
+ * what to write from a snapshot they take themselves, so two overlapping runs
+ * invert "last toggle wins": the second run's snapshot can predate the first
+ * run's write, it therefore computes an empty delta and issues nothing, and
+ * the first run's older intent lands and stays until the next worker start.
+ * One chain each — they share no rule ids and must not wait on each other,
+ * and neither applier calls the other, so a chain can never await itself.
+ * Each op re-reads storage, so the last op enqueued applies the final state.
+ */
+function makeOpChain() {
+  let chain = Promise.resolve();
+  return (op) => {
+    const run = chain.catch(() => {}).then(op);
+    chain = run.catch(() => {});
+    return run;
+  };
+}
+
+const enqueueRulesetOp = makeOpChain();
+const enqueuePrivacyOp = makeOpChain();
+
+/**
  * Rebuild allowlist state atomically — ensures DNR rules, matcher, and
  * dependent caches stay in sync. Internal: callers must go through
  * rebuildAllowlistState (or another enqueueAllowlistOp op) so rebuilds
@@ -2088,7 +2111,16 @@ async function initializeDefaults() {
 // ---------------------------------------------------------------------------
 // Privacy settings
 // ---------------------------------------------------------------------------
-async function applyPrivacySettings() {
+// §7.9 — serialized: two concurrent UPDATE_SETTINGS otherwise let the second
+// run snapshot the dynamic rules before the first run's write lands, so it
+// diffs to nothing and the first run's older intent is final (measured with
+// `privacyRulesDiff` on: settings say the persona is off while rule 820000
+// keeps spoofing the UA). Internal: callers go through applyPrivacySettings.
+function applyPrivacySettings() {
+  return enqueuePrivacyOp(_applyPrivacySettingsNow);
+}
+
+async function _applyPrivacySettingsNow() {
   const settings = await getStorageOrDefault(StorageKeys.SETTINGS, {});
 
   // Block WebRTC IP leaks
@@ -3594,7 +3626,10 @@ async function loadRulesetCountsFromBuild() {
 
 // Stability/safety lists first, then core blockers, then niche lists. Under
 // tight static-rule budgets we prioritize ad blocking before tracker blocking,
-// so every EasyList shard is attempted before any EasyPrivacy shard.
+// so every EasyList shard is attempted before any EasyPrivacy shard. §5.1 —
+// with `rulesetDeltaApply` on the sequential fallback orders only the shards
+// it still has to enable, so that holds among those: a shard Chrome already
+// has enabled is left alone rather than re-attempted in its priority slot.
 const RULESET_ENABLE_PRIORITY = [
   'system-unbreak',
   'ubo-unbreak',
@@ -3729,7 +3764,18 @@ async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds, { 
 }
 
 /** Apply all enabled static rulesets, respecting Chrome's global rule count limits. */
-async function applyRulesets() {
+// §7.9 — serialized: the options page flips a card optimistically and leaves
+// the control live, so a list clicked off and straight back on runs this twice
+// at once. Unserialized, the second run's getEnabledRulesets() snapshot can
+// predate the first run's write, the delta comes out empty, nothing is sent,
+// and the first run's disable is final — storage, the effective map and the
+// options toggle all say ON while the ruleset is OFF in Chrome. Internal:
+// callers go through applyRulesets.
+function applyRulesets() {
+  return enqueueRulesetOp(_applyRulesetsNow);
+}
+
+async function _applyRulesetsNow() {
   const enabledMap = normalizeEnabledRulesetsMap(
     (await getStorage(StorageKeys.ENABLED_RULESETS)) || {}
   );

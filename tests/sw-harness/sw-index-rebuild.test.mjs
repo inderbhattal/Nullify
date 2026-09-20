@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
-import { loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
+import { drainTicks, loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
 
 const SW_PATH = new URL('../../src/background/service-worker.js', import.meta.url);
 
@@ -499,6 +499,172 @@ test('5.1 (flag off): behaviour is unchanged', async () => {
     { enable: [], disable: [...wanted, 'annoyances'] },
     ...RULESETS_IN_PRIORITY_ORDER.filter((id) => id !== 'annoyances').map((id) => ({ enable: [id], disable: [] })),
   ]);
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+// ---------------------------------------------------------------------------
+// §7.9 — applyRulesets was not serialized. The options page flips a card
+// optimistically and leaves the control live, so a list clicked off and
+// straight back on runs applyRulesets twice at once. The second run decides
+// from a getEnabledRulesets() snapshot it takes itself, and under
+// `rulesetDeltaApply` that snapshot can predate the first run's write: the
+// delta comes out empty, nothing is sent, and the first run's disable is
+// final. Storage, the reply's enabledMap and the options toggle then all say
+// ON while the ruleset is OFF in Chrome, until the next worker start.
+// The flag-off path has a weaker version of the same bug — two full batches
+// whose landing order decides the outcome — which the same fix closes.
+// ---------------------------------------------------------------------------
+
+for (const [mode, seed] of [['flag off', {}], ['flag on', DELTA_ON]]) {
+  test(`7.9: a list toggled off and straight back on ends up enabled (${mode})`, async () => {
+    const { chrome, hooks } = await loadServiceWorker({ seed, awaitReady: true });
+    const dnr = chrome.declarativeNetRequest;
+    assert.equal(dnr._staticEnabled.has('annoyances'), true, 'precondition: the list starts enabled');
+
+    // Hold the first write so the second toggle makes its decision while the
+    // first one is still outstanding. Released unconditionally below, so a
+    // serialized applier (which parks the second run before it writes
+    // anything) cannot deadlock this test.
+    let releaseFirstWrite;
+    const firstWriteGate = new Promise((resolve) => { releaseFirstWrite = resolve; });
+    let firstWriteHeld = false;
+    const origUpdate = dnr.updateEnabledRulesets.bind(dnr);
+    dnr.updateEnabledRulesets = async (options = {}) => {
+      if (!firstWriteHeld) {
+        firstWriteHeld = true;
+        await firstWriteGate;
+      }
+      return origUpdate(options);
+    };
+
+    const off = chrome.runtime.sendMessage({
+      type: 'SET_RULESET_ENABLED', payload: { rulesetId: 'annoyances', enabled: false },
+    });
+    await drainTicks(5);
+    const on = chrome.runtime.sendMessage({
+      type: 'SET_RULESET_ENABLED', payload: { rulesetId: 'annoyances', enabled: true },
+    });
+    await drainTicks(5);
+    releaseFirstWrite();
+    const [offRes, onRes] = await Promise.all([off, on]);
+    await drainTicks(5);
+
+    assert.equal(offRes.ok, true);
+    assert.equal(onRes.ok, true);
+    assert.equal(firstWriteHeld, true,
+      'the first apply must have reached its write, or this test exercised nothing');
+    assert.equal(chrome.storage.local._data().enabledRulesets.annoyances, true,
+      'precondition: storage holds the last toggle the user made');
+    assert.equal(onRes.enabledMap.annoyances, true,
+      'precondition: the options page is told the list is on');
+    assert.equal(dnr._staticEnabled.has('annoyances'), true,
+      'and Chrome must enforce the toggle the user ended on, not the one they started on');
+
+    hooks.cancelPendingStatsPersistForTest();
+  });
+}
+
+test('5.1: a steady-state wake with a list turned off still issues no call', async () => {
+  // The disable half of the delta: every other §5.1 test runs on the
+  // all-lists-enabled profile, where disableRulesetIds is empty and dropping
+  // the snapshot filter from `toDisable` changes nothing observable.
+  const seed = { ...DELTA_ON, enabledRulesets: { annoyances: false } };
+  const first = await loadServiceWorker({ seed, awaitReady: true });
+  first.hooks.cancelPendingStatsPersistForTest();
+
+  const wanted = RULESETS_IN_LIST_ORDER.filter((id) => id !== 'annoyances');
+  assert.deepEqual(sorted(first.chrome.declarativeNetRequest._staticEnabled), sorted(wanted),
+    'precondition: the first life enabled everything except the list the user turned off');
+
+  const probe = probeRulesetCalls(first.chrome);
+  const second = await loadServiceWorker({
+    stub: first.chrome, idb: first.idb, seed, awaitReady: true,
+  });
+  second.hooks.cancelPendingStatsPersistForTest();
+
+  assert.deepEqual(shapeOf(probe.updates), [],
+    'a list the user turned off is already disabled in Chrome, so no wake may re-disable it');
+  assert.deepEqual(sorted(first.chrome.declarativeNetRequest._staticEnabled), sorted(wanted),
+    'and the state is unchanged');
+});
+
+test('5.1: a failed snapshot AND a failed batch still reset the union', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
+  const dnr = chrome.declarativeNetRequest;
+  const probe = probeRulesetCalls(chrome);
+
+  // Only the delta's own snapshot fails, so the run degrades to the pre-flag
+  // path — including its fallback, which the "unreadable snapshot" test above
+  // never reaches because its batch succeeds.
+  const readThrough = dnr.getEnabledRulesets;
+  let snapshotFailed = false;
+  dnr.getEnabledRulesets = async () => {
+    if (snapshotFailed) return readThrough();
+    snapshotFailed = true;
+    throw new Error('snapshot unavailable');
+  };
+  probe.refuse = (call) => (call.enable.length > 1 ? RULE_LIMIT : null);
+
+  await chrome.storage.local.set({ enabledRulesets: { annoyances: false } });
+  const wanted = RULESETS_IN_LIST_ORDER.filter((id) => id !== 'annoyances');
+  const effective = await hooks.applyRulesets();
+
+  assert.equal(snapshotFailed, true,
+    'the snapshot must have failed, or this test exercised nothing');
+  assert.deepEqual(shapeOf(probe.updates), [
+    { enable: wanted, disable: ['annoyances'] },
+    { enable: [], disable: [...wanted, 'annoyances'] },
+    ...RULESETS_IN_PRIORITY_ORDER.filter((id) => id !== 'annoyances').map((id) => ({ enable: [id], disable: [] })),
+  ], 'with no snapshot the fallback is the pre-flag one: reset the union, then enable one at a time');
+  assert.equal(effective.annoyances, false, 'and the user\'s toggle still lands');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.9: an apply that fails does not wedge the queue for the worker life', async () => {
+  const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON, awaitReady: true });
+
+  // applyRulesets reads ENABLED_RULESETS strictly, so a transient storage
+  // fault rejects the op...
+  const fired = chrome.storage.local._failNextRead((keys) => keys.includes('enabledRulesets'));
+  await assert.rejects(() => hooks.applyRulesets(), /unexpected error/i);
+  assert.equal(fired(), true, 'the fault must have landed on the apply, or this test exercised nothing');
+
+  // ...and the queue must still accept work afterwards. A chain that kept the
+  // rejection would reject every later apply, so the options toggle would be
+  // dead until the worker restarted.
+  await chrome.storage.local.set({ enabledRulesets: { annoyances: false } });
+  const effective = await hooks.applyRulesets();
+  assert.equal(effective.annoyances, false, 'the next apply must still run');
+  assert.equal(chrome.declarativeNetRequest._staticEnabled.has('annoyances'), false,
+    'and land in Chrome');
+
+  hooks.cancelPendingStatsPersistForTest();
+});
+
+test('7.9: a boot and both appliers in flight at once all settle', { timeout: 10_000 }, async () => {
+  // Both chains are reachable from ensureBackgroundSetup AND from a message
+  // handler. Drive the boot, both message paths and a direct apply at once: a
+  // chain that could await itself, or two that could await each other, would
+  // hang here rather than fail an assertion, so this test is time-boxed.
+  const { chrome, hooks } = await loadServiceWorker({ seed: DELTA_ON });
+  const ruleset = chrome.runtime.sendMessage({
+    type: 'SET_RULESET_ENABLED', payload: { rulesetId: 'annoyances', enabled: false },
+  });
+  const settings = chrome.runtime.sendMessage({
+    type: 'UPDATE_SETTINGS', payload: { stealthPersona: 'windows' },
+  });
+  const direct = hooks.applyRulesets();
+
+  await hooks.whenCriticalReady();
+  await hooks.whenBackgroundSetupDone();
+  const [rulesetRes, settingsRes] = await Promise.all([ruleset, settings, direct]);
+
+  assert.equal(rulesetRes.ok, true, 'the ruleset toggle must answer');
+  assert.equal(settingsRes.ok, true, 'the settings write must answer');
+  assert.equal(chrome.storage.local._data().enabledRulesets.annoyances, false);
+  assert.equal(chrome.storage.local._data().settings.stealthPersona, 'windows');
 
   hooks.cancelPendingStatsPersistForTest();
 });

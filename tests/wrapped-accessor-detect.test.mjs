@@ -26,7 +26,7 @@
  * covered by the same comparison in `tests/youtube-shield.test.mjs`
  * (`DETECTOR_SNIPPET`).
  *
- * §7.10 adds the navigator spoofs to the same treatment. bot-stealth.js and
+ * §9.6 adds the navigator spoofs to the same treatment. bot-stealth.js and
  * persona-spoof.js each carried a byte-identical local `defineGetter` that
  * installed an *arrow* getter: no own `prototype`, so §7.8's leak was genuinely
  * absent, but an empty `name` and the arrow's own source where a native getter
@@ -38,6 +38,8 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
+import { readFile } from 'node:fs/promises';
 
 // --- Page-realm stand-ins, installed before the scriptlets are imported -----
 
@@ -102,6 +104,13 @@ globalThis.getComputedStyle = ({
 
 const { defineNativeGetter, maskNative, proxyApply, wrapInstanceGetter } =
   await import('../src/scriptlets/shared-utils.js');
+
+// The same module source, evaluated as a classic script in a throwaway realm.
+// `shared-utils.js` is import-free and side-effect-free at load, which is what
+// makes this possible — the shield harness relies on the same property.
+const SHARED_UTILS_SCRIPT = (await readFile(
+  new URL('../src/scriptlets/shared-utils.js', import.meta.url), 'utf8',
+)).replace(/^export\s+/gm, '');
 const { botStealth } = await import('../src/scriptlets/bot-stealth.js');
 const { spoofCss } = await import('../src/scriptlets/spoof-css.js');
 const { personaSpoof } = await import('../src/scriptlets/persona-spoof.js');
@@ -256,7 +265,7 @@ test('7.8: bot-stealth\'s WebGL wrapper is shaped like the native getParameter',
   assert.equal(wrapped.call(ctx, 1), 'real:1', 'an unspoofed parameter must still reach the original');
 });
 
-// --- §7.10: the navigator spoofs ------------------------------------------
+// --- §9.6: the navigator spoofs ------------------------------------------
 //
 // bot-stealth.js and persona-spoof.js each carried a byte-identical local
 // `defineGetter` that installed an *arrow* getter with a partial descriptor.
@@ -268,7 +277,7 @@ test('7.8: bot-stealth\'s WebGL wrapper is shaped like the native getParameter',
 // a hard-coded list, so a surface added to either scriptlet is covered here
 // the day it is added.
 
-test('7.10: every navigator surface the scriptlets spoof stays shaped like the native', () => {
+test('9.6: every navigator surface the scriptlets spoof stays shaped like the native', () => {
   // Non-vacuity: if the spoofs stopped applying, the loop below would have
   // nothing to check and would pass.
   for (const prop of ['userAgent', 'platform', 'webdriver']) {
@@ -297,7 +306,7 @@ test('7.10: every navigator surface the scriptlets spoof stays shaped like the n
     'nothing may land as an own property of the navigator instance');
 });
 
-test('7.10: defineNativeGetter takes the descriptor from the prototype chain, not the own slot', () => {
+test('9.6: defineNativeGetter takes the descriptor from the prototype chain, not the own slot', () => {
   // The locked-prototype fallback defines on the instance, whose own
   // descriptor list is empty — the native to copy lives on the prototype. Read
   // only the own slot and `enumerable` silently defaults to false.
@@ -325,7 +334,7 @@ test('7.10: defineNativeGetter takes the descriptor from the prototype chain, no
   assertIndistinguishable(desc.get, native.get, 'get instance.thing');
 });
 
-test('7.10: defineNativeGetter gives a property the platform lacks the shape one would have', () => {
+test('9.6: defineNativeGetter gives a property the platform lacks the shape one would have', () => {
   const target = {};
 
   assert.equal(defineNativeGetter(target, 'invented', () => 7), true);
@@ -341,7 +350,7 @@ test('7.10: defineNativeGetter gives a property the platform lacks the shape one
   assert.throws(() => new desc.get(), TypeError, 'and not constructible');
 });
 
-test('7.10: defineNativeGetter reports failure rather than throwing on a locked target', () => {
+test('9.6: defineNativeGetter reports failure rather than throwing on a locked target', () => {
   const target = Object.freeze({});
   assert.equal(defineNativeGetter(target, 'nope', () => 1), false,
     'a frozen target must yield false, which is what drives the instance fallback');
@@ -372,4 +381,74 @@ test('7.8: spoof-css\'s wrappers are shaped like the natives they replace', () =
   assert.equal(new HTMLElementStub('.other').offsetHeight, 0,
     'a non-matching element must still read the real height');
   assert.equal(wrappedGCS(match).display, 'block', 'the computed-style pair must still be spoofed');
+});
+
+// --- Masking that fails must say so ----------------------------------------
+//
+// `maskNative` used to swallow a failed `Object.defineProperty` and hand the
+// wrapper back regardless, so a caller could install a function that still
+// reports its own `name` and believe it was hidden. That is the one failure in
+// this module that is a correctness problem rather than a detectability one: a
+// leak of exactly the class closed three times over would ship green.
+//
+// No caller can do anything useful with the failure — an unmasked wrapper
+// still intercepts, it is merely detectable, which beats not intercepting at
+// all — so every one of them deliberately ignores the result. The signal
+// exists so a future caller, and these tests, can see it.
+
+test('a wrapper that could not be masked is reported, not handed back', () => {
+  const native = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+  const wrapper = Object.freeze(({ get() { return 0; } }).get);
+
+  assert.equal(maskNative(wrapper, native), null,
+    'a frozen wrapper cannot take the native name, and that must be reported');
+  assert.notEqual(wrapper.name, native.name,
+    'and the wrapper really is unmasked — the report is not spurious');
+});
+
+test('maskNative reports non-function arguments rather than returning them', () => {
+  const native = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+  assert.equal(maskNative(null, native), null);
+  assert.equal(maskNative(({ get() {} }).get, undefined), null);
+});
+
+test('proxyApply reports an assignment the owner silently ignored', () => {
+  // An assignment to a non-writable property throws only in strict mode; a
+  // sloppy-mode realm — which is how the shield harness evaluates this module
+  // — drops it silently, and an owner that traps `set` can drop it in any
+  // mode. Either way the wrapper is not installed, so saying so is the only
+  // honest answer.
+  const target = { m() { return 'native'; } };
+  const owner = new Proxy(target, { set: () => true });
+
+  assert.equal(proxyApply(owner, 'm', ({ reflect }) => reflect()), null,
+    'nothing was installed, so the caller must not be told it was');
+  assert.equal(owner.m, target.m, 'and the original is still in place');
+});
+
+test('maskNative reports failure when the page has frozen Function.prototype', () => {
+  // The whole-bundle `Function.prototype.toString` proxy is what makes a
+  // wrapper print as native code. A page that freezes `Function.prototype`
+  // — a known anti-adblock move — defeats it for every wrapper at once, and
+  // the assignment that installs it fails *silently* in a sloppy-mode realm,
+  // which is how the shield harness evaluates this module. A fresh realm is
+  // the only way to test it: the mask is process-wide and one-way.
+  const context = vm.createContext({});
+  vm.runInContext('Object.freeze(Function.prototype);', context);
+  vm.runInContext(SHARED_UTILS_SCRIPT, context);
+
+  const result = JSON.parse(vm.runInContext(`(() => {
+    const native = Object.getOwnPropertyDescriptor(Map.prototype, 'size').get;
+    const wrapper = ({ get() { return 0; } }).get;
+    const returned = maskNative(wrapper, native);
+    return JSON.stringify({
+      reported: returned === null,
+      source: String(wrapper),
+    });
+  })()`, context));
+
+  assert.equal(result.reported, true,
+    'masking that could not be installed must be reported, not assumed');
+  assert.match(result.source, /return 0/,
+    'and the wrapper really does still print its own source');
 });

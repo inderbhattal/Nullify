@@ -13,7 +13,7 @@
  * up. Test 7 below does NOT: §7's #7 is "upgrade in place" — install v(N-1),
  * browse YouTube, reload the extension, verify blocking continues with no
  * manual refresh — and nothing in this repository covers it. It is the other
- * half of the case §7.9's extension-life sweep addresses, so it is the obvious
+ * half of the case §5.18's extension-life sweep addresses, so it is the obvious
  * gap to close next; it is recorded here rather than invented, because a
  * convincing one needs a real extension reload, not a stub.
  *
@@ -382,7 +382,7 @@ test('5.18: the flag is read on every sync, not captured when the module is crea
   flag.current = true;
   stub.calls.clear();
   await sync.syncRegistration();
-  // §7.9 — the first sync after the flag comes on still sweeps, and marks the
+  // §5.18 — the first sync after the flag comes on still sweeps, and marks the
   // extension life as swept. Nothing had marked it: Rule 2 keeps the flag-off
   // path free of storage writes, so the syncs before this one left no trace,
   // and the conservative answer to "has this life been swept?" is no. One
@@ -400,7 +400,7 @@ test('5.18: the flag is read on every sync, not captured when the module is crea
 });
 
 // ---------------------------------------------------------------------------
-// §7.9 — the same-registration branch is the only repair path for a YouTube
+// §5.18 second review — the same-registration branch is the only repair path for a YouTube
 // document the persisted registration never actually reached, and with
 // `shieldNoReinject` on it was removed outright. `registerContentScripts` and
 // `injectIntoOpenTabs` are the only two ways the shield ever enters a page, so
@@ -410,7 +410,7 @@ test('5.18: the flag is read on every sync, not captured when the module is crea
 // "a new worker in the same extension life", below, pin that).
 // ---------------------------------------------------------------------------
 
-test('7.9 (flag on): a tab whose injection was swallowed is repaired on the next sync', async () => {
+test('5.18 repair (flag on): a tab whose injection was swallowed is repaired on the next sync', async () => {
   const { stub, sync, faults } = setupHarness({
     tabs: [
       { id: 1, url: 'https://www.youtube.com/' },
@@ -438,7 +438,7 @@ test('7.9 (flag on): a tab whose injection was swallowed is repaired on the next
     'once repaired, §5.18 holds again: no re-injection on a clean wake');
 });
 
-test('7.9 (flag on): a failed tabs.query makes the next sync sweep rather than skip', async () => {
+test('5.18 repair (flag on): a failed tabs.query makes the next sync sweep rather than skip', async () => {
   const { stub, sync, faults } = setupHarness({
     tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
     isFeatureEnabled: SHIELD_ON,
@@ -456,7 +456,7 @@ test('7.9 (flag on): a failed tabs.query makes the next sync sweep rather than s
     'a query failure hides which tabs were missed, so the next sync sweeps');
 });
 
-test('7.9 (flag on): a tab whose frame list could not be read is repaired', async () => {
+test('5.18 repair (flag on): a tab whose frame list could not be read is repaired', async () => {
   // A getAllFrames rejection degrades to the tab-URL path, which reaches the
   // top frame only — the sub-frames the registration covers are missed.
   const { stub, sync, faults } = setupHarness({
@@ -479,7 +479,7 @@ test('7.9 (flag on): a tab whose frame list could not be read is repaired', asyn
   assert.deepEqual(frameIds, [0, 7], 'both frames must be reached on the repair pass');
 });
 
-test('7.9 (flag on): the first sync of a new extension life sweeps the open tabs', async () => {
+test('5.18 repair (flag on): the first sync of a new extension life sweeps the open tabs', async () => {
   const first = setupHarness({
     tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
     isFeatureEnabled: SHIELD_ON,
@@ -500,7 +500,7 @@ test('7.9 (flag on): the first sync of a new extension life sweeps the open tabs
     'a document loaded while no registration was in force must be repaired');
 });
 
-test('7.9 (flag on, didn\'t re-break §5.18): a new worker in the same extension life does not sweep', async () => {
+test('5.18 repair (flag on, didn\'t re-break the §5.18 win): a new worker in the same extension life does not sweep', async () => {
   const first = setupHarness({
     tabs: [{ id: 1, url: 'https://www.youtube.com/' }],
     isFeatureEnabled: SHIELD_ON,
@@ -518,7 +518,7 @@ test('7.9 (flag on, didn\'t re-break §5.18): a new worker in the same extension
     'a persisted registration must not be re-evaluated in every open tab on every wake');
 });
 
-test('7.9 (flag on): a repair id for a tab that has closed is dropped, not retried forever', async () => {
+test('5.18 repair (flag on): a repair id for a tab that has closed is dropped, not retried forever', async () => {
   const { stub, sync, faults } = setupHarness({
     tabs: [
       { id: 1, url: 'https://www.youtube.com/' },

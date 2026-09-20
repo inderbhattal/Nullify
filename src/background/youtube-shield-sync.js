@@ -24,7 +24,8 @@
  *   is injected (`isFeatureEnabled`) rather than read from storage here, so the
  *   harness can drive it without a global chrome.
  *
- * §7.9 — why the same-registration branch still injects sometimes.
+ * §5.18 second review — why the same-registration branch still injects
+ * sometimes.
  * `registerContentScripts` and `injectIntoOpenTabs` are the only two ways the
  * shield ever enters a page, and this branch is the only repair path for a
  * document the persisted registration did not actually reach. §5.18's premise
@@ -66,7 +67,7 @@ export function createYouTubeShieldSync({
   const targetHostnames = new Set(targets.map(({ hostname }) => normalizeHostname(hostname)));
   let inFlight = null;
 
-  // §7.9 — the bounded repair state. Closure-scoped, not module-scoped: the
+  // §5.18 — the bounded repair state. Closure-scoped, not module-scoped: the
   // worker builds one instance, and a test builds one per scenario.
   //
   // `pendingRepairTabs` holds the tab ids whose injection did not complete
@@ -132,7 +133,7 @@ export function createYouTubeShieldSync({
 
   /**
    * @param {{ onlyTabIds?: Set<number>|null }} [options] Restrict the pass to
-   *   these tab ids — the §7.9 repair. Omitted, every open target tab is swept,
+   *   these tab ids — the §5.18 repair. Omitted, every open target tab is swept,
    *   which is what every caller but the same-registration branch wants.
    */
   async function injectIntoOpenTabs({ onlyTabIds = null } = {}) {
@@ -141,7 +142,7 @@ export function createYouTubeShieldSync({
       .query({ url: targets.map(({ pattern }) => pattern) })
       .catch(() => { queryFailed = true; return []; });
 
-    // §7.9 — a failed query hides which tabs were missed, so the repair set
+    // §5.18 — a failed query hides which tabs were missed, so the repair set
     // cannot be trusted and the next sync sweeps everything instead.
     if (queryFailed) {
       pendingFullSweep = true;
@@ -163,7 +164,7 @@ export function createYouTubeShieldSync({
       if (tab.id == null) return;
       if (onlyTabIds !== null && !onlyTabIds.has(tab.id)) return;
 
-      // §7.9 — the outcome is recorded rather than swallowed. With
+      // §5.18 — the outcome is recorded rather than swallowed. With
       // `shieldNoReinject` on, the same-registration branch injects into
       // exactly the tabs this set holds, so a failure dropped here would never
       // be repaired: `registerContentScripts` and this function are the only
@@ -227,7 +228,7 @@ export function createYouTubeShieldSync({
   }
 
   /**
-   * §7.9 — the bounded repair the same-registration branch performs when
+   * §5.18 — the bounded repair the same-registration branch performs when
    * `shieldNoReinject` is on. Normally a no-op: the repair set is empty and the
    * extension life is already marked, so not one `executeScript` is issued.
    */
@@ -248,7 +249,7 @@ export function createYouTubeShieldSync({
     // the answer, so it is read here rather than at the point of use.
     const noReinject = isFeatureEnabled('shieldNoReinject') === true;
     await _syncBranches(noReinject);
-    // §7.9 — every branch above has considered this extension life's open tabs,
+    // §5.18 — every branch above has considered this extension life's open tabs,
     // so a later worker in the same life can skip the sweep. Only reached on
     // success: a throw propagates and leaves the life unmarked, so the next
     // sync sweeps. The flag-off path never marks — it sweeps unconditionally
@@ -284,7 +285,7 @@ export function createYouTubeShieldSync({
         return;
       }
       // …except for the documents the registration never actually reached.
-      // See §7.9 in the file header: bounded, and normally zero injections.
+      // See §5.18 in the file header: bounded, and normally zero injections.
       await repairMissedDocuments();
       return;
     }

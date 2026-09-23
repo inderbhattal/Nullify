@@ -74,7 +74,7 @@ import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList, parseExpiresHeader, COSMETIC_SCOPE_OPTIONS} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '../shared/hostname.js';
-import { ancestorDomains } from '../shared/psl.js';
+import { ancestorDomains, isPublicSuffix } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
 import { applyScriptletExceptions } from '../shared/filter-syntax.js';
 import {
@@ -3402,6 +3402,208 @@ function appendUserFilterLine(line) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// PICKER-2026-09 SW1 — the renderer-facing trust gate on APPEND_USER_FILTER.
+//
+// APPEND_USER_FILTER is SENDER_ANY and the element picker is its only sender,
+// yet it checked nothing about what the line MEANT: a compromised renderer
+// could write `@@||bank.example^`, `||x^$important`, `##+js(...)` or `##body`
+// into My Filters. A denylist cannot close that. The privileged shapes are
+// open-ended, and a JS test does not read the line the way the compiler does:
+// a leading U+0085 fails `startsWith('@@')`, then Rust's `str::trim` strips it
+// and compiles a live allow rule.
+//
+// So this is an ALLOWLIST of the two shapes the picker emits, tested on the
+// line exactly as the compiler will read it:
+//  1. First, JS `trim()` and Rust's `str::trim` must agree on where the line
+//     starts and ends. They disagree on exactly U+0085 (only Rust strips it)
+//     and U+FEFF (only JS does), so a line with either at an edge is refused.
+//     Otherwise the rest of the gate reads the trimmed line, which is what
+//     `appendUserFilterLine` stores and the compiler compiles. That line may
+//     hold no control, line/paragraph separator or lone surrogate (Rust gets
+//     U+FFFD for one), and may not end in an odd run of backslashes: the last
+//     one escapes whatever comes next, be it the space the trim removed
+//     (`#ad\ ` is not `#ad\`) or the comma that joins the next selector.
+//  2. No extended-syntax marker anywhere. The compiler does not go by the
+//     FIRST marker: it tests `#@#`, `#?#` and `+js(` before `##`, so
+//     `example.com##div:has-text(x#@#y)` compiles as an exception and
+//     `##.x,bank.example#?#body` hides bank.example's body. Refusing every
+//     `#@` `#?` `#$` `#%` `#+` leaves `##` as the only marker a line can hold.
+//  3. Then a cosmetic hide or a `||host` block, as below — nothing else.
+//     No scope (hide hostname, `||` host, `domain=`) may reach past one
+//     site: user cosmetic rules are looked up by walking every parent domain
+//     with no suffix stop, and DNR's `||` anchors at any label, so `com##div`
+//     hides on every .com site and `1##.login-form` on every x.x.x.1 host
+//     (router and NAS admin pages). A scope may not be a public suffix, and
+//     one whose last label is a number must be a whole IPv4 address. The
+//     picker scopes to the page's own host, which is neither unless the page
+//     sits on a listed suffix itself (`github.io`), where a saved rule would
+//     blanket the suffix too.
+// The options page (SET_USER_FILTERS, extension pages only) keeps full syntax.
+// ---------------------------------------------------------------------------
+const PICKER_RUST_SPACE = /^\p{White_Space}$/u;
+const PICKER_LINE_INTERIOR = /[\p{Cc}\p{Cs}\u{2028}\u{2029}]/u;
+const PICKER_EXTENDED_MARKER = /#[@?$%+]/;
+// The picker's own hostname (the page's host less `www.`) for a scoped hide
+// or `domain=`: ASCII lowercase labels, no wildcard, list or negation.
+const PICKER_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+// A last label the URL parser reads as a number (WHATWG "ends in a number":
+// decimal, or `0x` hex), and the dotted quad it then serialises the host as.
+// The parser yields no other numeric-tailed host, so nothing it produces is
+// refused.
+const PICKER_NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
+const PICKER_IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+// `||` + the resource host PK2a validates (`[a-z0-9.-]`, or a bracketed IPv6
+// literal), then `^`, or a path made only of what a WHATWG pathname keeps
+// literally less the metacharacters PK2a truncates at (`$ ^ | *`) with an
+// optional closing `^`; then an optional `$` option list.
+const PICKER_NETWORK_LINE =
+  /^\|\|([a-z0-9.-]+|\[[0-9a-f:]+\])(?:\^|\/[\w!%&'()+,\-.:;=@[\]~/]*\^?)(?:\$(.+))?$/;
+// Option TOKENS (never substrings: `||x/important.png^` is not `$important`),
+// exact and lowercase; `domain=` is handled on its own. The resource types
+// PK2a maps, the rest of the plain types, and the party/case modifiers.
+const PICKER_NETWORK_OPTIONS = new Set([
+  'image', 'subdocument', 'media', 'object',
+  'script', 'stylesheet', 'font', 'xmlhttprequest', 'ping', 'websocket', 'other',
+  '3p', '1p', 'third-party', 'first-party', 'match-case',
+]);
+// Every procedural operator except the two the picker generates, matched as
+// the planners match them (`:name(`, ASCII case-insensitive, at any depth).
+// Built from the shared list, so an operator added there is refused here.
+const PICKER_REFUSED_PROC_OP = new RegExp(`:(?:${PROC_OPS
+  .filter((op) => op !== 'has-text' && op !== 'upward')
+  .map((op) => op.replace(/[-.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|')})\\(`, 'i');
+// `:has-text(/…/)` is the engine's regex form: `/.*/` matches every element.
+const PICKER_HAS_TEXT_REGEX = /:has-text\(\s*\//i;
+// At the top level, `:scope` and (CSS Nesting) a bare `&` are the root element.
+const PICKER_DOCUMENT_ROOTS = new Set(['html', 'head', 'body', '*', ':root', ':scope', '&']);
+const PICKER_CSS_ESCAPE = /\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|([^\n\r\f]))/g;
+
+/** Rust's `str::trim`: strips every White_Space code point (all in the BMP). */
+function rustTrim(text) {
+  let start = 0;
+  let end = text.length;
+  while (start < end && PICKER_RUST_SPACE.test(text[start])) start++;
+  while (end > start && PICKER_RUST_SPACE.test(text[end - 1])) end--;
+  return text.slice(start, end);
+}
+
+/** Would a rule scoped to `host` reach past one site? See 3. above. */
+function isPickerScopeTooBroad(host) {
+  return isPublicSuffix(host) || (PICKER_NUMERIC_TAIL.test(host) && !PICKER_IPV4.test(host));
+}
+
+/**
+ * Split a selector list at its top-level commas: not inside parentheses,
+ * brackets or quotes, and not escaped. `div:has-text(Mind, Body, Spirit)` is
+ * one selector, and so is `[title="a, body"]`.
+ */
+function splitPickerSelectorList(selector) {
+  const members = [];
+  let depth = 0;
+  let quote = null;
+  let start = 0;
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector[i];
+    if (ch === '\\') {
+      i++;
+    } else if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '(' || ch === '[') {
+      depth++;
+    } else if ((ch === ')' || ch === ']') && depth > 0) {
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      members.push(selector.slice(start, i));
+      start = i + 1;
+    }
+  }
+  members.push(selector.slice(start));
+  return members;
+}
+
+/**
+ * Is one top-level member of a selector list a bare document root? CSS reads
+ * `BODY`, `\62 ody` and `*|body` as `body`, so this does too. It stops those
+ * spellings only: `:is(body)`, `:where(html)`, `body:first-child` and plain
+ * generics (`##div`) still blank a page. That is the recorded residual, since
+ * a renderer can append anything the picker could.
+ */
+function isPickerDocumentRoot(member) {
+  const name = member
+    .replace(PICKER_CSS_ESCAPE, (_, hex, ch) => (hex
+      ? String.fromCodePoint(Math.min(parseInt(hex, 16), 0x10ffff))
+      : ch))
+    .trim()
+    .replace(/^\*?\|/, '')
+    .toLowerCase();
+  return PICKER_DOCUMENT_ROOTS.has(name);
+}
+
+/**
+ * The APPEND_USER_FILTER gate: may a renderer append this line? True only for
+ * the picker's two shapes, read as both trims read the line —
+ *  - a cosmetic hide `[hostname]##selector`, where the selector is not a
+ *    scriptlet (`+js(`), not a uBO HTML filter (leading `^`), holds no CSS
+ *    comment, is not a bare document root, uses no procedural operator but
+ *    `:has-text()` and `:upward()` (native `:has()` is CSS), and never the
+ *    `:has-text(/regex/)` form;
+ *  - a network block `||host^` or `||host/path[^]`, optionally followed by
+ *    `$` and distinct tokens from PICKER_NETWORK_OPTIONS plus at most one
+ *    `domain=<hostname>`.
+ * Neither's hostname, host or `domain=` may reach past one site.
+ * Pure: no storage, no chrome.* — the harness calls it directly.
+ */
+function isPickerSafeUserFilterLine(rawLine) {
+  if (typeof rawLine !== 'string') return false;
+  const line = rawLine.trim();
+  if (!line || line !== rustTrim(rawLine)) return false;
+  if (PICKER_LINE_INTERIOR.test(line)) return false;
+  let backslashes = 0;
+  while (backslashes < line.length && line[line.length - 1 - backslashes] === '\\') backslashes++;
+  if (backslashes % 2 === 1) return false;
+  if (PICKER_EXTENDED_MARKER.test(line)) return false;
+
+  if (line.startsWith('||')) {
+    // The network alphabet has no `#`; refused outright as well, so no widening
+    // of it can let through `||[x,bank.example##body]^`, which the compiler
+    // reads as a hide on bank.example.
+    if (line.includes('#')) return false;
+    const match = PICKER_NETWORK_LINE.exec(line);
+    if (!match || isPickerScopeTooBroad(match[1])) return false;
+    if (match[2] === undefined) return true;
+    const seen = new Set();
+    let domains = 0;
+    for (const token of match[2].split(',')) {
+      if (seen.has(token)) return false;
+      seen.add(token);
+      if (token.startsWith('domain=')) {
+        const value = token.slice('domain='.length);
+        if (++domains > 1 || !PICKER_HOSTNAME.test(value) || isPickerScopeTooBroad(value)) return false;
+      } else if (!PICKER_NETWORK_OPTIONS.has(token)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const separator = line.indexOf('##');
+  if (separator === -1) return false;
+  const domain = line.slice(0, separator);
+  if (domain && (!PICKER_HOSTNAME.test(domain) || isPickerScopeTooBroad(domain))) return false;
+  const selector = line.slice(separator + 2);
+  const trimmed = selector.trim();
+  if (!trimmed || trimmed.startsWith('+js(') || trimmed.startsWith('^')) return false;
+  if (selector.includes('/*')) return false;
+  if (splitPickerSelectorList(selector).some(isPickerDocumentRoot)) return false;
+  if (PICKER_REFUSED_PROC_OP.test(selector)) return false;
+  if (PICKER_HAS_TEXT_REGEX.test(selector)) return false;
+  return true;
+}
+
 // §5.6 — the ONLY `$options` this parser can express in DNR. Anything absent
 // from this map makes the whole line unrepresentable, and the line is dropped.
 const SIMPLE_RULE_RESOURCE_TYPES = {
@@ -4868,6 +5070,11 @@ async function handleMessage(message, sender) {
       if (utf8ByteLength(line) > MAX_USER_FILTERS_BYTES) {
         return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
       }
+      // PICKER-2026-09 SW1 — any renderer can send this; admit only the
+      // picker's own shapes (see isPickerSafeUserFilterLine).
+      if (!isPickerSafeUserFilterLine(line)) {
+        return { error: 'This rule type cannot be added from the page picker; add it in the options page instead.' };
+      }
       const result = await appendUserFilterLine(line);
       if (result?.error) return { error: result.error };
       return { ok: true, counts: result };
@@ -5402,6 +5609,7 @@ export const __testHooks = {
   applyUserFilters,
   setAndApplyUserFilters,
   appendUserFilterLine,
+  isPickerSafeUserFilterLine,
   setCompileUserFiltersOverrideForTest: (fn) => { _compileUserFiltersOverride = fn; },
   parseSimpleNetworkRule,
   DNR_USER_FILTER_PRIORITY,

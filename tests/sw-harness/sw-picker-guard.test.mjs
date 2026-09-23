@@ -1,0 +1,724 @@
+/**
+ * PICKER-2026-09 SW1 — the renderer-facing trust gate on APPEND_USER_FILTER.
+ *
+ * APPEND_USER_FILTER is SENDER_ANY: any renderer running our content script
+ * can send it, and the element picker is its only legitimate sender. Before
+ * this gate the handler checked only "non-empty, one line, under the byte
+ * cap", so a compromised renderer could write an allow rule, an `$important`
+ * override, a scriptlet or a page-blanking hide into My Filters. A denylist
+ * was tried on paper and failed twice: `"\u0085@@||bank.example^"` passes a
+ * JS `startsWith('@@')` test (JS `trim()` keeps U+0085, Rust's `str::trim`
+ * strips it and compiles a live allow rule), and the list of privileged
+ * shapes is open-ended. The gate is therefore an ALLOWLIST of the two shapes
+ * the picker emits — a cosmetic hide and a `||host` block — checked on the
+ * line exactly as the compiler will read it.
+ *
+ * Every refusal case is sent from a content-script sender through the real
+ * `compile_user_filters` when the WASM artifact is built (the harness cuts the
+ * network, so the worker's own WASM init fails; the artifact is loaded from
+ * disk as `wasm-parity.test.mjs` does). The refusal assertions do not depend
+ * on it: the gate answers before anything is stored or compiled.
+ *
+ * The "didn't re-break" lists are the exact strings the picker emits today
+ * and the ones PICKER-2026-09 pins for PK2a (network candidates), PK3
+ * (`:has-text()`/`:has()`/`:upward()`) and PK4 (`:nth-of-type()`), so a
+ * change to either side's vocabulary that is not mirrored fails here.
+ */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import test from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { loadServiceWorker } from './sw-loader.mjs';
+
+const DNR_USER_RULES_START = 900_000;
+const DNR_ALLOWLIST_START = 990_000;
+const REFUSAL = 'This rule type cannot be added from the page picker; add it in the options page instead.';
+
+// ---------------------------------------------------------------------------
+// The real compiler (a build product — src/shared/wasm/ is gitignored).
+// ---------------------------------------------------------------------------
+
+const WASM_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/shared/wasm');
+const GLUE_PATH = path.join(WASM_DIR, 'nullify_core.js');
+const BYTES_PATH = path.join(WASM_DIR, 'nullify_core_bg.wasm');
+const NO_WASM = 'WASM artifact not built (run `npm run build:wasm`)';
+
+let wasm = null;
+if (fs.existsSync(GLUE_PATH) && fs.existsSync(BYTES_PATH)) {
+  wasm = await import(pathToFileURL(GLUE_PATH).href);
+  await wasm.default({ module_or_path: fs.readFileSync(BYTES_PATH) });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Sender shape of our content script running in an arbitrary web page. */
+function contentScriptSender(url = 'https://evil.example/page') {
+  return { url, tab: { id: 7, url }, frameId: 0 };
+}
+
+/** Run `body` against a fresh worker (real compiler when built), always retiring it. */
+async function withWorker(body) {
+  const env = await loadServiceWorker({ awaitReady: true });
+  if (wasm) {
+    env.hooks.setCompileUserFiltersOverrideForTest(
+      (text, startId) => wasm.compile_user_filters(text, startId));
+  }
+  try {
+    return await body(env);
+  } finally {
+    env.teardown();
+  }
+}
+
+function userRules(chrome) {
+  return [...chrome.declarativeNetRequest._dynamic.values()]
+    .filter((r) => r.id >= DNR_USER_RULES_START && r.id < DNR_ALLOWLIST_START);
+}
+
+/** Everything an APPEND could change: the stored text and what it compiled to. */
+function userFilterState(chrome) {
+  const data = chrome.storage.local._data();
+  return JSON.parse(JSON.stringify({
+    userFilters: data.userFilters,
+    userFiltersApplied: data.userFiltersApplied,
+    userCosmeticRules: data.userCosmeticRules,
+    userScriptletRules: data.userScriptletRules,
+    dnr: userRules(chrome),
+  }));
+}
+
+function append(chrome, line) {
+  return chrome.runtime.sendMessage(
+    { type: 'APPEND_USER_FILTER', payload: { line } }, contentScriptSender());
+}
+
+/** Printable form of a test line, so a failure names invisible characters. */
+function show(line) {
+  return JSON.stringify(line).replace(/[^\x20-\x7e]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
+/**
+ * Every line must be refused with the gate's error, and none may leave a
+ * trace: not in the stored text, not in DNR, not in the cosmetic or scriptlet
+ * stores.
+ */
+async function assertRefused(lines) {
+  await withWorker(async ({ chrome }) => {
+    const before = userFilterState(chrome);
+    for (const line of lines) {
+      const res = await append(chrome, line);
+      assert.deepEqual(res, { error: REFUSAL },
+        `${show(line)} must be refused by the picker gate, got ${JSON.stringify(res)}`);
+    }
+    assert.deepEqual(userFilterState(chrome), before,
+      'a refused line must not be stored, compiled or applied');
+  });
+}
+
+// ---------------------------------------------------------------------------
+// What the picker emits. Hostnames are the page's own host as the picker
+// scopes it (less `www.`).
+// ---------------------------------------------------------------------------
+
+/** Cosmetic lines the picker at HEAD builds (`buildCosmeticRule`) from its candidates. */
+const PICKER_COSMETIC_TODAY = [
+  'example.test###ad',                                   // 1. ID
+  'example.test##div#ad',                                // 2. Tag + ID
+  'example.test##div#\\31 23',                           //    CSS.escape of id "123"
+  'example.test##.ad-slot',                              // 3. class
+  'example.test##div.ad-slot',
+  'example.test##.ad-slot.banner.top',                   //    all classes
+  'example.test##div.ad-slot.banner.top',
+  'example.test##.a\\:b',                                //    CSS.escape of class "a:b"
+  'example.test##.x\\#\\@\\#y',                          //    CSS.escape of class "x#@#y" (PK2a Rec2)
+  'example.test##[data-ad="slot-1"]',                    // 4. attribute
+  'example.test##div[data-ad="slot-1"]',
+  'example.test##[aria-label="Sponsored content"]',
+  'example.test##[id*="ad-top"]',                        // 5. partial id
+  'example.test##div.wrapper > div.ad-slot',             // 6. parent > element
+  'example.test###main > div.content > div.ad-slot',     // 7. ancestor path
+  'example.test##my-ad-widget',                          //    shadow host tag
+  '##.ad-slot',                                          //    "apply only to this site" unchecked
+  'localhost##.ad',
+  '192.168.1.10##.ad',
+  'xn--bcher-kva.example##.ad',
+  'news.bbc.co.uk##.ad',
+  // The strings existing suites already append through this handler.
+  'evil.example##.ad',
+  'site.example##.picked',
+];
+
+/** PICKER-2026-09 PK3 and PK4 cosmetic candidates. */
+const PICKER_COSMETIC_PLANNED = [
+  'example.test##div:has-text(Sponsored)',               // PK3 :has-text
+  'example.test##div:has(> img.ad)',                     // PK3 native :has
+  'example.test##div.ad-slot:upward(1)',                 // PK3 "block the container"
+  'example.com##.x:upward(2)',                           // plan SW1 didn't-re-break
+  'example.com##.ad',
+  'example.com##div:has-text(Sponsored)',
+  'example.com##div:has(> img.ad)',
+  'example.test##div.content > div:nth-of-type(2) > img', // PK4 positional path
+];
+
+/** Network lines: PICKER-2026-09 PK2a's pinned strings, plus the shapes its escaping contract allows. */
+const PICKER_NETWORK = [
+  '||cdn.ads.example/a/banner.png^$image,domain=example.test', // path (query dropped)
+  '||cdn.ads.example/a$image,domain=example.test',            // metachar in path → prefix, no ^
+  '||cdn.ads.example^$image,domain=example.test',             // host-only
+  '||cdn.ads.example/a/banner.png^$image',                    // site scope unchecked
+  '||ads.example/f.html^$subdocument,domain=example.test',    // iframe
+  '||ads.example/v.mp4^$media,domain=example.test',           // video/audio
+  '||ads.example/x.swf^$object,domain=example.test',          // embed/object
+  '||203.0.113.7/ad.png^$image,domain=example.test',          // IPv4 host
+  '||[2001:db8::1]/ad.png^$image,domain=example.test',        // bracketed IPv6 host
+  // Every character a WHATWG pathname keeps literally, minus the metacharacters PK2a truncates at.
+  "||res.cloudinary.example/image/upload/w_300,h_250,c_fill/v1/a(b)!~'+@:;=&[x]%20_Z.jpg^$image,domain=example.test",
+  '||ads.example/b.png^$image,domain=example.com',            // plan SW1 didn't-re-break
+  // A path or host that merely CONTAINS an option name is not that option.
+  '||ads.example/important/popup/banner.png^$image,domain=example.com',
+  '||important.example^$image',
+  '||ads.example/b.png^$image,domain=important.example',
+  // The rest of the closed option set.
+  '||ads.example/x.js^$script,3p',
+  '||ads.example/x.css^$stylesheet,1p',
+  '||ads.example/f.woff^$font,third-party',
+  '||ads.example/api^$xmlhttprequest,first-party',
+  '||ads.example/p^$ping,match-case',
+  '||ads.example/ws^$websocket',
+  '||ads.example/o^$other',
+  // The strings existing suites already append through this handler.
+  '||second.example^',
+  '||overflow.example^',
+];
+
+/**
+ * Registrable names at the Public Suffix List's edges, so still admitted.
+ * `www.ck` is the list's exception back out of `*.ck`: a naive suffix check
+ * (table-only, or "anything under a wildcard") gets it wrong. A wildcard is
+ * one label deep, so `deep.foo.ck` sits below the suffix `foo.ck`.
+ */
+const SUFFIX_EDGES_COSMETIC = ['www.ck##.ad', 'deep.foo.ck##.ad'];
+const SUFFIX_EDGES_NETWORK = ['||www.ck/x.png^$image,domain=www.ck', '||deep.foo.ck^$image,domain=deep.foo.ck'];
+
+/**
+ * CSS.escape ends every hex escape with a space, so an id or class that is or
+ * starts with a digit gives a picker line with a trailing U+0020. Both trims
+ * drop it, and a hex escape may end where the selector does, so the stored
+ * `li#\37` still means `li#7`. An even run of trailing backslashes is an
+ * escaped backslash (CSS.escape of a class ending in one).
+ */
+const TRAILING_ESCAPES = [
+  'example.test##li#\\37 ',
+  'example.test##section.wrap > #\\37 ',
+  'example.test##.a\\\\',
+];
+
+/** Edge whitespace both trims strip: admitted, stored and compiled trimmed. */
+const AGREED_TRIMS = [
+  ' example.test##.ad',
+  'example.test##.ad\u00a0',
+  'example.test##.ad\t',
+  'example.test##.ad\u2028',
+  '\u3000example.test##.ad',
+];
+
+/** Numeric scopes that are a whole IPv4 address, and names that merely hold a digit. */
+const NUMERIC_SCOPES_COSMETIC = ['192.168.1.10##.ad', 'cdn1.example##.ad'];
+const NUMERIC_SCOPES_NETWORK = ['||203.0.113.7/x.png^', '||ads.example^$image,domain=192.168.1.10'];
+
+/** Commas inside parentheses, brackets or quotes do not separate selectors. */
+const NESTED_COMMAS = [
+  'example.test##div:has-text(Mind, Body, Spirit)',     // PK3 text with commas
+  'example.test##[aria-label="Close\\,\\ body"]',      // CSS.escape of an attribute value
+  'example.test##[title="a, body"]',
+];
+
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
+
+test('SW1: the NEL-prefixed exception bypass is refused', async () => {
+  // The plan's headline exploit, kept as its regression pin. Every line here
+  // is also refused by shape, so this test does not by itself pin the trim
+  // check: the next test and the code-point sweep below do.
+  await assertRefused([
+    '\u0085@@||bank.example^',             // Rust trims U+0085; JS trim keeps it
+    '||x.example^$image,\u0085important',  // …inside the option list too
+    '\u0085||bank.example^$important',
+    ' @@||bank.example^',                  // edge characters both trims strip
+    '\u00a0@@||bank.example^',
+    '\u2028@@||bank.example^',
+    '\u3000@@||bank.example^',
+    '\ufeff@@||bank.example^',             // JS trim strips U+FEFF; Rust keeps it
+    '\t@@||bank.example^',
+  ]);
+});
+
+test('SW1: a line the two trims read differently, or with a control inside, is refused', async () => {
+  // Each line is a valid picker hide but for one character, so only this
+  // check can refuse it. JS `trim()` and Rust's `str::trim` disagree on
+  // exactly U+0085 (Rust strips it) and U+FEFF (JS strips it).
+  await assertRefused([
+    'example.com##.ad\u0085',
+    '\u0085example.com##.ad',
+    'example.com##.ad\ufeff',
+    '\ufeffexample.com##.ad',
+    'example.com##.ad\u001f',                // a control neither trim strips stays in the line
+    'example.com##.a\u0085b',
+    'example.com##.a\u2028b',
+    'example.com##.a\u2029b',
+    'example.com##.a\u0000b',
+    'example.com##.a\u007fb',
+    'example.com##.a\u009fb',
+    'example.com##.a\ud800b',              // lone surrogate: wasm-bindgen would hand Rust U+FFFD
+  ]);
+});
+
+test('SW1: a line ending in an escaping backslash is refused', async () => {
+  await assertRefused([
+    'example.test###ad\\ ',                  // `#ad\ ` escapes its space; trimming leaves `#ad\`
+    'example.test##.a\\',                    // joined into a list, `\,` fuses it with the next selector
+    '##.a\\',
+    'example.test##.a\\\\\\',                // `\\` then `\`: still odd
+  ]);
+});
+
+test('SW1: APPEND refuses a network exception', async () => {
+  await assertRefused([
+    '@@||bank.example^',
+    '@@*$document',
+    '@@*',
+    '@@/^https?:/$document',
+    '@@||example.com^$document,domain=example.com',
+  ]);
+});
+
+test('SW1: APPEND refuses $important / $all / $popup / $doc', async () => {
+  await assertRefused([
+    '||bank.example^$important',
+    '||x.example/a.png^$image,important',
+    '||bank.example^$all',
+    '||bank.example^$popup',
+    '||bank.example^$doc',
+    '||bank.example^$document',
+  ]);
+});
+
+test('SW1: APPEND refuses the elemhide family and cosmetic exceptions', async () => {
+  await assertRefused([
+    'example.com#@#.ad',
+    '#@#.ad',
+    'example.com##div:has-text(x#@#y)',     // compiles as an EXCEPTION: #@# outranks ##
+    '##.x,bank.example#@#.warning',         // …for bank.example, from a line that starts ##
+    '@@||x.example^$ghide',
+    '@@||x.example^$elemhide',
+    '||x.example^$elemhide',
+    '||x.example^$ehide',
+    '||x.example^$generichide',
+    '||x.example^$ghide',
+    '||x.example^$specifichide',
+    '||x.example^$shide',
+    '||x.example^$genericblock',
+  ]);
+});
+
+test('SW1: a line is classified by the compiler\'s marker precedence, not by its first ##', async () => {
+  await assertRefused([
+    'example.com##.x#?#y',
+    '##.x,bank.example#?#body',             // compiles to a body hide ON bank.example
+    'example.com#?#div:has-text(x)',
+    'example.com#$#body{display:none}',
+    'example.com##.x#$#body{display:none}',
+    'example.com#%#//scriptlet("abort-on-property-read", "x")',
+    'example.com##.a#%#x',
+    'example.com#@?#.x',
+  ]);
+});
+
+test('SW1: APPEND refuses scriptlets and uBO HTML filters', async () => {
+  await assertRefused([
+    '##+js(set-constant, adsEnabled, false)',
+    'bank.example##+js(remove-cookie, session)',
+    'bank.example#+js(remove-cookie, session)',
+    'bank.example#@#+js(nowebrtc)',
+    'example.com##.a#+js(noeval)',
+    'example.com## +js(set-constant, x, 1)',
+    'example.com##^script:has-text(ad)',
+    'example.com## ^script',
+    'example.com##^responseheader(set-cookie)',
+  ]);
+});
+
+test('SW1: APPEND refuses a page-blanking generic', async () => {
+  await assertRefused([
+    '##body',
+    '##html',
+    '##*',
+    '##:root',
+    '##head',
+    'example.com##body',
+    '##BODY',
+    '##:ROOT',
+    '## body',
+    '##\u00a0body',                          // both compilers trim the selector
+    '##html, body',
+    '##.ad,body',
+    '##\\62 ody',                            // CSS escape for "b"
+    '##bod\\y',
+    '##*|body',
+    '##*|*',
+    '##/**/body',
+    '##:scope',                              // the root element at the top level
+    '##:SCOPE',
+    '##&',                                   // CSS Nesting: a top-level `&` is `:scope`
+    'example.com##&',
+  ]);
+});
+
+test('SW1: the root check splits a selector list only at top-level commas', async () => {
+  await assertRefused([
+    '##div:has-text(x), body',               // the comma after the operator is top-level
+    '##[title="a(b"],body',                  // a parenthesis inside quotes opens nothing
+    '##.a\\(,body',                          // nor does an escaped one
+    '##[title="a\\"b"],body',                // an escaped quote does not close its string
+    "##[title='a\\'b'],html",
+  ]);
+});
+
+test('SW1: APPEND refuses procedural operators other than :has-text and :upward', async () => {
+  await assertRefused([
+    'bank.example##input[type=password]:style(background-image: url(https://evil.example/x))',
+    'example.com##div:Style(color: red)',
+    'example.com##div:STYLE(color: red)',
+    '##iframe:remove-attr(sandbox)',
+    'example.com##.ad:remove()',
+    'example.com##div:xpath(//body)',
+    'example.com##div:matches-css(display: block)',
+    'example.com##div:-abp-has(.ad)',
+    'example.com##div:-abp-contains(ad)',
+    'example.com##div:others()',
+    'example.com##div:nth-ancestor(2)',
+    'example.com##div:min-text-length(1)',
+    'example.com##div:has(span:style(color: red))',  // nested inside native :has()
+    'example.com##div:upward(:remove())',
+  ]);
+});
+
+test('SW1: APPEND refuses a has-text regex form', async () => {
+  await assertRefused([
+    'example.com##div:has-text(/.*/)',
+    'example.com##div:HAS-TEXT(/.*/)',
+    'example.com##div:has(span:has-text(/x/))',      // nested inside native :has()
+    'example.com##div:has-text( /.*/)',
+    'example.com##div:has-text(ok):has-text(/(a+)+b/)',
+  ]);
+});
+
+test('SW1: APPEND refuses an unlisted network option', async () => {
+  await assertRefused([
+    "||x.example^$csp=script-src 'none'",
+    '||x.example^$removeparam=utm',
+    '||x.example^$redirect=noopjs',
+    '||x.example^$redirect-rule=noopjs',
+    '||x.example^$header=via',
+    '||x.example^$replace=/a/b/',
+    '||x.example^$permissions=camera=()',
+    '||x.example^$badfilter',
+    '||x.example^$urltransform=/a/b/',
+    '||x.example^$to=bank.example',
+    '||x.example^$from=example.com',
+    '||x.example^$denyallow=bank.example',
+    '||x.example^$method=post',
+    '||x.example^$xhr',                     // an alias PK2a never emits
+    '*$script',
+    '$script',
+    '|http',
+    '/./',
+  ]);
+});
+
+test('SW1: option names match as exact tokens, never substrings or case-folded', async () => {
+  await assertRefused([
+    '||x.example^$IMAGE',
+    '||x.example^$Image',
+    '||x.example^$image,IMPORTANT',
+    '||x.example^$image, important',
+    '||x.example^$image,\uff49mportant',     // fullwidth "i"
+    '||x.example^$~image',
+    '||x.example^$image,~3p',
+    '||x.example^$image,image',
+    '||x.example^$image,',
+    '||x.example^$image,,media',
+    '||x.example^$',
+  ]);
+});
+
+test('SW1: domain= takes exactly one plain hostname', async () => {
+  await assertRefused([
+    '||x.example^$image,domain=a.example|b.example',
+    '||x.example^$image,domain=~a.example',
+    '||x.example^$image,domain=a.example|~b.example',
+    '||x.example^$image,domain=a.example,domain=b.example',
+    // A second domain= carrying the word "important" switches off the
+    // compiler's critical-path guard (`opts.contains("important")`) and
+    // blocks YouTube playback from youtube.com.
+    '||googlevideo.com/videoplayback$media,domain=youtube.com,domain=important.example',
+    '||x.example^$image,domain=',
+    '||x.example^$image,domain=A.example',
+    '||x.example^$image,domain=*.example',
+    '||x.example^$image,domain=example.*',
+    '||x.example^$image,~domain=a.example',
+  ]);
+});
+
+test('SW1: a cosmetic hide is scoped to one plain hostname or none, and hides something', async () => {
+  await assertRefused([
+    '~example.com##.ad',
+    'a.example,bank.example##.ad',
+    'example.*##.ad',
+    'Example.com##.ad',
+    'example.com ##.ad',
+    'x$important##.ad',
+    'x|y##.ad',
+    'example.com##',
+    '##',
+  ]);
+});
+
+// A public suffix is never a scope. User cosmetic rules are looked up by
+// walking every parent domain with no suffix stop, so `com##div` hides divs
+// on every .com site; `||com^` blocks every .com subresource.
+
+test('SW1: a cosmetic hide is never scoped to a public suffix', async () => {
+  await assertRefused([
+    'com##div',
+    'co.uk##.ad',
+    'foo.ck##.ad',                          // `*.ck`: a wildcard child is a suffix
+    'ck##.ad',                              // what stripping `www.` makes of the site www.ck
+    'github.io##.ad',                       // the list's curated private block
+  ]);
+});
+
+test('SW1: a network block\'s host is never a public suffix', async () => {
+  await assertRefused([
+    '||com^$image',
+    '||co.uk/x.png^',
+    '||foo.ck/x.png^$image',
+    '||com.^$image',                        // the fully-qualified spelling
+  ]);
+});
+
+test('SW1: domain= is never a public suffix', async () => {
+  await assertRefused([
+    '||ads.example^$image,domain=com',
+    '||ads.example^$image,domain=co.uk',
+    '||ads.example^$image,domain=foo.ck',
+  ]);
+});
+
+test('SW1: a scope that ends in a number is a whole IPv4 address, or refused', async () => {
+  // The suffix list has no numeric entries, yet `1` reaches every x.x.x.1
+  // host: the user cosmetic walk has no suffix stop and DNR's `||` is textual.
+  await assertRefused([
+    '1##.ad',
+    '0.1##.ad',
+    '10.0.0##.ad',
+    '||1^$image',
+    '||0.1^$subdocument',
+    '||1.2.3.4.^$image',                     // the URL parser drops an IPv4 host's trailing dot
+    '||0x1^$image',                          // WHATWG reads a 0x label as a number too
+    '||ads.example^$image,domain=10',
+    '||ads.example^$image,domain=0.0.1',
+  ]);
+});
+
+test('SW1: a network line must be ||host followed by ^ or a path, with no smuggled metacharacter', async () => {
+  await assertRefused([
+    '||[x,bank.example##body]^',            // `##` in a bracketed host: the compiler reads a hide on bank.example
+    '||[x,bank.example]^$image',            // a bracket holds an IPv6 literal and nothing else
+    '||*||ads.example^$image',              // only a match anchored at the start counts
+    '||x$important,domain=bank.example^',   // the WHATWG parser keeps `$ , =` in a hostname
+    '||x$image,domain=bank.example',        // host with neither ^ nor a path
+    '||ads.example',
+    '||ads.example$image',
+    '||*^$image',
+    '||*/x.png^$image',
+    '||^$image',
+    '||ADS.example^',
+    '|https://ads.example/',
+    'ads.example/b.png',
+    '||ads.example^^$image',
+    '||ads.example^|',
+    '||ads.example/a|b^',
+    '||ads.example/a*b^',
+    '||ads.example/a^b^$image',
+    '||ads.example/a b^',
+    '||ads.example/a#b^',
+    '||ads.example/a$script/x.png^$image',
+    '||ads.example/a\\b^',
+    '||ads.example/\u0441^$image',          // Cyrillic, unencoded
+    '||x.example^\uff04important',           // fullwidth $
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// The gate and the compiler read the same line
+// ---------------------------------------------------------------------------
+
+test('SW1: the gate refuses exactly the edge code points the two trims disagree on', async (t) => {
+  if (!wasm) { t.skip(NO_WASM); return; }
+  await withWorker(async ({ hooks }) => {
+    const isSafe = hooks.isPickerSafeUserFilterLine;
+    assert.equal(typeof isSafe, 'function', 'the gate must be a pure predicate the harness can call');
+    const base = 'example.com##.ad';
+    assert.equal(isSafe(base), true);
+
+    // Oracle for Rust: compile one hide per BMP code point, suffixed with it,
+    // and read back whether `str::trim` removed it. Oracle for JS: `trim()`.
+    // Line breaks are refused before the gate; lone surrogates below.
+    const cps = [];
+    for (let cp = 0; cp <= 0xffff; cp++) {
+      if (cp === 0x0a || cp === 0x0d || (cp >= 0xd800 && cp <= 0xdfff)) continue;
+      cps.push(cp);
+    }
+    const host = (cp) => `h${cp.toString(16)}.example`;
+    const hex = (cp) => cp.toString(16).padStart(4, '0');
+    const compiled = wasm.compile_user_filters(
+      cps.map((cp) => `${host(cp)}##.ad${String.fromCharCode(cp)}`).join('\n'), DNR_USER_RULES_START);
+    const kept = compiled.cosmeticRules.domainSpecific;
+
+    const disagree = [];
+    let agreed = 0;
+    for (const cp of cps) {
+      const ch = String.fromCharCode(cp);
+      const rustStrips = JSON.stringify(kept[host(cp)]) === '[".ad"]';
+      const jsStrips = `.ad${ch}`.trim() === '.ad';
+      if (rustStrips === jsStrips) {
+        if (!rustStrips) continue;
+        // Both strip it: the line means `base` to both, and `base` is stored.
+        agreed++;
+        assert.equal(isSafe(`${base}${ch}`), true, `U+${hex(cp)} at the end is stripped by both trims`);
+        assert.equal(isSafe(`${ch}${base}`), true, `U+${hex(cp)} at the start is stripped by both trims`);
+        continue;
+      }
+      disagree.push(cp);
+      const only = rustStrips ? 'Rust' : 'JS';
+      assert.equal(isSafe(`${base}${ch}`), false, `U+${hex(cp)} at the end: only ${only} trim strips it`);
+      assert.equal(isSafe(`${ch}${base}`), false, `U+${hex(cp)} at the start: only ${only} trim strips it`);
+    }
+    // The oracles must actually have run.
+    assert.deepEqual(disagree, [0x85, 0xfeff], 'the trims disagree on exactly U+0085 and U+FEFF');
+    assert.ok(agreed >= 22, `expected the rest of White_Space, found ${agreed}`);
+  });
+});
+
+test('SW1: the gate refuses every control, line separator and lone surrogate inside a line', async () => {
+  await withWorker(async ({ hooks }) => {
+    const isSafe = hooks.isPickerSafeUserFilterLine;
+    assert.equal(typeof isSafe, 'function', 'the gate must be a pure predicate the harness can call');
+    const refused = [0x2028, 0x2029, 0xd800, 0xdbff, 0xdc00, 0xdfff];
+    for (let cp = 0; cp <= 0x9f; cp++) if (cp < 0x20 || cp >= 0x7f) refused.push(cp);
+    for (const cp of refused) {
+      assert.equal(isSafe(`example.com##.a${String.fromCharCode(cp)}b`), false,
+        `interior U+${cp.toString(16).padStart(4, '0')} must be refused`);
+    }
+    // Didn't over-reach: interior spaces are selector syntax, and non-ASCII is
+    // what CSS.escape leaves in a class name.
+    for (const line of ['example.com##div > .a', 'example.com##.a\u00a0b', 'example.com##.caf\u00e9',
+      'example.com##.a\u{1f600}b', 'example.com##[title="a b"]']) {
+      assert.equal(isSafe(line), true, `${show(line)} must still be admitted`);
+    }
+    // Anything that is not a non-empty string is refused, never thrown on.
+    for (const value of [undefined, null, 42, '', ['##.ad'], { line: '##.ad' }]) {
+      assert.equal(isSafe(value), false, `${JSON.stringify(value)} must be refused`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Didn't re-break
+// ---------------------------------------------------------------------------
+
+test('SW1 (didn\'t re-break): every picker-legitimate shape is admitted and stored as both trims read it', async () => {
+  for (const line of [...PICKER_COSMETIC_TODAY, ...PICKER_COSMETIC_PLANNED, ...PICKER_NETWORK,
+    ...SUFFIX_EDGES_COSMETIC, ...SUFFIX_EDGES_NETWORK, ...TRAILING_ESCAPES, ...AGREED_TRIMS,
+    ...NUMERIC_SCOPES_COSMETIC, ...NUMERIC_SCOPES_NETWORK, ...NESTED_COMMAS]) {
+    await withWorker(async ({ chrome }) => {
+      const res = await append(chrome, line);
+      assert.equal(res.ok, true, `${show(line)} must be admitted, got ${JSON.stringify(res)}`);
+      assert.equal(chrome.storage.local._data().userFilters, line.trim());
+    });
+  }
+});
+
+test('SW1 (didn\'t re-break): every picker-legitimate shape applies on the WASM path', async (t) => {
+  if (!wasm) { t.skip(NO_WASM); return; }
+  for (const line of [...PICKER_COSMETIC_TODAY, ...PICKER_COSMETIC_PLANNED, ...SUFFIX_EDGES_COSMETIC,
+    ...TRAILING_ESCAPES, ...AGREED_TRIMS, ...NUMERIC_SCOPES_COSMETIC, ...NESTED_COMMAS]) {
+    await withWorker(async ({ chrome }) => {
+      const res = await append(chrome, line);
+      assert.equal(res.ok, true, `${show(line)}: ${JSON.stringify(res)}`);
+      assert.equal(res.counts.cosmetic, 1, `${show(line)} must compile to one hide`);
+      const stored = line.trim();
+      const sep = stored.indexOf('##');
+      const [domain, selector] = [stored.slice(0, sep), stored.slice(sep + 2)];
+      const cosmetic = chrome.storage.local._data().userCosmeticRules;
+      assert.deepEqual([cosmetic.generic, cosmetic.domainSpecific],
+        domain ? [[], { [domain]: [selector] }] : [[selector], {}],
+        `${show(line)} must be a plain hide of exactly that selector, on exactly that scope`);
+      assert.deepEqual([cosmetic.genericExceptions, cosmetic.domainExceptions], [[], {}]);
+      assert.deepEqual(chrome.storage.local._data().userScriptletRules, []);
+      assert.deepEqual(userRules(chrome), []);
+    });
+  }
+  for (const line of [...PICKER_NETWORK, ...SUFFIX_EDGES_NETWORK, ...NUMERIC_SCOPES_NETWORK]) {
+    await withWorker(async ({ chrome }) => {
+      const res = await append(chrome, line);
+      assert.equal(res.ok, true, `${show(line)}: ${JSON.stringify(res)}`);
+      assert.deepEqual([res.counts.network, res.counts.skippedNetwork], [1, 0],
+        `${show(line)} must compile to one live rule: ${JSON.stringify(res.counts)}`);
+      const [rule] = userRules(chrome);
+      assert.deepEqual([rule.action.type, rule.priority], ['block', 1],
+        `${show(line)} must be a plain block, never an allow or an $important override`);
+    });
+  }
+});
+
+test('SW1 (didn\'t re-break): Unicode lookalikes of # are not markers to the compiler either', async (t) => {
+  if (!wasm) { t.skip(NO_WASM); return; }
+  // Fullwidth #, @ and ? are ordinary characters to both compilers, so the
+  // gate may admit them: the line stays a plain hide.
+  const line = 'example.com##.x\uff03@\uff03y\uff03?\uff03z';
+  await withWorker(async ({ chrome }) => {
+    const res = await append(chrome, line);
+    assert.equal(res.ok, true, JSON.stringify(res));
+    const cosmetic = chrome.storage.local._data().userCosmeticRules;
+    assert.deepEqual(cosmetic.domainSpecific, { 'example.com': ['.x\uff03@\uff03y\uff03?\uff03z'] });
+    assert.deepEqual([cosmetic.genericExceptions, cosmetic.domainExceptions], [[], {}]);
+  });
+});
+
+test('SW1 (didn\'t re-break): the existing APPEND validations still answer first, with their own errors', async () => {
+  await withWorker(async ({ chrome }) => {
+    assert.match((await append(chrome, '   ')).error, /non-empty filter line/);
+    assert.match((await append(chrome, '@@||a.example^\n||b.example^')).error, /single line/);
+    assert.match((await append(chrome, 'a\rb')).error, /single line/);
+    assert.match((await append(chrome, `example.com##.${'\u0444'.repeat(1_100_000)}`)).error, /byte limit/);
+    // The cap answers before the gate even for a shape the gate refuses.
+    assert.match((await append(chrome, `@@||bank.example^$${'\u0444'.repeat(1_100_000)}`)).error, /byte limit/);
+  });
+});
+
+test('SW1 (didn\'t re-break): the options page keeps full syntax through SET_USER_FILTERS', async () => {
+  await withWorker(async ({ chrome }) => {
+    const filters = '@@||bank.example^\nexample.com#@#.ad\n||x.example^$important\n##body';
+    const res = await chrome.runtime.sendMessage({ type: 'SET_USER_FILTERS', payload: { filters } });
+    assert.equal(res.error, undefined, JSON.stringify(res));
+    assert.equal(chrome.storage.local._data().userFilters, filters);
+  });
+});

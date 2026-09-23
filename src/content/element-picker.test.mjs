@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { NATIVE_FUNCTIONAL_PSEUDO_CLASSES } from '../shared/proc-ops.js';
 
 // element-picker.js reads DOM globals at call time only (its module top level
 // just defines constants), so stubs installed here are in place before any
@@ -446,6 +447,178 @@ test('PK1 (didn\'t re-break): a clean apply with no drops still shows success', 
   // The probes the drop test reads as silent do fire on a real save.
   assert.deepEqual(hidden, ['display']);
   assert.ok(toasts.some((t) => /Rule saved/.test(t)), `no success toast: ${toasts}`);
+});
+
+// PICKER-2026-09 PK1b — never save a line the pipeline will discard. Two
+// independent ways to lose one: the browser cannot parse the selector (joined
+// into the site's one CSS declaration, it voids every other hide there —
+// REVIEW-2026-09 §3.2's mechanism), or the compiler refuses it, which it does
+// without a `droppedLines` entry, so PK1 cannot report the drop.
+
+/**
+ * CSSOM `CSS.escape` ("serialize an identifier"). The harness stubs identity,
+ * which hides every escape the picker relies on; tests that need the real
+ * output install this.
+ */
+function cssEscape(value) {
+  const s = String(value);
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0) out += '\uFFFD';
+    else if ((c >= 0x1 && c <= 0x1f) || c === 0x7f || (i === 0 && c >= 0x30 && c <= 0x39) ||
+      (i === 1 && c >= 0x30 && c <= 0x39 && s.charCodeAt(0) === 0x2d)) out += `\\${c.toString(16)} `;
+    else if (i === 0 && c === 0x2d && s.length === 1) out += `\\${s[i]}`;
+    else if (c >= 0x80 || c === 0x2d || c === 0x5f || /[0-9A-Za-z]/.test(s[i])) out += s[i];
+    else out += `\\${s[i]}`;
+  }
+  return out;
+}
+
+/**
+ * Run `fn` with the document parsing selectors the way Chrome does for the
+ * shapes these tests use. The harness stub never throws, so without this a
+ * test cannot tell "refused because the browser can't parse it" from "never
+ * checked". Chrome throws a SyntaxError for a functional pseudo-class it does
+ * not implement — every procedural operator (`:has-text(`) included — and for
+ * a `|`, `^`, `$` or `=` outside an attribute selector (a network filter
+ * pasted into the custom field). Escapes and strings are skipped, as the
+ * tokenizer does.
+ */
+async function withBrowserParser(fn) {
+  const doc = globalThis.document;
+  const { querySelector, querySelectorAll } = doc;
+  const parse = (sel) => {
+    const bare = sel.replace(/\\[\s\S]/g, '_').replace(/"[^"]*"|'[^']*'/g, '""');
+    const unknownFn = [...bare.matchAll(/:([\w-]+)\(/g)]
+      .some(([, name]) => !NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(name.toLowerCase()));
+    if (unknownFn || /[|^$=]/.test(bare.replace(/\[[^\]]*\]/g, ''))) {
+      throw new SyntaxError(`'${sel}' is not a valid selector`);
+    }
+  };
+  doc.querySelector = function (sel) { parse(sel); return querySelector.call(this, sel); };
+  doc.querySelectorAll = function (sel) { parse(sel); return querySelectorAll.call(this, sel); };
+  try {
+    return await fn();
+  } finally {
+    doc.querySelector = querySelector;
+    doc.querySelectorAll = querySelectorAll;
+  }
+}
+
+test('PK1b: a custom selector the browser cannot parse is refused, and nothing is sent', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ ok: true }); } },
+  };
+  docState.byLevel = new Map();
+  docState.all = [];
+
+  await withBrowserParser(async () => {
+    // A network filter pasted into the custom field, and a pseudo-class no
+    // browser implements (§3.2's shape). Joined into the site's one CSS
+    // declaration, either one voids every other hide rule there.
+    for (const selector of ['||x.example^$redirect=noopjs', 'div:nope(x)']) {
+      const dialog = makeDialog();
+      await savePickerRule(`example.test##${selector}`, selector, 'example.test', dialog);
+      assert.match(dialog.footerText(), /can.t be saved/, selector);
+      assert.ok(!dialog.footer.innerHTML.includes('Rule saved'), selector);
+    }
+  });
+  // Prior code sent both.
+  assert.deepEqual(sent, []);
+});
+
+test('PK1b: a custom selector the compiler would drop is refused, and nothing is sent', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ ok: true }); } },
+  };
+  docState.byLevel = new Map();
+  docState.all = [];
+
+  await withBrowserParser(async () => {
+    // Every plain one here parses as CSS (the escaped ones are exactly what a
+    // real CSS.escape emits for a page's class), so only the compiler mirror
+    // can refuse them; `is_valid_selector` drops each without a trace.
+    for (const selector of [
+      '.a\\{b', '.a\\}b', '[title="{"]', '.a\\;b', // { } ; outside any operator
+      '.ad;div:has-text(x)', // `;` before an operator's argument
+      'div:has-text(x);.y', // `;` after it
+      'div:has-text(a;b', // `;` in an operator that never closes
+      '.a\0b', // NUL
+      '\u0085', // empty once trimmed the way Rust trims
+    ]) {
+      const dialog = makeDialog();
+      await savePickerRule(`example.test##${selector}`, selector, 'example.test', dialog);
+      // Invisible characters spelled out, so a failure names the case.
+      const shown = selector.replace(/[^\x20-\x7e]/g, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+      assert.match(dialog.footerText(), /can.t be saved/, shown);
+    }
+  });
+  // Prior code sent every one: dead lines reported as "Rule saved".
+  assert.deepEqual(sent, []);
+});
+
+test('PK1b: a generated candidate carrying { } or ; is not offered', () => {
+  const identity = globalThis.CSS.escape;
+  globalThis.CSS.escape = cssEscape;
+  try {
+    docState.byLevel = new Map();
+    docState.all = [];
+    // The premise: a real escaper keeps these valid CSS, so only the compiler
+    // mirror stands between the page's class and a dead "Rule saved".
+    assert.equal(CSS.escape('ad{x'), 'ad\\{x');
+
+    const target = el({
+      classList: ['ad{x', 'ad}y', 'ad;z', 'clean'],
+      getAttribute: (name) => (name === 'data-ad' ? 'slot;1' : null),
+    });
+    const offered = generateSelectors(target).map((c) => c.selector);
+
+    assert.ok(offered.includes('.clean'), `clean class still offered: ${offered}`);
+    for (const selector of offered) assert.doesNotMatch(selector, /[{};]/, selector);
+  } finally {
+    globalThis.CSS.escape = identity;
+  }
+});
+
+test('PK1b (didn\'t re-break): a generated candidate the browser cannot parse is still not offered', async () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  // The identity CSS.escape leaves this id raw, standing in for any candidate
+  // the browser rejects: `add()` refused it before PK1b and still must.
+  const target = el({ id: 'ad:nope(1)', classList: ['clean'] });
+  const offered = await withBrowserParser(() => generateSelectors(target).map((c) => c.selector));
+
+  assert.ok(offered.includes('.clean'), `clean class still offered: ${offered}`);
+  assert.deepEqual(offered.filter((s) => s.includes('#ad:nope(1)')), []);
+});
+
+test('PK1b (didn\'t re-break): valid plain, native :has() and procedural selectors still save', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ ok: true }); } },
+  };
+  docState.byLevel = new Map([['.ad-banner', [el()]]]);
+  docState.all = [];
+  const selectors = [
+    '.ad-banner',
+    'div:has(> img.ad)', // native :has(): plain CSS the browser parses
+    'div:has-text(Sponsored)', // procedural: the browser throws on it, the engine plans it
+    'div:has-text(a;b)', // a `;` inside an operator's argument is kept by the compiler
+    'div:has-text(/a(b);c/)', // ... even past a nested paren, which the depth scan skips
+    'div:HAS-TEXT(a;b)', // ... and the operator matches case-insensitively, as in Rust
+  ];
+
+  await withBrowserParser(async () => {
+    for (const selector of selectors) {
+      const dialog = makeDialog();
+      await saveAndFlushToasts(`example.test##${selector}`, selector, dialog);
+      assert.match(dialog.footer.innerHTML, /Rule saved/, selector);
+    }
+  });
+  assert.deepEqual(sent.map((m) => m.payload.line), selectors.map((s) => `example.test##${s}`));
 });
 
 // §4.24 — ACTIVATE_PICKER is broadcast to every frame; a page with 15 iframes

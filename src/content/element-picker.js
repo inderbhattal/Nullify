@@ -12,6 +12,8 @@
  *  6. ESC or ✕ cancels without saving
  */
 
+import { isProceduralSelector, PROC_OP_REGEX } from '../shared/proc-ops.js';
+
 const PICKER_HIGHLIGHT_ID = '__adblock_picker_highlight__';
 const PICKER_OVERLAY_ID   = '__adblock_picker_overlay__';
 const PICKER_DIALOG_ID    = '__adblock_picker_dialog__';
@@ -370,6 +372,60 @@ export function isShadowOnlySelector(selector) {
 }
 
 /**
+ * Can `selector` be saved as a `##` rule that will actually run? A line is
+ * lost two independent ways: the browser cannot parse the selector — joined
+ * into the site's one CSS declaration, it voids every other hide rule there
+ * (REVIEW-2026-09 §3.2) — or the compiler refuses it, without a `droppedLines`
+ * entry, so the save would report "Rule saved" for a dead line
+ * (PICKER-2026-09 PK1b).
+ *
+ * A procedural selector gets the compiler test alone. The browser rejects it
+ * whole (`:has-text(` is not CSS), and it never reaches the joined
+ * declaration: the compiler plans every `:op(` match per rule, and the engine
+ * isolates each plan, so a bad base disables only its own rule. Checking its
+ * CSS "the way the engine plans it" would need a copy of the planner here.
+ */
+function isSaveableSelector(selector) {
+  if (!compilerKeepsSelector(selector)) return false;
+  if (isProceduralSelector(selector)) return true;
+  try {
+    document.querySelector(selector);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Mirrors `is_valid_selector` in wasm-core/src/lib.rs, the source of truth:
+// change the two together. Rust's `trim()` strips every White_Space code
+// point, U+0085 included, which JS `trim()` keeps.
+function compilerKeepsSelector(selector) {
+  const s = selector.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+  if (!s || /[{}\0]/.test(s)) return false;
+  return !s.includes(';') || semicolonsInProcOpArgs(s);
+}
+
+// Mirrors `semicolons_confined_to_proc_op_args`: every `;` must sit inside a
+// procedural operator's argument, which ends where paren depth returns to
+// zero (`find_matching_paren` — no quote or escape handling, as there).
+function semicolonsInProcOpArgs(s) {
+  let idx = 0;
+  while (idx < s.length) {
+    const m = PROC_OP_REGEX.exec(s.slice(idx));
+    if (!m) return !s.slice(idx).includes(';');
+    if (s.slice(idx, idx + m.index).includes(';')) return false;
+    let i = idx + m.index + m[0].length;
+    for (let depth = 1; depth > 0; i++) {
+      if (i >= s.length) return false; // the operator never closes
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') depth--;
+    }
+    idx = i;
+  }
+  return true;
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
  * Exported for tests.
@@ -381,8 +437,8 @@ export function generateSelectors(el) {
 
   function add(label, selector, scope) {
     if (!selector || seen.has(selector)) return;
-    // Validate selector
-    try { document.querySelector(selector); } catch { return; }
+    // Offer only what can be saved: it parses, and the compiler keeps it.
+    if (!isSaveableSelector(selector)) return;
     seen.add(selector);
     const count = deepQuerySelectorAll(selector).length;
     candidates.push({ label, selector, count, scope: scope || 'page', domain: hostname });
@@ -859,6 +915,16 @@ function buildCosmeticRule(selector, domain) {
 // ---------------------------------------------------------------------------
 export async function savePickerRule(rule, selector, hostname, dialog) {
   try {
+    // Every save passes here, and the custom field arrives unvalidated: a
+    // selector the browser cannot parse, or the compiler would drop, is never
+    // sent (PICKER-2026-09 PK1b).
+    if (!isSaveableSelector(selector)) {
+      showErrorInDialog(dialog,
+        'This selector can\'t be saved: it is not valid CSS, or it contains ' +
+        'characters ({, } or ;) that filter rules cannot carry.');
+      return;
+    }
+
     // A rule that only matches inside shadow roots cannot be applied by
     // document-level CSS — refuse clearly instead of reporting a success
     // that evaporates on reload (§5.30).

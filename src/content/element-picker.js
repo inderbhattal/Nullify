@@ -469,7 +469,7 @@ export function generateSelectors(el) {
     // fine (the picker pierces shadow roots) and then persist as dead
     // rules, so offer ONLY host-level candidates here (§5.30).
     if (host.id) add(`${hostLabel} ID`, `#${CSS.escape(host.id)}`);
-    for (const cls of Array.from(host.classList).slice(0, 2)) {
+    for (const cls of stableClassesFirst(Array.from(host.classList)).slice(0, 2)) {
       add(`${hostLabel} .${cls}`, `.${CSS.escape(cls)}`);
     }
     add(`${hostLabel} Tag`, host.tagName.toLowerCase());
@@ -489,7 +489,7 @@ export function generateSelectors(el) {
   }
 
   // 3. Class combinations (up to 3 most specific classes)
-  const classes = Array.from(el.classList).filter(c => c && !/^\d/.test(c));
+  const classes = stableClassesFirst(Array.from(el.classList).filter(c => c && !/^\d/.test(c)));
   if (classes.length > 0) {
     // Single class
     for (const cls of classes.slice(0, 4)) {
@@ -550,7 +550,18 @@ export function generateSelectors(el) {
   return candidates;
 }
 
-function selectorScore(c) {
+// PICKER-2026-09 PK4. A class a build hashed is renamed by the site's next
+// deploy, so a candidate held only by such classes ranks below a stable one of
+// equal count — by less than a count band, so the bands still decide — but is
+// still offered: it may be all an element has. A positional step breaks
+// whenever the page reorders, so a path that needs one ranks below every
+// candidate that matches something without one (and above those that match
+// nothing).
+const HASHED_CLASS_PENALTY = 6;
+const POSITIONAL_PENALTY = 60;
+
+/** Exported for tests. */
+export function selectorScore(c) {
   // Prefer selectors that match 1-3 elements (specific enough)
   // Penalize 0 (too specific/broken) and large counts (too broad)
   const countScore = c.count === 0 ? -100
@@ -565,13 +576,51 @@ function selectorScore(c) {
     : c.selector.includes('[') ? 5
     : 3;
 
-  return countScore + typeScore;
+  const penalty = (onlyHashedClasses(c.selector) ? HASHED_CLASS_PENALTY : 0) +
+    (c.selector.includes(':nth-of-type(') ? POSITIONAL_PENALTY : 0);
+  return countScore + typeScore - penalty;
+}
+
+/**
+ * Does `className` look build-generated? One alphabetic prefix, one hyphen,
+ * then six or more letters and digits holding at least two digits:
+ * `css-1x2y3z`, `jsx-2947163892`, `grid-12ab34`. The plan pins this rule
+ * against its own cases — `col-md-6`, `ad-slot-300x250`, `sr-only`, `h1` and
+ * `MuiBox-root` are not hashed (PICKER-2026-09 PK4). Exported for tests; PK3
+ * reuses it.
+ */
+export function looksHashed(className) {
+  const m = /^[A-Za-z]+-([A-Za-z0-9]{6,})$/.exec(className);
+  return m !== null && (m[1].match(/\d/g) || []).length >= 2;
+}
+
+/**
+ * `classes` with the stable-looking ones first, each group in page order.
+ * Candidates take only the first few classes, so a stable class behind hashed
+ * ones was never offered — on exactly the sites this penalty is for. The
+ * order within each group rides on `Array.prototype.sort` being stable, which
+ * ES2019 requires and V8 has guaranteed since 7.0 (PICKER-2026-09 PK4).
+ */
+function stableClassesFirst(classes) {
+  return [...classes].sort((a, b) => looksHashed(a) - looksHashed(b));
+}
+
+/**
+ * Is `selector` held only by hashed-looking classes: at least one class, all
+ * of them hashed, and no id or attribute to steady it? Classes are read as
+ * `CSS.escape` wrote them; a hashed-looking name never needs an escape, so a
+ * class that carries one is not hashed.
+ */
+function onlyHashedClasses(selector) {
+  if (/[#[]/.test(selector)) return false;
+  const classes = [...selector.matchAll(/\.((?:\\[\s\S]|[^\s.#[\]:>+~,()*|"'=\\])+)/g)].map((m) => m[1]);
+  return classes.length > 0 && classes.every(looksHashed);
 }
 
 function simpleSelector(el) {
   if (!el || el === document.body) return null;
   if (el.id) return `#${CSS.escape(el.id)}`;
-  const classes = Array.from(el.classList).filter(Boolean).slice(0, 2);
+  const classes = stableClassesFirst(Array.from(el.classList).filter(Boolean)).slice(0, 2);
   if (classes.length) return `${el.tagName.toLowerCase()}.${classes.map(CSS.escape).join('.')}`;
   return el.tagName.toLowerCase();
 }
@@ -582,10 +631,31 @@ function buildSelectorPath(el, maxDepth) {
   for (let i = 0; i < maxDepth && current && current !== document.body; i++) {
     const sel = simpleSelector(current);
     if (!sel) break;
-    parts.unshift(sel);
+    parts.unshift(pinnedStep(current, sel));
     current = current.parentElement;
   }
   return parts.length > 1 ? parts.join(' > ') : null;
+}
+
+/**
+ * `sel` pinned to `el`'s position when it would also match a sibling, so the
+ * path can single out a structurally anonymous element: `:nth-of-type(k)`,
+ * `k` counted among same-tag siblings as the pseudo-class counts it, with the
+ * tag written out for an id step (PICKER-2026-09 PK4).
+ */
+function pinnedStep(el, sel) {
+  const siblings = Array.from(el.parentElement?.children ?? []);
+  const collides = siblings.some((s) => {
+    if (s === el) return false;
+    try {
+      return s.matches(sel);
+    } catch {
+      return false;
+    }
+  });
+  if (!collides) return sel;
+  const k = siblings.filter((s) => s.tagName === el.tagName).indexOf(el) + 1;
+  return `${sel.startsWith('#') ? el.tagName.toLowerCase() : ''}${sel}:nth-of-type(${k})`;
 }
 
 // ---------------------------------------------------------------------------

@@ -95,7 +95,7 @@ globalThis.window.top = globalThis.window; // top frame by default
 
 const {
   generateSelectors, isShadowOnlySelector, savePickerRule, activatePicker, deactivatePicker,
-  generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector,
+  generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector, looksHashed, selectorScore,
 } = await import('./element-picker.js');
 
 /** Dispatch to whatever the picker registered on `document` for `type`. */
@@ -974,6 +974,213 @@ test('PK2a (didn\'t re-break): a plain div offers cosmetic candidates and no net
   assert.ok(cosmetic.some((c) => c.selector === '.ad-slot'), 'the class candidate is still offered');
   assert.ok(cosmetic.every((c) => c.kind === 'cosmetic'));
   assert.deepEqual(generateNetworkCandidates(div), []);
+});
+
+// PICKER-2026-09 PK4 — stronger CSS candidates. A class a build hashed is
+// de-ranked, never dropped; an ancestor path pins a structurally anonymous
+// element with `:nth-of-type`, and that path ranks below every candidate that
+// matches without one.
+
+/**
+ * Does `node` match `sel`, for the shapes `simpleSelector` emits (`#id`,
+ * `tag`, `tag.a.b`)? Enough of `Element.matches` for the sibling test.
+ */
+function matchesSimple(node, sel) {
+  const m = /^([a-z][a-z0-9-]*)?(?:#([\w-]+))?((?:\.[\w-]+)*)$/i.exec(sel);
+  if (!m) return false;
+  const [, tag, id, classes] = m;
+  if (tag && tag.toLowerCase() !== node.tagName.toLowerCase()) return false;
+  if (id && id !== node.id) return false;
+  return classes.split('.').filter(Boolean).every((c) => node.classList.includes(c));
+}
+
+/** An element stub wired into a tree: `children`, `parentElement`, `matches`. */
+function tree(tagName, props = {}, kids = []) {
+  const node = el({ tagName, children: kids, ...props });
+  node.matches = (sel) => matchesSimple(node, sel);
+  for (const kid of kids) kid.parentElement = node;
+  return node;
+}
+
+test('PK4: the ancestor path disambiguates colliding siblings with :nth-of-type', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const link = tree('A');
+  // The link's item is the third child but the second `li`: position is
+  // counted among same-tag siblings, as `:nth-of-type` counts it.
+  tree('UL', { classList: ['list'] }, [tree('SPAN'), tree('LI'), tree('LI', {}, [link]), tree('LI')]);
+
+  const offered = generateSelectors(link).map((c) => c.selector);
+  // Only the step that collides is pinned: `a` and `ul.list` are unique.
+  assert.ok(offered.includes('ul.list > li:nth-of-type(2) > a'), offered.join(' | '));
+});
+
+test('PK4: a step is pinned only when its own selector matches a sibling', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const link = tree('A');
+  // A sibling of the same tag but other classes does not match `li.ad`.
+  tree('UL', {}, [tree('LI', { classList: ['news'] }), tree('LI', { classList: ['ad'] }, [link])]);
+
+  const offered = generateSelectors(link).map((c) => c.selector);
+  assert.ok(offered.includes('ul > li.ad > a'), offered.join(' | '));
+  assert.ok(offered.every((s) => !s.includes(':nth-of-type(')), offered.join(' | '));
+});
+
+test('PK4: a colliding id step is pinned with its tag written out', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  // A duplicate id: the position must be read among `div`s, not every type.
+  const target = tree('DIV', { id: 'dup' });
+  tree('SECTION', { classList: ['box'] }, [tree('P'), tree('DIV', { id: 'dup' }), target]);
+
+  const offered = generateSelectors(target).map((c) => c.selector);
+  assert.ok(offered.includes('section.box > div#dup:nth-of-type(2)'), offered.join(' | '));
+});
+
+test('PK4: looksHashed matches every hashed class and no plain class', () => {
+  // The plan's eight, every one: the first draft's regex failed its own example.
+  for (const name of ['css-1x2y3z', 'jsx-2947163892', 'grid-12ab34']) {
+    assert.equal(looksHashed(name), true, name);
+  }
+  for (const name of ['col-md-6', 'ad-slot-300x250', 'sr-only', 'h1', 'MuiBox-root']) {
+    assert.equal(looksHashed(name), false, name);
+  }
+  // None of those five turns on the two-digit rule, so its edges are pinned
+  // here: six characters with two digits is hashed; five characters, one
+  // digit or none is not.
+  assert.equal(looksHashed('css-1a2bcd'), true);
+  for (const name of ['css-1x2y3', 'nav-sidebar1', 'ad-banner']) {
+    assert.equal(looksHashed(name), false, name);
+  }
+  // And its shape: a letters-only prefix, one hyphen, nothing after the run
+  // (emotion's labelled `css-1x2y3z-Button` is not a bare hash).
+  for (const name of ['h2-a1b2c3', 'css-1x2y3z-Button']) {
+    assert.equal(looksHashed(name), false, name);
+  }
+});
+
+test('PK4: a hashed-looking class is ranked below a stable class of equal count', () => {
+  const target = el({ classList: ['css-1x2y3z', 'ad-banner'] });
+  docState.byLevel = new Map([['.css-1x2y3z', [target]], ['.ad-banner', [target]]]);
+  docState.all = [];
+
+  const offered = generateSelectors(target).map((c) => c.selector);
+  // Prior code kept insertion order on a tie: the hashed class came first.
+  assert.ok(offered.indexOf('.ad-banner') < offered.indexOf('.css-1x2y3z'), offered.join(' | '));
+  assert.ok(selectorScore({ selector: '.ad-banner', count: 1 }) > selectorScore({ selector: '.css-1x2y3z', count: 1 }));
+});
+
+test('PK4: only a candidate held by hashed classes alone is de-ranked', () => {
+  const score = (selector) => selectorScore({ selector, count: 1 });
+  // Something steadier is present: a stable class, an id, or an escape that
+  // shows the name is not a bare hash.
+  assert.equal(score('.ad-banner.css-1x2y3z'), score('.ad-banner.stable'));
+  assert.equal(score('#main > div.css-1x2y3z'), score('#main > div.stable'));
+  assert.equal(score('.css-1x2y3z\\:hover'), score('.stable\\:hover'));
+  // Hashed classes alone, with or without a tag.
+  assert.ok(score('div.css-1x2y3z') < score('div.stable'));
+  assert.ok(score('.css-1x2y3z.jsx-2947163892') < score('.stable.other'));
+  // No class at all is not "only hashed classes".
+  assert.ok(score('li > a') > score('li > a.css-1x2y3z'));
+});
+
+test('PK4 (didn\'t re-break): a hashed class is de-ranked, never dropped', () => {
+  // It may be all an element has.
+  const target = el({ classList: ['css-1x2y3z'] });
+  docState.byLevel = new Map([['.css-1x2y3z', [target]]]);
+  docState.all = [];
+  const offered = generateSelectors(target).map((c) => c.selector);
+  assert.ok(offered.includes('.css-1x2y3z') && offered.includes('div.css-1x2y3z'), offered.join(' | '));
+});
+
+test('PK4: a positional path ranks below every candidate that matches without one', () => {
+  const link = tree('A', { id: 'ad' });
+  tree('UL', { classList: ['list'] }, [tree('LI'), tree('LI', {}, [link])]);
+  const path = 'ul.list > li:nth-of-type(2) > #ad';
+  docState.byLevel = new Map([
+    ['#ad', [link]],
+    ['[id*="ad"]', [link]],
+    ['li > #ad', Array.from({ length: 60 }, () => link)], // broad, but no positional step
+    [path, [link]],
+  ]);
+  docState.all = [];
+
+  const candidates = generateSelectors(link);
+  assert.equal(candidates[0].selector, '#ad', 'a clean id still ranks first');
+  const at = candidates.findIndex((c) => c.selector === path);
+  assert.ok(at > -1, candidates.map((c) => c.selector).join(' | '));
+  // Above it: every candidate that matches something without a positional
+  // step, even the one matching 60 elements. Below it: only what matches nothing.
+  for (const c of candidates.slice(0, at)) assert.ok(c.count > 0, c.selector);
+  for (const c of candidates.slice(at + 1)) assert.equal(c.count, 0, c.selector);
+  assert.ok(candidates.slice(at + 1).length > 0, 'a candidate matching nothing still ranks lowest');
+});
+
+test('PK4 (didn\'t re-break): a clean id still scores highest, and the count bands still decide', () => {
+  const target = el({ id: 'ad', classList: ['ad-banner'] });
+  docState.byLevel = new Map([['#ad', [target]], ['.ad-banner', [target]]]);
+  docState.all = [];
+  assert.equal(generateSelectors(target)[0].selector, '#ad');
+  assert.ok(selectorScore({ selector: '#ad', count: 1 }) > selectorScore({ selector: '.ad-banner', count: 1 }));
+
+  const band = (count) => selectorScore({ selector: '.ad-banner', count });
+  assert.ok(band(2) > band(5) && band(5) > band(20) && band(20) > band(60) && band(60) > band(0));
+  // The hashed penalty is less than a band: a precise hashed class still
+  // beats a broader stable one.
+  assert.ok(selectorScore({ selector: '.css-1x2y3z', count: 2 }) > selectorScore({ selector: '.ad-banner', count: 5 }));
+});
+
+// Candidates take only an element's first few classes (four singles, three
+// with the tag, three combined; two for a shadow host or a path step). Taken
+// in page order, a stable class behind hashed ones was never offered — on
+// exactly the sites PK4 is for.
+
+test('PK4: a stable class behind four hashed ones is still offered', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const target = el({ classList: ['css-a1b2c3', 'css-d4e5f6', 'css-g7h8i9', 'css-j0k1l2', 'ad-banner'] });
+  const offered = generateSelectors(target).map((c) => c.selector);
+  // One per slice: single class, tag + class, all classes combined.
+  for (const selector of ['.ad-banner', 'div.ad-banner', '.ad-banner.css-a1b2c3.css-d4e5f6']) {
+    assert.ok(offered.includes(selector), `${selector} not in ${offered.join(' | ')}`);
+  }
+  assert.ok(offered.includes('.css-a1b2c3'), 'the hashed classes are still offered');
+});
+
+test('PK4: a shadow host with hashed classes first still offers its stable class', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const host = el({ tagName: 'ASIDE', classList: ['css-a1b2c3', 'css-d4e5f6', 'promo'] });
+  const inner = el({ tagName: 'SPAN', getRootNode: () => new FakeShadowRoot(host) });
+  const offered = generateSelectors(inner).map((c) => c.selector);
+  assert.ok(offered.includes('.promo'), offered.join(' | '));
+});
+
+test('PK4: a path step prefers a stable class to hashed ones', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const link = tree('A');
+  tree('UL', {}, [tree('LI', { classList: ['css-a1b2c3', 'css-d4e5f6', 'item'] }, [link])]);
+  const offered = generateSelectors(link).map((c) => c.selector);
+  assert.ok(offered.includes('li.item.css-a1b2c3 > a'), offered.join(' | '));
+});
+
+test('PK4 (didn\'t re-break): classes that all look stable keep their page order', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const offered = generateSelectors(el({ classList: ['b', 'a', 'c'] })).map((c) => c.selector);
+  assert.deepEqual(offered.filter((s) => /^\.[abc]$/.test(s)), ['.b', '.a', '.c']);
+  assert.ok(offered.includes('.b.a.c'), offered.join(' | '));
+});
+
+test('PK4: moving stable classes ahead keeps each group in page order', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  // Neither group is in alphabetical order, so a sort that reorders within a
+  // group, not just between them, shows here.
+  const offered = generateSelectors(el({ classList: ['css-g7h8i9', 'q', 'css-a1b2c3', 'p'] })).map((c) => c.selector);
+  assert.ok(offered.includes('.q.p.css-g7h8i9'), offered.join(' | '));
 });
 
 // §4.24 — ACTIVATE_PICKER is broadcast to every frame; a page with 15 iframes

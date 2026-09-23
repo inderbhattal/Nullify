@@ -882,6 +882,18 @@ export async function savePickerRule(rule, selector, hostname, dialog) {
       return;
     }
 
+    // The append recompiles all of My Filters, so the skip counts cover every
+    // stored line: one unsupported line pasted long ago would fail every later
+    // save. Decide on this line's own entry, keyed on the text the SW stores
+    // (trimmed). A dropped line is not hidden either — the element vanishing
+    // is itself a claim that the rule works (PICKER-2026-09 PK1).
+    const savedLine = rule.trim();
+    const dropped = res.counts?.skippedRules?.find((s) => s.line === savedLine);
+    if (dropped) {
+      showErrorInDialog(dialog, dropped.reason || 'This rule couldn\'t be applied');
+      return;
+    }
+
     // Immediately hide elements on this page
     applyRuleImmediately(selector);
 

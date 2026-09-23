@@ -280,6 +280,174 @@ test('a second error replaces the first instead of stacking (§5.16)', async () 
   assert.match(errors[0].textContent, /second/);
 });
 
+// PICKER-2026-09 PK1 — the append recompiles the whole of My Filters, so the
+// reply's `skippedNetwork`/`skippedRules` describe every stored line. The save
+// must report its own line's drop, and must not blame a clean save for a line
+// the user pasted long ago.
+
+/**
+ * Save with `setTimeout` captured, then fire what was queued, so the delayed
+ * success toast lands inside the test. Returns the text of every toast
+ * mounted; nested timers (the toast's own removal) are captured and dropped.
+ */
+async function saveAndFlushToasts(rule, selector, dialog) {
+  const queued = [];
+  const toasts = [];
+  const root = globalThis.document.documentElement;
+  const realSetTimeout = globalThis.setTimeout;
+  const realAppend = root.appendChild;
+  globalThis.setTimeout = (fn) => { queued.push(fn); return 0; };
+  root.appendChild = function (node) {
+    if (node?.className === '__adblock_picker_toast__') toasts.push(node.textContent);
+    return realAppend.call(this, node);
+  };
+  try {
+    await savePickerRule(rule, selector, 'example.test', dialog);
+    for (const fn of queued.splice(0)) fn();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    root.appendChild = realAppend;
+  }
+  return toasts;
+}
+
+test('PK1: an unrelated dropped line does NOT block a clean save', async () => {
+  const cases = [
+    // A `$removeparam` line pasted into My Filters long ago.
+    { rule: '##.ad-banner', counts: { network: 0, cosmetic: 1 },
+      other: { id: null, line: '||facebook.com^$removeparam=fbclid', reason: 'unsupported option: removeparam' } },
+    // A longer line that merely starts with the saved one: a prefix or
+    // substring lookup blames the clean save for it.
+    { rule: '||ads.example^', counts: { network: 1, cosmetic: 0 },
+      other: { id: null, line: '||ads.example^$csp=x', reason: 'unsupported option: csp' } },
+  ];
+  for (const { rule, counts, other } of cases) {
+    globalThis.chrome = {
+      runtime: {
+        sendMessage: () => Promise.resolve({
+          ok: true,
+          counts: { ...counts, skippedNetwork: 1, skippedRules: [other] },
+        }),
+      },
+    };
+    docState.byLevel = new Map([['.ad-banner', [el()]]]);
+    docState.all = [];
+
+    const dialog = makeDialog();
+    await savePickerRule(rule, '.ad-banner', 'example.test', dialog);
+
+    // A `skippedNetwork > 0` check reports an error here: the counts cover
+    // every stored line, and this drop belongs to a different one.
+    assert.match(dialog.footer.innerHTML, /Rule saved/, `${rule} blamed for ${other.line}`);
+  }
+});
+
+test('PK1: the saved line\'s own drop is reported, not shown as saved', async () => {
+  const rule = '||x.example^$redirect=y';
+  globalThis.chrome = {
+    runtime: {
+      sendMessage: () => Promise.resolve({
+        ok: true,
+        counts: {
+          network: 0,
+          cosmetic: 0,
+          skippedNetwork: 2,
+          // An older, unrelated drop listed first: reporting `skippedRules[0]`
+          // shows its reason instead of this line's.
+          skippedRules: [
+            { id: null, line: '||facebook.com^$removeparam=fbclid', reason: 'unsupported option: removeparam' },
+            { id: null, line: rule, reason: 'unsupported option: redirect' },
+          ],
+        },
+      }),
+    },
+  };
+  const hidden = [];
+  docState.byLevel = new Map([['.ad-banner', [el({ style: { setProperty: (p) => hidden.push(p) } })]]]);
+  docState.all = [];
+
+  const dialog = makeDialog();
+  const toasts = await saveAndFlushToasts(rule, '.ad-banner', dialog);
+
+  // Prior code checked only `res.ok`, so a line the compiler dropped read as
+  // "Rule saved".
+  assert.match(dialog.footerText(), /unsupported option: redirect/);
+  assert.doesNotMatch(dialog.footerText(), /removeparam/);
+  assert.ok(!dialog.footer.innerHTML.includes('Rule saved'));
+  // Nor the other two success signals: the element vanishing (a reload will
+  // not hide it) and the toast.
+  assert.deepEqual(hidden, [], 'nothing hidden for a rule that is not applied');
+  assert.ok(!toasts.some((t) => /Rule saved/.test(t)), `success toast shown: ${toasts}`);
+});
+
+test('PK1: a drop entry without a reason still reports the line as not applied', async () => {
+  const rule = '||x.example^$csp=x';
+  globalThis.chrome = {
+    runtime: {
+      sendMessage: () => Promise.resolve({
+        ok: true,
+        counts: { network: 0, cosmetic: 0, skippedNetwork: 1, skippedRules: [{ id: null, line: rule }] },
+      }),
+    },
+  };
+  docState.byLevel = new Map([['.ad-banner', [el()]]]);
+  docState.all = [];
+
+  const dialog = makeDialog();
+  await savePickerRule(rule, '.ad-banner', 'example.test', dialog);
+
+  assert.match(dialog.footerText(), /couldn.t be applied/);
+  assert.ok(!dialog.footer.innerHTML.includes('Rule saved'));
+});
+
+test('PK1: the drop is matched on the line as the SW stores it, trimmed', async () => {
+  // `appendUserFilterLine` stores `line.trim()` and the compiler reports that
+  // trimmed text, so an untrimmed lookup misses the entry and reports success.
+  const rule = '||x.example^$redirect=y';
+  globalThis.chrome = {
+    runtime: {
+      sendMessage: () => Promise.resolve({
+        ok: true,
+        counts: {
+          network: 0,
+          cosmetic: 0,
+          skippedNetwork: 1,
+          skippedRules: [{ id: null, line: rule, reason: 'unsupported option: redirect' }],
+        },
+      }),
+    },
+  };
+  docState.byLevel = new Map([['.ad-banner', [el()]]]);
+  docState.all = [];
+
+  const dialog = makeDialog();
+  await savePickerRule(` ${rule}\t`, '.ad-banner', 'example.test', dialog);
+
+  assert.match(dialog.footerText(), /unsupported option: redirect/);
+});
+
+test('PK1 (didn\'t re-break): a clean apply with no drops still shows success', async () => {
+  globalThis.chrome = {
+    runtime: {
+      sendMessage: () => Promise.resolve({
+        ok: true,
+        counts: { network: 1, skippedNetwork: 0, skippedRules: [] },
+      }),
+    },
+  };
+  const hidden = [];
+  docState.byLevel = new Map([['.ad-banner', [el({ style: { setProperty: (p) => hidden.push(p) } })]]]);
+  docState.all = [];
+
+  const dialog = makeDialog();
+  const toasts = await saveAndFlushToasts('example.test##.ad-banner', '.ad-banner', dialog);
+
+  assert.match(dialog.footer.innerHTML, /Rule saved/);
+  // The probes the drop test reads as silent do fire on a real save.
+  assert.deepEqual(hidden, ['display']);
+  assert.ok(toasts.some((t) => /Rule saved/.test(t)), `no success toast: ${toasts}`);
+});
+
 // §4.24 — ACTIVATE_PICKER is broadcast to every frame; a page with 15 iframes
 // got 16 pickers, and ESC (which does not cross frame boundaries) could only
 // dismiss the focused one.

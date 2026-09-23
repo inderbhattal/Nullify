@@ -13,6 +13,8 @@
  */
 
 import { isProceduralSelector, PROC_OP_REGEX } from '../shared/proc-ops.js';
+import { normalizeHostname } from '../shared/hostname.js';
+import { isPublicSuffix } from '../shared/psl.js';
 
 const PICKER_HIGHLIGHT_ID = '__adblock_picker_highlight__';
 const PICKER_OVERLAY_ID   = '__adblock_picker_overlay__';
@@ -398,8 +400,9 @@ function isSaveableSelector(selector) {
 
 // Mirrors `is_valid_selector` in wasm-core/src/lib.rs, the source of truth:
 // change the two together. Rust's `trim()` strips every White_Space code
-// point, U+0085 included, which JS `trim()` keeps.
-function compilerKeepsSelector(selector) {
+// point, U+0085 included, which JS `trim()` keeps. Exported so a test pins
+// the mirror directly, not only through a save.
+export function compilerKeepsSelector(selector) {
   const s = selector.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
   if (!s || /[{}\0]/.test(s)) return false;
   return !s.includes(';') || semicolonsInProcOpArgs(s);
@@ -426,13 +429,24 @@ function semicolonsInProcOpArgs(s) {
 }
 
 /**
+ * The site a picked rule is scoped to — the cosmetic `site##` prefix and the
+ * network `domain=` alike. `normalizeHostname` drops a leading `www.` only
+ * when what remains is not a public suffix: the old `replace(/^www\./, '')`
+ * cut the registrable `www.ck` to the suffix `ck`, scoping the rule to every
+ * `.ck` site (PICKER-2026-09 PK2a).
+ */
+function siteScope() {
+  return normalizeHostname(location.hostname);
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
  * Exported for tests.
  */
 export function generateSelectors(el) {
   const candidates = [];
-  const hostname = location.hostname.replace(/^www\./, '');
+  const hostname = siteScope();
   const seen = new Set();
 
   function add(label, selector, scope) {
@@ -441,7 +455,7 @@ export function generateSelectors(el) {
     if (!isSaveableSelector(selector)) return;
     seen.add(selector);
     const count = deepQuerySelectorAll(selector).length;
-    candidates.push({ label, selector, count, scope: scope || 'page', domain: hostname });
+    candidates.push({ kind: 'cosmetic', label, selector, count, scope: scope || 'page', domain: hostname });
   }
 
   // Check if we are inside a shadow DOM
@@ -575,6 +589,151 @@ function buildSelectorPath(el, maxDepth) {
 }
 
 // ---------------------------------------------------------------------------
+// Network-block candidates (PICKER-2026-09 PK2a)
+// ---------------------------------------------------------------------------
+// Every line built here must pass SW1's APPEND_USER_FILTER gate
+// (`isPickerSafeUserFilterLine` in the service worker), or the save is
+// refused: `||host^` or `||host/path[^]`, then `$<type>,domain=<site>`. The
+// resource URL, host included, is the page's to choose, so nothing from it
+// reaches the line unvalidated.
+
+// The gate's `||` host: `[a-z0-9.-]`, or a bracketed IPv6 literal. WHATWG lets
+// `$ * , = { }` into a hostname, so this is a check, not a formality.
+const NETWORK_HOST = /^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])$/;
+// The first path character outside the gate's class: `$` would open an option
+// list, `^ | *` are pattern syntax, and a browser's URL parser may leave
+// others literal (`{ } \``) that the gate refuses.
+const NETWORK_PATH_STOP = /[^\w!%&'()+,\-.:;=@[\]~/]/;
+// The gate's `domain=` value: plain lower-case labels, one host, no negation.
+const SITE_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+const NETWORK_TYPES = new Set(['image', 'subdocument', 'media', 'object']);
+const NETWORK_LABELS = { path: 'Block request', prefix: 'Block path prefix', host: 'Block host' };
+
+/** `url` resolved against the document's base URL, as the browser resolves it. */
+function resolveUrl(url) {
+  if (!url) return null;
+  try {
+    return new URL(url, document.baseURI || location.href);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The network rule blocking `url` as a `type` request, scoped to `domain` —
+ * or null when no gate-safe line exists. `scope: 'path'` keeps the pathname
+ * less its query, so a cache-busting parameter cannot escape the block. A
+ * path character the gate refuses cuts it to the prefix before it, with no
+ * closing `^`: strictly narrower than the host, so the escape only narrows. A
+ * prefix of just `/`, or a non-default port (the gate admits none, and a path
+ * rule without it can never match), falls back to `scope: 'host'`, the host
+ * alone. Exported so SW1's gate can be checked against real output.
+ */
+export function urlToNetworkPattern(url, { scope = 'path', type, domain } = {}) {
+  if (!NETWORK_TYPES.has(type)) return null;
+  if (domain && (!SITE_HOSTNAME.test(domain) || isPublicSuffix(domain))) return null;
+  const u = resolveUrl(url);
+  if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:')) return null;
+  const host = u.hostname.toLowerCase();
+  if (!NETWORK_HOST.test(host) || isPublicSuffix(host)) return null;
+
+  let base = `||${host}^`;
+  if (scope === 'path' && !u.port) {
+    const cut = u.pathname.search(NETWORK_PATH_STOP);
+    if (cut === -1) base = `||${host}${u.pathname}^`;
+    else if (cut > 1) base = `||${host}${u.pathname.slice(0, cut)}`;
+  }
+  return `${base}$${type}${domain ? `,domain=${domain}` : ''}`;
+}
+
+/** The first `url(...)` in the element's background image, inline style first. */
+function backgroundImageUrl(el) {
+  const urlIn = (value) => {
+    const m = /url\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^"'()\s]+))\s*\)/.exec(value || '');
+    return m ? (m[1] ?? m[2] ?? m[3]).replace(/\\(.)/g, '$1') : null;
+  };
+  const inline = urlIn(el.style?.backgroundImage);
+  if (inline || typeof getComputedStyle !== 'function') return inline;
+  try {
+    return urlIn(getComputedStyle(el).backgroundImage);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The requests the element itself makes, most direct first, each with the
+ * type it is filtered as. The type follows the URL taken: a video's poster
+ * is an image request, not media.
+ */
+function elementResources(el) {
+  const attr = (name) => el.getAttribute(name);
+  switch (el.tagName.toLowerCase()) {
+    case 'img': {
+      const srcset = attr('srcset')?.trim().split(/\s+/)[0].replace(/,+$/, '');
+      return [el.currentSrc, attr('src'), srcset].map((url) => ({ url, type: 'image' }));
+    }
+    case 'image': // SVG
+      return [{ url: attr('href') || attr('xlink:href'), type: 'image' }];
+    case 'video':
+      return [{ url: el.currentSrc, type: 'media' }, { url: attr('src'), type: 'media' },
+        { url: attr('poster'), type: 'image' }];
+    case 'audio':
+      return [{ url: el.currentSrc, type: 'media' }, { url: attr('src'), type: 'media' }];
+    case 'source':
+      return [{ url: attr('src'), type: 'media' }];
+    case 'iframe':
+    case 'frame':
+      return [{ url: attr('src'), type: 'subdocument' }];
+    case 'embed':
+      return [{ url: attr('src'), type: 'object' }];
+    case 'object':
+      return [{ url: attr('data'), type: 'object' }];
+    default:
+      return [{ url: backgroundImageUrl(el), type: 'image' }];
+  }
+}
+
+/**
+ * Network-block candidates for the element's own request, scoped to the site:
+ * its path (or the prefix a refused character leaves), then its whole host.
+ * None when the element makes no http(s) request, when that request's host is
+ * not gate-safe, or when there is no plain, registrable site to scope to — an
+ * unscoped block of a shared CDN path would reach every site. `cosmetic` (the
+ * element's CSS candidates) supplies `previewSelector`, which hides the element
+ * until a reload applies the block. Exported for tests and SW1's gate
+ * cross-check; the dialog offers these from PK2b.
+ */
+export function generateNetworkCandidates(el, cosmetic) {
+  const resource = elementResources(el).find(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol));
+  const domain = siteScope();
+  if (!resource || !domain) return [];
+
+  const candidates = [];
+  for (const scope of ['path', 'host']) {
+    const rule = urlToNetworkPattern(resource.url, { scope, type: resource.type, domain });
+    if (!rule || candidates.some((c) => c.rule === rule)) continue;
+    const base = rule.slice(0, rule.indexOf('$'));
+    const real = !base.includes('/') ? 'host' : base.endsWith('^') ? 'path' : 'prefix';
+    candidates.push({
+      kind: 'network',
+      label: `${NETWORK_LABELS[real]} (${resource.type})`,
+      rule,
+      previewSelector: null,
+      scope: real,
+      count: 1,
+      domain,
+      type: resource.type,
+    });
+  }
+  if (candidates.length > 0) {
+    const previewSelector = (cosmetic || generateSelectors(el))[0]?.selector ?? null;
+    for (const c of candidates) c.previewSelector = previewSelector;
+  }
+  return candidates;
+}
+
+// ---------------------------------------------------------------------------
 // Picker dialog
 // ---------------------------------------------------------------------------
 function openPickerDialog(target) {
@@ -597,7 +756,7 @@ function openPickerDialog(target) {
 
 function updatePickerDialog(dialog) {
   const target = currentNavTarget;
-  const hostname = location.hostname.replace(/^www\./, '');
+  const hostname = siteScope();
   const candidates = generateSelectors(target);
 
   updateHighlight(target);

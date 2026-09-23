@@ -93,8 +93,10 @@ globalThis.ShadowRoot = FakeShadowRoot;
 globalThis.window = { top: globalThis.window ?? {} };
 globalThis.window.top = globalThis.window; // top frame by default
 
-const { generateSelectors, isShadowOnlySelector, savePickerRule, activatePicker, deactivatePicker } =
-  await import('./element-picker.js');
+const {
+  generateSelectors, isShadowOnlySelector, savePickerRule, activatePicker, deactivatePicker,
+  generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector,
+} = await import('./element-picker.js');
 
 /** Dispatch to whatever the picker registered on `document` for `type`. */
 function fireDocEvent(type, event) {
@@ -619,6 +621,359 @@ test('PK1b (didn\'t re-break): valid plain, native :has() and procedural selecto
     }
   });
   assert.deepEqual(sent.map((m) => m.payload.line), selectors.map((s) => `example.test##${s}`));
+});
+
+// PICKER-2026-09 PK2a — network-block candidates for the picked element's own
+// request, and the picker's site scope as the registrable host. Every line
+// must be one SW1's APPEND gate admits, or the user's save is refused; the
+// resource URL (host included) is the page's to choose, so nothing from it may
+// reach the line but a validated host, a gate-safe path and the fixed tail.
+
+/** SW1's network shape, with the picker's fixed `$type,domain=site` tail. */
+const PICKER_NETWORK_LINE =
+  /^\|\|(?:[a-z0-9.-]+|\[[0-9a-f:]+\])(?:\^|\/[\w!%&'()+,\-.:;=@[\]~/]*\^?)\$(?:image|subdocument|media|object),domain=[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+
+/** An element stub whose attributes come from `attrs`. */
+function tagged(tagName, attrs = {}, overrides = {}) {
+  return el({ tagName, getAttribute: (name) => attrs[name] ?? null, ...overrides });
+}
+
+/** Run `fn` with the page's `location.hostname` set to `hostname`. */
+function onSite(hostname, fn) {
+  const saved = globalThis.location.hostname;
+  globalThis.location.hostname = hostname;
+  try {
+    return fn();
+  } finally {
+    globalThis.location.hostname = saved;
+  }
+}
+
+const rulesOf = (candidates) => candidates.map((c) => c.rule);
+
+/**
+ * Open the picker's dialog on `target` the way a click does, with every
+ * control `updatePickerDialog` reads or wires stubbed by selector. Returns the
+ * lookup, so a test can read the rule preview and press Create.
+ */
+function openDialogFor(target) {
+  const controls = new Map();
+  const control = (sel) => {
+    if (!controls.has(sel)) {
+      controls.set(sel, {
+        value: '',
+        checked: sel === '#adblock-scope-site',
+        placeholder: '',
+        textContent: '',
+        innerHTML: '',
+        listeners: new Map(),
+        addEventListener(type, fn) { this.listeners.set(type, fn); },
+      });
+    }
+    return controls.get(sel);
+  };
+  const realCreate = globalThis.document.createElement;
+  globalThis.document.createElement = (tag) =>
+    Object.assign(makeNode(tag), { querySelector: control, querySelectorAll: () => [] });
+  try {
+    activatePicker();
+    Object.assign(target, {
+      closest: () => null,
+      getBoundingClientRect: () => ({ top: 0, left: 0, width: 10, height: 10 }),
+    });
+    globalThis.document.elementFromPoint = () => target;
+    fireDocEvent('click', makeEvent({ type: 'click', clientX: 1, clientY: 1 }));
+  } finally {
+    globalThis.document.createElement = realCreate;
+  }
+  return control;
+}
+
+test('PK2a: an ad image offers a domain-scoped path network candidate', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const img = tagged('IMG', { src: 'https://cdn.ads.example/a/banner.png?bust=1' }, { classList: ['banner'] });
+
+  const network = generateNetworkCandidates(img);
+  // The query is dropped: a cache-busting parameter must not escape the block.
+  assert.deepEqual(rulesOf(network), [
+    '||cdn.ads.example/a/banner.png^$image,domain=example.test',
+    '||cdn.ads.example^$image,domain=example.test',
+  ]);
+  const [path, host] = network;
+  assert.equal(path.kind, 'network');
+  assert.equal(path.scope, 'path');
+  assert.equal(host.scope, 'host');
+  // Each label states the block's real reach.
+  assert.equal(path.label, 'Block request (image)');
+  assert.equal(host.label, 'Block host (image)');
+  assert.equal(path.domain, 'example.test');
+  assert.equal(path.count, 1);
+  // The cosmetic stand-in that hides the element until a reload applies it.
+  assert.equal(path.previewSelector, '.banner');
+});
+
+test('PK2a: a metacharacter in the path truncates to the longest safe prefix (not host-only)', () => {
+  // `$` would open an option list; `*` and `|` are pattern syntax. The cut
+  // keeps the prefix before the first one, strictly narrower than the host.
+  for (const path of ['/a$script/x.png', '/a*b/x.png', '/a|b/x.png']) {
+    const [candidate] = generateNetworkCandidates(tagged('IMG', { src: `https://cdn.ads.example${path}` }));
+    assert.equal(candidate?.rule, '||cdn.ads.example/a$image,domain=example.test', path);
+    assert.equal(candidate.scope, 'prefix', path);
+    assert.equal(candidate.label, 'Block path prefix (image)', path);
+    assert.ok(!candidate.rule.includes('script'), path);
+  }
+  // A prefix of just `/` is the whole host: offered once, as the host.
+  assert.deepEqual(generateNetworkCandidates(tagged('IMG', { src: 'https://cdn.ads.example/$x/y.png' }))
+    .map((c) => [c.rule, c.scope]), [['||cdn.ads.example^$image,domain=example.test', 'host']]);
+});
+
+test('PK2a: a path character the gate refuses truncates even where the URL parser keeps it', () => {
+  // Node's URL percent-encodes `^ { } \`` in a path, a browser's parser has
+  // not always: whatever survives literally, only the gate's class is emitted.
+  const RealURL = globalThis.URL;
+  globalThis.URL = class extends RealURL {
+    get pathname() { return super.pathname.replace(/%(?:5E|7B|7D|60)/gi, decodeURIComponent); }
+  };
+  try {
+    assert.equal(new URL('https://h.example/a{b').pathname, '/a{b'); // the premise
+    for (const ch of ['^', '{', '}', '`']) {
+      const [candidate] = generateNetworkCandidates(tagged('IMG', { src: `https://cdn.ads.example/a${ch}b/x.png` }));
+      assert.equal(candidate?.rule, '||cdn.ads.example/a$image,domain=example.test', ch);
+    }
+  } finally {
+    globalThis.URL = RealURL;
+  }
+});
+
+test('PK2a: a hostile host rejects the candidate', () => {
+  // WHATWG keeps `$ , =` in a hostname, so this whole string is the HOST.
+  const img = tagged('IMG', { src: 'https://x$important,domain=bank.example/p.png' });
+  assert.deepEqual(generateNetworkCandidates(img), []);
+});
+
+test('PK2a: a wildcard host is rejected', () => {
+  assert.deepEqual(generateNetworkCandidates(tagged('IMG', { src: 'https://*/x.png' })), []);
+});
+
+test('PK2a: a data: URL yields no network candidate', () => {
+  for (const src of ['data:image/png;base64,AAAA', 'blob:https://ads.example/1']) {
+    assert.deepEqual(generateNetworkCandidates(tagged('IMG', { src })), [], src);
+  }
+});
+
+test('PK2a: an iframe offers a subdocument network candidate', () => {
+  const frame = tagged('IFRAME', { src: 'https://ads.example/f.html' });
+  assert.equal(generateNetworkCandidates(frame)[0]?.rule, '||ads.example/f.html^$subdocument,domain=example.test');
+});
+
+test('PK2a: each element kind maps to the request it makes, with that request\'s type', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const baseURI = globalThis.document.baseURI;
+  globalThis.document.baseURI = 'https://example.test/articles/';
+  try {
+    const cases = [
+      [tagged('IMG', { src: 'https://ads.example/stale.png' }, { currentSrc: 'https://ads.example/live.png' }),
+        '||ads.example/live.png^$image'],
+      [tagged('IMG', { srcset: 'https://ads.example/a.png 1x, https://ads.example/b.png 2x' }),
+        '||ads.example/a.png^$image'],
+      // No descriptor: the list's comma is not part of the URL.
+      [tagged('IMG', { srcset: 'https://ads.example/c.png, https://ads.example/d.png 2x' }),
+        '||ads.example/c.png^$image'],
+      [tagged('image', { href: 'https://ads.example/svg.png' }), '||ads.example/svg.png^$image'],
+      [tagged('image', { 'xlink:href': 'https://ads.example/svg2.png' }), '||ads.example/svg2.png^$image'],
+      [tagged('VIDEO', {}, { currentSrc: 'https://ads.example/v.mp4' }), '||ads.example/v.mp4^$media'],
+      [tagged('VIDEO', { src: 'https://ads.example/v2.mp4' }), '||ads.example/v2.mp4^$media'],
+      // A stream's blob: is no request; the poster is, and it is an image.
+      [tagged('VIDEO', { poster: 'https://ads.example/poster.jpg' }, { currentSrc: 'blob:https://ads.example/1' }),
+        '||ads.example/poster.jpg^$image'],
+      [tagged('AUDIO', {}, { currentSrc: 'https://ads.example/a.mp3' }), '||ads.example/a.mp3^$media'],
+      [tagged('AUDIO', { src: 'https://ads.example/a2.mp3' }), '||ads.example/a2.mp3^$media'],
+      [tagged('SOURCE', { src: 'https://ads.example/s.mp4' }), '||ads.example/s.mp4^$media'],
+      [tagged('EMBED', { src: 'https://ads.example/x.swf' }), '||ads.example/x.swf^$object'],
+      [tagged('OBJECT', { data: 'https://ads.example/o.swf' }), '||ads.example/o.swf^$object'],
+      [tagged('FRAME', { src: 'https://ads.example/fr.html' }), '||ads.example/fr.html^$subdocument'],
+      // Relative to the document's base URL, as the browser resolves it.
+      [tagged('IFRAME', { src: 'ads/f.html' }), '||example.test/articles/ads/f.html^$subdocument'],
+      [el({ style: { backgroundImage: 'url("https://ads.example/bg.png")' } }), '||ads.example/bg.png^$image'],
+      [el({ style: { backgroundImage: "none, url('https://ads.example/bg2.png')" } }), '||ads.example/bg2.png^$image'],
+      // Serialized with `"` escaped: the escape is undone, not read as a path.
+      [el({ style: { backgroundImage: 'url("https://ads.example/b\\"g.png")' } }), '||ads.example/b%22g.png^$image'],
+    ];
+    for (const [target, expected] of cases) {
+      assert.equal(generateNetworkCandidates(target)[0]?.rule, `${expected},domain=example.test`, expected);
+    }
+
+    // No inline image: the computed style's, where the browser provides one.
+    globalThis.getComputedStyle = () => ({ backgroundImage: 'url(https://ads.example/computed.png)' });
+    assert.equal(generateNetworkCandidates(el())[0]?.rule, '||ads.example/computed.png^$image,domain=example.test');
+  } finally {
+    globalThis.document.baseURI = baseURI;
+    delete globalThis.getComputedStyle;
+  }
+});
+
+test('PK2a: a resource on a non-default port is blocked by host, never by a path that cannot match', () => {
+  // `||ads.example/x.png^` never matches `ads.example:8443/x.png`; the gate
+  // admits no port, and `^` in `||ads.example^` matches the `:`.
+  assert.deepEqual(rulesOf(generateNetworkCandidates(tagged('IMG', { src: 'https://ads.example:8443/x.png' }))),
+    ['||ads.example^$image,domain=example.test']);
+  // The default port is no port.
+  assert.equal(generateNetworkCandidates(tagged('IMG', { src: 'https://ads.example:443/x.png' }))[0]?.rule,
+    '||ads.example/x.png^$image,domain=example.test');
+});
+
+test('PK2a: a public-suffix resource host yields no network candidate', () => {
+  for (const src of ['https://co.uk/banner.png', 'https://github.io/ad.png']) {
+    assert.deepEqual(generateNetworkCandidates(tagged('IMG', { src })), [], src);
+  }
+});
+
+test('PK2a: a picked site that is itself a public suffix gets no network candidate', () => {
+  onSite('github.io', () => {
+    assert.deepEqual(generateNetworkCandidates(tagged('IMG', { src: 'https://cdn.ads.example/a.png' })), []);
+  });
+});
+
+test('PK2a: urlToNetworkPattern emits nothing the gate would refuse, whatever it is handed', () => {
+  const url = 'https://cdn.ads.example/a.png';
+  assert.equal(urlToNetworkPattern(url, { type: 'image', domain: 'example.test' }),
+    '||cdn.ads.example/a.png^$image,domain=example.test');
+  // `domain=` is exactly one plain, registrable hostname: no list, negation,
+  // upper case, trailing dot or suffix.
+  for (const domain of ['co.uk', 'a.example|b.example', '~a.example', 'a.example,b.example', 'Example.test', 'a.example.']) {
+    assert.equal(urlToNetworkPattern(url, { type: 'image', domain }), null, domain);
+  }
+  // The type comes from a closed set, never from page text.
+  for (const type of ['important', 'image,domain=bank.example', 'IMAGE', undefined]) {
+    assert.equal(urlToNetworkPattern(url, { type, domain: 'example.test' }), null, String(type));
+  }
+  // Only a web request: another scheme's host would still anchor `||host`.
+  for (const other of ['ftp://ads.example/x.png', 'ws://ads.example/x', 'chrome-extension://abcdef/x.png']) {
+    assert.equal(urlToNetworkPattern(other, { type: 'image', domain: 'example.test' }), null, other);
+  }
+});
+
+test('PK2a: with no plain site to scope to, no network candidate is offered', () => {
+  // An unscoped block of a shared CDN path would reach every site.
+  for (const site of ['', '[::1]']) {
+    onSite(site, () => {
+      assert.deepEqual(generateNetworkCandidates(tagged('IMG', { src: 'https://cdn.ads.example/a.png' })), [], site);
+    });
+  }
+});
+
+test('PK2a: on www.ck the cosmetic scope is www.ck, never the suffix ck', () => {
+  resetPickerEnv();
+  const target = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['ad-slot'] });
+  docState.byLevel = new Map([['.ad-slot', [target]]]);
+  try {
+    onSite('www.ck', () => {
+      // `ck` is a suffix (`*.ck`) and `www.ck` the list's exception back out
+      // of it: a `ck##` hide would reach every .ck site.
+      for (const c of generateSelectors(target)) assert.equal(c.domain, 'www.ck', c.selector);
+
+      const control = openDialogFor(target);
+      assert.equal(control('#adblock-rule-preview').textContent, 'www.ck##.ad-slot');
+      const sent = [];
+      globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return new Promise(() => {}); } } };
+      control('#adblock-picker-custom').value = '.ad-slot';
+      control('#adblock-picker-create').listeners.get('click')();
+      assert.deepEqual(sent.map((m) => m.payload.line), ['www.ck##.ad-slot']);
+    });
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+test('PK2a: on www.ck a network candidate is scoped domain=www.ck', () => {
+  onSite('www.ck', () => {
+    const network = generateNetworkCandidates(tagged('IMG', { src: 'https://cdn.ads.example/a.png' }));
+    assert.deepEqual(rulesOf(network), [
+      '||cdn.ads.example/a.png^$image,domain=www.ck',
+      '||cdn.ads.example^$image,domain=www.ck',
+    ]);
+  });
+});
+
+test('PK2a (didn\'t re-break): on www.example.com the scope is still example.com', () => {
+  resetPickerEnv();
+  const target = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['ad-slot'] });
+  docState.byLevel = new Map([['.ad-slot', [target]]]);
+  try {
+    onSite('www.example.com', () => {
+      for (const c of generateSelectors(target)) assert.equal(c.domain, 'example.com', c.selector);
+      assert.equal(openDialogFor(target)('#adblock-rule-preview').textContent, 'example.com##.ad-slot');
+      assert.equal(generateNetworkCandidates(target)[0]?.rule, '||cdn.ads.example/a.png^$image,domain=example.com');
+    });
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+test('PK2a (Rec2): a real CSS.escape over hostile page text emits only gate-shaped lines', () => {
+  const identity = globalThis.CSS.escape;
+  globalThis.CSS.escape = cssEscape;
+  try {
+    docState.byLevel = new Map();
+    docState.all = [];
+    const target = tagged('IMG', {
+      src: 'https://cdn.ads.example/a$important,domain=bank.example/x.png',
+      'data-ad': 'a"]',
+      'aria-label': 'x#@#y',
+    }, {
+      id: 'ad##x',
+      // Single-class candidates come from the first four classes only.
+      classList: ['x#@#y', '$image,domain=bank', 'ad{x', 'clean'],
+      textContent: '$image,domain=bank',
+    });
+    const cosmetic = generateSelectors(target);
+    const network = generateNetworkCandidates(target, cosmetic);
+
+    assert.ok(cosmetic.some((c) => c.selector === '.clean'), 'cosmetic candidates still offered');
+    for (const { selector } of cosmetic) {
+      const line = `example.test##${selector}`;
+      // `##` stays the line's only marker: `#@#`, `#?#`, `#$#`, `#%#` or
+      // `#+js(` anywhere re-routes the line in the compiler.
+      assert.equal(line.split('##').length, 2, line);
+      assert.doesNotMatch(line, /#[@?$%+]/, line);
+      assert.doesNotMatch(selector, /[{};]/, line);
+    }
+    // The page's `$important,domain=bank.example` never becomes options.
+    assert.deepEqual(rulesOf(network), [
+      '||cdn.ads.example/a$image,domain=example.test',
+      '||cdn.ads.example^$image,domain=example.test',
+    ]);
+    for (const { rule } of network) assert.match(rule, PICKER_NETWORK_LINE, rule);
+  } finally {
+    globalThis.CSS.escape = identity;
+  }
+});
+
+// Invisible characters spelled out, so a failure names the case.
+const printable = (s) => s.replace(/[^\x20-\x7e]/g, (c) => `\\u{${c.codePointAt(0).toString(16)}}`);
+const NEL = String.fromCharCode(0x85); // Rust's trim strips it; JS `trim()` keeps it
+
+test('PK2a (didn\'t re-break): the compiler mirror still refuses NUL and blank selectors on its own', () => {
+  // Pinned directly, not only through a save: a stricter check put in front
+  // of it would hide these rules from every save-level test.
+  for (const selector of [`.a${String.fromCharCode(0)}b`, NEL, ' ']) {
+    assert.equal(compilerKeepsSelector(selector), false, printable(selector));
+  }
+  for (const selector of ['.a', `${NEL}.a${NEL}`, 'div:has-text(a;b)']) {
+    assert.equal(compilerKeepsSelector(selector), true, printable(selector));
+  }
+});
+
+test('PK2a (didn\'t re-break): a plain div offers cosmetic candidates and no network candidate', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const div = el({ tagName: 'DIV', classList: ['ad-slot'] });
+  const cosmetic = generateSelectors(div);
+  assert.ok(cosmetic.some((c) => c.selector === '.ad-slot'), 'the class candidate is still offered');
+  assert.ok(cosmetic.every((c) => c.kind === 'cosmetic'));
+  assert.deepEqual(generateNetworkCandidates(div), []);
 });
 
 // §4.24 — ACTIVATE_PICKER is broadcast to every frame; a page with 15 iframes

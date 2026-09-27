@@ -1589,6 +1589,51 @@ test('PK2b: a bare element with no hide to preview still saves its network block
   }
 });
 
+// A page for the `:has-text()` count (review R7), which reads the document's
+// text nodes rather than each element's `textContent`. `page(tag, props,
+// kids)` builds an element whose kids are elements or strings (text nodes);
+// its `textContent` is derived from them as the DOM derives it, and every read
+// of it, or of a node's `parentElement`, is counted in `pageReads`.
+const pageReads = { textContent: 0, parentElement: 0 };
+function page(tagName, props = {}, kids = []) {
+  const nodes = kids.map((k) => (typeof k === 'string' ? { nodeType: 3, data: k } : k));
+  const node = el({ tagName, ...props, nodeType: 1, childNodes: nodes, children: nodes.filter((n) => n.nodeType === 1) });
+  node.matches = (sel) => matchesSimple(node, sel);
+  Object.defineProperty(node, 'textContent', {
+    get() {
+      pageReads.textContent++;
+      return nodes.map((n) => (n.nodeType === 1 ? n.textContent : n.data)).join('');
+    },
+  });
+  for (const kid of nodes) {
+    let parent = node;
+    Object.defineProperty(kid, 'parentElement', {
+      get() { pageReads.parentElement++; return parent; },
+      set(value) { parent = value; },
+      configurable: true,
+    });
+  }
+  return node;
+}
+/** Run `fn` with `roots` as the document's content (under documentElement). */
+function onPage(roots, fn) {
+  const docEl = globalThis.document.documentElement;
+  docEl.nodeType = 1;
+  docEl.childNodes = roots;
+  for (const root of roots) root.parentElement = null;
+  pageReads.textContent = 0;
+  pageReads.parentElement = 0;
+  try {
+    return fn();
+  } finally {
+    delete docEl.childNodes;
+  }
+}
+/** Every element under `root`, in document order. */
+const elementsIn = (root) => [root, ...root.children.flatMap(elementsIn)];
+/** The engine's `:has-text()` test, as cosmetic-engine.js runs it. */
+const engineHasText = (node, arg) => new RegExp(arg.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(node.textContent);
+
 // PICKER-2026-09 PK3 — procedural candidates: `:has-text()` from the element's
 // own text, native `:has(> child)` for a container whose child makes the ad
 // request, and `:upward(1)` to hide the container. Page text becomes the
@@ -1596,16 +1641,18 @@ test('PK2b: a bare element with no hide to preview still saves its network block
 // turns into the engine's regex form or trips the gate.
 
 test('PK3: an element with text but no id or stable class offers a :has-text candidate with a real count', () => {
-  const target = el({ tagName: 'DIV', textContent: '  Sponsored\n  by Acme' });
+  const target = page('DIV', {}, ['  Sponsored\n  by Acme']);
   // The engine matches every div whose text holds the argument, case-blind:
   // the wrapper counts, the unrelated div does not.
-  const wrapper = el({ tagName: 'DIV', textContent: 'news SPONSORED by Acme more' });
-  const other = el({ tagName: 'DIV', textContent: 'Weather' });
-  docState.byLevel = new Map([['div', [wrapper, target, other]]]);
+  const wrapper = page('DIV', {}, ['news SPONSORED ', page('SPAN', {}, ['by Acme']), target, ' more']);
+  const other = page('DIV', {}, ['Weather']);
+  docState.byLevel = new Map();
   docState.all = [];
-  const c = generateSelectors(target).find((x) => x.selector.includes(':has-text('));
+  const c = onPage([page('MAIN', {}, [wrapper, other])],
+    () => generateSelectors(target).find((x) => x.selector.includes(':has-text(')));
   assert.equal(c?.selector, 'div:has-text(Sponsored)');
   assert.equal(c.count, 2);
+  assert.deepEqual(new Set(c.matches), new Set([wrapper, target]));
 });
 
 test('PK3: :has-text text is cut where it could close the operator, and refused when too short', () => {
@@ -1684,12 +1731,12 @@ test('PK3: :upward(1) blocks the container, with the containers counted', () => 
 });
 
 test('PK3: a text candidate ranks above a positional path, and a clean id still first', () => {
-  const link = tree('A', { textContent: 'Sponsored' });
-  tree('UL', {}, [tree('LI'), tree('LI', {}, [link])]);
+  const link = page('A', {}, ['Sponsored']);
+  const list = page('UL', {}, [page('LI'), page('LI', {}, [link])]);
   const path = 'ul > li:nth-of-type(2) > a';
   docState.byLevel = new Map([['a', [link]], [path, [link]]]);
   docState.all = [];
-  const order = generateSelectors(link).map((c) => c.selector);
+  const order = onPage([list], () => generateSelectors(link).map((c) => c.selector));
   assert.ok(order.indexOf('a:has-text(Sponsored)') > -1 && order.indexOf('a:has-text(Sponsored)') < order.indexOf(path),
     order.join(' | '));
 
@@ -1701,13 +1748,13 @@ test('PK3: a text candidate ranks above a positional path, and a clean id still 
 
 test('PK3: the dialog previews and sends a :has-text candidate', () => {
   resetPickerEnv();
-  const target = el({ tagName: 'DIV', textContent: 'Sponsored' });
+  const target = page('DIV', {}, ['Sponsored']);
   docState.byLevel = new Map([['div', [target]]]);
   const sent = [];
   globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return new Promise(() => {}); } } };
   try {
-    const control = openDialogFor(target);
-    const index = generateSelectors(target).findIndex((c) => c.selector === 'div:has-text(Sponsored)');
+    const [control, index] = onPage([page('MAIN', {}, [target])], () => [openDialogFor(target),
+      generateSelectors(target).findIndex((c) => c.selector === 'div:has-text(Sponsored)')]);
     // The browser cannot run `:has-text(`: the preview says who will.
     assert.match(control('#adblock-picker-preview').innerHTML, /1 element will be hidden by the page's rule engine/);
     control('input[type="radio"]:checked').value = String(index);
@@ -1845,10 +1892,16 @@ test('R4: Create on a network candidate marks the element the dialog was opened 
 test('PK5: a procedural candidate previews the set it would hide, wrapper included, and every mark goes', async () => {
   resetPickerEnv();
   clearSheets();
-  const target = markable({ tagName: 'DIV', textContent: 'Sponsored' });
-  const wrapper = markable({ tagName: 'DIV', textContent: 'news Sponsored more' });
-  const other = markable({ tagName: 'DIV', textContent: 'Weather' });
+  const marks = () => {
+    const attrs = new Map();
+    return { attrs, setAttribute: (n, v) => attrs.set(n, v), removeAttribute: (n) => attrs.delete(n) };
+  };
+  const target = page('DIV', marks(), ['Sponsored']);
+  const wrapper = page('DIV', marks(), ['news ', target, ' more']);
+  const other = page('DIV', marks(), ['Weather']);
   docState.byLevel = new Map([['div', [wrapper, target, other]]]);
+  const docEl = globalThis.document.documentElement;
+  docEl.childNodes = [page('MAIN', {}, [wrapper, other])];
   try {
     openDialogFor(target);
     // The engine's `div:has-text(Sponsored)` hides the wrapper too: the user sees it go.
@@ -1876,6 +1929,7 @@ test('PK5: a procedural candidate previews the set it would hide, wrapper includ
     // The engine applies a procedural rule from the saved line: no CSS for it.
     assert.doesNotMatch(appliedCss(), /has-text/);
   } finally {
+    delete docEl.childNodes;
     resetPickerEnv();
   }
 });
@@ -2184,4 +2238,83 @@ test('R12: toggling "Apply only to" redraws the rule line, for a hide, a network
   } finally {
     resetPickerEnv();
   }
+});
+
+// Review R7 — the `:has-text()` count read `textContent` for every element of
+// the tag, and each read walks that element's whole subtree: on a deep page
+// that is quadratic, and it ran on every pick. It also lower-cased with
+// `toLowerCase()`, where the engine tests `new RegExp(arg, 'i')`, which folds
+// one UTF-16 unit at a time and never maps a non-ASCII character to ASCII
+// (the Kelvin sign is not `k`). The count now comes from one pass over the
+// document's text nodes: each occurrence, overlapping ones and ones that span
+// several nodes included, and the ancestors of the tag holding it.
+
+test('R7: the :has-text count and set equal the engine\'s on a nested page', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const k = String.fromCharCode(0x212a); // KELVIN SIGN
+  const target = page('DIV', {}, ['Book deal']);
+  const root = page('MAIN', {}, [
+    page('DIV', {}, ['x ', page('DIV', {}, [target]), ' y']), // nested wrappers
+    page('DIV', {}, ['BOOK DEAL']), // case-blind
+    page('DIV', {}, ['Boo', page('B', {}, ['k d']), 'eal']), // spans three text nodes
+    page('DIV', {}, ['Boo', page('DIV', {}, ['k deal'])]), // spans into a child div, which alone lacks it
+    page('DIV', {}, [`Boo${k} deal`]), // the engine's /i does not fold K to k
+    page('SECTION', {}, ['Book deal']), // another tag
+    page('DIV', {}, ['Book dea']), page('DIV', {}, ['l']), // split across siblings
+    page('DIV', {}, []),
+  ]);
+  const c = onPage([root], () => generateSelectors(target).find((x) => x.selector.includes(':has-text(')));
+  assert.equal(c?.selector, 'div:has-text(Book deal)');
+  const expected = elementsIn(root).filter((n) => n.tagName === 'DIV' && engineHasText(n, 'Book deal'));
+  assert.equal(expected.length, 6); // the premise: the fixture exercises each case
+  assert.deepEqual(new Set(c.matches), new Set(expected));
+  assert.equal(c.count, expected.length);
+});
+
+test('R7: overlapping occurrences are all found, as each element tests its own text', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  // The page reads `ababab`; a scan that resumes after each match finds only
+  // the `abab` at 0, which the inner div does not hold.
+  const inner = page('DIV', {}, ['abab']);
+  const outer = page('DIV', {}, ['ab', inner]);
+  const c = onPage([page('MAIN', {}, [outer])],
+    () => generateSelectors(inner).find((x) => x.selector.includes(':has-text(')));
+  assert.equal(c?.selector, 'div:has-text(abab)');
+  assert.deepEqual(new Set(c.matches), new Set([outer, inner]));
+});
+
+test('R7: the count is one pass, whatever the depth: no textContent per element', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const depth = 400;
+  let node = page('DIV', {}, ['Sponsored']);
+  const target = node;
+  // Every level holds the text as well: an occurrence per level, each of
+  // whose climbs must stop where an earlier one passed.
+  for (let i = 0; i < depth - 1; i++) node = page('DIV', {}, ['Sponsored ', node]);
+  const c = onPage([page('MAIN', {}, [node])], () => {
+    const found = generateSelectors(target).find((x) => x.selector.includes(':has-text('));
+    return { found, reads: { ...pageReads } };
+  });
+  assert.equal(c.found?.count, depth);
+  // The picked element's own text is read once for the argument; the prior
+  // count read every div's, each read walking its subtree (about 80,000 here).
+  assert.ok(c.reads.textContent <= 2, `textContent reads: ${c.reads.textContent}`);
+  assert.ok(c.reads.parentElement <= 4 * depth, `parentElement reads: ${c.reads.parentElement}`);
+});
+
+test('R7: the picker\'s own dialog and toast are not counted', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const target = page('DIV', {}, ['Sponsored']);
+  // The dialog lists the picked element's text; the page will not hold it.
+  const dialog = page('DIV', { id: '__adblock_picker_dialog__' }, [page('DIV', {}, ['Sponsored'])]);
+  // And the toast a save leaves up for three seconds names the rule.
+  const toastClasses = Object.assign(['__adblock_picker_toast__'], { contains(c) { return this.includes(c); } });
+  const toast = page('DIV', { classList: toastClasses }, ['Rule saved: ##div:has-text(Sponsored)']);
+  const c = onPage([page('MAIN', {}, [target]), dialog, toast],
+    () => generateSelectors(target).find((x) => x.selector.includes(':has-text(')));
+  assert.deepEqual(c?.matches, [target]);
 });

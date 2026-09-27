@@ -825,6 +825,67 @@ function isDocumentRoot(node) {
   return !node || node === document.body || node === document.documentElement || tag === 'body' || tag === 'html';
 }
 
+// The engine's own escaping (cosmetic-engine.js): its `:has-text(x)` is
+// `new RegExp(escapeRegex(x), 'i').test(el.textContent)`.
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// The picker's own nodes: gone by the time the engine runs a saved rule.
+const PICKER_OWN_IDS = new Set([PICKER_DIALOG_ID, PICKER_OVERLAY_ID, PICKER_HIGHLIGHT_ID, PICKER_STYLE_ID,
+  PREVIEW_SHEET_ID, APPLIED_SHEET_ID]);
+
+/**
+ * The elements the engine's `tag:has-text(text)` hides: every `tag` element in
+ * the document (not in a shadow root: the engine seeds from
+ * `document.querySelectorAll`) whose `textContent` the engine's case-blind
+ * regex matches. Reading `textContent` per element walks each subtree again,
+ * quadratic on a deep page, so this makes one pass instead (review R7): the
+ * document's text nodes joined in order, as every element's `textContent` is
+ * a slice of that string; each occurrence of the pattern in it, overlapping
+ * ones included; and for each, the ancestors whose slice holds all of it,
+ * climbing from the node holding its last character and stopping at one
+ * already climbed. The `/i` flag folds one UTF-16 unit at a time, so a match
+ * in the joined string is a match in any slice that covers it.
+ */
+function hasTextMatches(tag, text) {
+  const texts = [];
+  const starts = new Map();
+  let joined = '';
+  const stack = [document.documentElement];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node?.nodeType === 3 || node?.nodeType === 4) {
+      texts.push({ start: joined.length, node });
+      joined += node.data;
+    } else if (node && (node === document.documentElement || node.nodeType === 1) && !PICKER_OWN_IDS.has(node.id) &&
+      !node.classList?.contains?.('__adblock_picker_toast__')) {
+      starts.set(node, joined.length);
+      const kids = node.childNodes ?? [];
+      for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+  }
+
+  const matched = [];
+  const climbed = new Set();
+  const pattern = new RegExp(escapeRegex(text), 'gi');
+  let t = 0;
+  for (let m = pattern.exec(joined); m; m = pattern.exec(joined)) {
+    const first = m.index;
+    const last = first + m[0].length - 1;
+    pattern.lastIndex = first + 1;
+    while (t + 1 < texts.length && texts[t + 1].start <= last) t++;
+    for (let e = texts[t].node.parentElement; e && !climbed.has(e); e = e.parentElement) {
+      const start = starts.get(e);
+      if (start === undefined) break;
+      if (start > first) continue; // below the node holding all of it
+      climbed.add(e);
+      if (e.matches?.(tag)) matched.push(e);
+    }
+  }
+  return matched;
+}
+
 /**
  * `:has-text()` and `:has(> child)` for an element whose own names are weak (no
  * id, no class but hashed ones), and `:upward(1)` to block its container.
@@ -843,11 +904,7 @@ function addProceduralCandidates(el, classes, candidates, add) {
   if (weak && tag) {
     const text = escapeHasTextArg(el.textContent);
     if (text) {
-      // The engine's test: a case-blind substring of the element's text.
-      const needle = text.toLowerCase();
-      const matched = deepQuerySelectorAll(tag)
-        .filter((m) => String(m.textContent ?? '').toLowerCase().includes(needle));
-      add(':has-text', `${tag}:has-text(${text})`, 'page', matched);
+      add(':has-text', `${tag}:has-text(${text})`, 'page', hasTextMatches(tag, text));
     }
     const child = Array.from(el.children ?? []).find((c) =>
       elementResources(c).some(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol)));
@@ -1562,6 +1619,14 @@ export async function savePickerRule(rule, selector, hostname, dialog, kind = 'c
 const NOT_PICKER_UI = [PICKER_DIALOG_ID, PICKER_OVERLAY_ID, PICKER_HIGHLIGHT_ID]
   .map((id) => `:not(#${id}):not(#${id} *)`).join('') + ':not(.__adblock_picker_toast__)';
 
+// Known limit (review R6): these sheets are author-origin CSS, and an inline
+// `style="display: block !important"` on the element outranks an author
+// `!important` rule, so on such an element the preview, and the hide after a
+// save, show nothing until the reload. The engine injects the saved rule as
+// user-origin CSS (`insertCSS` with `origin: 'USER'`), whose `!important`
+// outranks every author declaration, inline included: the rule does apply.
+// Only a user-origin sheet would close the gap, and a content script cannot
+// add one (PICKER-2026-09 §6).
 function hideRule(selector) {
   return `:is(${selector})${NOT_PICKER_UI} { display: none !important; }`;
 }

@@ -95,7 +95,7 @@ globalThis.window.top = globalThis.window; // top frame by default
 
 const {
   generateSelectors, isShadowOnlySelector, savePickerRule, activatePicker, deactivatePicker,
-  generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector, looksHashed, selectorScore,
+  generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector, compilerKeepsAsCss, looksHashed, selectorScore,
   candidateLine, escapeHasTextArg,
 } = await import('./element-picker.js');
 
@@ -1875,4 +1875,78 @@ test('R1: :upward(1) is not offered when any match\'s container is a document ro
   // Didn't re-break: without the body child, the container rule is offered.
   docState.byLevel = new Map([['.promo', [target, third]]]);
   assert.ok(generateSelectors(target).some((c) => c.selector === '.promo:upward(1)'));
+});
+
+// Review R3 — the engine compiles a plain selector only if Rust's
+// `is_css_safe_selector` passes it: balanced brackets, parens and quotes, no
+// leading combinator, no malformed `*`, no unknown pseudo-element or
+// functional pseudo-class, and no `/*`. It drops the rest without a
+// `droppedLines` entry. The browser's parse, the picker's only other check,
+// accepts several of those (it closes an open bracket or paren at the end of
+// the input, and it reads a comment), so the picker said "Rule saved" for a
+// rule that never ran.
+
+test('R3: a custom selector the browser parses but the engine would drop is refused, and nothing is sent', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ ok: true }); } },
+  };
+  docState.byLevel = new Map();
+  docState.all = [];
+
+  await withBrowserParser(async () => {
+    for (const selector of [
+      '.a/*x*/', // a comment, which in the sheet would swallow the rules after it
+      'div:not(.x', // a paren the browser closes at the end of the input
+      '[title', // ... and a bracket
+      '.a::-webkit-scrollbar', // a pseudo-element the engine does not know
+      'div:has-text(a/*b)', // procedural: SW1's gate refuses a `/*` anywhere
+    ]) {
+      const dialog = makeDialog();
+      await savePickerRule(`example.test##${selector}`, selector, 'example.test', dialog);
+      assert.match(dialog.footerText(), /can.t be saved/, selector);
+    }
+  });
+  // Prior code sent every one.
+  assert.deepEqual(sent, []);
+});
+
+test('R3: a generated candidate the engine would drop is not offered', async () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  // The HTML parser takes any character but whitespace, `/` and `>` into a
+  // tag name, and the picker writes the tag name out raw: `<a:not(x id=ad>`
+  // gave `a:not(x#ad`, which the browser reads with its paren closed.
+  const target = el({ tagName: 'A:NOT(X', id: 'ad', classList: ['clean'] });
+  const offered = await withBrowserParser(() => generateSelectors(target).map((c) => c.selector));
+
+  assert.ok(offered.includes('.clean'), `clean class still offered: ${offered}`);
+  assert.ok(offered.includes('#ad'), `the id still offered: ${offered}`);
+  assert.deepEqual(offered.filter((s) => s.includes('a:not(x')), []);
+});
+
+test('R3: compilerKeepsAsCss mirrors is_css_safe_selector, clause by clause', () => {
+  const refused = [
+    // `/*` anywhere, even quoted or escaped after the slash.
+    '.a/*x*/', 'div /* x */ .b', '[title="/*"]', '.a\\/*b',
+    // A leading combinator or comma, after the trim Rust makes (U+0085 too).
+    '> .a', '+ .a', '~ .a', ', .a', `${String.fromCharCode(0x85)}> .a`,
+    // Unbalanced brackets, parens or quotes, or a nested bracket.
+    'div:not(.x', '.a)', '[a', 'a]', '[a[b]]', '[title="x', "[title='x]",
+    // A `*` glued to a name or a closing bracket, or followed by a stray.
+    'div*', '.a*', '[a]*', ':not(.x)*', '* %', '.a */',
+    // A pseudo-element the engine does not know, however near a known one.
+    '.a::before2', '.a::-webkit-scrollbar', '.a::first-line-x', `.a::bac${String.fromCharCode(0x212a)}drop`,
+    // A functional pseudo-class no browser implements, at any depth.
+    'div:nope(x)', ':not(:bogus(x))',
+    // What the compiler drops outright, and a procedural selector.
+    '.a{', '.a;b', '', ' ', 'div:has-text(x)',
+  ];
+  const kept = [
+    '.ad', 'div *', '.ad > *', '*', '*.a', '* > .a', 'div:has(> img.ad)', 'a:NOT(.b)', '.x::BEFORE',
+    '::part(x)', '.a::before:hover', '[data-x=":bogus("]', '[x=a:bogus(y)]', '[title="*/"]', '.a\\/\\*b', ':is(a, b)',
+    'li:nth-of-type(2) > .a', '.a\\(', ` .a${String.fromCharCode(0x85)}`, '.café',
+  ];
+  for (const selector of refused) assert.equal(compilerKeepsAsCss(selector), false, printable(selector));
+  for (const selector of kept) assert.equal(compilerKeepsAsCss(selector), true, printable(selector));
 });

@@ -12,7 +12,7 @@
  *  6. ESC or ✕ cancels without saving
  */
 
-import { isProceduralSelector, PROC_OP_REGEX } from '../shared/proc-ops.js';
+import { isProceduralSelector, PROC_OP_REGEX, NATIVE_FUNCTIONAL_PSEUDO_CLASSES } from '../shared/proc-ops.js';
 import { normalizeHostname } from '../shared/hostname.js';
 import { isPublicSuffix } from '../shared/psl.js';
 
@@ -392,7 +392,8 @@ export function isShadowOnlySelector(selector) {
  * (REVIEW-2026-09 §3.2) — or the compiler refuses it, without a `droppedLines`
  * entry, so the save would report "Rule saved" for a dead line
  * (PICKER-2026-09 PK1b). And SW1's APPEND gate refuses some lines outright
- * for the characters in them (PK2c).
+ * for the characters in them (PK2c). A plain selector must also pass the
+ * compiler's CSS gate, which is stricter than the browser's parse (review R3).
  *
  * A procedural selector skips the parse test. The browser rejects it
  * whole (`:has-text(` is not CSS), and it never reaches the joined
@@ -403,6 +404,7 @@ export function isShadowOnlySelector(selector) {
 function isSaveableSelector(selector) {
   if (!gateAdmitsSelectorText(selector) || !compilerKeepsSelector(selector)) return false;
   if (isProceduralSelector(selector)) return true;
+  if (!compilerKeepsAsCss(selector)) return false;
   try {
     document.querySelector(selector);
     return true;
@@ -416,12 +418,14 @@ function isSaveableSelector(selector) {
 // and Rust's `str::trim` must agree where it ends (they part on U+0085 and
 // U+FEFF), and the agreed line may hold no control, line or paragraph
 // separator, lone surrogate or extended-syntax marker (`#@ #? #$ #% #+`), nor
-// end in an odd run of backslashes. A cosmetic line is `site##` and then the
+// end in an odd run of backslashes; and the selector may hold no `/*`, even
+// in a procedural one. A cosmetic line is `site##` and then the
 // selector, so the selector's end is the line's (PICKER-2026-09 PK2c).
 function gateAdmitsSelectorText(selector) {
   const stored = selector.trimEnd();
   if (stored !== selector.replace(/\p{White_Space}+$/u, '')) return false;
   if (/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(stored) || /#[@?$%+]/.test(`#${stored}`)) return false;
+  if (selector.includes('/*')) return false;
   return stored.match(/\\*$/)[0].length % 2 === 0;
 }
 
@@ -474,6 +478,87 @@ function semicolonsInProcOpArgs(s) {
     idx = i;
   }
   return true;
+}
+
+// Mirrors `is_css_safe_selector` in wasm-core/src/lib.rs, the source of truth
+// for which plain selectors compile to CSS: change the two together. The
+// engine drops the rest without a `droppedLines` entry, and the browser parses
+// several of them: it closes an open bracket, paren or string at the end of
+// the input, reads a `/*` as a comment (one that in the joined sheet swallows
+// every rule after it) and knows pseudo-elements the engine does not (review
+// R3). Exported so a test pins the mirror directly, and the cross-check pins it
+// against the WASM build.
+export function compilerKeepsAsCss(selector) {
+  const s = selector.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+  return !s.includes('/*') && compilerKeepsSelector(s) && !isProceduralSelector(s) &&
+    hasBalancedDelimiters(s) && !hasInvalidUniversalUsage(s) && !/^[>+~,]/.test(s);
+}
+
+// `has_balanced_selector_delimiters`: brackets, parens and quotes all close,
+// skipping escapes and quoted text, with no bracket inside another.
+function hasBalancedDelimiters(s) {
+  let brackets = 0;
+  let parens = 0;
+  let quote = null;
+  let escaped = false;
+  for (const ch of s) {
+    if (escaped) escaped = false;
+    else if (ch === '\\') escaped = true;
+    else if (quote) { if (ch === quote) quote = null; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '[') { if (brackets++ > 0) return false; }
+    else if (ch === ']') { if (brackets-- === 0) return false; }
+    else if (ch === '(') parens++;
+    else if (ch === ')') { if (parens-- === 0) return false; }
+    else if (ch === '{' || ch === '}') return false;
+  }
+  return quote === null && brackets === 0 && parens === 0;
+}
+
+// Rust's `KNOWN_PSEUDO_ELEMENTS`, matched ASCII case-blind.
+const KNOWN_PSEUDO_ELEMENTS = ['::before', '::after', '::first-line', '::first-letter', '::selection',
+  '::backdrop', '::placeholder', '::marker', '::cue', '::slotted', '::part', '::file-selector-button'];
+
+const asciiLower = (s) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+// `has_invalid_universal_usage`, walked by code point as Rust walks chars: a
+// `*` glued to a name or a closing bracket or followed by a stray, an unknown
+// pseudo-element (a known name must not run on into an identifier), a
+// functional pseudo-class no browser implements, or a stray `]` or `)`.
+function hasInvalidUniversalUsage(s) {
+  const chars = [...s];
+  let brackets = 0;
+  let parens = 0;
+  let quote = null;
+  let escaped = false;
+  let prev = null;
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const before = prev;
+    prev = ch;
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '[') brackets++;
+    else if (ch === ']') { if (--brackets < 0) return true; }
+    else if (ch === '(') parens++;
+    else if (ch === ')') { if (--parens < 0) return true; }
+    else if (ch === '*' && brackets === 0 && parens === 0) {
+      if (before !== null && /[A-Za-z0-9_\-)\]]/.test(before)) return true;
+      const next = chars.slice(i + 1).find((c) => !/\p{White_Space}/u.test(c));
+      if (next !== undefined && !/[A-Za-z0-9#.[:>+~,]/.test(next)) return true;
+    } else if (ch === ':' && chars[i + 1] === ':') {
+      const rest = chars.slice(i).join('');
+      const known = KNOWN_PSEUDO_ELEMENTS.some((p) => asciiLower(rest.slice(0, p.length)) === p &&
+        !/^(?:[A-Za-z0-9_\\-]|[^\0-\x7f])/u.test(rest.slice(p.length)));
+      if (!known) return true;
+    } else if (ch === ':' && brackets === 0 && before !== ':') {
+      const name = /^[A-Za-z_-][A-Za-z0-9_-]*\(/.exec(chars.slice(i + 1).join(''));
+      if (name && !NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(asciiLower(name[0].slice(0, -1)))) return true;
+    }
+  }
+  return false;
 }
 
 /**

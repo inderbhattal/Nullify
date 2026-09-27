@@ -19,6 +19,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { loadServiceWorker } from './sw-harness/sw-loader.mjs';
 
 // The committed gate, taken from a worker loaded the way every SW test loads
@@ -61,7 +64,7 @@ globalThis.CSS = { escape: cssEscape };
 globalThis.window = {};
 globalThis.window.top = globalThis.window;
 
-const { generateSelectors, generateNetworkCandidates, urlToNetworkPattern, candidateLine } =
+const { generateSelectors, generateNetworkCandidates, urlToNetworkPattern, candidateLine, compilerKeepsAsCss } =
   await import('../src/content/element-picker.js');
 
 /** An element stub carrying what the picker reads. */
@@ -130,6 +133,9 @@ const rand = (n) => {
 const randText = (max) => Array.from({ length: 1 + rand(max) }, () => ALPHABET[rand(ALPHABET.length)]).join('');
 // A class token never holds ASCII whitespace: `classList` splits on it.
 const randClass = () => randText(8).replace(/[\t\n\f\r ]/g, '') || 'x';
+// The HTML parser takes any character but whitespace, `/` and `>` into a tag
+// name, and the picker writes the tag name out raw (review R3).
+const randTag = () => `A${randText(4).replace(/[\t\n\f\r />]/g, '')}`.toUpperCase();
 const HASHED = ['css-1x2y3z', 'jsx-2947163892', 'grid-12ab34'];
 
 /** Every line the picker emits for this corpus, by kind. */
@@ -172,7 +178,7 @@ function emittedLines() {
     const classes = [randClass(), randClass(), rand(4) === 0 ? HASHED[rand(3)] : randClass()];
     // Text for `:has-text()`, and a child making an ad request for `:has()`.
     const kids = rand(2) === 0 ? [element('IMG', { src: url }, { classList: [randClass()] })] : [];
-    const el = element(['IMG', 'IFRAME', 'OBJECT', 'DIV'][rand(4)], {
+    const el = element(['IMG', 'IFRAME', 'OBJECT', 'DIV', randTag()][rand(5)], {
       src: url, data: url, 'data-ad': randText(6), 'aria-label': randText(6),
     }, {
       id: rand(3) === 0 ? randText(6) : '',
@@ -224,4 +230,52 @@ test('PK2c: what the picker previews is what the gate stores', () => {
   });
   assert.deepEqual(altered.slice(0, 10).map(printable), [], `${altered.length} cosmetic line(s) altered by the trim`);
   assert.deepEqual(network.filter((line) => line.trim() !== line).map(printable), []);
+});
+
+// Review R3 — the engine compiles a plain selector to CSS only if Rust's
+// `is_css_safe_selector` passes it, and drops the rest without a trace. These
+// run the shipped WASM build, as tests/wasm-parity.test.mjs does, and skip
+// when it is not built. A stale build fails them the way it fails that file:
+// rebuild before reading a failure here as a picker bug.
+const WASM_DIR = fileURLToPath(new URL('../src/shared/wasm/', import.meta.url));
+let wasm = null;
+if (fs.existsSync(`${WASM_DIR}nullify_core.js`) && fs.existsSync(`${WASM_DIR}nullify_core_bg.wasm`)) {
+  wasm = await import(new URL('../src/shared/wasm/nullify_core.js', import.meta.url).href);
+  await wasm.default({ module_or_path: fs.readFileSync(`${WASM_DIR}nullify_core_bg.wasm`) });
+}
+const skipWasm = wasm ? false : 'WASM artifact not built (run `npm run build:wasm`)';
+
+/** The selectors, as the engine trims them, that it would compile to CSS. */
+function engineCss(selectors) {
+  const planned = JSON.parse(wasm.plan_selector_rules_json(JSON.stringify(selectors)));
+  return new Set(planned.cssSelectors);
+}
+const rustTrim = (s) => s.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+
+test('R3: the engine compiles every plain candidate the picker emits as CSS', { skip: skipWasm }, () => {
+  const plain = [...new Set(emittedLines().cosmetic.map((line) => line.slice(line.indexOf('##') + 2))
+    .filter((selector) => !/:(?:has-text|upward)\(/.test(selector)))];
+  assert.ok(plain.length > 5000, `plain selectors: ${plain.length}`);
+  const css = engineCss(plain);
+  const dropped = plain.filter((selector) => !css.has(rustTrim(selector)));
+  assert.deepEqual(dropped.slice(0, 10).map(printable), [], `${dropped.length} selector(s) dropped`);
+});
+
+test('R3: the picker\'s CSS mirror agrees with the engine on every selector', { skip: skipWasm }, () => {
+  const ch = (c) => String.fromCharCode(c);
+  const TOKENS = ['a', 'div', '.x', '#y', '*', ' ', '>', '+', '~', ',', '[', 'a]', '[a="b"]', '"', "'", '(', ')',
+    ':', '::', '::before', '::BEFORE', '::part(', '::-webkit-x', '::before2', ':not(', ':has(', ':nope(',
+    ':nth-child(', ':has-text(', ':hover', '\\', '/', '/*', '*/', '{', ';', '-', '_', '1', '|', '=', ch(0),
+    ch(0x85), ch(0xa0), ch(0x212a), ch(0xe9)];
+  const corpus = Array.from({ length: 30000 }, () =>
+    Array.from({ length: 1 + rand(7) }, () => TOKENS[rand(TOKENS.length)]).join(''));
+  const css = engineCss(corpus);
+  const verdicts = corpus.map((selector) => [selector, css.has(rustTrim(selector))]);
+
+  // Both verdicts, in number, or agreement proves nothing.
+  assert.ok(verdicts.filter(([, kept]) => kept).length > 2000, 'selectors the engine keeps');
+  assert.ok(verdicts.filter(([, kept]) => !kept).length > 2000, 'selectors the engine drops');
+  const disagree = verdicts.filter(([selector, kept]) => compilerKeepsAsCss(selector) !== kept);
+  assert.deepEqual(disagree.slice(0, 10).map(([s, kept]) => `${printable(s)} engine:${kept}`), [],
+    `${disagree.length} disagreement(s)`);
 });

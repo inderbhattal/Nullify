@@ -58,7 +58,7 @@ globalThis.CSS = { escape: cssEscape };
 globalThis.window = {};
 globalThis.window.top = globalThis.window;
 
-const { generateSelectors, generateNetworkCandidates, urlToNetworkPattern } =
+const { generateSelectors, generateNetworkCandidates, urlToNetworkPattern, candidateLine } =
   await import('../src/content/element-picker.js');
 
 /** An element stub carrying what the picker reads. */
@@ -135,11 +135,14 @@ function emittedLines() {
   const network = [];
   const pick = (el) => {
     const candidates = generateSelectors(el);
-    for (const c of candidates) {
-      cosmetic.push(`${c.domain}##${c.selector}`); // "Apply only to <site>"
-      cosmetic.push(`##${c.selector}`); // unchecked
+    // Exactly what the dialog sends, with "Apply only to <site>" checked and not.
+    for (const c of candidates) cosmetic.push(candidateLine(c, c.domain), candidateLine(c, null));
+    for (const n of generateNetworkCandidates(el, candidates)) {
+      for (const line of [candidateLine(n, n.domain), candidateLine(n, null)]) {
+        assert.ok(line, `no line for ${n.rule}`);
+        network.push(line);
+      }
     }
-    for (const n of generateNetworkCandidates(el, candidates)) network.push(n.rule);
   };
 
   for (const site of SITES) {

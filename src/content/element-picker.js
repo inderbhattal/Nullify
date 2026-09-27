@@ -838,6 +838,7 @@ export function generateNetworkCandidates(el, cosmetic) {
       count: 1,
       domain,
       type: resource.type,
+      url: resource.url,
     });
   }
   if (candidates.length > 0) {
@@ -845,6 +846,22 @@ export function generateNetworkCandidates(el, cosmetic) {
     for (const c of candidates) c.previewSelector = previewSelector;
   }
   return candidates;
+}
+
+/**
+ * The line the dialog sends for `candidate`, scoped to `domain` or, when the
+ * user unchecks "Apply only to <site>", to nothing: a hide as `site##selector`, a
+ * network candidate rebuilt from its URL by the same `urlToNetworkPattern`.
+ * Exported so the gate cross-check feeds exactly what the dialog sends
+ * (PICKER-2026-09 PK2b).
+ */
+export function candidateLine(candidate, domain) {
+  if (candidate.kind !== 'network') return buildCosmeticRule(candidate.selector, domain);
+  return urlToNetworkPattern(candidate.url, {
+    scope: candidate.scope === 'host' ? 'host' : 'path',
+    type: candidate.type,
+    domain: domain || undefined,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +888,9 @@ function openPickerDialog(target) {
 function updatePickerDialog(dialog) {
   const target = currentNavTarget;
   const hostname = siteScope();
-  const candidates = generateSelectors(target);
+  const cosmetic = generateSelectors(target);
+  const candidates = [...generateNetworkCandidates(target, cosmetic), ...cosmetic];
+  const scopeOf = () => (dialog.querySelector('#adblock-scope-site')?.checked ? hostname : null);
 
   updateHighlight(target);
   dialog.innerHTML = buildDialogHTML(candidates, target, hostname);
@@ -881,15 +900,14 @@ function updatePickerDialog(dialog) {
     const firstRadio = dialog.querySelector('input[type="radio"]');
     if (firstRadio) {
       firstRadio.checked = true;
-      updatePreview(dialog, candidates[0], hostname);
+      updatePreview(dialog, candidates[0], scopeOf());
     }
   }
 
   // Wire up events
   dialog.querySelectorAll('input[type="radio"]').forEach((radio, i) => {
     radio.addEventListener('change', () => {
-      updatePreview(dialog, candidates[i], hostname);
-      updateCustomInput(dialog, candidates[i].selector, hostname);
+      updatePreview(dialog, candidates[i], scopeOf());
     });
   });
 
@@ -928,13 +946,19 @@ function updatePickerDialog(dialog) {
 
   dialog.querySelector('#adblock-picker-create')?.addEventListener('click', () => {
     const custom = dialog.querySelector('#adblock-picker-custom')?.value?.trim();
-    const selected = dialog.querySelector('input[type="radio"]:checked');
-    const selector = custom || (selected ? selected.value : '');
+    // A typed selector is a hide; otherwise the checked candidate, of its kind.
+    const candidate = custom
+      ? { kind: 'cosmetic', selector: custom }
+      : candidates[Number(dialog.querySelector('input[type="radio"]:checked')?.value)];
+    if (!candidate?.selector && candidate?.kind !== 'network') return;
 
-    if (!selector) return;
-
-    const rule = buildCosmeticRule(selector, dialog.querySelector('#adblock-scope-site')?.checked ? hostname : null);
-    savePickerRule(rule, selector, hostname, dialog);
+    const rule = candidateLine(candidate, scopeOf());
+    if (!rule) return;
+    if (candidate.kind === 'network') {
+      savePickerRule(rule, candidate.previewSelector, hostname, dialog, 'network');
+    } else {
+      savePickerRule(rule, candidate.selector, hostname, dialog);
+    }
   });
 }
 
@@ -945,8 +969,8 @@ function buildDialogHTML(candidates, target, hostname) {
 
   const candidateRows = candidates.slice(0, 8).map((c, i) => `
     <label class="adblock-picker-row">
-      <input type="radio" name="selector" value="${escAttr(c.selector)}" ${i === 0 ? 'checked' : ''}>
-      <span class="adblock-picker-sel">${escHTML(c.selector)}</span>
+      <input type="radio" name="selector" value="${i}" ${i === 0 ? 'checked' : ''}>
+      <span class="adblock-picker-sel">${escHTML(c.kind === 'network' ? `${c.label}: ${c.rule}` : c.selector)}</span>
       <span class="adblock-picker-count ${c.count === 0 ? 'zero' : c.count <= 5 ? 'good' : 'broad'}">
         ${c.count} match${c.count !== 1 ? 'es' : ''}
       </span>
@@ -1123,7 +1147,20 @@ function buildDialogHTML(candidates, target, hostname) {
   `;
 }
 
-function updatePreview(dialog, candidate, hostname) {
+function updatePreview(dialog, candidate, domain) {
+  if (candidate.kind === 'network') {
+    // The resource is already loaded, so the block itself only shows on a
+    // reload; the element is hidden meanwhile (PICKER-2026-09 PK2b).
+    const preview = dialog.querySelector('#adblock-picker-preview');
+    if (preview) {
+      preview.innerHTML = `<div style="font-size:11px;color:#8b949e">${escHTML(candidate.label)}: ` +
+        'blocks the request. It applies now and on every reload.</div>';
+    }
+    const ruleEl = dialog.querySelector('#adblock-rule-preview');
+    if (ruleEl) ruleEl.textContent = candidateLine(candidate, domain) ?? '';
+    return;
+  }
+  const hostname = domain || '';
   updatePreviewForCustom(dialog, candidate.selector, hostname, candidate.count);
   updateCustomInput(dialog, candidate.selector, hostname);
 }
@@ -1186,12 +1223,16 @@ function buildCosmeticRule(selector, domain) {
 // ---------------------------------------------------------------------------
 // Save rule
 // ---------------------------------------------------------------------------
-export async function savePickerRule(rule, selector, hostname, dialog) {
+export async function savePickerRule(rule, selector, hostname, dialog, kind = 'cosmetic') {
   try {
+    // A network line is no selector: the two selector guards below are for
+    // hides; `selector` is then only the element's cosmetic stand-in, hidden
+    // until a reload applies the block (PICKER-2026-09 PK2b).
+    const network = kind === 'network';
     // Every save passes here, and the custom field arrives unvalidated: a
     // selector the browser cannot parse, or the compiler would drop, is never
     // sent (PICKER-2026-09 PK1b).
-    if (!isSaveableSelector(selector)) {
+    if (!network && !isSaveableSelector(selector)) {
       showErrorInDialog(dialog,
         'This selector can\'t be saved: it is not valid CSS, or it contains ' +
         'characters a filter rule cannot carry, such as {, } or ;.');
@@ -1201,7 +1242,7 @@ export async function savePickerRule(rule, selector, hostname, dialog) {
     // A rule that only matches inside shadow roots cannot be applied by
     // document-level CSS — refuse clearly instead of reporting a success
     // that evaporates on reload (§5.30).
-    if (isShadowOnlySelector(selector)) {
+    if (!network && isShadowOnlySelector(selector)) {
       showErrorInDialog(dialog,
         'This element is inside a shadow DOM that page-level rules cannot reach. ' +
         'Pick the outer (shadow host) element instead.');
@@ -1234,7 +1275,7 @@ export async function savePickerRule(rule, selector, hostname, dialog) {
     }
 
     // Immediately hide elements on this page
-    applyRuleImmediately(selector);
+    if (selector) applyRuleImmediately(selector);
 
     // Show success state in dialog
     showSuccessInDialog(dialog, rule);
@@ -1312,8 +1353,4 @@ function escHTML(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
-}
-
-function escAttr(s) {
-  return String(s).replace(/"/g, '&quot;');
 }

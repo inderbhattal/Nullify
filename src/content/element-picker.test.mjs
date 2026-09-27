@@ -96,6 +96,7 @@ globalThis.window.top = globalThis.window; // top frame by default
 const {
   generateSelectors, isShadowOnlySelector, savePickerRule, activatePicker, deactivatePicker,
   generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector, looksHashed, selectorScore,
+  candidateLine,
 } = await import('./element-picker.js');
 
 /** Dispatch to whatever the picker registered on `document` for `type`. */
@@ -293,7 +294,7 @@ test('a second error replaces the first instead of stacking (§5.16)', async () 
  * success toast lands inside the test. Returns the text of every toast
  * mounted; nested timers (the toast's own removal) are captured and dropped.
  */
-async function saveAndFlushToasts(rule, selector, dialog) {
+async function saveAndFlushToasts(rule, selector, dialog, kind) {
   const queued = [];
   const toasts = [];
   const root = globalThis.document.documentElement;
@@ -305,7 +306,7 @@ async function saveAndFlushToasts(rule, selector, dialog) {
     return realAppend.call(this, node);
   };
   try {
-    await savePickerRule(rule, selector, 'example.test', dialog);
+    await savePickerRule(rule, selector, 'example.test', dialog, kind);
     for (const fn of queued.splice(0)) fn();
   } finally {
     globalThis.setTimeout = realSetTimeout;
@@ -873,7 +874,8 @@ test('PK2a: with no plain site to scope to, no network candidate is offered', ()
 
 test('PK2a: on www.ck the cosmetic scope is www.ck, never the suffix ck', () => {
   resetPickerEnv();
-  const target = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['ad-slot'] });
+  // No resource of its own, so a hide is the dialog's first candidate (PK2b).
+  const target = tagged('DIV', {}, { classList: ['ad-slot'] });
   docState.byLevel = new Map([['.ad-slot', [target]]]);
   try {
     onSite('www.ck', () => {
@@ -907,11 +909,12 @@ test('PK2a: on www.ck a network candidate is scoped domain=www.ck', () => {
 test('PK2a (didn\'t re-break): on www.example.com the scope is still example.com', () => {
   resetPickerEnv();
   const target = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['ad-slot'] });
+  const box = tagged('DIV', {}, { classList: ['ad-slot'] }); // a hide first in the dialog (PK2b)
   docState.byLevel = new Map([['.ad-slot', [target]]]);
   try {
     onSite('www.example.com', () => {
       for (const c of generateSelectors(target)) assert.equal(c.domain, 'example.com', c.selector);
-      assert.equal(openDialogFor(target)('#adblock-rule-preview').textContent, 'example.com##.ad-slot');
+      assert.equal(openDialogFor(box)('#adblock-rule-preview').textContent, 'example.com##.ad-slot');
       assert.equal(generateNetworkCandidates(target)[0]?.rule, '||cdn.ads.example/a.png^$image,domain=example.com');
     });
   } finally {
@@ -1459,4 +1462,115 @@ test('the overlay stays mounted once the dialog opens (§5.17)', () => {
   assert.equal(overlay.style.pointerEvents, 'none', 'but no longer eating dialog clicks');
 
   resetPickerEnv();
+});
+
+// PICKER-2026-09 PK2b — the candidate's kind travels through the dialog,
+// preview and save: a network candidate is offered, previewed and sent as
+// its `||…` line, never rebuilt as a `##` rule.
+
+test('PK2b: saving a network candidate sends the network line verbatim', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ error: 'stop' }); } },
+  };
+  // The preview selector matches only inside a shadow root, and a network line
+  // is no CSS the browser parses: both cosmetic guards would refuse it.
+  const hostEl = el();
+  hostEl.shadowRoot = { querySelectorAll: (sel) => (sel === '.banner' ? [el()] : []) };
+  docState.byLevel = new Map();
+  docState.all = [hostEl];
+  const rule = '||cdn.ads.example/a/banner.png^$image,domain=example.test';
+  await withBrowserParser(() => savePickerRule(rule, '.banner', 'example.test', makeDialog(), 'network'));
+  assert.deepEqual(sent.map((m) => m.payload.line), [rule]);
+});
+
+test('PK2b (didn\'t re-break): a cosmetic save still goes through both guards', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ error: 'stop' }); } },
+  };
+  docState.byLevel = new Map();
+  docState.all = [];
+  await withBrowserParser(async () => {
+    const dialog = makeDialog();
+    await savePickerRule('example.test##||x^', '||x^', 'example.test', dialog, 'cosmetic');
+    assert.match(dialog.footerText(), /can.t be saved/);
+  });
+  assert.deepEqual(sent, []);
+});
+
+test('PK2b: the dialog offers the network candidate first and sends its line', () => {
+  resetPickerEnv();
+  const img = tagged('IMG', { src: 'https://cdn.ads.example/a/banner.png' }, { classList: ['banner'] });
+  docState.byLevel = new Map([['.banner', [img]]]);
+  const sent = [];
+  globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return new Promise(() => {}); } } };
+  try {
+    const control = openDialogFor(img);
+    // The best candidate is the network one; its line is the preview.
+    assert.equal(control('#adblock-rule-preview').textContent, '||cdn.ads.example/a/banner.png^$image,domain=example.test');
+    assert.match(control('#adblock-picker-preview').innerHTML, /applies now and on every reload/);
+
+    control('input[type="radio"]:checked').value = '0';
+    control('#adblock-picker-create').listeners.get('click')();
+    // Unchecking "Apply only to <site>" drops the scope, as for a hide.
+    control('#adblock-scope-site').checked = false;
+    control('#adblock-picker-create').listeners.get('click')();
+    // A cosmetic radio still builds a hide.
+    control('input[type="radio"]:checked').value = '2';
+    control('#adblock-scope-site').checked = true;
+    control('#adblock-picker-create').listeners.get('click')();
+    assert.deepEqual(sent.map((m) => m.payload.line), [
+      '||cdn.ads.example/a/banner.png^$image,domain=example.test',
+      '||cdn.ads.example/a/banner.png^$image',
+      'example.test##.banner',
+    ]);
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+test('PK2b: candidateLine builds the line the dialog sends, for either kind', () => {
+  const [network] = generateNetworkCandidates(tagged('IMG', { src: 'https://cdn.ads.example/x.png' }));
+  assert.equal(candidateLine(network, 'example.test'), network.rule);
+  assert.equal(candidateLine(network, null), '||cdn.ads.example/x.png^$image');
+  assert.equal(candidateLine({ kind: 'cosmetic', selector: '.ad' }, 'example.test'), 'example.test##.ad');
+  assert.equal(candidateLine({ kind: 'cosmetic', selector: '.ad' }, null), '##.ad');
+});
+
+test('PK2b: a saved network block hides its element through the preview selector', async () => {
+  globalThis.chrome = { runtime: { sendMessage: () => Promise.resolve({ ok: true, counts: { skippedRules: [] } }) } };
+  const hidden = [];
+  docState.byLevel = new Map([['.banner', [el({ style: { setProperty: (p) => hidden.push(p) } })]]]);
+  docState.all = [];
+  const dialog = makeDialog();
+  await saveAndFlushToasts('||cdn.ads.example/b.png^$image,domain=example.test', '.banner', dialog, 'network');
+  assert.match(dialog.footer.innerHTML, /Rule saved/);
+  assert.deepEqual(hidden, ['display']);
+});
+
+test('PK2b: a bare element with no hide to preview still saves its network block', async () => {
+  // No id, class or attribute: no cosmetic candidate, so no preview selector.
+  // The cosmetic guards would throw on it and the save would never be sent.
+  const sent = [];
+  globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ error: 'stop' }); } } };
+  docState.byLevel = new Map();
+  docState.all = [];
+  const img = tagged('IMG', { src: 'https://cdn.ads.example/bare.png' });
+  const [candidate] = generateNetworkCandidates(img);
+  assert.equal(candidate.previewSelector, null);
+  await savePickerRule(candidate.rule, candidate.previewSelector, 'example.test', makeDialog(), 'network');
+
+  resetPickerEnv();
+  // Through the dialog: Create does not await the save, so a reply that never
+  // settles leaves nothing running after the test.
+  globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return new Promise(() => {}); } } };
+  try {
+    const control = openDialogFor(img);
+    control('input[type="radio"]:checked').value = '0';
+    control('#adblock-picker-create').listeners.get('click')();
+    assert.deepEqual(sent.map((m) => m.payload.line), [candidate.rule, candidate.rule]);
+  } finally {
+    resetPickerEnv();
+  }
 });

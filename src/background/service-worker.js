@@ -935,7 +935,10 @@ function hasInvalidUniversalUsage(selector) {
 function isSafeCssSelector(selector) {
   if (typeof selector !== 'string') return false;
   const trimmed = selector.trim();
+  // Code review R2 — a `/*` opens a comment that swallows every rule after it
+  // in the sheet (the next hide, the exception CSS). Mirrors is_css_safe_selector.
   return !!trimmed &&
+    !trimmed.includes('/*') &&
     !trimmed.includes('{') &&
     !trimmed.includes('}') &&
     !trimmed.includes(';') &&

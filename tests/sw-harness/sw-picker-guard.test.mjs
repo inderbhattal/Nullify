@@ -1085,3 +1085,28 @@ test('SW4 (didn\'t re-break): a Chrome without setAccessLevel starts as before',
     env.teardown();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Code review R2 — a `/*` in a selector opens a CSS comment that swallows every
+// rule after it in the sheet: the next user rule, and the exception CSS. SW1
+// refuses comments on APPEND; the options page reaches the bundler directly.
+// The WASM half needs the artifact rebuilt from wasm-core (is_css_safe_selector).
+// ---------------------------------------------------------------------------
+
+test('R2: a selector holding a CSS comment start never reaches the page CSS', async (t) => {
+  for (const realBundler of [false, true]) {
+    if (realBundler && !wasm) { t.skip(NO_WASM); return; }
+    const tag = realBundler ? 'WASM' : 'JS fallback';
+    await withIndexedWorker(async ({ hooks }) => {
+      const bundle = await hooks.getCosmeticBundleForPage('example.com');
+      for (const [name, css] of [['cssText', bundle.cssText], ['exceptionCss', bundle.exceptionCss]]) {
+        assert.ok(!css.includes('/*'), `${tag}: ${name} must hold no comment start: ${css}`);
+      }
+      const sels = ruleSelectors(bundle.cssText).flat();
+      assert.ok(sels.includes('.next') && sels.includes('.site-ad'), `${tag}: the rules after it still apply: ${bundle.cssText}`);
+      assert.match(bundle.exceptionCss, /\.keep/, `${tag}: the exceptions after it still apply`);
+    }, { realBundler, userCosmeticRules: {
+      generic: ['/*.stale', '.ad /* old', '.next', '.keep'], domainSpecific: {},
+      genericExceptions: ['/* x */.gone', '.keep'], domainExceptions: {} } });
+  }
+});

@@ -2484,7 +2484,11 @@ fn has_invalid_universal_usage(selector: &str) -> bool {
 
 fn is_css_safe_selector(selector: &str) -> bool {
     let trimmed = selector.trim();
-    is_valid_selector(trimmed)
+    // A `/*` opens a CSS comment that runs until the next `*/` anywhere in
+    // the sheet, swallowing every rule after it: the next hide and the
+    // exception CSS. No selector needs one; refused even inside a string.
+    !trimmed.contains("/*")
+        && is_valid_selector(trimmed)
         && !contains_proc_op(trimmed)
         && has_balanced_selector_delimiters(trimmed)
         && !has_invalid_universal_usage(trimmed)
@@ -4947,6 +4951,30 @@ mod tests {
         let widest = semantic_ad_text((SW_CAP_UTF16_UNITS - 9) * 3 + 9, false, "あ");
         assert_eq!(widest.encode_utf16().count(), SW_CAP_UTF16_UNITS);
         assert!(is_semantic_ad(&widest));
+    }
+
+    #[test]
+    fn a_css_comment_start_never_reaches_emitted_css() {
+        // A `/*` in a selector opens a comment that swallows every rule after
+        // it in the same sheet: the next user rule, and the exception CSS.
+        for bad in [".ad /* old", "/**/body", ".a/*x*/.b", "a[title='/*']", "div:not(/* x */.a)"] {
+            assert!(!is_css_safe_selector(bad), "{bad} must be refused");
+        }
+        for ok in ["a[href$='/x']", "div > *", ".a, .b", "a[href*='*/']"] {
+            assert!(is_css_safe_selector(ok), "{ok} must stay CSS-safe");
+        }
+        let bundle = build_page_bundle_internal(
+            vec![],
+            vec![".ad /* old".into(), ".next".into()],
+            vec!["/* x */.keep".into(), ".keep".into()],
+            1,
+        );
+        assert!(!bundle.css_text.contains("/*"), "{}", bundle.css_text);
+        assert!(bundle.css_text.contains(".next"), "{}", bundle.css_text);
+        assert!(!bundle.exception_css.contains("/*"), "{}", bundle.exception_css);
+        assert!(bundle.exception_css.contains(".keep"), "{}", bundle.exception_css);
+        let css = build_css_from_selectors(".ad /* old\n.next", "", 1);
+        assert!(!css.contains("/*") && css.contains(".next"), "{css}");
     }
 }
 

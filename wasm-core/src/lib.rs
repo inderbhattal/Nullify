@@ -2163,6 +2163,12 @@ fn parse_procedural_plan(selector: &str) -> Vec<ProceduralPlanStep> {
     plan
 }
 
+/// Mirrored in JS: the element picker's `compilerKeepsSelector`
+/// (src/content/element-picker.js) applies the same rules so it never offers
+/// a selector this drops, and the service worker's APPEND gate
+/// (`isPickerSafeUserFilterLine`) must admit every line the picker emits.
+/// Change this and update the picker's mirror, re-check the gate, and keep
+/// tests/picker-gate-crosscheck.test.mjs green.
 fn is_valid_selector(selector: &str) -> bool {
     let trimmed = selector.trim();
     if trimmed.is_empty() || trimmed.contains('{') || trimmed.contains('}') {
@@ -2195,6 +2201,10 @@ fn is_valid_selector(selector: &str) -> bool {
 /// drift from the set of operators whose arguments are not CSS. Nested cases
 /// (`div:has(span:has-text(/ad;box/))`) work because the scan finds the
 /// innermost operator opener first and the `;` lives inside its argument.
+///
+/// Mirrored by the picker's `semicolonsInProcOpArgs`
+/// (src/content/element-picker.js); see `is_valid_selector` for what else a
+/// change here must update.
 fn semicolons_confined_to_proc_op_args(selector: &str) -> bool {
     let mut idx = 0;
     while idx < selector.len() {

@@ -598,6 +598,18 @@ function scopableSite() {
 }
 
 /**
+ * `el`'s tag as a type selector, or null. The HTML parser takes any character
+ * but whitespace, `/` and `>` into a tag name, so `<a,b id=ad>` gave the
+ * candidate `a,b#ad`: a selector list hiding every `<a>`, which the browser
+ * and the engine both accept. A tag outside `[a-z][a-z0-9-]*` is never
+ * written; the element's id, classes and attributes still are (review R11).
+ */
+function typeSelector(el) {
+  const tag = String(el?.tagName ?? '').toLowerCase();
+  return /^[a-z][a-z0-9-]*$/.test(tag) ? tag : null;
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
  * Exported for tests.
@@ -633,7 +645,7 @@ export function generateSelectors(el) {
     for (const cls of stableClassesFirst(Array.from(host.classList)).slice(0, 2)) {
       add(`${hostLabel} .${cls}`, `.${escapeIdent(cls)}`);
     }
-    add(`${hostLabel} Tag`, host.tagName.toLowerCase());
+    if (typeSelector(host)) add(`${hostLabel} Tag`, typeSelector(host));
 
     candidates.sort((a, b) => selectorScore(b) - selectorScore(a));
     return candidates;
@@ -645,8 +657,9 @@ export function generateSelectors(el) {
   }
 
   // 2. Tag + ID
-  if (el.id) {
-    add('Tag + ID', `${el.tagName.toLowerCase()}#${escapeIdent(el.id)}`, 'page');
+  const tag = typeSelector(el);
+  if (el.id && tag) {
+    add('Tag + ID', `${tag}#${escapeIdent(el.id)}`, 'page');
   }
 
   // 3. Class combinations (up to 3 most specific classes)
@@ -657,14 +670,14 @@ export function generateSelectors(el) {
       add(`Class .${cls}`, `.${escapeIdent(cls)}`, 'page');
     }
     // Tag + single class
-    for (const cls of classes.slice(0, 3)) {
-      add(`${el.tagName.toLowerCase()}.${cls}`, `${el.tagName.toLowerCase()}.${escapeIdent(cls)}`, 'page');
+    for (const cls of tag ? classes.slice(0, 3) : []) {
+      add(`${tag}.${cls}`, `${tag}.${escapeIdent(cls)}`, 'page');
     }
     // All classes combined
     if (classes.length > 1) {
       const combined = classes.slice(0, 3).map(c => `.${escapeIdent(c)}`).join('');
       add('All classes', combined, 'page');
-      add(`Tag + all classes`, `${el.tagName.toLowerCase()}${combined}`, 'page');
+      if (tag) add(`Tag + all classes`, `${tag}${combined}`, 'page');
     }
   }
 
@@ -675,8 +688,7 @@ export function generateSelectors(el) {
     const val = el.getAttribute(attr);
     if (val) {
       add(`[${attr}="${val}"]`, `[${attr}="${CSS.escape(val)}"]`, 'page');
-      add(`${el.tagName.toLowerCase()}[${attr}="${val}"]`,
-          `${el.tagName.toLowerCase()}[${attr}="${CSS.escape(val)}"]`, 'page');
+      if (tag) add(`${tag}[${attr}="${val}"]`, `${tag}[${attr}="${CSS.escape(val)}"]`, 'page');
     }
   }
 
@@ -825,10 +837,10 @@ function isDocumentRoot(node) {
  */
 function addProceduralCandidates(el, classes, candidates, add) {
   if (isDocumentRoot(el)) return;
-  const tag = el.tagName.toLowerCase();
+  const tag = typeSelector(el);
   const weak = !el.id && classes.every(looksHashed);
 
-  if (weak) {
+  if (weak && tag) {
     const text = escapeHasTextArg(el.textContent);
     if (text) {
       // The engine's test: a case-blind substring of the element's text.
@@ -863,8 +875,9 @@ function simpleSelector(el) {
   if (!el || el === document.body) return null;
   if (el.id) return `#${escapeIdent(el.id)}`;
   const classes = stableClassesFirst(Array.from(el.classList).filter(Boolean)).slice(0, 2);
-  if (classes.length) return `${el.tagName.toLowerCase()}.${classes.map(escapeIdent).join('.')}`;
-  return el.tagName.toLowerCase();
+  const tag = typeSelector(el) ?? '';
+  if (classes.length) return `${tag}.${classes.map(escapeIdent).join('.')}`;
+  return tag || null;
 }
 
 function buildSelectorPath(el, maxDepth) {
@@ -897,7 +910,7 @@ function pinnedStep(el, sel) {
   });
   if (!collides) return sel;
   const k = siblings.filter((s) => s.tagName === el.tagName).indexOf(el) + 1;
-  return `${sel.startsWith('#') ? el.tagName.toLowerCase() : ''}${sel}:nth-of-type(${k})`;
+  return `${sel.startsWith('#') ? typeSelector(el) ?? '' : ''}${sel}:nth-of-type(${k})`;
 }
 
 // ---------------------------------------------------------------------------

@@ -2075,3 +2075,75 @@ test('R5: no candidate carries a scope the gate refuses, of either kind', () => 
     assert.equal(generateNetworkCandidates(img())[0].domain, 'example.test');
   });
 });
+
+// Review R11 — the HTML parser takes any character but whitespace, `/` and `>`
+// into a tag name, and the picker wrote the tag name out raw: `<a,b id=ad>`
+// gave `a,b#ad`, a selector LIST that hides every `<a>` on the site, which
+// both the browser and the engine accept. A tag outside `[a-z][a-z0-9-]*` is
+// now never written; the element's id, classes and attributes still are.
+
+const HOSTILE_TAGS = ['A,B', 'A:HOVER', 'A[X]', 'A*', 'A"B', 'SVG:RECT', 'MY_ELEM', 'A.B', 'A#B', `CAF${String.fromCharCode(0xc9)}`];
+
+test('R11: a tag name outside [a-z][a-z0-9-]* is never written into a candidate', () => {
+  for (const tagName of HOSTILE_TAGS) {
+    const tag = tagName.toLowerCase();
+    docState.byLevel = new Map();
+    docState.all = [];
+    const offered = [];
+
+    // Its own id, class and attribute candidates, each with the tag.
+    const named = tree(tagName, { id: 'ad', classList: ['clean', 'promo'], getAttribute: (n) => (n === 'role' ? 'banner' : null) });
+    tree('SECTION', { classList: ['box'] }, [named]);
+    offered.push(...generateSelectors(named).map((c) => c.selector));
+    assert.ok(offered.includes('#ad') && offered.includes('.clean'), `${tag}: ${offered.join(' | ')}`);
+
+    // Weak names: `tag:has-text()` and `tag:has(> child)`.
+    const kid = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['pic'] });
+    const weak = tree(tagName, { textContent: 'Sponsored story' }, [kid]);
+    tree('SECTION', { classList: ['box'] }, [weak]);
+    docState.byLevel = new Map([[tag, [weak]]]);
+    offered.push(...generateSelectors(weak).map((c) => c.selector));
+
+    // As a path step (with a class, bare, and as a colliding id step), and
+    // as a parent.
+    const leaf = tree('SPAN', { classList: ['leaf'] });
+    const bare = tree(tagName, {}, [leaf]);
+    tree('MAIN', { classList: ['m'] }, [tree(tagName, { classList: ['c'] }, [bare])]);
+    offered.push(...generateSelectors(leaf).map((c) => c.selector));
+    const dup = tree(tagName, { id: 'dup' });
+    tree('SECTION', { classList: ['box'] }, [tree(tagName, { id: 'dup' }), dup]);
+    offered.push(...generateSelectors(dup).map((c) => c.selector));
+
+    // A shadow host, whose tag is one of its only candidates.
+    const host = el({ tagName, classList: ['h'] });
+    const inner = el({ getRootNode: () => new FakeShadowRoot(host) });
+    offered.push(...generateSelectors(inner).map((c) => c.selector));
+
+    // Nor a stand-in: a dropped tag must not leave `null` or `undefined` behind.
+    const raw = offered.filter((s) => s.includes(tag) || /null|undefined/.test(s));
+    assert.deepEqual(raw, [], `${tag}: ${raw.join(' | ')}`);
+  }
+});
+
+test('R11 (didn\'t re-break): a plain or custom-element tag is still written', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const target = tree('AD-SLOT', { id: 'ad', classList: ['clean'] });
+  tree('SECTION', { classList: ['box'] }, [target]);
+  const offered = generateSelectors(target).map((c) => c.selector);
+  for (const s of ['ad-slot#ad', 'ad-slot.clean', 'section.box > #ad']) {
+    assert.ok(offered.includes(s), `${s}: ${offered.join(' | ')}`);
+  }
+  // As a bare path step, and a colliding id step with its tag written out.
+  const leaf = tree('SPAN', { classList: ['leaf'] });
+  tree('MAIN', { classList: ['m'] }, [tree('AD-SLOT', {}, [leaf])]);
+  assert.ok(generateSelectors(leaf).some((c) => c.selector === 'main.m > ad-slot > span.leaf'));
+  const dup = tree('AD-SLOT', { id: 'dup' });
+  tree('SECTION', { classList: ['box'] }, [tree('AD-SLOT', { id: 'dup' }), dup]);
+  assert.ok(generateSelectors(dup).some((c) => c.selector === 'section.box > ad-slot#dup:nth-of-type(2)'));
+  // A weak custom element still gets its text candidate.
+  const weak = tree('AD-SLOT', { textContent: 'Sponsored story' });
+  tree('SECTION', { classList: ['box'] }, [weak]);
+  docState.byLevel = new Map([['ad-slot', [weak]]]);
+  assert.ok(generateSelectors(weak).some((c) => c.selector === 'ad-slot:has-text(Sponsored story)'));
+});

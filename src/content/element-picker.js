@@ -485,12 +485,13 @@ export function generateSelectors(el) {
   const hostname = siteScope();
   const seen = new Set();
 
-  function add(label, selector, scope) {
+  function add(label, selector, scope, knownCount) {
     if (!selector || seen.has(selector)) return;
     // Offer only what can be saved: it parses, and the compiler keeps it.
     if (!isSaveableSelector(selector)) return;
     seen.add(selector);
-    const count = deepQuerySelectorAll(selector).length;
+    // A procedural selector throws in the browser; its caller counts it.
+    const count = knownCount ?? deepQuerySelectorAll(selector).length;
     candidates.push({ kind: 'cosmetic', label, selector, count, scope: scope || 'page', domain: hostname });
   }
 
@@ -576,6 +577,8 @@ export function generateSelectors(el) {
     add('Ancestor path', fullPath, 'page');
   }
 
+  addProceduralCandidates(el, classes, candidates, add);
+
   // Sort: prefer domain-specific medium-count selectors (count 1-5 is ideal)
   candidates.sort((a, b) => {
     const scoreA = selectorScore(a);
@@ -595,9 +598,12 @@ export function generateSelectors(el) {
 // nothing).
 const HASHED_CLASS_PENALTY = 6;
 const POSITIONAL_PENALTY = 60;
+const UPWARD_PENALTY = 10;
 
 /** Exported for tests. */
 export function selectorScore(c) {
+  // (PK3) `:upward(1)` hides the container, not the element picked: it ranks
+  // below the element's own selector.
   // Prefer selectors that match 1-3 elements (specific enough)
   // Penalize 0 (too specific/broken) and large counts (too broad)
   const countScore = c.count === 0 ? -100
@@ -613,7 +619,8 @@ export function selectorScore(c) {
     : 3;
 
   const penalty = (onlyHashedClasses(c.selector) ? HASHED_CLASS_PENALTY : 0) +
-    (c.selector.includes(':nth-of-type(') ? POSITIONAL_PENALTY : 0);
+    (c.selector.includes(':nth-of-type(') ? POSITIONAL_PENALTY : 0) +
+    (/:upward\(/i.test(c.selector) ? UPWARD_PENALTY : 0);
   return countScore + typeScore - penalty;
 }
 
@@ -651,6 +658,75 @@ function onlyHashedClasses(selector) {
   if (/[#[]/.test(selector)) return false;
   const classes = [...selector.matchAll(/\.((?:\\[\s\S]|[^\s.#[\]:>+~,()*|"'=\\])+)/g)].map((m) => m[1]);
   return classes.length > 0 && classes.every(looksHashed);
+}
+
+// ---------------------------------------------------------------------------
+// Procedural candidates (PICKER-2026-09 PK3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The element's own text as a `:has-text()` argument, or null. Page text
+ * becomes the argument, so it is cut at the first character that could close
+ * the operator or open another (`( ) #`), that the compiler refuses (`{ }`),
+ * that escapes (`\`) or starts a comment (`/`), that SW1's gate refuses (a
+ * control, a lone surrogate), or any whitespace but a single space (which
+ * takes U+2028/2029 too). What is left is then a literal piece of the element's own text, so
+ * the engine's case-blind substring test still matches the element it came
+ * from; whitespace is cut, not collapsed, for that reason. A leading `/`, the
+ * engine's regex form (`/.*\/` matches every element), so leaves nothing. At
+ * most 64 characters, cut by code point; fewer than three: refused. Exported
+ * for tests.
+ */
+export function escapeHasTextArg(text) {
+  const trimmed = String(text ?? '').trim();
+  const stop = trimmed.search(/[()#\\{}/\p{Cc}\p{Cs}]|[^\S ]| {2}/u);
+  const arg = [...(stop === -1 ? trimmed : trimmed.slice(0, stop))].slice(0, 64).join('').trimEnd();
+  return [...arg].length >= 3 ? arg : null;
+}
+
+function isDocumentRoot(node) {
+  const tag = node?.tagName?.toLowerCase();
+  return !node || node === document.body || node === document.documentElement || tag === 'body' || tag === 'html';
+}
+
+/**
+ * `:has-text()` and `:has(> child)` for an element whose own names are weak (no
+ * id, no class but hashed ones), and `:upward(1)` to block its container.
+ * Each carries a real match count: the browser cannot run `:has-text()`, and
+ * a count of 0 would rank it below even a positional path. Neither is offered
+ * on, or up into, `body` or `html`: the gate refuses only a bare root, and
+ * `body:has-text(x)` would blank the page.
+ */
+function addProceduralCandidates(el, classes, candidates, add) {
+  if (isDocumentRoot(el)) return;
+  const tag = el.tagName.toLowerCase();
+  const weak = !el.id && classes.every(looksHashed);
+
+  if (weak) {
+    const text = escapeHasTextArg(el.textContent);
+    if (text) {
+      // The engine's test: a case-blind substring of the element's text.
+      const needle = text.toLowerCase();
+      const count = deepQuerySelectorAll(tag)
+        .filter((m) => String(m.textContent ?? '').toLowerCase().includes(needle)).length;
+      add(':has-text', `${tag}:has-text(${text})`, 'page', count);
+    }
+    const child = Array.from(el.children ?? []).find((c) =>
+      elementResources(c).some(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol)));
+    const childSel = child && simpleSelector(child);
+    if (childSel) add('Contains the ad', `${tag}:has(> ${childSel})`, 'page');
+  }
+
+  if (!isDocumentRoot(el.parentElement)) {
+    const self = candidates
+      .filter((c) => c.count > 0 && !isProceduralSelector(c.selector) &&
+        !c.selector.includes(':nth-of-type(') && !c.selector.includes(':has('))
+      .sort((a, b) => selectorScore(b) - selectorScore(a))[0];
+    if (self) {
+      const containers = new Set(deepQuerySelectorAll(self.selector).map((m) => m.parentElement).filter(Boolean));
+      add('Block the container', `${self.selector}:upward(1)`, 'page', containers.size);
+    }
+  }
 }
 
 function simpleSelector(el) {
@@ -1171,6 +1247,16 @@ function updatePreviewForCustom(dialog, selector, hostname, count) {
 
   if (!selector) {
     preview.innerHTML = '<em>Enter a selector above</em>';
+    return;
+  }
+
+  // The browser cannot run a procedural selector; the page's rule engine
+  // does, from the saved rule (PICKER-2026-09 PK3).
+  if (isProceduralSelector(selector)) {
+    const n = Number.isFinite(count) ? count : 0;
+    preview.innerHTML = `<div style="font-size:11px;color:#8b949e">${n} element${n !== 1 ? 's' : ''} ` +
+      'will be hidden by the page\'s rule engine</div>';
+    updateRulePreview(dialog, selector, hostname);
     return;
   }
 

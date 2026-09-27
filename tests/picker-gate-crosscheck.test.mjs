@@ -43,11 +43,14 @@ function cssEscape(value) {
   return out;
 }
 
-// The picker reads these at call time only. The document matches nothing and
-// never throws, so every candidate the picker builds reaches the gate.
+// The picker reads these at call time only. The document never throws, so
+// every candidate the picker builds reaches the gate, and every query matches
+// the element being picked, so each candidate has something to count (a
+// procedural `:upward()` is offered only off a base that matches).
+let picking = null;
 globalThis.document = {
   querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelectorAll: (sel) => (picking && sel !== '*' ? [picking] : []),
   getElementById: () => null,
   createElement: () => ({ style: {} }),
   documentElement: { appendChild() {} },
@@ -134,6 +137,7 @@ function emittedLines() {
   const cosmetic = [];
   const network = [];
   const pick = (el) => {
+    picking = el;
     const candidates = generateSelectors(el);
     // Exactly what the dialog sends, with "Apply only to <site>" checked and not.
     for (const c of candidates) cosmetic.push(candidateLine(c, c.domain), candidateLine(c, null));
@@ -166,9 +170,17 @@ function emittedLines() {
     // Raw, as a page writes it: the picker's own URL parsing encodes it.
     const url = `https://${['cdn.ads.example', 'ads.example', '1.2.3.4'][rand(3)]}/${randText(10)}`;
     const classes = [randClass(), randClass(), rand(4) === 0 ? HASHED[rand(3)] : randClass()];
+    // Text for `:has-text()`, and a child making an ad request for `:has()`.
+    const kids = rand(2) === 0 ? [element('IMG', { src: url }, { classList: [randClass()] })] : [];
     const el = element(['IMG', 'IFRAME', 'OBJECT', 'DIV'][rand(4)], {
       src: url, data: url, 'data-ad': randText(6), 'aria-label': randText(6),
-    }, { id: rand(3) === 0 ? randText(6) : '', classList: classes });
+    }, {
+      id: rand(3) === 0 ? randText(6) : '',
+      classList: rand(3) === 0 ? [HASHED[rand(3)]] : classes,
+      textContent: randText(24),
+      children: kids,
+    });
+    for (const kid of kids) kid.parentElement = el;
     // Half in a tree whose siblings collide, so positional paths are emitted.
     pick(rand(2) === 0 ? el : amongTwins(el, { classList: [randClass()], id: rand(2) === 0 ? randText(4) : '' }));
   }
@@ -191,6 +203,9 @@ test('PK2c: SW1\'s gate admits every line the picker emits', () => {
   assert.ok(cosmetic.length > 10000, `cosmetic lines: ${cosmetic.length}`);
   assert.ok(network.length > 1000, `network lines: ${network.length}`);
   assert.ok(cosmetic.some((l) => l.includes(':nth-of-type(')), 'a positional path');
+  assert.ok(cosmetic.some((l) => l.includes(':has-text(')), 'a :has-text() candidate');
+  assert.ok(cosmetic.some((l) => l.includes(':has(> ')), 'a native :has() candidate');
+  assert.ok(cosmetic.some((l) => l.endsWith(':upward(1)')), 'an :upward() candidate');
   assert.ok(cosmetic.some((l) => l !== l.trim()), 'a line ending in a hex escape\'s closing space');
   assert.ok(network.some((l) => !l.slice(0, l.indexOf('$')).endsWith('^')), 'a path-prefix block');
   assert.ok(network.some((l) => !l.includes('domain=')), 'an unscoped block');

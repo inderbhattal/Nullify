@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { NATIVE_FUNCTIONAL_PSEUDO_CLASSES } from '../shared/proc-ops.js';
+import { NATIVE_FUNCTIONAL_PSEUDO_CLASSES, isProceduralSelector } from '../shared/proc-ops.js';
 
 // element-picker.js reads DOM globals at call time only (its module top level
 // just defines constants), so stubs installed here are in place before any
@@ -96,7 +96,7 @@ globalThis.window.top = globalThis.window; // top frame by default
 const {
   generateSelectors, isShadowOnlySelector, savePickerRule, activatePicker, deactivatePicker,
   generateNetworkCandidates, urlToNetworkPattern, compilerKeepsSelector, looksHashed, selectorScore,
-  candidateLine,
+  candidateLine, escapeHasTextArg,
 } = await import('./element-picker.js');
 
 /** Dispatch to whatever the picker registered on `document` for `type`. */
@@ -1570,6 +1570,135 @@ test('PK2b: a bare element with no hide to preview still saves its network block
     control('input[type="radio"]:checked').value = '0';
     control('#adblock-picker-create').listeners.get('click')();
     assert.deepEqual(sent.map((m) => m.payload.line), [candidate.rule, candidate.rule]);
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+// PICKER-2026-09 PK3 — procedural candidates: `:has-text()` from the element's
+// own text, native `:has(> child)` for a container whose child makes the ad
+// request, and `:upward(1)` to hide the container. Page text becomes the
+// argument, so it may carry nothing that closes the operator, adds a rule,
+// turns into the engine's regex form or trips the gate.
+
+test('PK3: an element with text but no id or stable class offers a :has-text candidate with a real count', () => {
+  const target = el({ tagName: 'DIV', textContent: '  Sponsored\n  by Acme' });
+  // The engine matches every div whose text holds the argument, case-blind:
+  // the wrapper counts, the unrelated div does not.
+  const wrapper = el({ tagName: 'DIV', textContent: 'news SPONSORED by Acme more' });
+  const other = el({ tagName: 'DIV', textContent: 'Weather' });
+  docState.byLevel = new Map([['div', [wrapper, target, other]]]);
+  docState.all = [];
+  const c = generateSelectors(target).find((x) => x.selector.includes(':has-text('));
+  assert.equal(c?.selector, 'div:has-text(Sponsored)');
+  assert.equal(c.count, 2);
+});
+
+test('PK3: :has-text text is cut where it could close the operator, and refused when too short', () => {
+  for (const [text, expected] of [
+    [') evil', null], ['ab', null], ['Hello (world)', 'Hello'], ['Buy now # deal', 'Buy now'],
+    ['a{b}cdef', null], ['Deals\\here', 'Deals'], ['one  two', 'one'], ['Sponsored\tads', 'Sponsored'],
+    [`Spon${NEL}sored`, 'Spon'], [`Spon${C1}x`, 'Spon'], [`Offer${LS}x`, 'Offer'], [`Offer${LONE}x`, 'Offer'],
+    ['Half / price', 'Half'], [`Offer${PS}x`, 'Offer'],
+    [`Offer${NBSP}x`, 'Offer'], [`Offer${IDEOGRAPHIC_SPACE}x`, 'Offer'],
+  ]) {
+    assert.equal(escapeHasTextArg(text), expected, printable(text));
+  }
+  // At most 64 characters, cut by code point: never half a surrogate pair.
+  const emoji = String.fromCodePoint(0x1f600);
+  assert.equal(escapeHasTextArg('x'.repeat(100)), 'x'.repeat(64));
+  assert.equal(escapeHasTextArg(`${'a'.repeat(63)}${emoji}bc`), `${'a'.repeat(63)}${emoji}`);
+  docState.byLevel = new Map();
+  docState.all = [];
+  for (const text of [') evil', 'ab']) {
+    const offered = generateSelectors(el({ textContent: text })).map((c) => c.selector);
+    assert.ok(offered.every((s) => !s.includes(':has-text(')), offered.join(' | '));
+  }
+});
+
+test('PK3 (REQUIRED 3): :has-text text beginning with / yields no candidate', () => {
+  // The engine reads a leading `/` as a regex: `/.*/` would hide every div.
+  for (const text of ['/.*/', ' /ad/', '/gi']) assert.equal(escapeHasTextArg(text), null, text);
+  docState.byLevel = new Map();
+  docState.all = [];
+  const offered = generateSelectors(el({ textContent: '/.*/' })).map((c) => c.selector);
+  assert.ok(offered.every((s) => !/:has-text\(\s*\//.test(s)), offered.join(' | '));
+});
+
+test('PK3: :has-text is offered only where the names are weak, and never on body or html', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const has = (target) => generateSelectors(target).some((c) => c.selector.includes(':has-text('));
+  assert.equal(has(el({ textContent: 'Sponsored', classList: ['ad-box'] })), false, 'a stable class');
+  assert.equal(has(el({ textContent: 'Sponsored', id: 'promo' })), false, 'an id');
+  assert.equal(has(el({ textContent: 'Sponsored', classList: ['css-1x2y3z'] })), true, 'only hashed classes');
+  // `body:has-text(x)` is no bare root to the gate, yet it blanks the page.
+  assert.equal(has(el({ tagName: 'BODY', textContent: 'Sponsored' })), false, 'body');
+});
+
+test('PK3: a parent of an ad image offers a native :has() candidate', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const img = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['ad'] });
+  const box = tree('DIV', {}, [tree('SPAN'), img]);
+  const offered = generateSelectors(box).map((c) => c.selector);
+  assert.ok(offered.includes('div:has(> img.ad)'), offered.join(' | '));
+  assert.equal(isProceduralSelector('div:has(> img.ad)'), false);
+});
+
+test('PK3: :upward(1) blocks the container, with the containers counted', () => {
+  const target = tree('SPAN', { classList: ['ad-box'] });
+  const other = tree('SPAN', { classList: ['ad-box'] });
+  const box = tree('DIV', {}, [target, other]); // both in one container
+  tree('MAIN', {}, [box]);
+  docState.byLevel = new Map([['.ad-box', [target, other]]]);
+  docState.all = [];
+  const c = generateSelectors(target).find((x) => x.selector.endsWith(':upward(1)'));
+  assert.equal(c?.selector, '.ad-box:upward(1)');
+  assert.equal(c.count, 1);
+  // The container ranks below the element's own selector of equal count.
+  assert.ok(selectorScore({ selector: '.ad-box:upward(1)', count: 1 }) < selectorScore({ selector: '.ad-box', count: 1 }));
+  // Its container is the body: hiding it blanks the page.
+  const top = tree('SPAN', { classList: ['ad-box'] });
+  const body = tree('BODY', {}, [top]);
+  globalThis.document.body = body;
+  try {
+    assert.ok(generateSelectors(top).every((x) => !x.selector.includes(':upward(')));
+  } finally {
+    delete globalThis.document.body;
+  }
+});
+
+test('PK3: a text candidate ranks above a positional path, and a clean id still first', () => {
+  const link = tree('A', { textContent: 'Sponsored' });
+  tree('UL', {}, [tree('LI'), tree('LI', {}, [link])]);
+  const path = 'ul > li:nth-of-type(2) > a';
+  docState.byLevel = new Map([['a', [link]], [path, [link]]]);
+  docState.all = [];
+  const order = generateSelectors(link).map((c) => c.selector);
+  assert.ok(order.indexOf('a:has-text(Sponsored)') > -1 && order.indexOf('a:has-text(Sponsored)') < order.indexOf(path),
+    order.join(' | '));
+
+  const withId = tree('A', { id: 'ad', textContent: 'Sponsored', classList: ['css-1x2y3z'] });
+  tree('DIV', {}, [withId]);
+  docState.byLevel = new Map([['#ad', [withId]], ['.css-1x2y3z', [withId]]]);
+  assert.equal(generateSelectors(withId)[0].selector, '#ad');
+});
+
+test('PK3: the dialog previews and sends a :has-text candidate', () => {
+  resetPickerEnv();
+  const target = el({ tagName: 'DIV', textContent: 'Sponsored' });
+  docState.byLevel = new Map([['div', [target]]]);
+  const sent = [];
+  globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return new Promise(() => {}); } } };
+  try {
+    const control = openDialogFor(target);
+    const index = generateSelectors(target).findIndex((c) => c.selector === 'div:has-text(Sponsored)');
+    // The browser cannot run `:has-text(`: the preview says who will.
+    assert.match(control('#adblock-picker-preview').innerHTML, /1 element will be hidden by the page's rule engine/);
+    control('input[type="radio"]:checked').value = String(index);
+    control('#adblock-picker-create').listeners.get('click')();
+    assert.deepEqual(sent.map((m) => m.payload.line), ['example.test##div:has-text(Sponsored)']);
   } finally {
     resetPickerEnv();
   }

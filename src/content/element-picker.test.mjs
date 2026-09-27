@@ -2147,3 +2147,41 @@ test('R11 (didn\'t re-break): a plain or custom-element tag is still written', (
   docState.byLevel = new Map([['ad-slot', [weak]]]);
   assert.ok(generateSelectors(weak).some((c) => c.selector === 'ad-slot:has-text(Sponsored story)'));
 });
+
+// Review R12 — "Apply only to <site>" had no `change` listener, so the rule
+// line shown under it kept the scope it was drawn with while Create sent the
+// other: what the user read was not what was saved.
+
+test('R12: toggling "Apply only to" redraws the rule line, for a hide, a network block and a typed selector', () => {
+  resetPickerEnv();
+  const img = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['banner'] });
+  docState.byLevel = new Map([['.banner', [img]]]);
+  try {
+    const control = openDialogFor(img);
+    const box = control('#adblock-scope-site');
+    const line = () => control('#adblock-rule-preview').textContent;
+    const toggle = (on) => { box.checked = on; box.listeners.get('change')?.(); };
+
+    // The network candidate is selected first.
+    assert.equal(line(), '||cdn.ads.example/a.png^$image,domain=example.test');
+    toggle(false);
+    assert.equal(line(), '||cdn.ads.example/a.png^$image');
+    toggle(true);
+    assert.equal(line(), '||cdn.ads.example/a.png^$image,domain=example.test');
+
+    // A hide.
+    const index = generateSelectors(img).findIndex((c) => c.selector === '.banner');
+    control('input[type="radio"]:checked').value = String(index + generateNetworkCandidates(img).length);
+    toggle(false);
+    assert.equal(line(), '##.banner');
+    toggle(true);
+    assert.equal(line(), 'example.test##.banner');
+
+    // A typed selector wins over the radio, as it does on Create.
+    control('#adblock-picker-custom').value = ' .typed ';
+    toggle(false);
+    assert.equal(line(), '##.typed');
+  } finally {
+    resetPickerEnv();
+  }
+});

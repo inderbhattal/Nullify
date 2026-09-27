@@ -1148,6 +1148,23 @@ function updatePickerDialog(dialog) {
   });
 
   const customInput = dialog.querySelector('#adblock-picker-custom');
+  // What Create would save: a typed selector is a hide; otherwise the checked
+  // candidate, of its kind.
+  const chosen = () => {
+    const custom = customInput?.value?.trim();
+    return custom
+      ? { kind: 'cosmetic', selector: custom }
+      : candidates[Number(dialog.querySelector('input[type="radio"]:checked')?.value)];
+  };
+
+  // The rule line follows "Apply only to <site>", or it shows one scope while
+  // Create sends the other (review R12).
+  siteCheck?.addEventListener('change', () => {
+    const ruleEl = dialog.querySelector('#adblock-rule-preview');
+    const candidate = chosen();
+    if (ruleEl && candidate) ruleEl.textContent = candidateLine(candidate, scopeOf()) ?? '';
+  });
+
   customInput?.addEventListener('input', () => {
     const sel = customInput.value.trim();
     try {
@@ -1184,11 +1201,7 @@ function updatePickerDialog(dialog) {
   });
 
   dialog.querySelector('#adblock-picker-create')?.addEventListener('click', () => {
-    const custom = dialog.querySelector('#adblock-picker-custom')?.value?.trim();
-    // A typed selector is a hide; otherwise the checked candidate, of its kind.
-    const candidate = custom
-      ? { kind: 'cosmetic', selector: custom }
-      : candidates[Number(dialog.querySelector('input[type="radio"]:checked')?.value)];
+    const candidate = chosen();
     if (!candidate?.selector && candidate?.kind !== 'network') return;
 
     const rule = candidateLine(candidate, scopeOf());

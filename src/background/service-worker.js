@@ -1689,10 +1689,34 @@ function ensureBackgroundSetup() {
   return _backgroundSetupPromise;
 }
 
+/**
+ * PICKER-2026-09 SW4 — MV3 opens `chrome.storage.local` to content scripts
+ * by default, and this worker trusts `userFilters`, `userCosmeticRules`,
+ * `userScriptletRules` and `allowlist` from it: a compromised renderer could
+ * write them directly, never meeting the APPEND_USER_FILTER gate. No content
+ * bundle touches chrome.storage (content, youtube-shield and scriptlets-world
+ * were checked, source graph and built bundle), so the area is restricted to
+ * the extension's own pages and this worker. Requested before anything reads
+ * storage, never awaited, and a Chrome without the API, or one that refuses,
+ * only loses the restriction: the failure is reported, startup goes on.
+ */
+function restrictStorageToTrustedContexts() {
+  const setAccessLevel = chrome.storage?.local?.setAccessLevel;
+  if (typeof setAccessLevel !== 'function') return;
+  try {
+    Promise.resolve(setAccessLevel.call(chrome.storage.local, { accessLevel: 'TRUSTED_CONTEXTS' }))
+      .catch((err) => reportError('storage:setAccessLevel', err));
+  } catch (err) {
+    reportError('storage:setAccessLevel', err);
+  }
+}
+
 function startInitialization() {
   if (_criticalPromise) return _criticalPromise;
 
   _criticalPromise = (async () => {
+    restrictStorageToTrustedContexts();
+
     // Stage 0: Initialize WASM
     try {
       wasmReadyPromise = initWasmFromRuntimeAsset(init, 'nullify_core_bg.wasm');

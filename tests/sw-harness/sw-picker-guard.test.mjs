@@ -30,6 +30,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { makeChromeStub } from './chrome-stub.mjs';
 import { loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
 
 const DNR_USER_RULES_START = 900_000;
@@ -1009,4 +1010,78 @@ test('SW3 (didn\'t re-break): a bundle stored after the split is served again on
     assert.match(bundle.cssText, /\.site-ad/);
     assert.equal(rereads, 0, 'the stored bundle must be served, not rebuilt');
   }, { realBundler: false, stub: first.chrome, idb: first.idb });
+});
+
+// ---------------------------------------------------------------------------
+// PICKER-2026-09 SW4 — MV3 opens `chrome.storage.local` to content scripts by
+// default, and the worker trusts `userFilters`, `userCosmeticRules`,
+// `userScriptletRules` and `allowlist` from it: a compromised renderer could
+// write them directly and never meet the APPEND gate. No content-side bundle
+// uses chrome.storage, so the worker restricts the area to trusted contexts.
+// The stub has no access levels; these tests pin the call, not its effect,
+// which only a real browser enforces.
+// ---------------------------------------------------------------------------
+
+/** Boot a worker whose storage.local.setAccessLevel is `impl` (omitted: the API is absent). */
+async function bootWithAccessLevel(impl) {
+  const stub = makeChromeStub();
+  const seen = [];
+  if (impl) {
+    stub.storage.local.setAccessLevel = (opts) => {
+      seen.push({ opts, readsBefore: stub.calls.filter((c) => c.api === 'storage.get').length });
+      return impl(opts);
+    };
+  }
+  const env = await loadServiceWorker({ stub, awaitReady: true });
+  return { ...env, seen };
+}
+
+/** The worker still answers a renderer's APPEND end to end. */
+async function assertWorkerServes(chrome) {
+  const res = await append(chrome, 'example.com##.ad');
+  assert.equal(res.ok, true, JSON.stringify(res));
+}
+
+test('SW4: startup restricts storage.local to trusted contexts, once, before reading storage', async () => {
+  const env = await bootWithAccessLevel(async () => {});
+  try {
+    assert.deepEqual(env.seen.map((s) => s.opts), [{ accessLevel: 'TRUSTED_CONTEXTS' }]);
+    assert.equal(env.seen[0].readsBefore, 0, 'no storage read may run before the restriction is requested');
+    assert.ok(env.chrome.calls.entries.some((c) => c.api === 'storage.get'), 'the worker did read storage afterwards');
+    env.chrome.runtime.onStartup._fire();
+    await env.hooks.whenCriticalReady();
+    assert.equal(env.seen.length, 1, 'once per worker life, even when onStartup fires');
+    await assertWorkerServes(env.chrome);
+  } finally {
+    env.teardown();
+  }
+});
+
+test('SW4: a rejected or throwing setAccessLevel is reported and startup goes on', async () => {
+  for (const impl of [async () => { throw new Error('access level refused'); }, () => { throw new Error('access level refused'); }]) {
+    const env = await bootWithAccessLevel(impl);
+    try {
+      assert.equal(env.seen.length, 1);
+      await env.hooks.whenBackgroundSetupDone();
+      const report = env.hooks.errorReport;
+      assert.ok([...report.critical, ...report.warnings].some((e) => e.context === 'storage:setAccessLevel'),
+        `the failure must reach the error report: ${JSON.stringify(report.warnings.map((e) => e.context))}`);
+      assert.ok(!report.critical.some((e) => e.context === 'Critical startup'), 'startup must not fail');
+      await assertWorkerServes(env.chrome);
+    } finally {
+      env.teardown();
+    }
+  }
+});
+
+test('SW4 (didn\'t re-break): a Chrome without setAccessLevel starts as before', async () => {
+  const env = await bootWithAccessLevel(undefined);
+  try {
+    const report = env.hooks.errorReport;
+    assert.ok(![...report.critical, ...report.warnings].some((e) => e.context === 'storage:setAccessLevel'));
+    assert.ok(!report.critical.some((e) => e.context === 'Critical startup'));
+    await assertWorkerServes(env.chrome);
+  } finally {
+    env.teardown();
+  }
 });

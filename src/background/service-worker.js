@@ -74,7 +74,7 @@ import {RulesDB} from '../shared/db.js';
 import {BloomFilter} from '../shared/bloom.js';
 import {fetchAndExpand, parseFilterList, parseExpiresHeader, COSMETIC_SCOPE_OPTIONS} from '../shared/filter-parser.js';
 import { normalizeAllowlist, normalizeHostname, isValidAllowlistDomain } from '../shared/hostname.js';
-import { ancestorDomains } from '../shared/psl.js';
+import { ancestorDomains, isPublicSuffix } from '../shared/psl.js';
 import { encodeBinaryRules } from '../shared/rule-transport.js';
 import { applyScriptletExceptions } from '../shared/filter-syntax.js';
 import {
@@ -935,7 +935,10 @@ function hasInvalidUniversalUsage(selector) {
 function isSafeCssSelector(selector) {
   if (typeof selector !== 'string') return false;
   const trimmed = selector.trim();
+  // Code review R2 — a `/*` opens a comment that swallows every rule after it
+  // in the sheet (the next hide, the exception CSS). Mirrors is_css_safe_selector.
   return !!trimmed &&
+    !trimmed.includes('/*') &&
     !trimmed.includes('{') &&
     !trimmed.includes('}') &&
     !trimmed.includes(';') &&
@@ -956,14 +959,28 @@ function buildCssFromSelectorList(selectors, declarations) {
     .join('\n');
 }
 
-function buildPageBundle(rawRules) {
-  if (wasmReady) {
+// Test-only seam (see tests/sw-harness), like _compileUserFiltersOverride:
+// lets the harness run the real `build_page_bundle`, which never initializes
+// in Node. Never set in production.
+let _pageBundleBuilderOverride = null;
+// Same, for `build_css_from_selectors`: the path WASM takes when it is ready
+// but `build_page_bundle` throws.
+let _cssBuilderOverride = null;
+
+/**
+ * `cssChunkSize` is how many CSS selectors share one rule. A browser drops a
+ * whole rule for one selector it cannot parse, so selectors that must not
+ * void each other are built at 1 (PICKER-2026-09 SW3).
+ */
+function buildPageBundle(rawRules, cssChunkSize = 150) {
+  const buildWithWasm = _pageBundleBuilderOverride || (wasmReady ? build_page_bundle : null);
+  if (buildWithWasm) {
     try {
-      return build_page_bundle(
+      return buildWithWasm(
         rawRules.generic || [],
         rawRules.domainSpecific || [],
         rawRules.exceptions || [],
-        150
+        cssChunkSize
       );
     } catch (err) {
       console.error('[Nullify] WASM page bundle build failed:', err);
@@ -991,9 +1008,10 @@ function buildPageBundle(rawRules) {
     exceptions,
   };
 
+  const buildCssWithWasm = _cssBuilderOverride || (wasmReady ? build_css_from_selectors : null);
   const cssText = cssSelectors.length > 0
-    ? (wasmReady
-        ? build_css_from_selectors(cssSelectors.join('\n'), '', 150)
+    ? (buildCssWithWasm
+        ? buildCssWithWasm(cssSelectors.join('\n'), '', cssChunkSize)
         : buildCssFromSelectorList(cssSelectors, 'display: none !important; visibility: hidden !important;'))
     : '';
 
@@ -1674,10 +1692,34 @@ function ensureBackgroundSetup() {
   return _backgroundSetupPromise;
 }
 
+/**
+ * PICKER-2026-09 SW4 — MV3 opens `chrome.storage.local` to content scripts
+ * by default, and this worker trusts `userFilters`, `userCosmeticRules`,
+ * `userScriptletRules` and `allowlist` from it: a compromised renderer could
+ * write them directly, never meeting the APPEND_USER_FILTER gate. No content
+ * bundle touches chrome.storage (content, youtube-shield and scriptlets-world
+ * were checked, source graph and built bundle), so the area is restricted to
+ * the extension's own pages and this worker. Requested before anything reads
+ * storage, never awaited, and a Chrome without the API, or one that refuses,
+ * only loses the restriction: the failure is reported, startup goes on.
+ */
+function restrictStorageToTrustedContexts() {
+  const setAccessLevel = chrome.storage?.local?.setAccessLevel;
+  if (typeof setAccessLevel !== 'function') return;
+  try {
+    Promise.resolve(setAccessLevel.call(chrome.storage.local, { accessLevel: 'TRUSTED_CONTEXTS' }))
+      .catch((err) => reportError('storage:setAccessLevel', err));
+  } catch (err) {
+    reportError('storage:setAccessLevel', err);
+  }
+}
+
 function startInitialization() {
   if (_criticalPromise) return _criticalPromise;
 
   _criticalPromise = (async () => {
+    restrictStorageToTrustedContexts();
+
     // Stage 0: Initialize WASM
     try {
       wasmReadyPromise = initWasmFromRuntimeAsset(init, 'nullify_core_bg.wasm');
@@ -3093,6 +3135,37 @@ function compileUserFiltersViaWasm(filtersText) {
   }
 }
 
+/** A compiled DNR rule's meaning, without its id (Code review R8). */
+function dnrRuleKey(rule) {
+  return JSON.stringify([rule?.priority, rule?.action, rule?.condition]);
+}
+
+/** The DNR rules one line compiles to, by the compiler the full apply used. */
+function compileLineAlone(line, useWasm) {
+  if (useWasm) return compileUserFiltersViaWasm(line)?.dnrRules || [];
+  const rule = parseSimpleNetworkRule(line, DNR_USER_RULES_START);
+  return rule ? [rule] : [];
+}
+
+/**
+ * PICKER-2026-09 SW2 — the skipped entries a reply may carry.
+ *
+ * APPEND_USER_FILTER is SENDER_ANY, so its reply reaches a renderer, and the
+ * rest of My Filters is private from renderers (REVIEW-2026-08 §4.19). An
+ * append recompiles every stored line, though, so its reply listed up to 20
+ * of the user's own dropped lines: compiler drops since REVIEW-2026-09 §3.3
+ * routed them here, and the WASM-down fallback's drops once it reported them.
+ * The picker needs only its own line's entry (PK1: `skippedRules.find((s) =>
+ * s.line === rule.trim())`), which the 20-entry cap could also push out of the
+ * list. So an APPEND reply carries exactly that entry or none. The options
+ * page's reply (extension pages only, no appended line) keeps the first 20.
+ */
+function skippedRulesForReply(skipped, appendedLine) {
+  if (appendedLine === undefined) return skipped.slice(0, 20);
+  const own = skipped.find((s) => s.line === appendedLine);
+  return own ? [own] : [];
+}
+
 /**
  * Apply user-defined filters as dynamic DNR rules + cosmetic rules.
  * Internal: callers go through applyUserFilters / setAndApplyUserFilters /
@@ -3101,8 +3174,10 @@ function compileUserFiltersViaWasm(filtersText) {
  * Returns `{network, cosmetic}` counts on success, or `{error}` when the DNR
  * write failed — in which case USER_FILTERS_APPLIED is NOT updated, so the
  * next startup retries the apply instead of skipping it forever (§4.6).
+ * `appendedLine` is APPEND_USER_FILTER's line: the reply then lists that
+ * line's own skipped entry and nothing else (see skippedRulesForReply).
  */
-async function _applyUserFiltersNow(filtersText) {
+async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
   const lines = (filtersText || '').split('\n').filter(Boolean);
   let newRules = [];
   let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
@@ -3127,7 +3202,20 @@ async function _applyUserFiltersNow(filtersText) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('!')) continue;
       const rule = parseSimpleNetworkRule(trimmed, id++);
-      if (rule) newRules.push(rule);
+      if (rule) {
+        newRules.push(rule);
+      } else if (!/^(?:\[|%|@@#)/.test(trimmed)
+        && !['##', '#@#', '#?#', '#+js('].some((marker) => trimmed.includes(marker))) {
+        // PICKER-2026-09 SW2 — a network line this parser cannot express
+        // (`$domain=`, `$3p`, `$object`, …) vanished here with no record, so
+        // the reply said nothing was wrong. Report it as the compiler reports
+        // its own drops, and only a line the compiler reads as a network rule,
+        // by its own tests: `should_skip_filter_line` skips a line starting
+        // `[`, `%` or `@@#` (and `!` or blank, skipped above), a `#+js(` line
+        // goes to the scriptlet branch, and a line holding `##`, `#@#` or
+        // `#?#` is cosmetic. What this parser compiles is unchanged.
+        droppedLines.push({ line: trimmed, reason: 'unsupported by the fallback compiler (WASM unavailable)' });
+      }
     }
   }
 
@@ -3199,11 +3287,13 @@ async function _applyUserFiltersNow(filtersText) {
   }
 
   let appliedNetworkRules = 0;
+  const appliedIds = new Set();
   for (let i = 0; i < vetted.length; i += USER_RULE_ADD_CHUNK) {
     const chunk = vetted.slice(i, i + USER_RULE_ADD_CHUNK);
     try {
       await chrome.declarativeNetRequest.updateDynamicRules({ addRules: chunk });
       appliedNetworkRules += chunk.length;
+      for (const rule of chunk) appliedIds.add(rule.id);
     } catch (chunkErr) {
       // §4.16 — classify before retrying. "This rule is malformed" is worth
       // isolating rule-by-rule; "the dynamic ruleset is full" is not — every
@@ -3222,6 +3312,7 @@ async function _applyUserFiltersNow(filtersText) {
         try {
           await chrome.declarativeNetRequest.updateDynamicRules({ addRules: [rule] });
           appliedNetworkRules += 1;
+          appliedIds.add(rule.id);
         } catch (ruleErr) {
           if (isDnrCapacityError(ruleErr)) {
             const remaining = vetted.length - i - chunk.indexOf(rule);
@@ -3235,6 +3326,28 @@ async function _applyUserFiltersNow(filtersText) {
           skipped.push({ id: rule.id, reason: ruleErr?.message || String(ruleErr) });
         }
       }
+    }
+  }
+  // Code review R8 — a cut after compilation (budget, id range, preflight, a
+  // per-rule rejection, a capacity stop) is reported by id or in aggregate,
+  // never with a `line`, and the appended rule is last in the batch, so it is
+  // the first cut. For APPEND, find the appended line's own rules (compiled
+  // alone, matched by content: an identical rule from another line is its
+  // effect too) and, if none went live, report it with its line.
+  // (A line the compiler already dropped has no rules, so it is never re-reported.)
+  if (appendedLine !== undefined) {
+    const own = new Set(compileLineAlone(appendedLine, wasmSucceeded).map(dnrRuleKey));
+    const mine = newRules.filter((rule) => own.has(dnrRuleKey(rule)));
+    if (mine.length > 0 && !mine.some((rule) => appliedIds.has(rule.id))) {
+      const budgetedIds = new Set(budgeted.map((rule) => rule.id));
+      const rule = mine[mine.length - 1];
+      const reason = !budgetedIds.has(rule.id)
+        ? (skipped.find((s) => s.id === null && !s.line
+          && (rule.id >= DNR_USER_RULES_START && rule.id < DNR_ALLOWLIST_START ? /budget/ : /range/).test(s.reason))
+          ?.reason ?? 'not applied')
+        : (skipped.find((s) => mine.some((m) => m.id === s.id))?.reason
+          ?? skipped.find((s) => /capacity/.test(s.reason))?.reason ?? 'not applied');
+      skipped.push({ id: null, line: appendedLine, reason });
     }
   }
   // Honest total: every compiled rule that is not live in DNR, whether it was
@@ -3290,7 +3403,7 @@ async function _applyUserFiltersNow(filtersText) {
     // Counted as "compiled but not live", so truncation, id-range drops,
     // preflight rejections and capacity stops are all included.
     skippedNetwork: skippedNetworkTotal,
-    skippedRules: skipped.slice(0, 20),
+    skippedRules: skippedRulesForReply(skipped, appendedLine),
   };
 
   log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic, ${counts.skippedNetwork} skipped`);
@@ -3398,8 +3511,216 @@ function appendUserFilterLine(line) {
       return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
     }
     await setStorage(StorageKeys.USER_FILTERS, next);
-    return _applyUserFiltersNow(next);
+    return _applyUserFiltersNow(next, { appendedLine: trimmedLine });
   });
+}
+
+// ---------------------------------------------------------------------------
+// PICKER-2026-09 SW1 — the renderer-facing trust gate on APPEND_USER_FILTER.
+//
+// APPEND_USER_FILTER is SENDER_ANY and the element picker is its only sender,
+// yet it checked nothing about what the line MEANT: a compromised renderer
+// could write `@@||bank.example^`, `||x^$important`, `##+js(...)` or `##body`
+// into My Filters. A denylist cannot close that. The privileged shapes are
+// open-ended, and a JS test does not read the line the way the compiler does:
+// a leading U+0085 fails `startsWith('@@')`, then Rust's `str::trim` strips it
+// and compiles a live allow rule.
+//
+// So this is an ALLOWLIST of the two shapes the picker emits, tested on the
+// line exactly as the compiler will read it:
+//  1. First, JS `trim()` and Rust's `str::trim` must agree on where the line
+//     starts and ends. They disagree on exactly U+0085 (only Rust strips it)
+//     and U+FEFF (only JS does), so a line with either at an edge is refused.
+//     Otherwise the rest of the gate reads the trimmed line, which is what
+//     `appendUserFilterLine` stores and the compiler compiles. That line may
+//     hold no control, line/paragraph separator or lone surrogate (Rust gets
+//     U+FFFD for one), and may not end in an odd run of backslashes: the last
+//     one escapes whatever comes next, be it the space the trim removed
+//     (`#ad\ ` is not `#ad\`) or the comma that joins the next selector.
+//  2. No extended-syntax marker anywhere. The compiler does not go by the
+//     FIRST marker: it tests `#@#`, `#?#` and `+js(` before `##`, so
+//     `example.com##div:has-text(x#@#y)` compiles as an exception and
+//     `##.x,bank.example#?#body` hides bank.example's body. Refusing every
+//     `#@` `#?` `#$` `#%` `#+` leaves `##` as the only marker a line can hold.
+//  3. Then a cosmetic hide or a `||host` block, as below — nothing else.
+//     No scope (hide hostname, `||` host, `domain=`) may reach past one
+//     site: user cosmetic rules are looked up by walking every parent domain
+//     with no suffix stop, and DNR's `||` anchors at any label, so `com##div`
+//     hides on every .com site and `1##.login-form` on every x.x.x.1 host
+//     (router and NAS admin pages). A scope may not be a public suffix, and
+//     one whose last label is a number must be a whole IPv4 address. The
+//     picker scopes to the page's own host, which is neither unless the page
+//     sits on a listed suffix itself (`github.io`), where a saved rule would
+//     blanket the suffix too.
+// The options page (SET_USER_FILTERS, extension pages only) keeps full syntax.
+// ---------------------------------------------------------------------------
+const PICKER_RUST_SPACE = /^\p{White_Space}$/u;
+const PICKER_LINE_INTERIOR = /[\p{Cc}\p{Cs}\u{2028}\u{2029}]/u;
+const PICKER_EXTENDED_MARKER = /#[@?$%+]/;
+// The picker's own hostname (the page's host less `www.`) for a scoped hide
+// or `domain=`: ASCII lowercase labels, no wildcard, list or negation.
+const PICKER_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+// A last label the URL parser reads as a number (WHATWG "ends in a number":
+// decimal, or `0x` hex), and the dotted quad it then serialises the host as.
+// The parser yields no other numeric-tailed host, so nothing it produces is
+// refused.
+const PICKER_NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
+const PICKER_IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+// `||` + the resource host PK2a validates (`[a-z0-9.-]`, or a bracketed IPv6
+// literal), then `^`, or a path made only of what a WHATWG pathname keeps
+// literally less the metacharacters PK2a truncates at (`$ ^ | *`) with an
+// optional closing `^`; then an optional `$` option list.
+const PICKER_NETWORK_LINE =
+  /^\|\|([a-z0-9.-]+|\[[0-9a-f:]+\])(?:\^|\/[\w!%&'()+,\-.:;=@[\]~/]*\^?)(?:\$(.+))?$/;
+// Option TOKENS (never substrings: `||x/important.png^` is not `$important`),
+// exact and lowercase; `domain=` is handled on its own. The resource types
+// PK2a maps, the rest of the plain types, and the party/case modifiers.
+const PICKER_NETWORK_OPTIONS = new Set([
+  'image', 'subdocument', 'media', 'object',
+  'script', 'stylesheet', 'font', 'xmlhttprequest', 'ping', 'websocket', 'other',
+  '3p', '1p', 'third-party', 'first-party', 'match-case',
+]);
+// Every procedural operator except the two the picker generates, matched as
+// the planners match them (`:name(`, ASCII case-insensitive, at any depth).
+// Built from the shared list, so an operator added there is refused here.
+const PICKER_REFUSED_PROC_OP = new RegExp(`:(?:${PROC_OPS
+  .filter((op) => op !== 'has-text' && op !== 'upward')
+  .map((op) => op.replace(/[-.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|')})\\(`, 'i');
+// `:has-text(/…/)` is the engine's regex form: `/.*/` matches every element.
+const PICKER_HAS_TEXT_REGEX = /:has-text\(\s*\//i;
+// At the top level, `:scope` and (CSS Nesting) a bare `&` are the root element.
+const PICKER_DOCUMENT_ROOTS = new Set(['html', 'head', 'body', '*', ':root', ':scope', '&']);
+const PICKER_CSS_ESCAPE = /\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|([^\n\r\f]))/g;
+
+/** Rust's `str::trim`: strips every White_Space code point (all in the BMP). */
+function rustTrim(text) {
+  let start = 0;
+  let end = text.length;
+  while (start < end && PICKER_RUST_SPACE.test(text[start])) start++;
+  while (end > start && PICKER_RUST_SPACE.test(text[end - 1])) end--;
+  return text.slice(start, end);
+}
+
+/** Would a rule scoped to `host` reach past one site? See 3. above. */
+function isPickerScopeTooBroad(host) {
+  return isPublicSuffix(host)
+    || (PICKER_NUMERIC_TAIL.test(host) && !PICKER_IPV4.test(host))
+    // Code review R10 — the list's implicit `*` rule: a single label it does
+    // not know (`lan`, `local`, `corp`, `home`) is a suffix all the same, so
+    // `lan##.login-form` reached every *.lan router page. `localhost` too:
+    // every *.localhost is loopback. A bracketed IPv6 literal is one host.
+    || (!host.startsWith('[') && !host.replace(/\.+$/, '').includes('.'));
+}
+
+/**
+ * Split a selector list at its top-level commas: not inside parentheses,
+ * brackets or quotes, and not escaped. `div:has-text(Mind, Body, Spirit)` is
+ * one selector, and so is `[title="a, body"]`.
+ */
+function splitPickerSelectorList(selector) {
+  const members = [];
+  let depth = 0;
+  let quote = null;
+  let start = 0;
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector[i];
+    if (ch === '\\') {
+      i++;
+    } else if (quote) {
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (ch === '(' || ch === '[') {
+      depth++;
+    } else if ((ch === ')' || ch === ']') && depth > 0) {
+      depth--;
+    } else if (ch === ',' && depth === 0) {
+      members.push(selector.slice(start, i));
+      start = i + 1;
+    }
+  }
+  members.push(selector.slice(start));
+  return members;
+}
+
+/**
+ * Is one top-level member of a selector list a bare document root? CSS reads
+ * `BODY`, `\62 ody` and `*|body` as `body`, so this does too. It stops those
+ * spellings only: `:is(body)`, `:where(html)`, `body:first-child` and plain
+ * generics (`##div`) still blank a page. That is the recorded residual, since
+ * a renderer can append anything the picker could.
+ */
+function isPickerDocumentRoot(member) {
+  const name = member
+    .replace(PICKER_CSS_ESCAPE, (_, hex, ch) => (hex
+      ? String.fromCodePoint(Math.min(parseInt(hex, 16), 0x10ffff))
+      : ch))
+    .trim()
+    .replace(/^\*?\|/, '')
+    .toLowerCase();
+  return PICKER_DOCUMENT_ROOTS.has(name);
+}
+
+/**
+ * The APPEND_USER_FILTER gate: may a renderer append this line? True only for
+ * the picker's two shapes, read as both trims read the line —
+ *  - a cosmetic hide `[hostname]##selector`, where the selector is not a
+ *    scriptlet (`+js(`), not a uBO HTML filter (leading `^`), holds no CSS
+ *    comment, is not a bare document root, uses no procedural operator but
+ *    `:has-text()` and `:upward()` (native `:has()` is CSS), and never the
+ *    `:has-text(/regex/)` form;
+ *  - a network block `||host^` or `||host/path[^]`, optionally followed by
+ *    `$` and distinct tokens from PICKER_NETWORK_OPTIONS plus at most one
+ *    `domain=<hostname>`.
+ * Neither's hostname, host or `domain=` may reach past one site.
+ * Pure: no storage, no chrome.* — the harness calls it directly.
+ */
+function isPickerSafeUserFilterLine(rawLine) {
+  if (typeof rawLine !== 'string') return false;
+  const line = rawLine.trim();
+  if (!line || line !== rustTrim(rawLine)) return false;
+  if (PICKER_LINE_INTERIOR.test(line)) return false;
+  let backslashes = 0;
+  while (backslashes < line.length && line[line.length - 1 - backslashes] === '\\') backslashes++;
+  if (backslashes % 2 === 1) return false;
+  if (PICKER_EXTENDED_MARKER.test(line)) return false;
+
+  if (line.startsWith('||')) {
+    // The network alphabet has no `#`; refused outright as well, so no widening
+    // of it can let through `||[x,bank.example##body]^`, which the compiler
+    // reads as a hide on bank.example.
+    if (line.includes('#')) return false;
+    const match = PICKER_NETWORK_LINE.exec(line);
+    if (!match || isPickerScopeTooBroad(match[1])) return false;
+    if (match[2] === undefined) return true;
+    const seen = new Set();
+    let domains = 0;
+    for (const token of match[2].split(',')) {
+      if (seen.has(token)) return false;
+      seen.add(token);
+      if (token.startsWith('domain=')) {
+        const value = token.slice('domain='.length);
+        if (++domains > 1 || !PICKER_HOSTNAME.test(value) || isPickerScopeTooBroad(value)) return false;
+      } else if (!PICKER_NETWORK_OPTIONS.has(token)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  const separator = line.indexOf('##');
+  if (separator === -1) return false;
+  const domain = line.slice(0, separator);
+  if (domain && (!PICKER_HOSTNAME.test(domain) || isPickerScopeTooBroad(domain))) return false;
+  const selector = line.slice(separator + 2);
+  const trimmed = selector.trim();
+  if (!trimmed || trimmed.startsWith('+js(') || trimmed.startsWith('^')) return false;
+  if (selector.includes('/*')) return false;
+  if (splitPickerSelectorList(selector).some(isPickerDocumentRoot)) return false;
+  if (PICKER_REFUSED_PROC_OP.test(selector)) return false;
+  if (PICKER_HAS_TEXT_REGEX.test(selector)) return false;
+  return true;
 }
 
 // §5.6 — the ONLY `$options` this parser can express in DNR. Anything absent
@@ -4868,9 +5189,19 @@ async function handleMessage(message, sender) {
       if (utf8ByteLength(line) > MAX_USER_FILTERS_BYTES) {
         return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
       }
+      // PICKER-2026-09 SW1 — any renderer can send this; admit only the
+      // picker's own shapes (see isPickerSafeUserFilterLine).
+      if (!isPickerSafeUserFilterLine(line)) {
+        return { error: 'This rule type cannot be added from the page picker; add it in the options page instead.' };
+      }
       const result = await appendUserFilterLine(line);
       if (result?.error) return { error: result.error };
-      return { ok: true, counts: result };
+      // Code review R9 — this reply reaches a renderer. `network`, `cosmetic`
+      // and `skippedNetwork` described all of My Filters: its size, and (the
+      // compiler dedupes) whether a line was already there. The picker needs
+      // only its own line's skipped entry; the options page's SET_USER_FILTERS
+      // reply keeps the counts.
+      return { ok: true, counts: { skippedRules: result.skippedRules } };
     }
     // §5.5 — RUN_SCRIPTLETS and GET_SCRIPTLET_RULES are deliberately gone:
     // they had no caller anywhere in src/content, src/popup or src/options,
@@ -5024,6 +5355,11 @@ async function handleMessage(message, sender) {
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
 
+// PICKER-2026-09 SW3 — a page bundle names its format, so one stored while
+// user and list selectors were still joined is a miss (rebuilt once) rather
+// than served until the lists next change.
+const PAGE_BUNDLE_FORMAT = 'user-css-apart';
+
 async function getCosmeticBundleForPage(hostname) {
   // Wait for critical caches if they aren't ready yet
   if (!_criticalReady && _criticalPromise) await _criticalPromise;
@@ -5038,7 +5374,7 @@ async function getCosmeticBundleForPage(hostname) {
   const persistedBundle = normalizeStoredBundle(
     await db.getPageBundle(hostname, activeRuleDataVersion)
   );
-  if (persistedBundle) {
+  if (persistedBundle?.format === PAGE_BUNDLE_FORMAT) {
     setCachedDomainRules(hostname, persistedBundle);
     return persistedBundle;
   }
@@ -5099,11 +5435,27 @@ async function getCosmeticBundleForPage(hostname) {
       userDom = userDom.slice(dotIdx + 1);
     }
 
-    return buildPageBundle({
-      generic: userGeneric,
-      domainSpecific: domainSpecific.concat(userDomainSelectors),
-      exceptions: [...userExceptions],
+    // PICKER-2026-09 SW3 — the user's CSS selectors are never joined with the
+    // lists'. `build_page_bundle` puts up to 150 selectors in one rule, and a
+    // browser discards the whole rule for one it cannot parse: a single bad
+    // user selector (`a:bogus`, which the worker cannot detect without a CSS
+    // parser) voided the lists' hides on every page, and a bad list selector
+    // the user's. User CSS is built one rule per selector, through the same
+    // gates and exception suppression; user procedural selectors stay with the
+    // lists', since each plan is its own rule.
+    const exceptions = [...userExceptions];
+    const format = PAGE_BUNDLE_FORMAT;
+    const userSelectors = [...userGeneric, ...userDomainSelectors].filter((sel) => typeof sel === 'string');
+    const bundle = buildPageBundle({
+      generic: [],
+      domainSpecific: domainSpecific.concat(userSelectors.filter((sel) => isProceduralSelector(sel))),
+      exceptions,
     });
+    const userCss = userSelectors.filter((sel) => !isProceduralSelector(sel));
+    const userCssText = userCss.length
+      ? buildPageBundle({ generic: [], domainSpecific: userCss, exceptions }, 1).cssText
+      : '';
+    return { ...bundle, cssText: [bundle.cssText, userCssText].filter(Boolean).join('\n'), format };
   })();
 
   _inFlightRules.set(hostname, promise);
@@ -5402,7 +5754,10 @@ export const __testHooks = {
   applyUserFilters,
   setAndApplyUserFilters,
   appendUserFilterLine,
+  isPickerSafeUserFilterLine,
   setCompileUserFiltersOverrideForTest: (fn) => { _compileUserFiltersOverride = fn; },
+  setPageBundleBuilderForTest: (fn) => { _pageBundleBuilderOverride = fn; },
+  setCssBuilderForTest: (fn) => { _cssBuilderOverride = fn; },
   parseSimpleNetworkRule,
   DNR_USER_FILTER_PRIORITY,
   DNR_ALLOWLIST_PRIORITY,

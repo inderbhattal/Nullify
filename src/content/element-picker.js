@@ -12,10 +12,29 @@
  *  6. ESC or ✕ cancels without saving
  */
 
+import { isProceduralSelector, PROC_OP_REGEX, NATIVE_FUNCTIONAL_PSEUDO_CLASSES } from '../shared/proc-ops.js';
+import { normalizeHostname } from '../shared/hostname.js';
+import { isPublicSuffix } from '../shared/psl.js';
+
 const PICKER_HIGHLIGHT_ID = '__adblock_picker_highlight__';
 const PICKER_OVERLAY_ID   = '__adblock_picker_overlay__';
 const PICKER_DIALOG_ID    = '__adblock_picker_dialog__';
 const PICKER_STYLE_ID     = '__adblock_picker_style__';
+
+// PICKER-2026-09 PK5. The preview and a saved rule's immediate hide go through
+// picker-owned stylesheets, never an inline `style.display` the page can read
+// or clear. The preview sheet (and every mark a procedural preview sets) goes
+// on cancel, save and deactivate; the applied sheet stands in for the saved
+// rule until a reload, as the inline write did. Named per session. A network
+// block hides only the element whose request it stops, so its preview and its
+// post-save hide mark that element (the applied mark stays until a reload)
+// rather than borrow a cosmetic selector that can match others (review R4).
+const PICKER_SESSION = Math.random().toString(36).slice(2, 10);
+const PREVIEW_SHEET_ID = `__adblock_picker_preview_${PICKER_SESSION}`;
+const APPLIED_SHEET_ID = `__adblock_picker_applied_${PICKER_SESSION}`;
+const PREVIEW_MARK = `data-adblock-picker-preview-${PICKER_SESSION}`;
+const APPLIED_MARK = `data-adblock-picker-applied-${PICKER_SESSION}`;
+let markedNodes = [];
 
 let pickerActive = false;
 let lastTarget = null;
@@ -69,6 +88,7 @@ export function deactivatePicker() {
   lastTarget = null;
   navStack = [];
   currentNavTarget = null;
+  clearPreview();
   removeHighlight();
   removeOverlay();
   removeDialog();
@@ -370,22 +390,245 @@ export function isShadowOnlySelector(selector) {
 }
 
 /**
+ * Can `selector` be saved as a `##` rule that will actually run? A line is
+ * lost two independent ways: the browser cannot parse the selector — joined
+ * into the site's one CSS declaration, it voids every other hide rule there
+ * (REVIEW-2026-09 §3.2) — or the compiler refuses it, without a `droppedLines`
+ * entry, so the save would report "Rule saved" for a dead line
+ * (PICKER-2026-09 PK1b). And SW1's APPEND gate refuses some lines outright
+ * for the characters in them (PK2c). A plain selector must also pass the
+ * compiler's CSS gate, which is stricter than the browser's parse (review R3).
+ *
+ * A procedural selector skips the parse test. The browser rejects it
+ * whole (`:has-text(` is not CSS), and it never reaches the joined
+ * declaration: the compiler plans every `:op(` match per rule, and the engine
+ * isolates each plan, so a bad base disables only its own rule. Checking its
+ * CSS "the way the engine plans it" would need a copy of the planner here.
+ */
+function isSaveableSelector(selector) {
+  if (!gateAdmitsSelectorText(selector) || !compilerKeepsSelector(selector)) return false;
+  if (isProceduralSelector(selector)) return true;
+  if (!compilerKeepsAsCss(selector)) return false;
+  try {
+    document.querySelector(selector);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Mirrors the line-level half of SW1's APPEND gate (`isPickerSafeUserFilterLine`
+// in the service worker), which reads a line as both trims read it. JS `trim()`
+// and Rust's `str::trim` must agree where it ends (they part on U+0085 and
+// U+FEFF), and the agreed line may hold no control, line or paragraph
+// separator, lone surrogate or extended-syntax marker (`#@ #? #$ #% #+`), nor
+// end in an odd run of backslashes; and the selector may hold no `/*`, even
+// in a procedural one. A cosmetic line is `site##` and then the
+// selector, so the selector's end is the line's (PICKER-2026-09 PK2c).
+function gateAdmitsSelectorText(selector) {
+  const stored = selector.trimEnd();
+  if (stored !== selector.replace(/\p{White_Space}+$/u, '')) return false;
+  if (/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(stored) || /#[@?$%+]/.test(`#${stored}`)) return false;
+  if (selector.includes('/*')) return false;
+  return stored.match(/\\*$/)[0].length % 2 === 0;
+}
+
+/**
+ * `CSS.escape` for a class or id, with any characters at its end that a trim
+ * would strip hex-escaped instead. The gate stores a line trimmed, and
+ * `CSS.escape` leaves U+0080 and up raw, so a page's class `ad` + U+00A0 was
+ * offered as that and stored as `.ad`: a broader rule than the one previewed.
+ * A hex escape's closing space may go to the trim, as the escape reads the
+ * same without it (PICKER-2026-09 PK2c).
+ */
+function escapeIdent(name) {
+  const chars = [...name];
+  let end = chars.length;
+  while (end > 0 && trimStrips(chars[end - 1])) end--;
+  return CSS.escape(chars.slice(0, end).join('')) +
+    chars.slice(end).map((ch) => `\\${ch.codePointAt(0).toString(16)} `).join('');
+}
+
+/** Would JS `trim()` or Rust's `str::trim` strip `ch` from the end of a line? */
+function trimStrips(ch) {
+  return /\p{White_Space}/u.test(ch) || ch.charCodeAt(0) === 0xfeff;
+}
+
+// Mirrors `is_valid_selector` in wasm-core/src/lib.rs, the source of truth:
+// change the two together. Rust's `trim()` strips every White_Space code
+// point, U+0085 included, which JS `trim()` keeps. Exported so a test pins
+// the mirror directly, not only through a save.
+export function compilerKeepsSelector(selector) {
+  const s = selector.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+  if (!s || /[{}\0]/.test(s)) return false;
+  return !s.includes(';') || semicolonsInProcOpArgs(s);
+}
+
+// Mirrors `semicolons_confined_to_proc_op_args`: every `;` must sit inside a
+// procedural operator's argument, which ends where paren depth returns to
+// zero (`find_matching_paren` — no quote or escape handling, as there).
+function semicolonsInProcOpArgs(s) {
+  let idx = 0;
+  while (idx < s.length) {
+    const m = PROC_OP_REGEX.exec(s.slice(idx));
+    if (!m) return !s.slice(idx).includes(';');
+    if (s.slice(idx, idx + m.index).includes(';')) return false;
+    let i = idx + m.index + m[0].length;
+    for (let depth = 1; depth > 0; i++) {
+      if (i >= s.length) return false; // the operator never closes
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')') depth--;
+    }
+    idx = i;
+  }
+  return true;
+}
+
+// Mirrors `is_css_safe_selector` in wasm-core/src/lib.rs, the source of truth
+// for which plain selectors compile to CSS: change the two together. The
+// engine drops the rest without a `droppedLines` entry, and the browser parses
+// several of them: it closes an open bracket, paren or string at the end of
+// the input, reads a `/*` as a comment (one that in the joined sheet swallows
+// every rule after it) and knows pseudo-elements the engine does not (review
+// R3). Exported so a test pins the mirror directly, and the cross-check pins it
+// against the WASM build.
+export function compilerKeepsAsCss(selector) {
+  const s = selector.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+  return !s.includes('/*') && compilerKeepsSelector(s) && !isProceduralSelector(s) &&
+    hasBalancedDelimiters(s) && !hasInvalidUniversalUsage(s) && !/^[>+~,]/.test(s);
+}
+
+// `has_balanced_selector_delimiters`: brackets, parens and quotes all close,
+// skipping escapes and quoted text, with no bracket inside another.
+function hasBalancedDelimiters(s) {
+  let brackets = 0;
+  let parens = 0;
+  let quote = null;
+  let escaped = false;
+  for (const ch of s) {
+    if (escaped) escaped = false;
+    else if (ch === '\\') escaped = true;
+    else if (quote) { if (ch === quote) quote = null; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '[') { if (brackets++ > 0) return false; }
+    else if (ch === ']') { if (brackets-- === 0) return false; }
+    else if (ch === '(') parens++;
+    else if (ch === ')') { if (parens-- === 0) return false; }
+    else if (ch === '{' || ch === '}') return false;
+  }
+  return quote === null && brackets === 0 && parens === 0;
+}
+
+// Rust's `KNOWN_PSEUDO_ELEMENTS`, matched ASCII case-blind.
+const KNOWN_PSEUDO_ELEMENTS = ['::before', '::after', '::first-line', '::first-letter', '::selection',
+  '::backdrop', '::placeholder', '::marker', '::cue', '::slotted', '::part', '::file-selector-button'];
+
+const asciiLower = (s) => s.replace(/[A-Z]/g, (c) => c.toLowerCase());
+
+// `has_invalid_universal_usage`, walked by code point as Rust walks chars: a
+// `*` glued to a name or a closing bracket or followed by a stray, an unknown
+// pseudo-element (a known name must not run on into an identifier), a
+// functional pseudo-class no browser implements, or a stray `]` or `)`.
+function hasInvalidUniversalUsage(s) {
+  const chars = [...s];
+  let brackets = 0;
+  let parens = 0;
+  let quote = null;
+  let escaped = false;
+  let prev = null;
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
+    const before = prev;
+    prev = ch;
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (quote) { if (ch === quote) quote = null; continue; }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '[') brackets++;
+    else if (ch === ']') { if (--brackets < 0) return true; }
+    else if (ch === '(') parens++;
+    else if (ch === ')') { if (--parens < 0) return true; }
+    else if (ch === '*' && brackets === 0 && parens === 0) {
+      if (before !== null && /[A-Za-z0-9_\-)\]]/.test(before)) return true;
+      const next = chars.slice(i + 1).find((c) => !/\p{White_Space}/u.test(c));
+      if (next !== undefined && !/[A-Za-z0-9#.[:>+~,]/.test(next)) return true;
+    } else if (ch === ':' && chars[i + 1] === ':') {
+      const rest = chars.slice(i).join('');
+      const known = KNOWN_PSEUDO_ELEMENTS.some((p) => asciiLower(rest.slice(0, p.length)) === p &&
+        !/^(?:[A-Za-z0-9_\\-]|[^\0-\x7f])/u.test(rest.slice(p.length)));
+      if (!known) return true;
+    } else if (ch === ':' && brackets === 0 && before !== ':') {
+      const name = /^[A-Za-z_-][A-Za-z0-9_-]*\(/.exec(chars.slice(i + 1).join(''));
+      if (name && !NATIVE_FUNCTIONAL_PSEUDO_CLASSES.has(asciiLower(name[0].slice(0, -1)))) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The site a picked rule is scoped to — the cosmetic `site##` prefix and the
+ * network `domain=` alike. `normalizeHostname` drops a leading `www.` only
+ * when what remains is not a public suffix: the old `replace(/^www\./, '')`
+ * cut the registrable `www.ck` to the suffix `ck`, scoping the rule to every
+ * `.ck` site (PICKER-2026-09 PK2a).
+ */
+function siteScope() {
+  return normalizeHostname(location.hostname);
+}
+
+/**
+ * Why SW1's gate will not scope a rule to `site`, or null when it will: the
+ * gate takes only a plain lower-case hostname that reaches no further than one
+ * site (`isPickerScopeTooBroad`). The dialog then unchecks and disables
+ * "Apply only to <site>" and says why, as a scoped line would be refused
+ * (review R5).
+ */
+function scopeRefusal(site) {
+  if (!site || !SITE_HOSTNAME.test(site)) return 'its name can\'t scope a rule';
+  if (isPublicSuffix(site)) return 'it is a public suffix, shared by many sites';
+  if (NUMERIC_TAIL.test(site) && !IPV4.test(site)) return 'it is not a whole IP address';
+  if (isSingleLabel(site)) return 'a single-label name reaches every host under it';
+  return null;
+}
+
+/** The site a rule may be scoped to, or null when the gate would refuse it. */
+function scopableSite() {
+  const site = siteScope();
+  return scopeRefusal(site) ? null : site;
+}
+
+/**
+ * `el`'s tag as a type selector, or null. The HTML parser takes any character
+ * but whitespace, `/` and `>` into a tag name, so `<a,b id=ad>` gave the
+ * candidate `a,b#ad`: a selector list hiding every `<a>`, which the browser
+ * and the engine both accept. A tag outside `[a-z][a-z0-9-]*` is never
+ * written; the element's id, classes and attributes still are (review R11).
+ */
+function typeSelector(el) {
+  const tag = String(el?.tagName ?? '').toLowerCase();
+  return /^[a-z][a-z0-9-]*$/.test(tag) ? tag : null;
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
  * Exported for tests.
  */
 export function generateSelectors(el) {
   const candidates = [];
-  const hostname = location.hostname.replace(/^www\./, '');
+  const hostname = scopableSite();
   const seen = new Set();
 
-  function add(label, selector, scope) {
+  function add(label, selector, scope, matched) {
     if (!selector || seen.has(selector)) return;
-    // Validate selector
-    try { document.querySelector(selector); } catch { return; }
+    // Offer only what can be saved: it parses, and the compiler keeps it.
+    if (!isSaveableSelector(selector)) return;
     seen.add(selector);
-    const count = deepQuerySelectorAll(selector).length;
-    candidates.push({ label, selector, count, scope: scope || 'page', domain: hostname });
+    // A procedural selector throws in the browser; its caller finds what it
+    // would hide, which is both its count and its preview (PK5).
+    const count = matched ? matched.length : deepQuerySelectorAll(selector).length;
+    candidates.push({ kind: 'cosmetic', label, selector, count, scope: scope || 'page', domain: hostname,
+      ...(matched && { matches: matched }) });
   }
 
   // Check if we are inside a shadow DOM
@@ -398,11 +641,11 @@ export function generateSelectors(el) {
     // global CSS — selectors built from the inner element would preview
     // fine (the picker pierces shadow roots) and then persist as dead
     // rules, so offer ONLY host-level candidates here (§5.30).
-    if (host.id) add(`${hostLabel} ID`, `#${CSS.escape(host.id)}`);
-    for (const cls of Array.from(host.classList).slice(0, 2)) {
-      add(`${hostLabel} .${cls}`, `.${CSS.escape(cls)}`);
+    if (host.id) add(`${hostLabel} ID`, `#${escapeIdent(host.id)}`);
+    for (const cls of stableClassesFirst(Array.from(host.classList)).slice(0, 2)) {
+      add(`${hostLabel} .${cls}`, `.${escapeIdent(cls)}`);
     }
-    add(`${hostLabel} Tag`, host.tagName.toLowerCase());
+    if (typeSelector(host)) add(`${hostLabel} Tag`, typeSelector(host));
 
     candidates.sort((a, b) => selectorScore(b) - selectorScore(a));
     return candidates;
@@ -410,30 +653,31 @@ export function generateSelectors(el) {
 
   // 1. By ID (most specific)
   if (el.id && /^[a-zA-Z]/.test(el.id)) {
-    add('ID', `#${CSS.escape(el.id)}`, 'page');
+    add('ID', `#${escapeIdent(el.id)}`, 'page');
   }
 
   // 2. Tag + ID
-  if (el.id) {
-    add('Tag + ID', `${el.tagName.toLowerCase()}#${CSS.escape(el.id)}`, 'page');
+  const tag = typeSelector(el);
+  if (el.id && tag) {
+    add('Tag + ID', `${tag}#${escapeIdent(el.id)}`, 'page');
   }
 
   // 3. Class combinations (up to 3 most specific classes)
-  const classes = Array.from(el.classList).filter(c => c && !/^\d/.test(c));
+  const classes = stableClassesFirst(Array.from(el.classList).filter(c => c && !/^\d/.test(c)));
   if (classes.length > 0) {
     // Single class
     for (const cls of classes.slice(0, 4)) {
-      add(`Class .${cls}`, `.${CSS.escape(cls)}`, 'page');
+      add(`Class .${cls}`, `.${escapeIdent(cls)}`, 'page');
     }
     // Tag + single class
-    for (const cls of classes.slice(0, 3)) {
-      add(`${el.tagName.toLowerCase()}.${cls}`, `${el.tagName.toLowerCase()}.${CSS.escape(cls)}`, 'page');
+    for (const cls of tag ? classes.slice(0, 3) : []) {
+      add(`${tag}.${cls}`, `${tag}.${escapeIdent(cls)}`, 'page');
     }
     // All classes combined
     if (classes.length > 1) {
-      const combined = classes.slice(0, 3).map(c => `.${CSS.escape(c)}`).join('');
+      const combined = classes.slice(0, 3).map(c => `.${escapeIdent(c)}`).join('');
       add('All classes', combined, 'page');
-      add(`Tag + all classes`, `${el.tagName.toLowerCase()}${combined}`, 'page');
+      if (tag) add(`Tag + all classes`, `${tag}${combined}`, 'page');
     }
   }
 
@@ -444,8 +688,7 @@ export function generateSelectors(el) {
     const val = el.getAttribute(attr);
     if (val) {
       add(`[${attr}="${val}"]`, `[${attr}="${CSS.escape(val)}"]`, 'page');
-      add(`${el.tagName.toLowerCase()}[${attr}="${val}"]`,
-          `${el.tagName.toLowerCase()}[${attr}="${CSS.escape(val)}"]`, 'page');
+      if (tag) add(`${tag}[${attr}="${val}"]`, `${tag}[${attr}="${CSS.escape(val)}"]`, 'page');
     }
   }
 
@@ -470,6 +713,8 @@ export function generateSelectors(el) {
     add('Ancestor path', fullPath, 'page');
   }
 
+  addProceduralCandidates(el, classes, candidates, add);
+
   // Sort: prefer domain-specific medium-count selectors (count 1-5 is ideal)
   candidates.sort((a, b) => {
     const scoreA = selectorScore(a);
@@ -480,7 +725,21 @@ export function generateSelectors(el) {
   return candidates;
 }
 
-function selectorScore(c) {
+// PICKER-2026-09 PK4. A class a build hashed is renamed by the site's next
+// deploy, so a candidate held only by such classes ranks below a stable one of
+// equal count — by less than a count band, so the bands still decide — but is
+// still offered: it may be all an element has. A positional step breaks
+// whenever the page reorders, so a path that needs one ranks below every
+// candidate that matches something without one (and above those that match
+// nothing).
+const HASHED_CLASS_PENALTY = 6;
+const POSITIONAL_PENALTY = 60;
+const UPWARD_PENALTY = 10;
+
+/** Exported for tests. */
+export function selectorScore(c) {
+  // (PK3) `:upward(1)` hides the container, not the element picked: it ranks
+  // below the element's own selector.
   // Prefer selectors that match 1-3 elements (specific enough)
   // Penalize 0 (too specific/broken) and large counts (too broad)
   const countScore = c.count === 0 ? -100
@@ -495,15 +754,187 @@ function selectorScore(c) {
     : c.selector.includes('[') ? 5
     : 3;
 
-  return countScore + typeScore;
+  const penalty = (onlyHashedClasses(c.selector) ? HASHED_CLASS_PENALTY : 0) +
+    (c.selector.includes(':nth-of-type(') ? POSITIONAL_PENALTY : 0) +
+    (/:upward\(/i.test(c.selector) ? UPWARD_PENALTY : 0);
+  return countScore + typeScore - penalty;
+}
+
+/**
+ * Does `className` look build-generated? One alphabetic prefix, one hyphen,
+ * then six or more letters and digits holding at least two digits:
+ * `css-1x2y3z`, `jsx-2947163892`, `grid-12ab34`. The plan pins this rule
+ * against its own cases — `col-md-6`, `ad-slot-300x250`, `sr-only`, `h1` and
+ * `MuiBox-root` are not hashed (PICKER-2026-09 PK4). Exported for tests; PK3
+ * reuses it.
+ */
+export function looksHashed(className) {
+  const m = /^[A-Za-z]+-([A-Za-z0-9]{6,})$/.exec(className);
+  return m !== null && (m[1].match(/\d/g) || []).length >= 2;
+}
+
+/**
+ * `classes` with the stable-looking ones first, each group in page order.
+ * Candidates take only the first few classes, so a stable class behind hashed
+ * ones was never offered — on exactly the sites this penalty is for. The
+ * order within each group rides on `Array.prototype.sort` being stable, which
+ * ES2019 requires and V8 has guaranteed since 7.0 (PICKER-2026-09 PK4).
+ */
+function stableClassesFirst(classes) {
+  return [...classes].sort((a, b) => looksHashed(a) - looksHashed(b));
+}
+
+/**
+ * Is `selector` held only by hashed-looking classes: at least one class, all
+ * of them hashed, and no id or attribute to steady it? Classes are read as
+ * `CSS.escape` wrote them; a hashed-looking name never needs an escape, so a
+ * class that carries one is not hashed.
+ */
+function onlyHashedClasses(selector) {
+  if (/[#[]/.test(selector)) return false;
+  const classes = [...selector.matchAll(/\.((?:\\[\s\S]|[^\s.#[\]:>+~,()*|"'=\\])+)/g)].map((m) => m[1]);
+  return classes.length > 0 && classes.every(looksHashed);
+}
+
+// ---------------------------------------------------------------------------
+// Procedural candidates (PICKER-2026-09 PK3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The element's own text as a `:has-text()` argument, or null. Page text
+ * becomes the argument, so it is cut at the first character that could close
+ * the operator or open another (`( ) #`), that the compiler refuses (`{ }`),
+ * that escapes (`\`) or starts a comment (`/`), that SW1's gate refuses (a
+ * control, a lone surrogate), or any whitespace but a single space (which
+ * takes U+2028/2029 too). What is left is then a literal piece of the element's own text, so
+ * the engine's case-blind substring test still matches the element it came
+ * from; whitespace is cut, not collapsed, for that reason. A leading `/`, the
+ * engine's regex form (`/.*\/` matches every element), so leaves nothing. At
+ * most 64 characters, cut by code point; fewer than three: refused. Exported
+ * for tests.
+ */
+export function escapeHasTextArg(text) {
+  const trimmed = String(text ?? '').trim();
+  const stop = trimmed.search(/[()#\\{}/\p{Cc}\p{Cs}]|[^\S ]| {2}/u);
+  const arg = [...(stop === -1 ? trimmed : trimmed.slice(0, stop))].slice(0, 64).join('').trimEnd();
+  return [...arg].length >= 3 ? arg : null;
+}
+
+function isDocumentRoot(node) {
+  const tag = node?.tagName?.toLowerCase();
+  return !node || node === document.body || node === document.documentElement || tag === 'body' || tag === 'html';
+}
+
+// The engine's own escaping (cosmetic-engine.js): its `:has-text(x)` is
+// `new RegExp(escapeRegex(x), 'i').test(el.textContent)`.
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// The picker's own nodes: gone by the time the engine runs a saved rule.
+const PICKER_OWN_IDS = new Set([PICKER_DIALOG_ID, PICKER_OVERLAY_ID, PICKER_HIGHLIGHT_ID, PICKER_STYLE_ID,
+  PREVIEW_SHEET_ID, APPLIED_SHEET_ID]);
+
+/**
+ * The elements the engine's `tag:has-text(text)` hides: every `tag` element in
+ * the document (not in a shadow root: the engine seeds from
+ * `document.querySelectorAll`) whose `textContent` the engine's case-blind
+ * regex matches. Reading `textContent` per element walks each subtree again,
+ * quadratic on a deep page, so this makes one pass instead (review R7): the
+ * document's text nodes joined in order, as every element's `textContent` is
+ * a slice of that string; each occurrence of the pattern in it, overlapping
+ * ones included; and for each, the ancestors whose slice holds all of it,
+ * climbing from the node holding its last character and stopping at one
+ * already climbed. The `/i` flag folds one UTF-16 unit at a time, so a match
+ * in the joined string is a match in any slice that covers it.
+ */
+function hasTextMatches(tag, text) {
+  const texts = [];
+  const starts = new Map();
+  let joined = '';
+  const stack = [document.documentElement];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (node?.nodeType === 3 || node?.nodeType === 4) {
+      texts.push({ start: joined.length, node });
+      joined += node.data;
+    } else if (node && (node === document.documentElement || node.nodeType === 1) && !PICKER_OWN_IDS.has(node.id) &&
+      !node.classList?.contains?.('__adblock_picker_toast__')) {
+      starts.set(node, joined.length);
+      const kids = node.childNodes ?? [];
+      for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+    }
+  }
+
+  const matched = [];
+  const climbed = new Set();
+  const pattern = new RegExp(escapeRegex(text), 'gi');
+  let t = 0;
+  for (let m = pattern.exec(joined); m; m = pattern.exec(joined)) {
+    const first = m.index;
+    const last = first + m[0].length - 1;
+    pattern.lastIndex = first + 1;
+    while (t + 1 < texts.length && texts[t + 1].start <= last) t++;
+    for (let e = texts[t].node.parentElement; e && !climbed.has(e); e = e.parentElement) {
+      const start = starts.get(e);
+      if (start === undefined) break;
+      if (start > first) continue; // below the node holding all of it
+      climbed.add(e);
+      if (e.matches?.(tag)) matched.push(e);
+    }
+  }
+  return matched;
+}
+
+/**
+ * `:has-text()` and `:has(> child)` for an element whose own names are weak (no
+ * id, no class but hashed ones), and `:upward(1)` to block its container.
+ * Each carries a real match count: the browser cannot run `:has-text()`, and
+ * a count of 0 would rank it below even a positional path. Neither is offered
+ * on, or up into, `body` or `html` — from the picked element or from any other
+ * match of the base: the gate refuses only a bare root, and `body:has-text(x)`
+ * would blank the page. (`tag:has-text()` and `tag:has()` match only `tag`
+ * elements, never a root, once the picked element is not one.)
+ */
+function addProceduralCandidates(el, classes, candidates, add) {
+  if (isDocumentRoot(el)) return;
+  const tag = typeSelector(el);
+  const weak = !el.id && classes.every(looksHashed);
+
+  if (weak && tag) {
+    const text = escapeHasTextArg(el.textContent);
+    if (text) {
+      add(':has-text', `${tag}:has-text(${text})`, 'page', hasTextMatches(tag, text));
+    }
+    const child = Array.from(el.children ?? []).find((c) =>
+      elementResources(c).some(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol)));
+    const childSel = child && simpleSelector(child);
+    if (childSel) add('Contains the ad', `${tag}:has(> ${childSel})`, 'page');
+  }
+
+  if (!isDocumentRoot(el.parentElement)) {
+    const self = candidates
+      .filter((c) => c.count > 0 && !isProceduralSelector(c.selector) &&
+        !c.selector.includes(':nth-of-type(') && !c.selector.includes(':has('))
+      .sort((a, b) => selectorScore(b) - selectorScore(a))[0];
+    if (self) {
+      const containers = new Set(deepQuerySelectorAll(self.selector).map((m) => m.parentElement).filter(Boolean));
+      // The base can match elsewhere too: if any of those sits directly in
+      // the body, the rule would hide the page (review R1).
+      if (![...containers].some(isDocumentRoot)) {
+        add('Block the container', `${self.selector}:upward(1)`, 'page', [...containers]);
+      }
+    }
+  }
 }
 
 function simpleSelector(el) {
   if (!el || el === document.body) return null;
-  if (el.id) return `#${CSS.escape(el.id)}`;
-  const classes = Array.from(el.classList).filter(Boolean).slice(0, 2);
-  if (classes.length) return `${el.tagName.toLowerCase()}.${classes.map(CSS.escape).join('.')}`;
-  return el.tagName.toLowerCase();
+  if (el.id) return `#${escapeIdent(el.id)}`;
+  const classes = stableClassesFirst(Array.from(el.classList).filter(Boolean)).slice(0, 2);
+  const tag = typeSelector(el) ?? '';
+  if (classes.length) return `${tag}.${classes.map(escapeIdent).join('.')}`;
+  return tag || null;
 }
 
 function buildSelectorPath(el, maxDepth) {
@@ -512,10 +943,208 @@ function buildSelectorPath(el, maxDepth) {
   for (let i = 0; i < maxDepth && current && current !== document.body; i++) {
     const sel = simpleSelector(current);
     if (!sel) break;
-    parts.unshift(sel);
+    parts.unshift(pinnedStep(current, sel));
     current = current.parentElement;
   }
   return parts.length > 1 ? parts.join(' > ') : null;
+}
+
+/**
+ * `sel` pinned to `el`'s position when it would also match a sibling, so the
+ * path can single out a structurally anonymous element: `:nth-of-type(k)`,
+ * `k` counted among same-tag siblings as the pseudo-class counts it, with the
+ * tag written out for an id step (PICKER-2026-09 PK4).
+ */
+function pinnedStep(el, sel) {
+  const siblings = Array.from(el.parentElement?.children ?? []);
+  const collides = siblings.some((s) => {
+    if (s === el) return false;
+    try {
+      return s.matches(sel);
+    } catch {
+      return false;
+    }
+  });
+  if (!collides) return sel;
+  const k = siblings.filter((s) => s.tagName === el.tagName).indexOf(el) + 1;
+  return `${sel.startsWith('#') ? typeSelector(el) ?? '' : ''}${sel}:nth-of-type(${k})`;
+}
+
+// ---------------------------------------------------------------------------
+// Network-block candidates (PICKER-2026-09 PK2a)
+// ---------------------------------------------------------------------------
+// Every line built here must pass SW1's APPEND_USER_FILTER gate
+// (`isPickerSafeUserFilterLine` in the service worker), or the save is
+// refused: `||host^` or `||host/path[^]`, then `$<type>,domain=<site>`. The
+// resource URL, host included, is the page's to choose, so nothing from it
+// reaches the line unvalidated.
+
+// The gate's `||` host: `[a-z0-9.-]`, or a bracketed IPv6 literal. WHATWG lets
+// `$ * , = { }` into a hostname, so this is a check, not a formality.
+const NETWORK_HOST = /^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])$/;
+// The first path character outside the gate's class: `$` would open an option
+// list, `^ | *` are pattern syntax, and a browser's URL parser may leave
+// others literal (`{ } \``) that the gate refuses.
+const NETWORK_PATH_STOP = /[^\w!%&'()+,\-.:;=@[\]~/]/;
+// The gate's `domain=` value: plain lower-case labels, one host, no negation.
+const SITE_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+// And no wider than one site, as SW1's `isPickerScopeTooBroad` rules for a
+// hide's hostname, a `||` host and `domain=` alike: not a public suffix, a
+// last label that is a number only in a whole IPv4 address (`domain=1` would
+// reach every x.x.x.1 host), and not a single label, trailing dots aside
+// (review R10): the list's implicit `*` rule makes an unknown one such as
+// `lan` a suffix, and every *.localhost is loopback. A bracketed IPv6 literal
+// is one host. A URL's own host never needs the number rule: the parser writes
+// such a host as a dotted quad or refuses it (PICKER-2026-09 PK2c).
+const NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
+const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+function isSingleLabel(host) {
+  return !host.startsWith('[') && !host.replace(/\.+$/, '').includes('.');
+}
+
+function scopeTooBroad(host) {
+  return isPublicSuffix(host) || (NUMERIC_TAIL.test(host) && !IPV4.test(host)) || isSingleLabel(host);
+}
+
+const NETWORK_TYPES = new Set(['image', 'subdocument', 'media', 'object']);
+const NETWORK_LABELS = { path: 'Block request', prefix: 'Block path prefix', host: 'Block host' };
+
+/** `url` resolved against the document's base URL, as the browser resolves it. */
+function resolveUrl(url) {
+  if (!url) return null;
+  try {
+    return new URL(url, document.baseURI || location.href);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The network rule blocking `url` as a `type` request, scoped to `domain` —
+ * or null when no gate-safe line exists. `scope: 'path'` keeps the pathname
+ * less its query, so a cache-busting parameter cannot escape the block. A
+ * path character the gate refuses cuts it to the prefix before it, with no
+ * closing `^`: strictly narrower than the host, so the escape only narrows. A
+ * prefix of just `/`, or a non-default port (the gate admits none, and a path
+ * rule without it can never match), falls back to `scope: 'host'`, the host
+ * alone. Exported so SW1's gate can be checked against real output.
+ */
+export function urlToNetworkPattern(url, { scope = 'path', type, domain } = {}) {
+  if (!NETWORK_TYPES.has(type)) return null;
+  if (domain && (!SITE_HOSTNAME.test(domain) || scopeTooBroad(domain))) return null;
+  const u = resolveUrl(url);
+  if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:')) return null;
+  const host = u.hostname.toLowerCase();
+  if (!NETWORK_HOST.test(host) || scopeTooBroad(host)) return null;
+
+  let base = `||${host}^`;
+  if (scope === 'path' && !u.port) {
+    const cut = u.pathname.search(NETWORK_PATH_STOP);
+    if (cut === -1) base = `||${host}${u.pathname}^`;
+    else if (cut > 1) base = `||${host}${u.pathname.slice(0, cut)}`;
+  }
+  return `${base}$${type}${domain ? `,domain=${domain}` : ''}`;
+}
+
+/** The first `url(...)` in the element's background image, inline style first. */
+function backgroundImageUrl(el) {
+  const urlIn = (value) => {
+    const m = /url\(\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|([^"'()\s]+))\s*\)/.exec(value || '');
+    return m ? (m[1] ?? m[2] ?? m[3]).replace(/\\(.)/g, '$1') : null;
+  };
+  const inline = urlIn(el.style?.backgroundImage);
+  if (inline || typeof getComputedStyle !== 'function') return inline;
+  try {
+    return urlIn(getComputedStyle(el).backgroundImage);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The requests the element itself makes, most direct first, each with the
+ * type it is filtered as. The type follows the URL taken: a video's poster
+ * is an image request, not media.
+ */
+function elementResources(el) {
+  const attr = (name) => el.getAttribute(name);
+  switch (el.tagName.toLowerCase()) {
+    case 'img': {
+      const srcset = attr('srcset')?.trim().split(/\s+/)[0].replace(/,+$/, '');
+      return [el.currentSrc, attr('src'), srcset].map((url) => ({ url, type: 'image' }));
+    }
+    case 'image': // SVG
+      return [{ url: attr('href') || attr('xlink:href'), type: 'image' }];
+    case 'video':
+      return [{ url: el.currentSrc, type: 'media' }, { url: attr('src'), type: 'media' },
+        { url: attr('poster'), type: 'image' }];
+    case 'audio':
+      return [{ url: el.currentSrc, type: 'media' }, { url: attr('src'), type: 'media' }];
+    case 'source':
+      return [{ url: attr('src'), type: 'media' }];
+    case 'iframe':
+    case 'frame':
+      return [{ url: attr('src'), type: 'subdocument' }];
+    case 'embed':
+      return [{ url: attr('src'), type: 'object' }];
+    case 'object':
+      return [{ url: attr('data'), type: 'object' }];
+    default:
+      return [{ url: backgroundImageUrl(el), type: 'image' }];
+  }
+}
+
+/**
+ * Network-block candidates for the element's own request, scoped to the site:
+ * its path (or the prefix a refused character leaves), then its whole host.
+ * None when the element makes no http(s) request, when that request's host is
+ * not gate-safe, or when there is no plain, registrable site to scope to — an
+ * unscoped block of a shared CDN path would reach every site. Each carries the
+ * element as `matches`: what the preview hides, and what is hidden once saved
+ * until a reload applies the block (review R4). Exported for tests and SW1's
+ * gate cross-check; the dialog offers these from PK2b.
+ */
+export function generateNetworkCandidates(el) {
+  const resource = elementResources(el).find(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol));
+  const domain = siteScope();
+  if (!resource || !domain) return [];
+
+  const candidates = [];
+  for (const scope of ['path', 'host']) {
+    const rule = urlToNetworkPattern(resource.url, { scope, type: resource.type, domain });
+    if (!rule || candidates.some((c) => c.rule === rule)) continue;
+    const base = rule.slice(0, rule.indexOf('$'));
+    const real = !base.includes('/') ? 'host' : base.endsWith('^') ? 'path' : 'prefix';
+    candidates.push({
+      kind: 'network',
+      label: `${NETWORK_LABELS[real]} (${resource.type})`,
+      rule,
+      matches: [el],
+      scope: real,
+      count: 1,
+      domain,
+      type: resource.type,
+      url: resource.url,
+    });
+  }
+  return candidates;
+}
+
+/**
+ * The line the dialog sends for `candidate`, scoped to `domain` or, when the
+ * user unchecks "Apply only to <site>", to nothing: a hide as `site##selector`, a
+ * network candidate rebuilt from its URL by the same `urlToNetworkPattern`.
+ * Exported so the gate cross-check feeds exactly what the dialog sends
+ * (PICKER-2026-09 PK2b).
+ */
+export function candidateLine(candidate, domain) {
+  if (candidate.kind !== 'network') return buildCosmeticRule(candidate.selector, domain);
+  return urlToNetworkPattern(candidate.url, {
+    scope: candidate.scope === 'host' ? 'host' : 'path',
+    type: candidate.type,
+    domain: domain || undefined,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -541,36 +1170,67 @@ function openPickerDialog(target) {
 
 function updatePickerDialog(dialog) {
   const target = currentNavTarget;
-  const hostname = location.hostname.replace(/^www\./, '');
-  const candidates = generateSelectors(target);
+  const site = siteScope();
+  const refusal = scopeRefusal(site);
+  const hostname = refusal ? null : site;
+  const cosmetic = generateSelectors(target);
+  const candidates = [...generateNetworkCandidates(target), ...cosmetic];
+  const scopeOf = () => (dialog.querySelector('#adblock-scope-site')?.checked ? hostname : null);
 
   updateHighlight(target);
-  dialog.innerHTML = buildDialogHTML(candidates, target, hostname);
+  dialog.innerHTML = buildDialogHTML(candidates, target, site, !refusal);
+  // A line scoped to a site the gate will not scope to is refused: offer
+  // only the unscoped rule, and say why (review R5).
+  const siteCheck = dialog.querySelector('#adblock-scope-site');
+  const scopeReason = dialog.querySelector('#adblock-scope-reason');
+  if (refusal) {
+    if (siteCheck) Object.assign(siteCheck, { checked: false, disabled: true });
+    if (scopeReason) scopeReason.textContent = `Can't limit the rule to ${site || 'this page'}: ${refusal}.`;
+  }
 
   // Select first (best) candidate by default
   if (candidates.length > 0) {
     const firstRadio = dialog.querySelector('input[type="radio"]');
     if (firstRadio) {
       firstRadio.checked = true;
-      updatePreview(dialog, candidates[0], hostname);
+      updatePreview(dialog, candidates[0], scopeOf());
     }
   }
 
   // Wire up events
   dialog.querySelectorAll('input[type="radio"]').forEach((radio, i) => {
     radio.addEventListener('change', () => {
-      updatePreview(dialog, candidates[i], hostname);
-      updateCustomInput(dialog, candidates[i].selector, hostname);
+      updatePreview(dialog, candidates[i], scopeOf());
     });
   });
 
   const customInput = dialog.querySelector('#adblock-picker-custom');
+  // What Create would save: a typed selector is a hide; otherwise the checked
+  // candidate, of its kind.
+  const chosen = () => {
+    const custom = customInput?.value?.trim();
+    return custom
+      ? { kind: 'cosmetic', selector: custom }
+      : candidates[Number(dialog.querySelector('input[type="radio"]:checked')?.value)];
+  };
+
+  // The rule line follows "Apply only to <site>", or it shows one scope while
+  // Create sends the other (review R12).
+  siteCheck?.addEventListener('change', () => {
+    const ruleEl = dialog.querySelector('#adblock-rule-preview');
+    const candidate = chosen();
+    if (ruleEl && candidate) ruleEl.textContent = candidateLine(candidate, scopeOf()) ?? '';
+  });
+
   customInput?.addEventListener('input', () => {
     const sel = customInput.value.trim();
     try {
       const count = document.querySelectorAll(sel).length;
       updatePreviewForCustom(dialog, sel, hostname, count);
-    } catch {}
+      showPreview({ kind: 'cosmetic', selector: sel });
+    } catch {
+      clearPreview();
+    }
   });
 
   // Navigation events
@@ -598,26 +1258,28 @@ function updatePickerDialog(dialog) {
   });
 
   dialog.querySelector('#adblock-picker-create')?.addEventListener('click', () => {
-    const custom = dialog.querySelector('#adblock-picker-custom')?.value?.trim();
-    const selected = dialog.querySelector('input[type="radio"]:checked');
-    const selector = custom || (selected ? selected.value : '');
+    const candidate = chosen();
+    if (!candidate?.selector && candidate?.kind !== 'network') return;
 
-    if (!selector) return;
-
-    const rule = buildCosmeticRule(selector, dialog.querySelector('#adblock-scope-site')?.checked ? hostname : null);
-    savePickerRule(rule, selector, hostname, dialog);
+    const rule = candidateLine(candidate, scopeOf());
+    if (!rule) return;
+    if (candidate.kind === 'network') {
+      savePickerRule(rule, null, hostname, dialog, 'network', candidate.matches);
+    } else {
+      savePickerRule(rule, candidate.selector, hostname, dialog);
+    }
   });
 }
 
-function buildDialogHTML(candidates, target, hostname) {
+function buildDialogHTML(candidates, target, hostname, scopable) {
   const tagName = target.tagName.toLowerCase();
   const preview = [tagName, target.id ? `#${target.id}` : '', ...Array.from(target.classList).slice(0, 3)]
     .filter(Boolean).join(' ');
 
   const candidateRows = candidates.slice(0, 8).map((c, i) => `
     <label class="adblock-picker-row">
-      <input type="radio" name="selector" value="${escAttr(c.selector)}" ${i === 0 ? 'checked' : ''}>
-      <span class="adblock-picker-sel">${escHTML(c.selector)}</span>
+      <input type="radio" name="selector" value="${i}" ${i === 0 ? 'checked' : ''}>
+      <span class="adblock-picker-sel">${escHTML(c.kind === 'network' ? `${c.label}: ${c.rule}` : c.selector)}</span>
       <span class="adblock-picker-count ${c.count === 0 ? 'zero' : c.count <= 5 ? 'good' : 'broad'}">
         ${c.count} match${c.count !== 1 ? 'es' : ''}
       </span>
@@ -664,9 +1326,10 @@ function buildDialogHTML(candidates, target, hostname) {
 
       <div class="adblock-picker-scope-row">
         <label>
-          <input type="checkbox" id="adblock-scope-site" checked>
-          Apply only to <strong>${escHTML(hostname)}</strong>
+          <input type="checkbox" id="adblock-scope-site" ${scopable ? 'checked' : 'disabled'}>
+          Apply only to <strong>${escHTML(hostname || 'this page')}</strong>
         </label>
+        <span class="adblock-picker-scope-reason" id="adblock-scope-reason"></span>
         <span class="adblock-picker-rule-preview" id="adblock-rule-preview"></span>
       </div>
     </div>
@@ -770,6 +1433,8 @@ function buildDialogHTML(candidates, target, hostname) {
       }
       .adblock-picker-scope-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
       .adblock-picker-scope-row input { accent-color: #58a6ff; }
+      .adblock-picker-scope-reason:empty { display: none; }
+      .adblock-picker-scope-reason { font-size: 11px; color: #d29922; }
       .adblock-picker-rule-preview {
         font-family: monospace; font-size: 11px; color: #3fb950;
         background: rgba(63,185,80,0.08); padding: 2px 8px; border-radius: 4px;
@@ -794,7 +1459,21 @@ function buildDialogHTML(candidates, target, hostname) {
   `;
 }
 
-function updatePreview(dialog, candidate, hostname) {
+function updatePreview(dialog, candidate, domain) {
+  showPreview(candidate);
+  if (candidate.kind === 'network') {
+    // The resource is already loaded, so the block itself only shows on a
+    // reload; the element is hidden meanwhile (PICKER-2026-09 PK2b).
+    const preview = dialog.querySelector('#adblock-picker-preview');
+    if (preview) {
+      preview.innerHTML = `<div style="font-size:11px;color:#8b949e">${escHTML(candidate.label)}: ` +
+        'blocks the request. It applies now and on every reload.</div>';
+    }
+    const ruleEl = dialog.querySelector('#adblock-rule-preview');
+    if (ruleEl) ruleEl.textContent = candidateLine(candidate, domain) ?? '';
+    return;
+  }
+  const hostname = domain || '';
   updatePreviewForCustom(dialog, candidate.selector, hostname, candidate.count);
   updateCustomInput(dialog, candidate.selector, hostname);
 }
@@ -805,6 +1484,16 @@ function updatePreviewForCustom(dialog, selector, hostname, count) {
 
   if (!selector) {
     preview.innerHTML = '<em>Enter a selector above</em>';
+    return;
+  }
+
+  // The browser cannot run a procedural selector; the page's rule engine
+  // does, from the saved rule (PICKER-2026-09 PK3).
+  if (isProceduralSelector(selector)) {
+    const n = Number.isFinite(count) ? count : 0;
+    preview.innerHTML = `<div style="font-size:11px;color:#8b949e">${n} element${n !== 1 ? 's' : ''} ` +
+      'will be hidden by the page\'s rule engine</div>';
+    updateRulePreview(dialog, selector, hostname);
     return;
   }
 
@@ -857,12 +1546,26 @@ function buildCosmeticRule(selector, domain) {
 // ---------------------------------------------------------------------------
 // Save rule
 // ---------------------------------------------------------------------------
-export async function savePickerRule(rule, selector, hostname, dialog) {
+export async function savePickerRule(rule, selector, hostname, dialog, kind = 'cosmetic', elements = []) {
   try {
+    // A network line is no selector: the two selector guards below are for
+    // hides. It hides `elements`, the picked element, until a reload applies
+    // the block (PICKER-2026-09 PK2b, review R4).
+    const network = kind === 'network';
+    // Every save passes here, and the custom field arrives unvalidated: a
+    // selector the browser cannot parse, or the compiler would drop, is never
+    // sent (PICKER-2026-09 PK1b).
+    if (!network && !isSaveableSelector(selector)) {
+      showErrorInDialog(dialog,
+        'This selector can\'t be saved: it is not valid CSS, or it contains ' +
+        'characters a filter rule cannot carry, such as {, } or ;.');
+      return;
+    }
+
     // A rule that only matches inside shadow roots cannot be applied by
     // document-level CSS — refuse clearly instead of reporting a success
     // that evaporates on reload (§5.30).
-    if (isShadowOnlySelector(selector)) {
+    if (!network && isShadowOnlySelector(selector)) {
       showErrorInDialog(dialog,
         'This element is inside a shadow DOM that page-level rules cannot reach. ' +
         'Pick the outer (shadow host) element instead.');
@@ -882,8 +1585,22 @@ export async function savePickerRule(rule, selector, hostname, dialog) {
       return;
     }
 
+    // The append recompiles all of My Filters, so the skip counts cover every
+    // stored line: one unsupported line pasted long ago would fail every later
+    // save. Decide on this line's own entry, keyed on the text the SW stores
+    // (trimmed). A dropped line is not hidden either — the element vanishing
+    // is itself a claim that the rule works (PICKER-2026-09 PK1).
+    const savedLine = rule.trim();
+    const dropped = res.counts?.skippedRules?.find((s) => s.line === savedLine);
+    if (dropped) {
+      showErrorInDialog(dialog, dropped.reason || 'This rule couldn\'t be applied');
+      return;
+    }
+
     // Immediately hide elements on this page
-    applyRuleImmediately(selector);
+    clearPreview();
+    if (network) hideElementsImmediately(elements);
+    else if (selector) applyRuleImmediately(selector);
 
     // Show success state in dialog
     showSuccessInDialog(dialog, rule);
@@ -898,12 +1615,75 @@ export async function savePickerRule(rule, selector, hostname, dialog) {
   }
 }
 
+// The picker's own UI is never hidden, however broad the selector (`div`).
+const NOT_PICKER_UI = [PICKER_DIALOG_ID, PICKER_OVERLAY_ID, PICKER_HIGHLIGHT_ID]
+  .map((id) => `:not(#${id}):not(#${id} *)`).join('') + ':not(.__adblock_picker_toast__)';
+
+// Known limit (review R6): these sheets are author-origin CSS, and an inline
+// `style="display: block !important"` on the element outranks an author
+// `!important` rule, so on such an element the preview, and the hide after a
+// save, show nothing until the reload. The engine injects the saved rule as
+// user-origin CSS (`insertCSS` with `origin: 'USER'`), whose `!important`
+// outranks every author declaration, inline included: the rule does apply.
+// Only a user-origin sheet would close the gap, and a content script cannot
+// add one (PICKER-2026-09 §6).
+function hideRule(selector) {
+  return `:is(${selector})${NOT_PICKER_UI} { display: none !important; }`;
+}
+
+function pickerSheet(id) {
+  let node = document.getElementById(id);
+  if (!node) {
+    node = document.createElement('style');
+    node.id = id;
+    document.documentElement.appendChild(node);
+  }
+  return node;
+}
+
+function clearPreview() {
+  document.getElementById(PREVIEW_SHEET_ID)?.remove();
+  for (const node of markedNodes) node.removeAttribute?.(PREVIEW_MARK);
+  markedNodes = [];
+}
+
+/**
+ * Hide what `candidate` would hide, now, through the preview sheet: a network
+ * block's own element, and a procedural candidate's actual matched set (the
+ * browser cannot run `:has-text()`), each marked with a picker-owned
+ * attribute. `tag:has-text(x)` also matches ancestor wrappers, so the user
+ * sees one go before saving (PICKER-2026-09 PK5, review R4).
+ */
+function showPreview(candidate) {
+  clearPreview();
+  let selector = candidate?.kind === 'network' ? null : candidate?.selector;
+  if (candidate?.kind !== 'network' && !selector) return;
+  if (candidate.kind === 'network' || isProceduralSelector(selector)) {
+    if (!candidate.matches?.length) return;
+    for (const node of candidate.matches) {
+      node.setAttribute?.(PREVIEW_MARK, '');
+      markedNodes.push(node);
+    }
+    selector = `[${PREVIEW_MARK}]`;
+  }
+  pickerSheet(PREVIEW_SHEET_ID).textContent = hideRule(selector);
+}
+
+/** Hide a saved network block's element until a reload applies the block. */
+function hideElementsImmediately(elements) {
+  if (!elements?.length) return;
+  for (const node of elements) node.setAttribute?.(APPLIED_MARK, '');
+  const node = pickerSheet(APPLIED_SHEET_ID);
+  const rule = hideRule(`[${APPLIED_MARK}]`);
+  if (!(node.textContent || '').includes(rule)) node.textContent = `${node.textContent || ''}${rule}\n`;
+}
+
+/** Hide a saved rule's matches until a reload applies it: the applied sheet. */
 function applyRuleImmediately(selector) {
-  try {
-    deepQuerySelectorAll(selector).forEach((el) => {
-      el.style.setProperty('display', 'none', 'important');
-    });
-  } catch {}
+  // The engine runs a procedural rule from the saved line; CSS cannot.
+  if (isProceduralSelector(selector)) return;
+  const node = pickerSheet(APPLIED_SHEET_ID);
+  node.textContent = `${node.textContent || ''}${hideRule(selector)}\n`;
 }
 
 function showSuccessInDialog(dialog, rule) {
@@ -961,8 +1741,4 @@ function escHTML(s) {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
-}
-
-function escAttr(s) {
-  return String(s).replace(/"/g, '&quot;');
 }

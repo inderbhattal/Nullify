@@ -1,8 +1,8 @@
 /**
  * status-format.js — pure formatters for the options page's status line.
  *
- * The service worker already reports what it refused: `SET_USER_FILTERS` /
- * `APPEND_USER_FILTER` return `{skippedNetwork, skippedRules}`, the allowlist
+ * The service worker already reports what it refused: `SET_USER_FILTERS`
+ * returns `{skippedNetwork, skippedRules}` (APPEND only `skippedRules`), the allowlist
  * writers return `rejected`, and `CHECK_FILTER_UPDATES` reports which lists it
  * actually refreshed. §5.32 found none of it had a reader, so the UI reported
  * "✓ Applied N rules" over 30 dropped lines. These helpers turn those fields

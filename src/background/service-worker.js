@@ -3094,6 +3094,25 @@ function compileUserFiltersViaWasm(filtersText) {
 }
 
 /**
+ * PICKER-2026-09 SW2 — the skipped entries a reply may carry.
+ *
+ * APPEND_USER_FILTER is SENDER_ANY, so its reply reaches a renderer, and the
+ * rest of My Filters is private from renderers (REVIEW-2026-08 §4.19). An
+ * append recompiles every stored line, though, so its reply listed up to 20
+ * of the user's own dropped lines: compiler drops since REVIEW-2026-09 §3.3
+ * routed them here, and the WASM-down fallback's drops once it reported them.
+ * The picker needs only its own line's entry (PK1: `skippedRules.find((s) =>
+ * s.line === rule.trim())`), which the 20-entry cap could also push out of the
+ * list. So an APPEND reply carries exactly that entry or none. The options
+ * page's reply (extension pages only, no appended line) keeps the first 20.
+ */
+function skippedRulesForReply(skipped, appendedLine) {
+  if (appendedLine === undefined) return skipped.slice(0, 20);
+  const own = skipped.find((s) => s.line === appendedLine);
+  return own ? [own] : [];
+}
+
+/**
  * Apply user-defined filters as dynamic DNR rules + cosmetic rules.
  * Internal: callers go through applyUserFilters / setAndApplyUserFilters /
  * appendUserFilterLine so runs never overlap.
@@ -3101,8 +3120,10 @@ function compileUserFiltersViaWasm(filtersText) {
  * Returns `{network, cosmetic}` counts on success, or `{error}` when the DNR
  * write failed — in which case USER_FILTERS_APPLIED is NOT updated, so the
  * next startup retries the apply instead of skipping it forever (§4.6).
+ * `appendedLine` is APPEND_USER_FILTER's line: the reply then lists that
+ * line's own skipped entry and nothing else (see skippedRulesForReply).
  */
-async function _applyUserFiltersNow(filtersText) {
+async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
   const lines = (filtersText || '').split('\n').filter(Boolean);
   let newRules = [];
   let cosmeticRules = { generic: [], domainSpecific: {}, exceptions: [] };
@@ -3127,7 +3148,20 @@ async function _applyUserFiltersNow(filtersText) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('!')) continue;
       const rule = parseSimpleNetworkRule(trimmed, id++);
-      if (rule) newRules.push(rule);
+      if (rule) {
+        newRules.push(rule);
+      } else if (!/^(?:\[|%|@@#)/.test(trimmed)
+        && !['##', '#@#', '#?#', '#+js('].some((marker) => trimmed.includes(marker))) {
+        // PICKER-2026-09 SW2 — a network line this parser cannot express
+        // (`$domain=`, `$3p`, `$object`, …) vanished here with no record, so
+        // the reply said nothing was wrong. Report it as the compiler reports
+        // its own drops, and only a line the compiler reads as a network rule,
+        // by its own tests: `should_skip_filter_line` skips a line starting
+        // `[`, `%` or `@@#` (and `!` or blank, skipped above), a `#+js(` line
+        // goes to the scriptlet branch, and a line holding `##`, `#@#` or
+        // `#?#` is cosmetic. What this parser compiles is unchanged.
+        droppedLines.push({ line: trimmed, reason: 'unsupported by the fallback compiler (WASM unavailable)' });
+      }
     }
   }
 
@@ -3290,7 +3324,7 @@ async function _applyUserFiltersNow(filtersText) {
     // Counted as "compiled but not live", so truncation, id-range drops,
     // preflight rejections and capacity stops are all included.
     skippedNetwork: skippedNetworkTotal,
-    skippedRules: skipped.slice(0, 20),
+    skippedRules: skippedRulesForReply(skipped, appendedLine),
   };
 
   log(`[AdBlock] Applied user filters: ${counts.network} network, ${counts.cosmetic} cosmetic, ${counts.skippedNetwork} skipped`);
@@ -3398,7 +3432,7 @@ function appendUserFilterLine(line) {
       return { error: `User filters exceed ${MAX_USER_FILTERS_BYTES} byte limit` };
     }
     await setStorage(StorageKeys.USER_FILTERS, next);
-    return _applyUserFiltersNow(next);
+    return _applyUserFiltersNow(next, { appendedLine: trimmedLine });
   });
 }
 

@@ -347,6 +347,7 @@ test('PK1: an unrelated dropped line does NOT block a clean save', async () => {
 });
 
 test('PK1: the saved line\'s own drop is reported, not shown as saved', async () => {
+  clearSheets(); // PK5: the applied sheet outlives a test
   const rule = '||x.example^$redirect=y';
   globalThis.chrome = {
     runtime: {
@@ -380,7 +381,8 @@ test('PK1: the saved line\'s own drop is reported, not shown as saved', async ()
   assert.ok(!dialog.footer.innerHTML.includes('Rule saved'));
   // Nor the other two success signals: the element vanishing (a reload will
   // not hide it) and the toast.
-  assert.deepEqual(hidden, [], 'nothing hidden for a rule that is not applied');
+  assert.deepEqual(hidden, [], 'nothing hidden inline');
+  assert.doesNotMatch(appliedCss(), /ad-banner/, 'nothing hidden for a rule that is not applied');
   assert.ok(!toasts.some((t) => /Rule saved/.test(t)), `success toast shown: ${toasts}`);
 });
 
@@ -431,6 +433,7 @@ test('PK1: the drop is matched on the line as the SW stores it, trimmed', async 
 });
 
 test('PK1 (didn\'t re-break): a clean apply with no drops still shows success', async () => {
+  clearSheets(); // PK5: the applied sheet outlives a test
   globalThis.chrome = {
     runtime: {
       sendMessage: () => Promise.resolve({
@@ -447,8 +450,10 @@ test('PK1 (didn\'t re-break): a clean apply with no drops still shows success', 
   const toasts = await saveAndFlushToasts('example.test##.ad-banner', '.ad-banner', dialog);
 
   assert.match(dialog.footer.innerHTML, /Rule saved/);
-  // The probes the drop test reads as silent do fire on a real save.
-  assert.deepEqual(hidden, ['display']);
+  // The probes the drop test reads as silent do fire on a real save (PK5:
+  // through the applied stylesheet, never inline).
+  assert.deepEqual(hidden, []);
+  assert.match(appliedCss(), /ad-banner/);
   assert.ok(toasts.some((t) => /Rule saved/.test(t)), `no success toast: ${toasts}`);
 });
 
@@ -1539,6 +1544,7 @@ test('PK2b: candidateLine builds the line the dialog sends, for either kind', ()
 });
 
 test('PK2b: a saved network block hides its element through the preview selector', async () => {
+  clearSheets(); // PK5: the applied sheet outlives a test
   globalThis.chrome = { runtime: { sendMessage: () => Promise.resolve({ ok: true, counts: { skippedRules: [] } }) } };
   const hidden = [];
   docState.byLevel = new Map([['.banner', [el({ style: { setProperty: (p) => hidden.push(p) } })]]]);
@@ -1546,7 +1552,8 @@ test('PK2b: a saved network block hides its element through the preview selector
   const dialog = makeDialog();
   await saveAndFlushToasts('||cdn.ads.example/b.png^$image,domain=example.test', '.banner', dialog, 'network');
   assert.match(dialog.footer.innerHTML, /Rule saved/);
-  assert.deepEqual(hidden, ['display']);
+  assert.deepEqual(hidden, []);
+  assert.match(appliedCss(), /banner/);
 });
 
 test('PK2b: a bare element with no hide to preview still saves its network block', async () => {
@@ -1702,4 +1709,145 @@ test('PK3: the dialog previews and sends a :has-text candidate', () => {
   } finally {
     resetPickerEnv();
   }
+});
+
+// PICKER-2026-09 PK5 — the preview and the saved-rule hide go through
+// picker-owned stylesheets, never an inline `style.display` the page can read
+// or clear. A procedural candidate previews the elements the engine would
+// actually hide, marked with a picker-owned attribute the preview sheet hides.
+
+const PICKER_UI_STYLE = '__adblock_picker_style__';
+const sheetsNamed = (prefix) => [...mountedById.values()].filter((n) => n.id?.startsWith(prefix));
+const sheetText = (prefix) => sheetsNamed(prefix).map((n) => n.textContent).join('\n');
+const appliedCss = () => sheetText('__adblock_picker_applied_');
+const previewCss = () => sheetText('__adblock_picker_preview_');
+function clearSheets() {
+  for (const id of [...mountedById.keys()]) {
+    if (id.startsWith('__adblock_picker_applied_') || id.startsWith('__adblock_picker_preview_')) mountedById.delete(id);
+  }
+}
+/** An element stub whose attributes can be set and removed, as marks are. */
+function markable(overrides = {}) {
+  const attrs = new Map();
+  return el({
+    attrs,
+    setAttribute: (name, value) => attrs.set(name, value),
+    removeAttribute: (name) => attrs.delete(name),
+    ...overrides,
+  });
+}
+
+test('PK5: applying a rule hides via an injected stylesheet, not an inline style', async () => {
+  clearSheets();
+  globalThis.chrome = { runtime: { sendMessage: () => Promise.resolve({ ok: true, counts: { skippedRules: [] } }) } };
+  const inline = [];
+  docState.byLevel = new Map([['.ad-banner', [el({ style: { setProperty: (p) => inline.push(p) } })]]]);
+  docState.all = [];
+  await saveAndFlushToasts('example.test##.ad-banner', '.ad-banner', makeDialog());
+  // Prior code wrote `display:none !important` inline: a tell the page can read and undo.
+  assert.deepEqual(inline, []);
+  assert.match(appliedCss(), /:is\(\.ad-banner\)[^{]*\{\s*display:\s*none !important/);
+  assert.notEqual(PICKER_UI_STYLE, sheetsNamed('__adblock_picker_applied_')[0]?.id);
+  // A second save adds to the sheet; the first rule's hide stays.
+  docState.byLevel.set('.ad-two', [el()]);
+  await saveAndFlushToasts('example.test##.ad-two', '.ad-two', makeDialog());
+  assert.match(appliedCss(), /ad-banner/);
+  assert.match(appliedCss(), /ad-two/);
+});
+
+test('PK5: the preview never hides the picker\'s own UI', async () => {
+  clearSheets();
+  globalThis.chrome = { runtime: { sendMessage: () => Promise.resolve({ ok: true, counts: { skippedRules: [] } }) } };
+  docState.byLevel = new Map([['div', [el()]]]);
+  docState.all = [];
+  await saveAndFlushToasts('example.test##div', 'div', makeDialog());
+  // `div` would hide the dialog, overlay and highlight themselves.
+  for (const id of ['__adblock_picker_dialog__', '__adblock_picker_overlay__', '__adblock_picker_highlight__']) {
+    assert.ok(appliedCss().includes(`:not(#${id})`) && appliedCss().includes(`:not(#${id} *)`), id);
+  }
+  assert.ok(appliedCss().includes(':not(.__adblock_picker_toast__)'));
+});
+
+test('PK5: the dialog previews the selected candidate live, and cancel leaves no trace', () => {
+  resetPickerEnv();
+  clearSheets();
+  const target = el({ tagName: 'DIV', classList: ['ad-slot'] });
+  docState.byLevel = new Map([['.ad-slot', [target]], ['.other', [el()]]]);
+  try {
+    const control = openDialogFor(target);
+    assert.match(previewCss(), /:is\(\.ad-slot\)/);
+    // A typed selector previews in its place.
+    control('#adblock-picker-custom').value = '.other';
+    control('#adblock-picker-custom').listeners.get('input')();
+    assert.match(previewCss(), /:is\(\.other\)/);
+    assert.doesNotMatch(previewCss(), /ad-slot/);
+    control('#adblock-picker-cancel').listeners.get('click')();
+    assert.equal(sheetsNamed('__adblock_picker_preview_').length, 0, 'preview sheet removed');
+    assert.equal(appliedCss(), '', 'nothing applied');
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+test('PK5: a network candidate previews by hiding its element', () => {
+  resetPickerEnv();
+  clearSheets();
+  const img = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['banner'] });
+  docState.byLevel = new Map([['.banner', [img]]]);
+  try {
+    openDialogFor(img);
+    assert.match(previewCss(), /:is\(\.banner\)/);
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+test('PK5: a procedural candidate previews the set it would hide, wrapper included, and every mark goes', async () => {
+  resetPickerEnv();
+  clearSheets();
+  const target = markable({ tagName: 'DIV', textContent: 'Sponsored' });
+  const wrapper = markable({ tagName: 'DIV', textContent: 'news Sponsored more' });
+  const other = markable({ tagName: 'DIV', textContent: 'Weather' });
+  docState.byLevel = new Map([['div', [wrapper, target, other]]]);
+  try {
+    openDialogFor(target);
+    // The engine's `div:has-text(Sponsored)` hides the wrapper too: the user sees it go.
+    const [mark] = [...target.attrs.keys()];
+    assert.ok(mark?.startsWith('data-adblock-picker-preview-'), 'target marked');
+    assert.ok(wrapper.attrs.has(mark), 'wrapper marked');
+    assert.equal(other.attrs.size, 0, 'unrelated div untouched');
+    assert.match(previewCss(), new RegExp(`\\[${mark}\\]`));
+    deactivatePicker();
+    assert.equal(target.attrs.size + wrapper.attrs.size, 0, 'marks removed on deactivate');
+
+    // And on save.
+    openDialogFor(target);
+    assert.equal(target.attrs.size, 1);
+    globalThis.chrome = { runtime: { sendMessage: () => Promise.resolve({ ok: true, counts: { skippedRules: [] } }) } };
+    // Checked before the save's delayed teardown runs, which would clear them anyway.
+    const realSetTimeout = globalThis.setTimeout;
+    globalThis.setTimeout = () => 0;
+    try {
+      await savePickerRule('example.test##div:has-text(Sponsored)', 'div:has-text(Sponsored)', 'example.test', makeDialog());
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+    assert.equal(target.attrs.size + wrapper.attrs.size, 0, 'marks removed on save');
+    // The engine applies a procedural rule from the saved line: no CSS for it.
+    assert.doesNotMatch(appliedCss(), /has-text/);
+  } finally {
+    resetPickerEnv();
+  }
+});
+
+test('PK5 (didn\'t re-break): deactivating removes the preview stylesheet', () => {
+  resetPickerEnv();
+  clearSheets();
+  const target = el({ tagName: 'DIV', classList: ['ad-slot'] });
+  docState.byLevel = new Map([['.ad-slot', [target]]]);
+  openDialogFor(target);
+  assert.equal(sheetsNamed('__adblock_picker_preview_').length, 1);
+  deactivatePicker();
+  assert.equal(sheetsNamed('__adblock_picker_preview_').length, 0);
+  resetPickerEnv();
 });

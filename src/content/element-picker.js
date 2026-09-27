@@ -21,6 +21,17 @@ const PICKER_OVERLAY_ID   = '__adblock_picker_overlay__';
 const PICKER_DIALOG_ID    = '__adblock_picker_dialog__';
 const PICKER_STYLE_ID     = '__adblock_picker_style__';
 
+// PICKER-2026-09 PK5. The preview and a saved rule's immediate hide go through
+// picker-owned stylesheets, never an inline `style.display` the page can read
+// or clear. The preview sheet (and every mark a procedural preview sets) goes
+// on cancel, save and deactivate; the applied sheet stands in for the saved
+// rule until a reload, as the inline write did. Named per session.
+const PICKER_SESSION = Math.random().toString(36).slice(2, 10);
+const PREVIEW_SHEET_ID = `__adblock_picker_preview_${PICKER_SESSION}`;
+const APPLIED_SHEET_ID = `__adblock_picker_applied_${PICKER_SESSION}`;
+const PREVIEW_MARK = `data-adblock-picker-preview-${PICKER_SESSION}`;
+let markedNodes = [];
+
 let pickerActive = false;
 let lastTarget = null;
 let navStack = [];
@@ -73,6 +84,7 @@ export function deactivatePicker() {
   lastTarget = null;
   navStack = [];
   currentNavTarget = null;
+  clearPreview();
   removeHighlight();
   removeOverlay();
   removeDialog();
@@ -485,14 +497,16 @@ export function generateSelectors(el) {
   const hostname = siteScope();
   const seen = new Set();
 
-  function add(label, selector, scope, knownCount) {
+  function add(label, selector, scope, matched) {
     if (!selector || seen.has(selector)) return;
     // Offer only what can be saved: it parses, and the compiler keeps it.
     if (!isSaveableSelector(selector)) return;
     seen.add(selector);
-    // A procedural selector throws in the browser; its caller counts it.
-    const count = knownCount ?? deepQuerySelectorAll(selector).length;
-    candidates.push({ kind: 'cosmetic', label, selector, count, scope: scope || 'page', domain: hostname });
+    // A procedural selector throws in the browser; its caller finds what it
+    // would hide, which is both its count and its preview (PK5).
+    const count = matched ? matched.length : deepQuerySelectorAll(selector).length;
+    candidates.push({ kind: 'cosmetic', label, selector, count, scope: scope || 'page', domain: hostname,
+      ...(matched && { matches: matched }) });
   }
 
   // Check if we are inside a shadow DOM
@@ -707,9 +721,9 @@ function addProceduralCandidates(el, classes, candidates, add) {
     if (text) {
       // The engine's test: a case-blind substring of the element's text.
       const needle = text.toLowerCase();
-      const count = deepQuerySelectorAll(tag)
-        .filter((m) => String(m.textContent ?? '').toLowerCase().includes(needle)).length;
-      add(':has-text', `${tag}:has-text(${text})`, 'page', count);
+      const matched = deepQuerySelectorAll(tag)
+        .filter((m) => String(m.textContent ?? '').toLowerCase().includes(needle));
+      add(':has-text', `${tag}:has-text(${text})`, 'page', matched);
     }
     const child = Array.from(el.children ?? []).find((c) =>
       elementResources(c).some(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol)));
@@ -724,7 +738,7 @@ function addProceduralCandidates(el, classes, candidates, add) {
       .sort((a, b) => selectorScore(b) - selectorScore(a))[0];
     if (self) {
       const containers = new Set(deepQuerySelectorAll(self.selector).map((m) => m.parentElement).filter(Boolean));
-      add('Block the container', `${self.selector}:upward(1)`, 'page', containers.size);
+      add('Block the container', `${self.selector}:upward(1)`, 'page', [...containers]);
     }
   }
 }
@@ -993,7 +1007,10 @@ function updatePickerDialog(dialog) {
     try {
       const count = document.querySelectorAll(sel).length;
       updatePreviewForCustom(dialog, sel, hostname, count);
-    } catch {}
+      showPreview({ kind: 'cosmetic', selector: sel });
+    } catch {
+      clearPreview();
+    }
   });
 
   // Navigation events
@@ -1224,6 +1241,7 @@ function buildDialogHTML(candidates, target, hostname) {
 }
 
 function updatePreview(dialog, candidate, domain) {
+  showPreview(candidate);
   if (candidate.kind === 'network') {
     // The resource is already loaded, so the block itself only shows on a
     // reload; the element is hidden meanwhile (PICKER-2026-09 PK2b).
@@ -1361,6 +1379,7 @@ export async function savePickerRule(rule, selector, hostname, dialog, kind = 'c
     }
 
     // Immediately hide elements on this page
+    clearPreview();
     if (selector) applyRuleImmediately(selector);
 
     // Show success state in dialog
@@ -1376,12 +1395,58 @@ export async function savePickerRule(rule, selector, hostname, dialog, kind = 'c
   }
 }
 
+// The picker's own UI is never hidden, however broad the selector (`div`).
+const NOT_PICKER_UI = [PICKER_DIALOG_ID, PICKER_OVERLAY_ID, PICKER_HIGHLIGHT_ID]
+  .map((id) => `:not(#${id}):not(#${id} *)`).join('') + ':not(.__adblock_picker_toast__)';
+
+function hideRule(selector) {
+  return `:is(${selector})${NOT_PICKER_UI} { display: none !important; }`;
+}
+
+function pickerSheet(id) {
+  let node = document.getElementById(id);
+  if (!node) {
+    node = document.createElement('style');
+    node.id = id;
+    document.documentElement.appendChild(node);
+  }
+  return node;
+}
+
+function clearPreview() {
+  document.getElementById(PREVIEW_SHEET_ID)?.remove();
+  for (const node of markedNodes) node.removeAttribute?.(PREVIEW_MARK);
+  markedNodes = [];
+}
+
+/**
+ * Hide what `candidate` would hide, now, through the preview sheet: a network
+ * block's element by its preview selector, and a procedural candidate's
+ * actual matched set (the browser cannot run `:has-text()`), marked with a
+ * picker-owned attribute. `tag:has-text(x)` also matches ancestor wrappers,
+ * so the user sees one go before saving (PICKER-2026-09 PK5).
+ */
+function showPreview(candidate) {
+  clearPreview();
+  let selector = candidate?.kind === 'network' ? candidate.previewSelector : candidate?.selector;
+  if (!selector) return;
+  if (isProceduralSelector(selector)) {
+    if (!candidate.matches?.length) return;
+    for (const node of candidate.matches) {
+      node.setAttribute?.(PREVIEW_MARK, '');
+      markedNodes.push(node);
+    }
+    selector = `[${PREVIEW_MARK}]`;
+  }
+  pickerSheet(PREVIEW_SHEET_ID).textContent = hideRule(selector);
+}
+
+/** Hide a saved rule's matches until a reload applies it: the applied sheet. */
 function applyRuleImmediately(selector) {
-  try {
-    deepQuerySelectorAll(selector).forEach((el) => {
-      el.style.setProperty('display', 'none', 'important');
-    });
-  } catch {}
+  // The engine runs a procedural rule from the saved line; CSS cannot.
+  if (isProceduralSelector(selector)) return;
+  const node = pickerSheet(APPLIED_SHEET_ID);
+  node.textContent = `${node.textContent || ''}${hideRule(selector)}\n`;
 }
 
 function showSuccessInDialog(dialog, rule) {

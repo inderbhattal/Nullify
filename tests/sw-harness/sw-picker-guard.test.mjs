@@ -1133,3 +1133,80 @@ test('R9 (didn\'t re-break): the options page still gets its counts', async () =
     assert.deepEqual([res.network, res.cosmetic, res.skippedNetwork, res.skippedRules], [1, 1, 0, []]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Code review R8 — a rule cut AFTER compilation (the dynamic-rule budget, a
+// capacity stop, a per-rule updateDynamicRules rejection) was reported by id
+// or as an aggregate, never with a `line`, so the picker's lookup found
+// nothing and said "saved". The appended line's own cut must carry its line.
+// ---------------------------------------------------------------------------
+
+/** Make updateDynamicRules throw `message` for any batch holding `urlFilter`. */
+function refuseRule(chrome, urlFilter, message) {
+  const original = chrome.declarativeNetRequest.updateDynamicRules.bind(chrome.declarativeNetRequest);
+  chrome.declarativeNetRequest.updateDynamicRules = async (opts) => {
+    if ((opts?.addRules || []).some((r) => r.condition?.urlFilter === urlFilter)) throw new Error(message);
+    return original(opts);
+  };
+}
+
+test('R8: the appended line\'s own post-compile cut carries its line', async () => {
+  for (const fallback of [false, true]) {
+    const tag = fallback ? 'fallback' : 'WASM';
+    // A per-rule rejection.
+    await withWorker(async ({ chrome }) => {
+      refuseRule(chrome, '||reject.example^', 'Rule with id 900001 is invalid');
+      const res = await append(chrome, '||reject.example^');
+      assert.deepEqual(res.counts.skippedRules,
+        [{ id: null, line: '||reject.example^', reason: 'Rule with id 900001 is invalid' }], tag);
+    }, { fallback, seed: { userFilters: '||clean.example^', userFiltersApplied: '||clean.example^' } });
+    // A capacity stop.
+    await withWorker(async ({ chrome }) => {
+      refuseRule(chrome, '||full.example^', 'exceeds the maximum number of dynamic rules');
+      const res = await append(chrome, '||full.example^');
+      assert.equal(res.counts.skippedRules.length, 1, `${tag}: ${JSON.stringify(res)}`);
+      assert.equal(res.counts.skippedRules[0].line, '||full.example^');
+      assert.match(res.counts.skippedRules[0].reason, /capacity/);
+    }, { fallback, seed: { userFilters: '||clean.example^', userFiltersApplied: '||clean.example^' } });
+  }
+});
+
+test('R8: past the dynamic-rule budget, the appended line is reported with its line', async () => {
+  const stored = Array.from({ length: 10_000 }, (_, i) => `||b${i}.example^`).join('\n');
+  await withWorker(async ({ chrome }) => {
+    const res = await append(chrome, '||over.example^');
+    assert.equal(res.counts.skippedRules.length, 1, JSON.stringify(res));
+    assert.equal(res.counts.skippedRules[0].line, '||over.example^');
+    assert.match(res.counts.skippedRules[0].reason, /budget/);
+  }, { fallback: true, seed: { userFilters: stored, userFiltersApplied: stored } });
+});
+
+test('R8 (didn\'t re-break): past the budget, an earlier live copy of the appended line is its effect', async () => {
+  const stored = ['||dup.example^', ...Array.from({ length: 10_000 }, (_, i) => `||b${i}.example^`)].join('\n');
+  await withWorker(async ({ chrome }) => {
+    const res = await append(chrome, '||dup.example^');
+    assert.deepEqual(res.counts.skippedRules, []);
+  }, { fallback: true, seed: { userFilters: stored, userFiltersApplied: stored } });
+});
+
+test('R8 (didn\'t re-break): only the appended line\'s own cut is attributed to it', async () => {
+  // Another line refused, the appended one live.
+  await withWorker(async ({ chrome }) => {
+    refuseRule(chrome, '||other.example^', 'Rule is invalid');
+    const res = await append(chrome, '||mine.example^');
+    assert.deepEqual(res.counts.skippedRules, []);
+  }, { seed: { userFilters: '||other.example^', userFiltersApplied: '||other.example^' } });
+  // The appended line already stored and live: its rule is live.
+  await withWorker(async ({ chrome }) => {
+    const res = await append(chrome, '||dup.example^');
+    assert.deepEqual(res.counts.skippedRules, []);
+  }, { seed: { userFilters: '||dup.example^', userFiltersApplied: '||dup.example^' } });
+  // The options page names no line: its reply is unchanged.
+  await withWorker(async ({ chrome }) => {
+    refuseRule(chrome, '||reject.example^', 'Rule is invalid');
+    const res = await chrome.runtime.sendMessage({ type: 'SET_USER_FILTERS',
+      payload: { filters: '||ok.example^\n||reject.example^' } });
+    assert.equal(res.skippedRules.length, 1);
+    assert.deepEqual([res.skippedRules[0].line, res.skippedRules[0].reason], [undefined, 'Rule is invalid']);
+  });
+});

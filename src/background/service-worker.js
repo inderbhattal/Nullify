@@ -3135,6 +3135,18 @@ function compileUserFiltersViaWasm(filtersText) {
   }
 }
 
+/** A compiled DNR rule's meaning, without its id (Code review R8). */
+function dnrRuleKey(rule) {
+  return JSON.stringify([rule?.priority, rule?.action, rule?.condition]);
+}
+
+/** The DNR rules one line compiles to, by the compiler the full apply used. */
+function compileLineAlone(line, useWasm) {
+  if (useWasm) return compileUserFiltersViaWasm(line)?.dnrRules || [];
+  const rule = parseSimpleNetworkRule(line, DNR_USER_RULES_START);
+  return rule ? [rule] : [];
+}
+
 /**
  * PICKER-2026-09 SW2 — the skipped entries a reply may carry.
  *
@@ -3275,11 +3287,13 @@ async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
   }
 
   let appliedNetworkRules = 0;
+  const appliedIds = new Set();
   for (let i = 0; i < vetted.length; i += USER_RULE_ADD_CHUNK) {
     const chunk = vetted.slice(i, i + USER_RULE_ADD_CHUNK);
     try {
       await chrome.declarativeNetRequest.updateDynamicRules({ addRules: chunk });
       appliedNetworkRules += chunk.length;
+      for (const rule of chunk) appliedIds.add(rule.id);
     } catch (chunkErr) {
       // §4.16 — classify before retrying. "This rule is malformed" is worth
       // isolating rule-by-rule; "the dynamic ruleset is full" is not — every
@@ -3298,6 +3312,7 @@ async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
         try {
           await chrome.declarativeNetRequest.updateDynamicRules({ addRules: [rule] });
           appliedNetworkRules += 1;
+          appliedIds.add(rule.id);
         } catch (ruleErr) {
           if (isDnrCapacityError(ruleErr)) {
             const remaining = vetted.length - i - chunk.indexOf(rule);
@@ -3311,6 +3326,28 @@ async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
           skipped.push({ id: rule.id, reason: ruleErr?.message || String(ruleErr) });
         }
       }
+    }
+  }
+  // Code review R8 — a cut after compilation (budget, id range, preflight, a
+  // per-rule rejection, a capacity stop) is reported by id or in aggregate,
+  // never with a `line`, and the appended rule is last in the batch, so it is
+  // the first cut. For APPEND, find the appended line's own rules (compiled
+  // alone, matched by content: an identical rule from another line is its
+  // effect too) and, if none went live, report it with its line.
+  // (A line the compiler already dropped has no rules, so it is never re-reported.)
+  if (appendedLine !== undefined) {
+    const own = new Set(compileLineAlone(appendedLine, wasmSucceeded).map(dnrRuleKey));
+    const mine = newRules.filter((rule) => own.has(dnrRuleKey(rule)));
+    if (mine.length > 0 && !mine.some((rule) => appliedIds.has(rule.id))) {
+      const budgetedIds = new Set(budgeted.map((rule) => rule.id));
+      const rule = mine[mine.length - 1];
+      const reason = !budgetedIds.has(rule.id)
+        ? (skipped.find((s) => s.id === null && !s.line
+          && (rule.id >= DNR_USER_RULES_START && rule.id < DNR_ALLOWLIST_START ? /budget/ : /range/).test(s.reason))
+          ?.reason ?? 'not applied')
+        : (skipped.find((s) => mine.some((m) => m.id === s.id))?.reason
+          ?? skipped.find((s) => /capacity/.test(s.reason))?.reason ?? 'not applied');
+      skipped.push({ id: null, line: appendedLine, reason });
     }
   }
   // Honest total: every compiled rule that is not live in DNR, whether it was

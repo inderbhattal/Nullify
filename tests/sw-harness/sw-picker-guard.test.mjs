@@ -148,7 +148,6 @@ const PICKER_COSMETIC_TODAY = [
   'example.test###main > div.content > div.ad-slot',     // 7. ancestor path
   'example.test##my-ad-widget',                          //    shadow host tag
   '##.ad-slot',                                          //    "apply only to this site" unchecked
-  'localhost##.ad',
   '192.168.1.10##.ad',
   'xn--bcher-kva.example##.ad',
   'news.bbc.co.uk##.ad',
@@ -1209,4 +1208,39 @@ test('R8 (didn\'t re-break): only the appended line\'s own cut is attributed to 
     assert.equal(res.skippedRules.length, 1);
     assert.deepEqual([res.skippedRules[0].line, res.skippedRules[0].reason], [undefined, 'Rule is invalid']);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Code review R10 — the Public Suffix List's implicit `*` rule: a single-label
+// name the list does not know (`lan`, `local`, `internal`, `corp`, `home`) is
+// still a suffix, and the user cosmetic walk has no suffix stop, so
+// `lan##.login-form` hid the form on every *.lan router or NAS page. Any
+// single-label scope is refused, `localhost` included (Chrome resolves every
+// *.localhost to loopback). A bracketed IPv6 literal is one host, not a label.
+// ---------------------------------------------------------------------------
+
+test('R10: a single-label scope is refused, localhost included', async () => {
+  await assertRefused([
+    'lan##.login-form',
+    'local##.ad',
+    'internal##.ad',
+    'corp##.ad',
+    'localhost##.ad',
+    '||lan^$image',
+    '||home/x.png^$image',
+    '||lan.^$image',                         // the fully-qualified spelling
+    '||localhost^$image',
+    '||ads.example^$image,domain=home',
+    '||ads.example^$image,domain=localhost',
+  ]);
+});
+
+test('R10 (didn\'t re-break): two-label names and IP literals are still scopes', async () => {
+  for (const line of ['router.lan##.ad', 'nas.home##.ad', '192.168.1.10##.ad',
+    '||router.lan/x.png^$image,domain=nas.home', '||[2001:db8::1]/ad.png^$image,domain=router.lan']) {
+    await withWorker(async ({ chrome }) => {
+      const res = await append(chrome, line);
+      assert.equal(res.ok, true, `${line}: ${JSON.stringify(res)}`);
+    });
+  }
 });

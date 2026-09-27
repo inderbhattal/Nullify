@@ -3604,7 +3604,13 @@ function rustTrim(text) {
 
 /** Would a rule scoped to `host` reach past one site? See 3. above. */
 function isPickerScopeTooBroad(host) {
-  return isPublicSuffix(host) || (PICKER_NUMERIC_TAIL.test(host) && !PICKER_IPV4.test(host));
+  return isPublicSuffix(host)
+    || (PICKER_NUMERIC_TAIL.test(host) && !PICKER_IPV4.test(host))
+    // Code review R10 — the list's implicit `*` rule: a single label it does
+    // not know (`lan`, `local`, `corp`, `home`) is a suffix all the same, so
+    // `lan##.login-form` reached every *.lan router page. `localhost` too:
+    // every *.localhost is loopback. A bracketed IPv6 literal is one host.
+    || (!host.startsWith('[') && !host.replace(/\.+$/, '').includes('.'));
 }
 
 /**

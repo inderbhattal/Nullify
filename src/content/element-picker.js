@@ -379,16 +379,17 @@ export function isShadowOnlySelector(selector) {
  * into the site's one CSS declaration, it voids every other hide rule there
  * (REVIEW-2026-09 §3.2) — or the compiler refuses it, without a `droppedLines`
  * entry, so the save would report "Rule saved" for a dead line
- * (PICKER-2026-09 PK1b).
+ * (PICKER-2026-09 PK1b). And SW1's APPEND gate refuses some lines outright
+ * for the characters in them (PK2c).
  *
- * A procedural selector gets the compiler test alone. The browser rejects it
+ * A procedural selector skips the parse test. The browser rejects it
  * whole (`:has-text(` is not CSS), and it never reaches the joined
  * declaration: the compiler plans every `:op(` match per rule, and the engine
  * isolates each plan, so a bad base disables only its own rule. Checking its
  * CSS "the way the engine plans it" would need a copy of the planner here.
  */
 function isSaveableSelector(selector) {
-  if (!compilerKeepsSelector(selector)) return false;
+  if (!gateAdmitsSelectorText(selector) || !compilerKeepsSelector(selector)) return false;
   if (isProceduralSelector(selector)) return true;
   try {
     document.querySelector(selector);
@@ -396,6 +397,41 @@ function isSaveableSelector(selector) {
   } catch {
     return false;
   }
+}
+
+// Mirrors the line-level half of SW1's APPEND gate (`isPickerSafeUserFilterLine`
+// in the service worker), which reads a line as both trims read it. JS `trim()`
+// and Rust's `str::trim` must agree where it ends (they part on U+0085 and
+// U+FEFF), and the agreed line may hold no control, line or paragraph
+// separator, lone surrogate or extended-syntax marker (`#@ #? #$ #% #+`), nor
+// end in an odd run of backslashes. A cosmetic line is `site##` and then the
+// selector, so the selector's end is the line's (PICKER-2026-09 PK2c).
+function gateAdmitsSelectorText(selector) {
+  const stored = selector.trimEnd();
+  if (stored !== selector.replace(/\p{White_Space}+$/u, '')) return false;
+  if (/[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(stored) || /#[@?$%+]/.test(`#${stored}`)) return false;
+  return stored.match(/\\*$/)[0].length % 2 === 0;
+}
+
+/**
+ * `CSS.escape` for a class or id, with any characters at its end that a trim
+ * would strip hex-escaped instead. The gate stores a line trimmed, and
+ * `CSS.escape` leaves U+0080 and up raw, so a page's class `ad` + U+00A0 was
+ * offered as that and stored as `.ad`: a broader rule than the one previewed.
+ * A hex escape's closing space may go to the trim, as the escape reads the
+ * same without it (PICKER-2026-09 PK2c).
+ */
+function escapeIdent(name) {
+  const chars = [...name];
+  let end = chars.length;
+  while (end > 0 && trimStrips(chars[end - 1])) end--;
+  return CSS.escape(chars.slice(0, end).join('')) +
+    chars.slice(end).map((ch) => `\\${ch.codePointAt(0).toString(16)} `).join('');
+}
+
+/** Would JS `trim()` or Rust's `str::trim` strip `ch` from the end of a line? */
+function trimStrips(ch) {
+  return /\p{White_Space}/u.test(ch) || ch.charCodeAt(0) === 0xfeff;
 }
 
 // Mirrors `is_valid_selector` in wasm-core/src/lib.rs, the source of truth:
@@ -468,9 +504,9 @@ export function generateSelectors(el) {
     // global CSS — selectors built from the inner element would preview
     // fine (the picker pierces shadow roots) and then persist as dead
     // rules, so offer ONLY host-level candidates here (§5.30).
-    if (host.id) add(`${hostLabel} ID`, `#${CSS.escape(host.id)}`);
+    if (host.id) add(`${hostLabel} ID`, `#${escapeIdent(host.id)}`);
     for (const cls of stableClassesFirst(Array.from(host.classList)).slice(0, 2)) {
-      add(`${hostLabel} .${cls}`, `.${CSS.escape(cls)}`);
+      add(`${hostLabel} .${cls}`, `.${escapeIdent(cls)}`);
     }
     add(`${hostLabel} Tag`, host.tagName.toLowerCase());
 
@@ -480,12 +516,12 @@ export function generateSelectors(el) {
 
   // 1. By ID (most specific)
   if (el.id && /^[a-zA-Z]/.test(el.id)) {
-    add('ID', `#${CSS.escape(el.id)}`, 'page');
+    add('ID', `#${escapeIdent(el.id)}`, 'page');
   }
 
   // 2. Tag + ID
   if (el.id) {
-    add('Tag + ID', `${el.tagName.toLowerCase()}#${CSS.escape(el.id)}`, 'page');
+    add('Tag + ID', `${el.tagName.toLowerCase()}#${escapeIdent(el.id)}`, 'page');
   }
 
   // 3. Class combinations (up to 3 most specific classes)
@@ -493,15 +529,15 @@ export function generateSelectors(el) {
   if (classes.length > 0) {
     // Single class
     for (const cls of classes.slice(0, 4)) {
-      add(`Class .${cls}`, `.${CSS.escape(cls)}`, 'page');
+      add(`Class .${cls}`, `.${escapeIdent(cls)}`, 'page');
     }
     // Tag + single class
     for (const cls of classes.slice(0, 3)) {
-      add(`${el.tagName.toLowerCase()}.${cls}`, `${el.tagName.toLowerCase()}.${CSS.escape(cls)}`, 'page');
+      add(`${el.tagName.toLowerCase()}.${cls}`, `${el.tagName.toLowerCase()}.${escapeIdent(cls)}`, 'page');
     }
     // All classes combined
     if (classes.length > 1) {
-      const combined = classes.slice(0, 3).map(c => `.${CSS.escape(c)}`).join('');
+      const combined = classes.slice(0, 3).map(c => `.${escapeIdent(c)}`).join('');
       add('All classes', combined, 'page');
       add(`Tag + all classes`, `${el.tagName.toLowerCase()}${combined}`, 'page');
     }
@@ -619,9 +655,9 @@ function onlyHashedClasses(selector) {
 
 function simpleSelector(el) {
   if (!el || el === document.body) return null;
-  if (el.id) return `#${CSS.escape(el.id)}`;
+  if (el.id) return `#${escapeIdent(el.id)}`;
   const classes = stableClassesFirst(Array.from(el.classList).filter(Boolean)).slice(0, 2);
-  if (classes.length) return `${el.tagName.toLowerCase()}.${classes.map(CSS.escape).join('.')}`;
+  if (classes.length) return `${el.tagName.toLowerCase()}.${classes.map(escapeIdent).join('.')}`;
   return el.tagName.toLowerCase();
 }
 
@@ -676,6 +712,13 @@ const NETWORK_HOST = /^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])$/;
 const NETWORK_PATH_STOP = /[^\w!%&'()+,\-.:;=@[\]~/]/;
 // The gate's `domain=` value: plain lower-case labels, one host, no negation.
 const SITE_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
+// And no wider than one site, as SW1's `isPickerScopeTooBroad` rules: not a
+// public suffix, and a last label that is a number only in a whole IPv4
+// address (`domain=1` would reach every x.x.x.1 host). A URL's own host never
+// needs the number rule: the parser writes such a host as a dotted quad or
+// refuses it (PICKER-2026-09 PK2c).
+const NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
+const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 const NETWORK_TYPES = new Set(['image', 'subdocument', 'media', 'object']);
 const NETWORK_LABELS = { path: 'Block request', prefix: 'Block path prefix', host: 'Block host' };
 
@@ -701,7 +744,8 @@ function resolveUrl(url) {
  */
 export function urlToNetworkPattern(url, { scope = 'path', type, domain } = {}) {
   if (!NETWORK_TYPES.has(type)) return null;
-  if (domain && (!SITE_HOSTNAME.test(domain) || isPublicSuffix(domain))) return null;
+  if (domain && (!SITE_HOSTNAME.test(domain) || isPublicSuffix(domain) ||
+    (NUMERIC_TAIL.test(domain) && !IPV4.test(domain)))) return null;
   const u = resolveUrl(url);
   if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:')) return null;
   const host = u.hostname.toLowerCase();
@@ -1150,7 +1194,7 @@ export async function savePickerRule(rule, selector, hostname, dialog) {
     if (!isSaveableSelector(selector)) {
       showErrorInDialog(dialog,
         'This selector can\'t be saved: it is not valid CSS, or it contains ' +
-        'characters ({, } or ;) that filter rules cannot carry.');
+        'characters a filter rule cannot carry, such as {, } or ;.');
       return;
     }
 

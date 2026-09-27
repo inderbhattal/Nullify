@@ -853,6 +853,13 @@ test('PK2a: urlToNetworkPattern emits nothing the gate would refuse, whatever it
   for (const other of ['ftp://ads.example/x.png', 'ws://ads.example/x', 'chrome-extension://abcdef/x.png']) {
     assert.equal(urlToNetworkPattern(other, { type: 'image', domain: 'example.test' }), null, other);
   }
+  // PK2c: a scope whose last label is a number must be a whole IPv4 address,
+  // as SW1 requires: `domain=1` would reach every x.x.x.1 host.
+  for (const domain of ['1', 'a.1', '0x1f', '999.1.1.1']) {
+    assert.equal(urlToNetworkPattern(url, { type: 'image', domain }), null, domain);
+  }
+  assert.equal(urlToNetworkPattern(url, { type: 'image', domain: '192.168.1.1' }),
+    '||cdn.ads.example/a.png^$image,domain=192.168.1.1');
 });
 
 test('PK2a: with no plain site to scope to, no network candidate is offered', () => {
@@ -1181,6 +1188,163 @@ test('PK4: moving stable classes ahead keeps each group in page order', () => {
   // group, not just between them, shows here.
   const offered = generateSelectors(el({ classList: ['css-g7h8i9', 'q', 'css-a1b2c3', 'p'] })).map((c) => c.selector);
   assert.ok(offered.includes('.q.p.css-g7h8i9'), offered.join(' | '));
+});
+
+// PICKER-2026-09 PK2c — the picker offers only lines SW1's gate admits, and
+// what it previews is what the gate stores. The gate reads the line both trims
+// agree on and stores it trimmed; `CSS.escape` leaves U+0080 and up raw, so a
+// page's names can put a character a trim strips at the line's end. (Every
+// emitted line is also fed through the real gate by
+// tests/picker-gate-crosscheck.test.mjs.)
+
+const NBSP = String.fromCharCode(0xa0); // both trims strip it
+const IDEOGRAPHIC_SPACE = String.fromCharCode(0x3000); // both trims strip it
+const LS = String.fromCharCode(0x2028); // a line separator: both trims strip it
+const PS = String.fromCharCode(0x2029); // a paragraph separator
+const C1 = String.fromCharCode(0x81); // a C1 control that is no whitespace
+const LONE = String.fromCharCode(0xd800); // a lone surrogate
+const BOM = String.fromCharCode(0xfeff); // JS `trim()` strips it, Rust's keeps it
+
+/** An escaped CSS identifier read back the way the tokenizer reads it. */
+const unescapeIdent = (text) => text.replace(/\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|([^\n\r\f]))/g,
+  (_, hex, ch) => (hex ? String.fromCodePoint(parseInt(hex, 16)) : ch));
+
+/** The selector the gate stores for `site##selector`: the line, trimmed. */
+const storedSelector = (selector) => `example.test##${selector}`.trim().slice('example.test##'.length);
+
+test('PK2c: a name ending in a character a trim strips is stored as that exact name', () => {
+  const identity = globalThis.CSS.escape;
+  globalThis.CSS.escape = cssEscape;
+  try {
+    docState.byLevel = new Map();
+    docState.all = [];
+    // Prior code offered `.ad` + U+00A0, and the gate stored `.ad`: a broader
+    // rule than the one previewed.
+    for (const tail of [NBSP, IDEOGRAPHIC_SPACE, LS]) {
+      const cls = `ad${tail}`;
+      const single = generateSelectors(el({ classList: [cls] })).map((c) => c.selector).find((s) => s.startsWith('.'));
+      assert.ok(single, printable(cls));
+      assert.equal(unescapeIdent(storedSelector(single).slice(1)), cls, printable(single));
+    }
+    // An id may end in a plain space, which CSS.escape writes as `\ `.
+    const byId = generateSelectors(el({ id: 'ad ' })).map((c) => c.selector).find((s) => s.startsWith('#'));
+    assert.equal(unescapeIdent(storedSelector(byId).slice(1)), 'ad ', printable(byId));
+    // And the last step of an ancestor path.
+    const link = tree('A', { classList: [`ad${NBSP}`] });
+    tree('UL', { classList: ['list'] }, [tree('LI', {}, [link])]);
+    const path = generateSelectors(link).map((c) => c.selector).find((s) => s.startsWith('ul.list > li > a.'));
+    assert.ok(path, 'the ancestor path is offered');
+    assert.equal(unescapeIdent(storedSelector(path).split('a.').pop()), `ad${NBSP}`, printable(path));
+
+    // Every candidate, from every builder (single class, tag + class, all
+    // classes, id, tag + id, path steps, a shadow host's id and class), loses
+    // nothing to the trim but a hex escape's closing space.
+    const host = el({ tagName: 'ASIDE', id: `w${IDEOGRAPHIC_SPACE}`, classList: [`p${NBSP}`] });
+    const item = tree('LI', { id: `ad${NBSP}` }); // "Parent > Element" ends in its id
+    tree('UL', {}, [item]);
+    for (const target of [
+      el({ id: `ad${NBSP}`, classList: [`a${LS}`, `b${NBSP}`, `c${IDEOGRAPHIC_SPACE}`] }),
+      el({ tagName: 'SPAN', getRootNode: () => new FakeShadowRoot(host) }),
+      link,
+      item,
+    ]) {
+      for (const { selector } of generateSelectors(target)) {
+        const line = `example.test##${selector}`;
+        const stored = line.trim();
+        assert.ok(stored === line || (line === `${stored} ` && /\\[0-9a-f]{1,6}$/i.test(stored)), printable(line));
+      }
+    }
+  } finally {
+    globalThis.CSS.escape = identity;
+  }
+});
+
+test('PK2c: where the two trims part, a name\'s last character is escaped rather than refused', () => {
+  const identity = globalThis.CSS.escape;
+  globalThis.CSS.escape = cssEscape;
+  try {
+    docState.byLevel = new Map();
+    docState.all = [];
+    // A raw U+0085 or U+FEFF at the end is a line the gate refuses: JS and
+    // Rust would store different lines. Hex-escaped, it is plain text. The
+    // whole trailing run is escaped: an unescaped U+0085 left inside it would
+    // still be a control the gate refuses anywhere.
+    for (const tail of [NEL, BOM, `${NEL}${NBSP}`]) {
+      const cls = `ad${tail}`;
+      const single = generateSelectors(el({ classList: [cls] })).map((c) => c.selector).find((s) => s.startsWith('.'));
+      assert.ok(single, `${printable(cls)} is offered`);
+      assert.ok(!single.includes(tail), printable(single));
+      assert.equal(unescapeIdent(storedSelector(single).slice(1)), cls, printable(single));
+    }
+  } finally {
+    globalThis.CSS.escape = identity;
+  }
+});
+
+test('PK2c: a candidate carrying a control, separator or lone surrogate is not offered', () => {
+  const identity = globalThis.CSS.escape;
+  globalThis.CSS.escape = cssEscape;
+  try {
+    docState.byLevel = new Map();
+    docState.all = [];
+    // Not at the end, so not a trim's to strip: the gate refuses the line.
+    const offered = generateSelectors(el({ classList: [`ad${NEL}x`, `ad${LS}y`, `ad${LONE}z`, 'clean'] }))
+      .map((c) => c.selector);
+    assert.ok(offered.includes('.clean'), offered.map(printable).join(' | '));
+    for (const selector of offered) {
+      assert.doesNotMatch(selector, /[\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u, printable(selector));
+    }
+  } finally {
+    globalThis.CSS.escape = identity;
+  }
+});
+
+test('PK2c: a custom selector the gate would refuse is refused, and nothing is sent', async () => {
+  const sent = [];
+  globalThis.chrome = {
+    runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ ok: true }); } },
+  };
+  docState.byLevel = new Map();
+  docState.all = [];
+
+  await withBrowserParser(async () => {
+    // Each parses and survives the compiler mirror; only the gate refuses it.
+    for (const selector of [
+      `.a${NEL}b`, `.a${C1}b`, `.a${LS}b`, `.a${PS}b`, `.a${LONE}b`, // anywhere in the line
+      `.ad${NEL}`, `.ad${BOM}`, // at the end, where the two trims part
+      '.a\\', '.a\\\\\\', // an odd run of backslashes: the last escapes what the trim removed
+      'div:has-text(a#@b)', // an extended-syntax marker, which would re-route the line
+      '+js(set-constant, a, b)', // ... and one made with the `##` in front: `##+js(`
+    ]) {
+      const dialog = makeDialog();
+      await savePickerRule(`example.test##${selector}`, selector, 'example.test', dialog);
+      assert.match(dialog.footerText(), /can.t be saved/, printable(selector));
+    }
+  });
+  assert.deepEqual(sent, []);
+});
+
+test('PK2c (didn\'t re-break): a hex escape\'s closing space is admitted, as the gate admits it', async () => {
+  const identity = globalThis.CSS.escape;
+  globalThis.CSS.escape = cssEscape;
+  try {
+    docState.byLevel = new Map();
+    docState.all = [];
+    // `<li id="7">`: SW1's first draft refused `li#\37 `, which HEAD stored as `li#7`.
+    const offered = generateSelectors(el({ tagName: 'LI', id: '7' })).map((c) => c.selector);
+    assert.ok(offered.includes('li#\\37 '), offered.map(printable).join(' | '));
+
+    const sent = [];
+    globalThis.chrome = {
+      runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ error: 'stop' }); } },
+    };
+    for (const selector of ['li#\\37 ', '.a\\\\']) { // an even run of backslashes is two escaped ones
+      await savePickerRule(`example.test##${selector}`, selector, 'example.test', makeDialog());
+    }
+    assert.deepEqual(sent.map((m) => m.payload.line), ['example.test##li#\\37 ', 'example.test##.a\\\\']);
+  } finally {
+    globalThis.CSS.escape = identity;
+  }
 });
 
 // §4.24 — ACTIVATE_PICKER is broadcast to every frame; a page with 15 iframes

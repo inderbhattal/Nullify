@@ -708,8 +708,10 @@ function isDocumentRoot(node) {
  * id, no class but hashed ones), and `:upward(1)` to block its container.
  * Each carries a real match count: the browser cannot run `:has-text()`, and
  * a count of 0 would rank it below even a positional path. Neither is offered
- * on, or up into, `body` or `html`: the gate refuses only a bare root, and
- * `body:has-text(x)` would blank the page.
+ * on, or up into, `body` or `html` — from the picked element or from any other
+ * match of the base: the gate refuses only a bare root, and `body:has-text(x)`
+ * would blank the page. (`tag:has-text()` and `tag:has()` match only `tag`
+ * elements, never a root, once the picked element is not one.)
  */
 function addProceduralCandidates(el, classes, candidates, add) {
   if (isDocumentRoot(el)) return;
@@ -738,7 +740,11 @@ function addProceduralCandidates(el, classes, candidates, add) {
       .sort((a, b) => selectorScore(b) - selectorScore(a))[0];
     if (self) {
       const containers = new Set(deepQuerySelectorAll(self.selector).map((m) => m.parentElement).filter(Boolean));
-      add('Block the container', `${self.selector}:upward(1)`, 'page', [...containers]);
+      // The base can match elsewhere too: if any of those sits directly in
+      // the body, the rule would hide the page (review R1).
+      if (![...containers].some(isDocumentRoot)) {
+        add('Block the container', `${self.selector}:upward(1)`, 'page', [...containers]);
+      }
     }
   }
 }

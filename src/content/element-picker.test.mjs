@@ -1851,3 +1851,28 @@ test('PK5 (didn\'t re-break): deactivating removes the preview stylesheet', () =
   assert.equal(sheetsNamed('__adblock_picker_preview_').length, 0);
   resetPickerEnv();
 });
+
+// Review R1 — `:upward(1)` was checked against the picked element's parent
+// only. Its base selector can also match elements whose parent IS the body,
+// and then the preview, or the saved rule, hides the whole page.
+
+test('R1: :upward(1) is not offered when any match\'s container is a document root', () => {
+  const target = tree('SPAN', { classList: ['promo'] });
+  const third = tree('SPAN', { classList: ['promo'] });
+  tree('MAIN', {}, [tree('DIV', {}, [target, third])]);
+  const atTop = tree('SPAN', { classList: ['promo'] });
+  const body = tree('BODY', {}, [atTop]);
+  globalThis.document.body = body;
+  docState.byLevel = new Map([['.promo', [target, atTop, third]]]);
+  docState.all = [];
+  try {
+    const offered = generateSelectors(target).map((c) => c.selector);
+    assert.ok(offered.includes('.promo'), offered.join(' | '));
+    assert.ok(offered.every((s) => !s.includes(':upward(')), offered.join(' | '));
+  } finally {
+    delete globalThis.document.body;
+  }
+  // Didn't re-break: without the body child, the container rule is offered.
+  docState.byLevel = new Map([['.promo', [target, third]]]);
+  assert.ok(generateSelectors(target).some((c) => c.selector === '.promo:upward(1)'));
+});

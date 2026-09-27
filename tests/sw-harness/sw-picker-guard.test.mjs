@@ -30,7 +30,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { loadServiceWorker } from './sw-loader.mjs';
+import { loadServiceWorker, samplePackagedSources } from './sw-loader.mjs';
 
 const DNR_USER_RULES_START = 900_000;
 const DNR_ALLOWLIST_START = 990_000;
@@ -898,4 +898,115 @@ test('SW2 (didn\'t re-break): a plain block still applies on the fallback', asyn
     const res = await append(chrome, '||ads.example/b.png^');
     assert.deepEqual([res.counts.network, res.counts.skippedNetwork, res.counts.skippedRules], [1, 0, []]);
   }, { fallback: true });
+});
+
+// ---------------------------------------------------------------------------
+// PICKER-2026-09 SW3 — a user selector is never comma-joined with list
+// selectors. `build_page_bundle` joins up to 150 CSS selectors per rule, and a
+// browser discards a whole rule for one selector it cannot parse, so one bad
+// user selector (`a:bogus`, which no gate can refuse: the worker has no CSS
+// parser) voided the lists' hides on every page, and a bad list selector voided
+// the user's. The harness's sample index gives example.com the list hide
+// `.site-ad`.
+// ---------------------------------------------------------------------------
+
+const NO_EXCEPTIONS = { genericExceptions: [], domainExceptions: {} };
+
+async function withIndexedWorker(body, { userCosmeticRules, realBundler = true, stub, idb } = {}) {
+  const env = await loadServiceWorker({
+    awaitReady: true, packagedSources: samplePackagedSources(), stub, idb,
+    seed: userCosmeticRules ? { userCosmeticRules } : {},
+  });
+  if (realBundler && wasm) env.hooks.setPageBundleBuilderForTest((...args) => wasm.build_page_bundle(...args));
+  try {
+    return await body(env);
+  } finally {
+    env.teardown();
+  }
+}
+
+/** The selector list of every rule in a stylesheet, as arrays. */
+function ruleSelectors(cssText) {
+  return (cssText || '').split('}').map((rule) => rule.split('{')[0].trim()).filter(Boolean)
+    .map((list) => list.split(',').map((sel) => sel.trim()));
+}
+
+test('SW3: an unparseable user selector never shares a CSS rule with a list selector', async (t) => {
+  if (!wasm) { t.skip(NO_WASM); return; }
+  const user = ['a:bogus', 'div:bogus', '.user-ad'];
+  await withIndexedWorker(async ({ hooks }) => {
+    const rules = ruleSelectors((await hooks.getCosmeticBundleForPage('example.com')).cssText);
+    const listRule = rules.find((list) => list.includes('.site-ad'));
+    assert.ok(listRule, `the list hide must be emitted: ${JSON.stringify(rules)}`);
+    assert.deepEqual(listRule.filter((sel) => user.includes(sel)), [],
+      `a list rule must hold no user selector: ${JSON.stringify(listRule)}`);
+    for (const sel of user) {
+      assert.deepEqual(rules.filter((list) => list.includes(sel)), [[sel]], `${sel} must be a rule of its own`);
+    }
+  }, { userCosmeticRules: { generic: ['a:bogus'], domainSpecific: { 'example.com': ['div:bogus', '.user-ad'] }, ...NO_EXCEPTIONS } });
+});
+
+test('SW3: when build_page_bundle throws, the WASM CSS fallback still builds user CSS one selector per rule', async (t) => {
+  if (!wasm) { t.skip(NO_WASM); return; }
+  const user = ['a:bogus', 'div:bogus', '.user-ad'];
+  await withIndexedWorker(async ({ hooks }) => {
+    hooks.setPageBundleBuilderForTest(() => { throw new Error('bundle build failed'); });
+    hooks.setCssBuilderForTest((...args) => wasm.build_css_from_selectors(...args));
+    const rules = ruleSelectors((await hooks.getCosmeticBundleForPage('example.com')).cssText);
+    const listRule = rules.find((list) => list.includes('.site-ad'));
+    assert.ok(listRule, `the list hide must be emitted: ${JSON.stringify(rules)}`);
+    assert.deepEqual(listRule.filter((sel) => user.includes(sel)), [], `a list rule must hold no user selector: ${JSON.stringify(listRule)}`);
+    for (const sel of user) {
+      assert.deepEqual(rules.filter((list) => list.includes(sel)), [[sel]], `${sel} must be a rule of its own`);
+    }
+  }, { realBundler: false, userCosmeticRules: { generic: ['a:bogus'], domainSpecific: { 'example.com': ['div:bogus', '.user-ad'] }, ...NO_EXCEPTIONS } });
+});
+
+test('SW3: a page bundle stored before the split is not served', async () => {
+  await withIndexedWorker(async ({ hooks }) => {
+    await hooks.db.putPageBundle('example.com', {
+      rules: { generic: [], domainSpecific: [], exceptions: [] },
+      cssText: 'a:bogus,.site-ad { display: none !important; }', exceptionCss: '', cosmeticRulesBinary: null,
+    }, hooks.getActiveRuleDataVersion());
+    const bundle = await hooks.getCosmeticBundleForPage('example.com');
+    assert.ok(!bundle.cssText.includes('a:bogus,.site-ad'), `a joined bundle from before must be rebuilt: ${bundle.cssText}`);
+  }, { realBundler: false });
+});
+
+test('SW3 (didn\'t re-break): user and list hides, user procedural rules and exceptions all still apply', async (t) => {
+  if (!wasm) { t.skip(NO_WASM); return; }
+  for (const realBundler of [true, false]) {
+    const tag = realBundler ? 'WASM' : 'JS fallback';
+    await withIndexedWorker(async ({ hooks }) => {
+      const bundle = await hooks.getCosmeticBundleForPage('example.com');
+      const sels = ruleSelectors(bundle.cssText).flat();
+      assert.ok(sels.includes('.site-ad') && sels.includes('.user-ad') && sels.includes('.user-generic'),
+        `${tag}: list and user hides: ${bundle.cssText}`);
+      assert.deepEqual(bundle.rules.domainSpecific.map((r) => r.selector), ['div:has-text(Sponsored)'],
+        `${tag}: the user's procedural rule is planned`);
+    }, { realBundler, userCosmeticRules: {
+      generic: ['.user-generic'], domainSpecific: { 'example.com': ['.user-ad', 'div:has-text(Sponsored)'] }, ...NO_EXCEPTIONS } });
+    // A user exception still cancels a list hide and a user hide.
+    await withIndexedWorker(async ({ hooks }) => {
+      const bundle = await hooks.getCosmeticBundleForPage('example.com');
+      const sels = ruleSelectors(bundle.cssText).flat();
+      assert.ok(!sels.includes('.site-ad') && !sels.includes('.user-ad'), `${tag}: excepted hides must go: ${bundle.cssText}`);
+      assert.match(bundle.exceptionCss, /\.site-ad/);
+    }, { realBundler, userCosmeticRules: {
+      generic: ['.user-ad'], domainSpecific: {}, genericExceptions: ['.site-ad', '.user-ad'], domainExceptions: {} } });
+  }
+});
+
+test('SW3 (didn\'t re-break): a bundle stored after the split is served again on the next worker', async () => {
+  let rereads = 0;
+  const first = await loadServiceWorker({ awaitReady: true, packagedSources: samplePackagedSources() });
+  await first.hooks.getCosmeticBundleForPage('example.com');
+  first.teardown();
+  await withIndexedWorker(async ({ hooks }) => {
+    const original = hooks.db.getCosmeticRules.bind(hooks.db);
+    hooks.db.getCosmeticRules = async (...args) => { rereads++; return original(...args); };
+    const bundle = await hooks.getCosmeticBundleForPage('example.com');
+    assert.match(bundle.cssText, /\.site-ad/);
+    assert.equal(rereads, 0, 'the stored bundle must be served, not rebuilt');
+  }, { realBundler: false, stub: first.chrome, idb: first.idb });
 });

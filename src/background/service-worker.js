@@ -956,14 +956,28 @@ function buildCssFromSelectorList(selectors, declarations) {
     .join('\n');
 }
 
-function buildPageBundle(rawRules) {
-  if (wasmReady) {
+// Test-only seam (see tests/sw-harness), like _compileUserFiltersOverride:
+// lets the harness run the real `build_page_bundle`, which never initializes
+// in Node. Never set in production.
+let _pageBundleBuilderOverride = null;
+// Same, for `build_css_from_selectors`: the path WASM takes when it is ready
+// but `build_page_bundle` throws.
+let _cssBuilderOverride = null;
+
+/**
+ * `cssChunkSize` is how many CSS selectors share one rule. A browser drops a
+ * whole rule for one selector it cannot parse, so selectors that must not
+ * void each other are built at 1 (PICKER-2026-09 SW3).
+ */
+function buildPageBundle(rawRules, cssChunkSize = 150) {
+  const buildWithWasm = _pageBundleBuilderOverride || (wasmReady ? build_page_bundle : null);
+  if (buildWithWasm) {
     try {
-      return build_page_bundle(
+      return buildWithWasm(
         rawRules.generic || [],
         rawRules.domainSpecific || [],
         rawRules.exceptions || [],
-        150
+        cssChunkSize
       );
     } catch (err) {
       console.error('[Nullify] WASM page bundle build failed:', err);
@@ -991,9 +1005,10 @@ function buildPageBundle(rawRules) {
     exceptions,
   };
 
+  const buildCssWithWasm = _cssBuilderOverride || (wasmReady ? build_css_from_selectors : null);
   const cssText = cssSelectors.length > 0
-    ? (wasmReady
-        ? build_css_from_selectors(cssSelectors.join('\n'), '', 150)
+    ? (buildCssWithWasm
+        ? buildCssWithWasm(cssSelectors.join('\n'), '', cssChunkSize)
         : buildCssFromSelectorList(cssSelectors, 'display: none !important; visibility: hidden !important;'))
     : '';
 
@@ -5265,6 +5280,11 @@ async function handleMessage(message, sender) {
 // Cosmetic + scriptlet rule lookup
 // ---------------------------------------------------------------------------
 
+// PICKER-2026-09 SW3 — a page bundle names its format, so one stored while
+// user and list selectors were still joined is a miss (rebuilt once) rather
+// than served until the lists next change.
+const PAGE_BUNDLE_FORMAT = 'user-css-apart';
+
 async function getCosmeticBundleForPage(hostname) {
   // Wait for critical caches if they aren't ready yet
   if (!_criticalReady && _criticalPromise) await _criticalPromise;
@@ -5279,7 +5299,7 @@ async function getCosmeticBundleForPage(hostname) {
   const persistedBundle = normalizeStoredBundle(
     await db.getPageBundle(hostname, activeRuleDataVersion)
   );
-  if (persistedBundle) {
+  if (persistedBundle?.format === PAGE_BUNDLE_FORMAT) {
     setCachedDomainRules(hostname, persistedBundle);
     return persistedBundle;
   }
@@ -5340,11 +5360,27 @@ async function getCosmeticBundleForPage(hostname) {
       userDom = userDom.slice(dotIdx + 1);
     }
 
-    return buildPageBundle({
-      generic: userGeneric,
-      domainSpecific: domainSpecific.concat(userDomainSelectors),
-      exceptions: [...userExceptions],
+    // PICKER-2026-09 SW3 — the user's CSS selectors are never joined with the
+    // lists'. `build_page_bundle` puts up to 150 selectors in one rule, and a
+    // browser discards the whole rule for one it cannot parse: a single bad
+    // user selector (`a:bogus`, which the worker cannot detect without a CSS
+    // parser) voided the lists' hides on every page, and a bad list selector
+    // the user's. User CSS is built one rule per selector, through the same
+    // gates and exception suppression; user procedural selectors stay with the
+    // lists', since each plan is its own rule.
+    const exceptions = [...userExceptions];
+    const format = PAGE_BUNDLE_FORMAT;
+    const userSelectors = [...userGeneric, ...userDomainSelectors].filter((sel) => typeof sel === 'string');
+    const bundle = buildPageBundle({
+      generic: [],
+      domainSpecific: domainSpecific.concat(userSelectors.filter((sel) => isProceduralSelector(sel))),
+      exceptions,
     });
+    const userCss = userSelectors.filter((sel) => !isProceduralSelector(sel));
+    const userCssText = userCss.length
+      ? buildPageBundle({ generic: [], domainSpecific: userCss, exceptions }, 1).cssText
+      : '';
+    return { ...bundle, cssText: [bundle.cssText, userCssText].filter(Boolean).join('\n'), format };
   })();
 
   _inFlightRules.set(hostname, promise);
@@ -5645,6 +5681,8 @@ export const __testHooks = {
   appendUserFilterLine,
   isPickerSafeUserFilterLine,
   setCompileUserFiltersOverrideForTest: (fn) => { _compileUserFiltersOverride = fn; },
+  setPageBundleBuilderForTest: (fn) => { _pageBundleBuilderOverride = fn; },
+  setCssBuilderForTest: (fn) => { _cssBuilderOverride = fn; },
   parseSimpleNetworkRule,
   DNR_USER_FILTER_PRIORITY,
   DNR_ALLOWLIST_PRIORITY,

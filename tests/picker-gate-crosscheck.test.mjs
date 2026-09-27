@@ -152,10 +152,10 @@ function emittedLines() {
     const site = globalThis.location.hostname;
     if (!bySite.has(site)) bySite.set(site, []);
     bySite.get(site).push(...candidates.map((c) => candidateLine(c, c.domain)),
-      ...generateNetworkCandidates(el, candidates).map((n) => candidateLine(n, n.domain)));
+      ...generateNetworkCandidates(el).map((n) => candidateLine(n, n.domain)));
     // Exactly what the dialog sends, with "Apply only to <site>" checked and not.
     for (const c of candidates) cosmetic.push(candidateLine(c, c.domain), candidateLine(c, null));
-    for (const n of generateNetworkCandidates(el, candidates)) {
+    for (const n of generateNetworkCandidates(el)) {
       for (const line of [candidateLine(n, n.domain), candidateLine(n, null)]) {
         assert.ok(line, `no line for ${n.rule}`);
         network.push(line);

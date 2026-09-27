@@ -25,11 +25,15 @@ const PICKER_STYLE_ID     = '__adblock_picker_style__';
 // picker-owned stylesheets, never an inline `style.display` the page can read
 // or clear. The preview sheet (and every mark a procedural preview sets) goes
 // on cancel, save and deactivate; the applied sheet stands in for the saved
-// rule until a reload, as the inline write did. Named per session.
+// rule until a reload, as the inline write did. Named per session. A network
+// block hides only the element whose request it stops, so its preview and its
+// post-save hide mark that element (the applied mark stays until a reload)
+// rather than borrow a cosmetic selector that can match others (review R4).
 const PICKER_SESSION = Math.random().toString(36).slice(2, 10);
 const PREVIEW_SHEET_ID = `__adblock_picker_preview_${PICKER_SESSION}`;
 const APPLIED_SHEET_ID = `__adblock_picker_applied_${PICKER_SESSION}`;
 const PREVIEW_MARK = `data-adblock-picker-preview-${PICKER_SESSION}`;
+const APPLIED_MARK = `data-adblock-picker-applied-${PICKER_SESSION}`;
 let markedNodes = [];
 
 let pickerActive = false;
@@ -1026,12 +1030,12 @@ function elementResources(el) {
  * its path (or the prefix a refused character leaves), then its whole host.
  * None when the element makes no http(s) request, when that request's host is
  * not gate-safe, or when there is no plain, registrable site to scope to — an
- * unscoped block of a shared CDN path would reach every site. `cosmetic` (the
- * element's CSS candidates) supplies `previewSelector`, which hides the element
- * until a reload applies the block. Exported for tests and SW1's gate
- * cross-check; the dialog offers these from PK2b.
+ * unscoped block of a shared CDN path would reach every site. Each carries the
+ * element as `matches`: what the preview hides, and what is hidden once saved
+ * until a reload applies the block (review R4). Exported for tests and SW1's
+ * gate cross-check; the dialog offers these from PK2b.
  */
-export function generateNetworkCandidates(el, cosmetic) {
+export function generateNetworkCandidates(el) {
   const resource = elementResources(el).find(({ url }) => /^https?:$/.test(resolveUrl(url)?.protocol));
   const domain = siteScope();
   if (!resource || !domain) return [];
@@ -1046,17 +1050,13 @@ export function generateNetworkCandidates(el, cosmetic) {
       kind: 'network',
       label: `${NETWORK_LABELS[real]} (${resource.type})`,
       rule,
-      previewSelector: null,
+      matches: [el],
       scope: real,
       count: 1,
       domain,
       type: resource.type,
       url: resource.url,
     });
-  }
-  if (candidates.length > 0) {
-    const previewSelector = (cosmetic || generateSelectors(el))[0]?.selector ?? null;
-    for (const c of candidates) c.previewSelector = previewSelector;
   }
   return candidates;
 }
@@ -1104,7 +1104,7 @@ function updatePickerDialog(dialog) {
   const refusal = scopeRefusal(site);
   const hostname = refusal ? null : site;
   const cosmetic = generateSelectors(target);
-  const candidates = [...generateNetworkCandidates(target, cosmetic), ...cosmetic];
+  const candidates = [...generateNetworkCandidates(target), ...cosmetic];
   const scopeOf = () => (dialog.querySelector('#adblock-scope-site')?.checked ? hostname : null);
 
   updateHighlight(target);
@@ -1181,7 +1181,7 @@ function updatePickerDialog(dialog) {
     const rule = candidateLine(candidate, scopeOf());
     if (!rule) return;
     if (candidate.kind === 'network') {
-      savePickerRule(rule, candidate.previewSelector, hostname, dialog, 'network');
+      savePickerRule(rule, null, hostname, dialog, 'network', candidate.matches);
     } else {
       savePickerRule(rule, candidate.selector, hostname, dialog);
     }
@@ -1463,11 +1463,11 @@ function buildCosmeticRule(selector, domain) {
 // ---------------------------------------------------------------------------
 // Save rule
 // ---------------------------------------------------------------------------
-export async function savePickerRule(rule, selector, hostname, dialog, kind = 'cosmetic') {
+export async function savePickerRule(rule, selector, hostname, dialog, kind = 'cosmetic', elements = []) {
   try {
     // A network line is no selector: the two selector guards below are for
-    // hides; `selector` is then only the element's cosmetic stand-in, hidden
-    // until a reload applies the block (PICKER-2026-09 PK2b).
+    // hides. It hides `elements`, the picked element, until a reload applies
+    // the block (PICKER-2026-09 PK2b, review R4).
     const network = kind === 'network';
     // Every save passes here, and the custom field arrives unvalidated: a
     // selector the browser cannot parse, or the compiler would drop, is never
@@ -1516,7 +1516,8 @@ export async function savePickerRule(rule, selector, hostname, dialog, kind = 'c
 
     // Immediately hide elements on this page
     clearPreview();
-    if (selector) applyRuleImmediately(selector);
+    if (network) hideElementsImmediately(elements);
+    else if (selector) applyRuleImmediately(selector);
 
     // Show success state in dialog
     showSuccessInDialog(dialog, rule);
@@ -1557,16 +1558,16 @@ function clearPreview() {
 
 /**
  * Hide what `candidate` would hide, now, through the preview sheet: a network
- * block's element by its preview selector, and a procedural candidate's
- * actual matched set (the browser cannot run `:has-text()`), marked with a
- * picker-owned attribute. `tag:has-text(x)` also matches ancestor wrappers,
- * so the user sees one go before saving (PICKER-2026-09 PK5).
+ * block's own element, and a procedural candidate's actual matched set (the
+ * browser cannot run `:has-text()`), each marked with a picker-owned
+ * attribute. `tag:has-text(x)` also matches ancestor wrappers, so the user
+ * sees one go before saving (PICKER-2026-09 PK5, review R4).
  */
 function showPreview(candidate) {
   clearPreview();
-  let selector = candidate?.kind === 'network' ? candidate.previewSelector : candidate?.selector;
-  if (!selector) return;
-  if (isProceduralSelector(selector)) {
+  let selector = candidate?.kind === 'network' ? null : candidate?.selector;
+  if (candidate?.kind !== 'network' && !selector) return;
+  if (candidate.kind === 'network' || isProceduralSelector(selector)) {
     if (!candidate.matches?.length) return;
     for (const node of candidate.matches) {
       node.setAttribute?.(PREVIEW_MARK, '');
@@ -1575,6 +1576,15 @@ function showPreview(candidate) {
     selector = `[${PREVIEW_MARK}]`;
   }
   pickerSheet(PREVIEW_SHEET_ID).textContent = hideRule(selector);
+}
+
+/** Hide a saved network block's element until a reload applies the block. */
+function hideElementsImmediately(elements) {
+  if (!elements?.length) return;
+  for (const node of elements) node.setAttribute?.(APPLIED_MARK, '');
+  const node = pickerSheet(APPLIED_SHEET_ID);
+  const rule = hideRule(`[${APPLIED_MARK}]`);
+  if (!(node.textContent || '').includes(rule)) node.textContent = `${node.textContent || ''}${rule}\n`;
 }
 
 /** Hide a saved rule's matches until a reload applies it: the applied sheet. */

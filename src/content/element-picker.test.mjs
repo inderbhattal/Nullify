@@ -294,7 +294,7 @@ test('a second error replaces the first instead of stacking (§5.16)', async () 
  * success toast lands inside the test. Returns the text of every toast
  * mounted; nested timers (the toast's own removal) are captured and dropped.
  */
-async function saveAndFlushToasts(rule, selector, dialog, kind) {
+async function saveAndFlushToasts(rule, selector, dialog, kind, elements) {
   const queued = [];
   const toasts = [];
   const root = globalThis.document.documentElement;
@@ -306,7 +306,7 @@ async function saveAndFlushToasts(rule, selector, dialog, kind) {
     return realAppend.call(this, node);
   };
   try {
-    await savePickerRule(rule, selector, 'example.test', dialog, kind);
+    await savePickerRule(rule, selector, 'example.test', dialog, kind, elements);
     for (const fn of queued.splice(0)) fn();
   } finally {
     globalThis.setTimeout = realSetTimeout;
@@ -715,8 +715,9 @@ test('PK2a: an ad image offers a domain-scoped path network candidate', () => {
   assert.equal(host.label, 'Block host (image)');
   assert.equal(path.domain, 'example.test');
   assert.equal(path.count, 1);
-  // The cosmetic stand-in that hides the element until a reload applies it.
-  assert.equal(path.previewSelector, '.banner');
+  // The element itself is what the block hides until a reload applies it (R4).
+  assert.deepEqual(path.matches, [img]);
+  assert.equal('previewSelector' in path, false);
 });
 
 test('PK2a: a metacharacter in the path truncates to the longest safe prefix (not host-only)', () => {
@@ -944,7 +945,7 @@ test('PK2a (Rec2): a real CSS.escape over hostile page text emits only gate-shap
       textContent: '$image,domain=bank',
     });
     const cosmetic = generateSelectors(target);
-    const network = generateNetworkCandidates(target, cosmetic);
+    const network = generateNetworkCandidates(target);
 
     assert.ok(cosmetic.some((c) => c.selector === '.clean'), 'cosmetic candidates still offered');
     for (const { selector } of cosmetic) {
@@ -1478,14 +1479,12 @@ test('PK2b: saving a network candidate sends the network line verbatim', async (
   globalThis.chrome = {
     runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ error: 'stop' }); } },
   };
-  // The preview selector matches only inside a shadow root, and a network line
-  // is no CSS the browser parses: both cosmetic guards would refuse it.
-  const hostEl = el();
-  hostEl.shadowRoot = { querySelectorAll: (sel) => (sel === '.banner' ? [el()] : []) };
+  // A network line is no CSS the browser parses: the cosmetic guards would
+  // refuse it.
   docState.byLevel = new Map();
-  docState.all = [hostEl];
+  docState.all = [];
   const rule = '||cdn.ads.example/a/banner.png^$image,domain=example.test';
-  await withBrowserParser(() => savePickerRule(rule, '.banner', 'example.test', makeDialog(), 'network'));
+  await withBrowserParser(() => savePickerRule(rule, null, 'example.test', makeDialog(), 'network', [el()]));
   assert.deepEqual(sent.map((m) => m.payload.line), [rule]);
 });
 
@@ -1543,17 +1542,25 @@ test('PK2b: candidateLine builds the line the dialog sends, for either kind', ()
   assert.equal(candidateLine({ kind: 'cosmetic', selector: '.ad' }, null), '##.ad');
 });
 
-test('PK2b: a saved network block hides its element through the preview selector', async () => {
+test('R4: a saved network block hides the picked element itself, by a mark, until a reload', async () => {
   clearSheets(); // PK5: the applied sheet outlives a test
   globalThis.chrome = { runtime: { sendMessage: () => Promise.resolve({ ok: true, counts: { skippedRules: [] } }) } };
   const hidden = [];
-  docState.byLevel = new Map([['.banner', [el({ style: { setProperty: (p) => hidden.push(p) } })]]]);
+  const img = markable({ tagName: 'IMG', classList: ['banner'], style: { setProperty: (p) => hidden.push(p) } });
+  const other = markable({ tagName: 'IMG', classList: ['banner'] });
+  docState.byLevel = new Map([['.banner', [img, other]]]);
   docState.all = [];
   const dialog = makeDialog();
-  await saveAndFlushToasts('||cdn.ads.example/b.png^$image,domain=example.test', '.banner', dialog, 'network');
+  await saveAndFlushToasts('||cdn.ads.example/b.png^$image,domain=example.test', null, dialog, 'network', [img]);
   assert.match(dialog.footer.innerHTML, /Rule saved/);
   assert.deepEqual(hidden, []);
-  assert.match(appliedCss(), /banner/);
+  // The picker has gone (the toast flush tore it down); the element's mark and
+  // the sheet hiding it stay, and nothing else is hidden. Prior code hid
+  // every `.banner`: the block only stops this element's request.
+  assert.deepEqual([...img.attrs.keys()].map(markKind), ['applied']);
+  assert.deepEqual([...other.attrs.keys()], []);
+  assert.doesNotMatch(appliedCss(), /banner/);
+  assert.match(appliedCss(), new RegExp(`:is\\(\\[${[...img.attrs.keys()][0]}\\]\\)`));
 });
 
 test('PK2b: a bare element with no hide to preview still saves its network block', async () => {
@@ -1565,8 +1572,8 @@ test('PK2b: a bare element with no hide to preview still saves its network block
   docState.all = [];
   const img = tagged('IMG', { src: 'https://cdn.ads.example/bare.png' });
   const [candidate] = generateNetworkCandidates(img);
-  assert.equal(candidate.previewSelector, null);
-  await savePickerRule(candidate.rule, candidate.previewSelector, 'example.test', makeDialog(), 'network');
+  assert.deepEqual(candidate.matches, [img]);
+  await savePickerRule(candidate.rule, null, 'example.test', makeDialog(), 'network', candidate.matches);
 
   resetPickerEnv();
   // Through the dialog: Create does not await the save, so a reply that never
@@ -1726,6 +1733,9 @@ function clearSheets() {
     if (id.startsWith('__adblock_picker_applied_') || id.startsWith('__adblock_picker_preview_')) mountedById.delete(id);
   }
 }
+/** Which picker mark an attribute name is: 'preview', 'applied', or the name. */
+const markKind = (name) => /^data-adblock-picker-(preview|applied)-[a-z0-9]+$/.exec(name)?.[1] ?? name;
+
 /** An element stub whose attributes can be set and removed, as marks are. */
 function markable(overrides = {}) {
   const attrs = new Map();
@@ -1789,15 +1799,45 @@ test('PK5: the dialog previews the selected candidate live, and cancel leaves no
   }
 });
 
-test('PK5: a network candidate previews by hiding its element', () => {
+test('R4: a network candidate previews by marking the picked element, and nothing else', () => {
   resetPickerEnv();
   clearSheets();
-  const img = tagged('IMG', { src: 'https://cdn.ads.example/a.png' }, { classList: ['banner'] });
-  docState.byLevel = new Map([['.banner', [img]]]);
+  const attrs = { src: 'https://cdn.ads.example/a.png' };
+  const img = markable({ tagName: 'IMG', classList: ['banner'], getAttribute: (name) => attrs[name] ?? null });
+  const other = markable({ tagName: 'IMG', classList: ['banner'] });
+  docState.byLevel = new Map([['.banner', [img, other]]]);
   try {
     openDialogFor(img);
-    assert.match(previewCss(), /:is\(\.banner\)/);
+    // Prior code previewed `:is(.banner)`, hiding `other` as well.
+    assert.deepEqual([...img.attrs.keys()].map(markKind), ['preview']);
+    assert.deepEqual([...other.attrs.keys()], []);
+    assert.match(previewCss(), new RegExp(`^:is\\(\\[${[...img.attrs.keys()][0]}\\]\\)`));
   } finally {
+    resetPickerEnv();
+  }
+  // Cancel took the mark with it.
+  assert.deepEqual([...img.attrs.keys()], []);
+});
+
+test('R4: Create on a network candidate marks the element the dialog was opened on', async () => {
+  resetPickerEnv();
+  clearSheets();
+  const attrs = { src: 'https://cdn.ads.example/a.png' };
+  const img = markable({ tagName: 'IMG', classList: ['banner'], getAttribute: (name) => attrs[name] ?? null });
+  docState.byLevel = new Map([['.banner', [img]]]);
+  const sent = [];
+  globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return Promise.resolve({ ok: true, counts: { skippedRules: [] } }); } } };
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = () => 0; // the success toast is not under test
+  try {
+    const control = openDialogFor(img);
+    control('input[type="radio"]:checked').value = '0';
+    control('#adblock-picker-create').listeners.get('click')();
+    for (let i = 0; i < 5; i++) await null;
+    assert.deepEqual(sent.map((m) => m.payload.line), ['||cdn.ads.example/a.png^$image,domain=example.test']);
+    assert.deepEqual([...img.attrs.keys()].map(markKind), ['applied']);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
     resetPickerEnv();
   }
 });
@@ -2020,7 +2060,7 @@ test('R5: no candidate carries a scope the gate refuses, of either kind', () => 
     onSite(hostname, () => {
       assert.ok(generateSelectors(img()).every((c) => c.domain === null), hostname);
       // Unscoped network blocks reach every site: none is offered.
-      assert.deepEqual(generateNetworkCandidates(img(), []), [], hostname);
+      assert.deepEqual(generateNetworkCandidates(img()), [], hostname);
     });
   }
   // A single-label resource host or `domain=` is refused; a bracketed IPv6
@@ -2032,6 +2072,6 @@ test('R5: no candidate carries a scope the gate refuses, of either kind', () => 
   assert.equal(urlToNetworkPattern('http://[::1]/ad.png', opts), '||[::1]/ad.png^$image,domain=example.test');
   onSite('example.test', () => {
     assert.ok(generateSelectors(img()).every((c) => c.domain === 'example.test'));
-    assert.equal(generateNetworkCandidates(img(), [])[0].domain, 'example.test');
+    assert.equal(generateNetworkCandidates(img())[0].domain, 'example.test');
   });
 });

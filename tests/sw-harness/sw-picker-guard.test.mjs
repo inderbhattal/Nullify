@@ -667,7 +667,6 @@ test('SW1 (didn\'t re-break): every picker-legitimate shape applies on the WASM 
     await withWorker(async ({ chrome }) => {
       const res = await append(chrome, line);
       assert.equal(res.ok, true, `${show(line)}: ${JSON.stringify(res)}`);
-      assert.equal(res.counts.cosmetic, 1, `${show(line)} must compile to one hide`);
       const stored = line.trim();
       const sep = stored.indexOf('##');
       const [domain, selector] = [stored.slice(0, sep), stored.slice(sep + 2)];
@@ -684,7 +683,7 @@ test('SW1 (didn\'t re-break): every picker-legitimate shape applies on the WASM 
     await withWorker(async ({ chrome }) => {
       const res = await append(chrome, line);
       assert.equal(res.ok, true, `${show(line)}: ${JSON.stringify(res)}`);
-      assert.deepEqual([res.counts.network, res.counts.skippedNetwork], [1, 0],
+      assert.deepEqual([userRules(chrome).length, res.counts.skippedRules], [1, []],
         `${show(line)} must compile to one live rule: ${JSON.stringify(res.counts)}`);
       const [rule] = userRules(chrome);
       assert.deepEqual([rule.action.type, rule.priority], ['block', 1],
@@ -752,8 +751,8 @@ test('SW2: a network line the fallback compiler refuses is reported, not dropped
     await withWorker(async ({ chrome }) => {
       const res = await append(chrome, line);
       assert.equal(res.ok, true, JSON.stringify(res));
-      assert.deepEqual([res.counts.network, res.counts.skippedNetwork, res.counts.skippedRules],
-        [0, 1, [{ id: null, reason: FALLBACK_REASON, line }]], `${show(line)} must be reported as dropped`);
+      assert.deepEqual([userRules(chrome).length, res.counts.skippedRules],
+        [0, [{ id: null, reason: FALLBACK_REASON, line }]], `${show(line)} must be reported as dropped`);
     }, { fallback: true });
   }
   // The options page's full-text apply takes the same path; the entry holds
@@ -774,7 +773,6 @@ test('SW2: an APPEND reply carries the appended line\'s own drop entry, however 
   await withWorker(async ({ chrome }) => {
     const res = await append(chrome, CRITICAL);
     assert.equal(res.ok, true, JSON.stringify(res));
-    assert.equal(res.counts.skippedNetwork, 27, 'the count stays the true total');
     const list = res.counts.skippedRules;
     const own = list.find((s) => s.line === CRITICAL.trim());   // PK1's lookup, verbatim
     assert.ok(own, `the appended line's entry must be in the reply: ${JSON.stringify(list.map((s) => s.line))}`);
@@ -790,7 +788,6 @@ test('SW2: on the fallback too, the APPEND reply carries the appended line\'s ow
   const rule = '||cdn.ads.example/b.png^$image,domain=example.com ';
   await withWorker(async ({ chrome }) => {
     const res = await append(chrome, rule);
-    assert.equal(res.counts.skippedNetwork, 26);
     assert.deepEqual(res.counts.skippedRules, [{ id: null, reason: FALLBACK_REASON, line: rule.trim() }]);
   }, { fallback: true, seed: { userFilters: stored, userFiltersApplied: stored } });
 });
@@ -823,8 +820,7 @@ test('SW2: an APPEND reply lists no other line of My Filters (WASM down)', async
     await withWorker(async ({ chrome }) => {
       const res = await append(chrome, line);
       assert.equal(res.ok, true, JSON.stringify(res));
-      assert.equal(res.counts.skippedNetwork, PRIVATE_FALLBACK_DROPS.length);
-      assert.deepEqual(res.counts.skippedRules, []);
+      assert.deepEqual(res, { ok: true, counts: { skippedRules: [] } }, 'no count of My Filters either (R9)');
       assertReplyLeaksNothing(res, PRIVATE_FALLBACK_DROPS);
     }, { fallback: true, seed: { userFilters: stored, userFiltersApplied: stored } });
   }
@@ -838,8 +834,7 @@ test('SW2: an APPEND reply lists no other line of My Filters (WASM)', async (t) 
     await withWorker(async ({ chrome }) => {
       const res = await append(chrome, line);
       assert.equal(res.ok, true, JSON.stringify(res));
-      assert.equal(res.counts.skippedNetwork, storedLines.length);
-      assert.deepEqual(res.counts.skippedRules, []);
+      assert.deepEqual(res, { ok: true, counts: { skippedRules: [] } }, 'no count of My Filters either (R9)');
       assertReplyLeaksNothing(res, storedLines);
     }, { seed: { userFilters: stored, userFiltersApplied: stored } });
   }
@@ -881,7 +876,8 @@ test('SW2: on the fallback, only a line the compiler reads as a network rule is 
 test('SW2 (didn\'t re-break): on the fallback, a cosmetic line is never reported as a dropped network rule', async () => {
   await withWorker(async ({ chrome }) => {
     const res = await append(chrome, 'example.com##.ad');
-    assert.deepEqual([res.counts.cosmetic, res.counts.skippedNetwork, res.counts.skippedRules], [1, 0, []]);
+    assert.deepEqual(res.counts.skippedRules, []);
+    assert.deepEqual(chrome.storage.local._data().userCosmeticRules.domainSpecific, { 'example.com': ['.ad'] });
     // One line per marker the compiler tests, each refused by the fallback
     // network parser (options page: the gate refuses all but the first).
     const set = await chrome.runtime.sendMessage({ type: 'SET_USER_FILTERS', payload: { filters: [
@@ -897,7 +893,7 @@ test('SW2 (didn\'t re-break): on the fallback, a cosmetic line is never reported
 test('SW2 (didn\'t re-break): a plain block still applies on the fallback', async () => {
   await withWorker(async ({ chrome }) => {
     const res = await append(chrome, '||ads.example/b.png^');
-    assert.deepEqual([res.counts.network, res.counts.skippedNetwork, res.counts.skippedRules], [1, 0, []]);
+    assert.deepEqual([userRules(chrome).length, res.counts.skippedRules], [1, []]);
   }, { fallback: true });
 });
 
@@ -1109,4 +1105,31 @@ test('R2: a selector holding a CSS comment start never reaches the page CSS', as
       generic: ['/*.stale', '.ad /* old', '.next', '.keep'], domainSpecific: {},
       genericExceptions: ['/* x */.gone', '.keep'], domainExceptions: {} } });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Code review R9 — the APPEND reply goes to a renderer. Its `network`,
+// `cosmetic` and `skippedNetwork` counts disclosed the size of My Filters and,
+// since the compiler dedupes, whether a line was already there: append it and
+// watch `network` stay put. The picker reads only `skippedRules`.
+// ---------------------------------------------------------------------------
+
+test('R9: an APPEND reply carries skippedRules and nothing else', async () => {
+  const stored = '||dup.example^\nexample.com##.ad\n||x.example^$image';
+  for (const fallback of [false, true]) {
+    await withWorker(async ({ chrome }) => {
+      const again = await append(chrome, '||dup.example^');   // already in My Filters
+      const fresh = await append(chrome, '||fresh.example^');
+      assert.deepEqual(again, { ok: true, counts: { skippedRules: [] } });
+      assert.deepEqual(fresh, again, 'a line already present must not answer differently');
+    }, { fallback, seed: { userFilters: stored, userFiltersApplied: stored } });
+  }
+});
+
+test('R9 (didn\'t re-break): the options page still gets its counts', async () => {
+  await withWorker(async ({ chrome }) => {
+    const res = await chrome.runtime.sendMessage({ type: 'SET_USER_FILTERS',
+      payload: { filters: '||a.example^\nexample.com##.ad' } });
+    assert.deepEqual([res.network, res.cosmetic, res.skippedNetwork, res.skippedRules], [1, 1, 0, []]);
+  });
 });

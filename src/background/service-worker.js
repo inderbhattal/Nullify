@@ -5153,7 +5153,12 @@ async function handleMessage(message, sender) {
       }
       const result = await appendUserFilterLine(line);
       if (result?.error) return { error: result.error };
-      return { ok: true, counts: result };
+      // Code review R9 — this reply reaches a renderer. `network`, `cosmetic`
+      // and `skippedNetwork` described all of My Filters: its size, and (the
+      // compiler dedupes) whether a line was already there. The picker needs
+      // only its own line's skipped entry; the options page's SET_USER_FILTERS
+      // reply keeps the counts.
+      return { ok: true, counts: { skippedRules: result.skippedRules } };
     }
     // §5.5 — RUN_SCRIPTLETS and GET_SCRIPTLET_RULES are deliberately gone:
     // they had no caller anywhere in src/content, src/popup or src/options,

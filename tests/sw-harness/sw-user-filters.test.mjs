@@ -136,7 +136,9 @@ test('APPEND_USER_FILTER: appends atomically and runs the same apply path', asyn
   });
 
   assert.equal(res.ok, true);
-  assert.equal(res.counts.network, 2);
+  // Code review R9: the reply carries only this line's skip entry; the
+  // applied rules are pinned below through storage and DNR.
+  assert.deepEqual(res.counts, { skippedRules: [] });
   assert.equal(
     chrome.storage.local._data().userFilters,
     '||first.example^\n||second.example^'

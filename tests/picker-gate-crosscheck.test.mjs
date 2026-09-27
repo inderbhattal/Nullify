@@ -99,7 +99,10 @@ const printable = (s) => s.replace(/[^\x20-\x7e]/g, (c) => `\\u{${c.codePointAt(
 const ENDS_IN_HEX_ESCAPE = /(?:^|[^\\])(?:\\\\)*\\[0-9a-fA-F]{1,6}$/;
 
 const SITES = ['example.test', 'www.ck', 'www.example.com', 'localhost', '192.168.1.1', 'www.github.io',
-  'sub.shop.example.co.uk'];
+  'sub.shop.example.co.uk', 'github.io', 'intranet'];
+// Sites the gate will not scope a rule to (a public suffix, a single label):
+// every line picked on one is unscoped (review R5, R10).
+const UNSCOPABLE_SITES = new Set(['localhost', 'github.io', 'intranet']);
 const URLS = [
   'https://cdn.ads.example/a/banner.png?bust=1', 'https://cdn.ads.example/a$script/x.png',
   'https://x$important,domain=bank.example/p.png', 'https://*/x.png', 'https://ads.example:8443/x.png',
@@ -107,7 +110,7 @@ const URLS = [
   'https://ads.example/%24x.png', "https://ads.example/!&'()+,;=@[]~:/x.png", 'https://ADS.Example/X.PNG',
   'https://1.2.3.4/x.png', 'https://xn--bcher-kva.example/x.png', 'ads/rel.png', '/root.png',
   'https://ads.example/', 'https://ads.example/$', 'https://a..b/x.png', 'https://-a-.example/x.png',
-  'data:image/png;base64,AAAA', 'blob:https://ads.example/1',
+  'data:image/png;base64,AAAA', 'blob:https://ads.example/1', 'http://intranet/x.png', 'http://localhost./x.png',
 ];
 const KINDS = [['IMG', 'src'], ['IFRAME', 'src'], ['EMBED', 'src'], ['OBJECT', 'data'], ['VIDEO', 'poster'],
   ['AUDIO', 'src']];
@@ -142,9 +145,14 @@ const HASHED = ['css-1x2y3z', 'jsx-2947163892', 'grid-12ab34'];
 function emittedLines() {
   const cosmetic = [];
   const network = [];
+  const bySite = new Map();
   const pick = (el) => {
     picking = el;
     const candidates = generateSelectors(el);
+    const site = globalThis.location.hostname;
+    if (!bySite.has(site)) bySite.set(site, []);
+    bySite.get(site).push(...candidates.map((c) => candidateLine(c, c.domain)),
+      ...generateNetworkCandidates(el, candidates).map((n) => candidateLine(n, n.domain)));
     // Exactly what the dialog sends, with "Apply only to <site>" checked and not.
     for (const c of candidates) cosmetic.push(candidateLine(c, c.domain), candidateLine(c, null));
     for (const n of generateNetworkCandidates(el, candidates)) {
@@ -190,7 +198,7 @@ function emittedLines() {
     // Half in a tree whose siblings collide, so positional paths are emitted.
     pick(rand(2) === 0 ? el : amongTwins(el, { classList: [randClass()], id: rand(2) === 0 ? randText(4) : '' }));
   }
-  return { cosmetic, network };
+  return { cosmetic, network, bySite };
 }
 
 test('PK2c: the gate hook is the real one', () => {
@@ -278,4 +286,18 @@ test('R3: the picker\'s CSS mirror agrees with the engine on every selector', { 
   const disagree = verdicts.filter(([selector, kept]) => compilerKeepsAsCss(selector) !== kept);
   assert.deepEqual(disagree.slice(0, 10).map(([s, kept]) => `${printable(s)} engine:${kept}`), [],
     `${disagree.length} disagreement(s)`);
+});
+
+test('R5: on a site the gate will not scope to, every line the picker offers is unscoped', () => {
+  const { bySite } = emittedLines();
+  for (const site of UNSCOPABLE_SITES) {
+    const lines = bySite.get(site) ?? [];
+    assert.ok(lines.length > 50, `${site}: ${lines.length} lines`);
+    // No network block either: unscoped, one would reach every site.
+    const scoped = lines.filter((line) => !line.startsWith('##'));
+    assert.deepEqual(scoped.slice(0, 5).map(printable), [], `${site}: ${scoped.length} line(s) not unscoped hides`);
+  }
+  // And the rest still scope: the premise is not "nothing is ever scoped".
+  assert.ok(bySite.get('example.test').some((line) => line.startsWith('example.test##')));
+  assert.ok(bySite.get('192.168.1.1').some((line) => line.includes('domain=192.168.1.1')));
 });

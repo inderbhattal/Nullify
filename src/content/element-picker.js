@@ -573,13 +573,34 @@ function siteScope() {
 }
 
 /**
+ * Why SW1's gate will not scope a rule to `site`, or null when it will: the
+ * gate takes only a plain lower-case hostname that reaches no further than one
+ * site (`isPickerScopeTooBroad`). The dialog then unchecks and disables
+ * "Apply only to <site>" and says why, as a scoped line would be refused
+ * (review R5).
+ */
+function scopeRefusal(site) {
+  if (!site || !SITE_HOSTNAME.test(site)) return 'its name can\'t scope a rule';
+  if (isPublicSuffix(site)) return 'it is a public suffix, shared by many sites';
+  if (NUMERIC_TAIL.test(site) && !IPV4.test(site)) return 'it is not a whole IP address';
+  if (isSingleLabel(site)) return 'a single-label name reaches every host under it';
+  return null;
+}
+
+/** The site a rule may be scoped to, or null when the gate would refuse it. */
+function scopableSite() {
+  const site = siteScope();
+  return scopeRefusal(site) ? null : site;
+}
+
+/**
  * Generate a ranked list of CSS selector candidates for an element.
  * Each candidate includes: selector string, match count, and a label.
  * Exported for tests.
  */
 export function generateSelectors(el) {
   const candidates = [];
-  const hostname = siteScope();
+  const hostname = scopableSite();
   const seen = new Set();
 
   function add(label, selector, scope, matched) {
@@ -893,13 +914,25 @@ const NETWORK_HOST = /^(?:[a-z0-9.-]+|\[[0-9a-f:]+\])$/;
 const NETWORK_PATH_STOP = /[^\w!%&'()+,\-.:;=@[\]~/]/;
 // The gate's `domain=` value: plain lower-case labels, one host, no negation.
 const SITE_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
-// And no wider than one site, as SW1's `isPickerScopeTooBroad` rules: not a
-// public suffix, and a last label that is a number only in a whole IPv4
-// address (`domain=1` would reach every x.x.x.1 host). A URL's own host never
-// needs the number rule: the parser writes such a host as a dotted quad or
-// refuses it (PICKER-2026-09 PK2c).
+// And no wider than one site, as SW1's `isPickerScopeTooBroad` rules for a
+// hide's hostname, a `||` host and `domain=` alike: not a public suffix, a
+// last label that is a number only in a whole IPv4 address (`domain=1` would
+// reach every x.x.x.1 host), and not a single label, trailing dots aside
+// (review R10): the list's implicit `*` rule makes an unknown one such as
+// `lan` a suffix, and every *.localhost is loopback. A bracketed IPv6 literal
+// is one host. A URL's own host never needs the number rule: the parser writes
+// such a host as a dotted quad or refuses it (PICKER-2026-09 PK2c).
 const NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
 const IPV4 = /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+function isSingleLabel(host) {
+  return !host.startsWith('[') && !host.replace(/\.+$/, '').includes('.');
+}
+
+function scopeTooBroad(host) {
+  return isPublicSuffix(host) || (NUMERIC_TAIL.test(host) && !IPV4.test(host)) || isSingleLabel(host);
+}
+
 const NETWORK_TYPES = new Set(['image', 'subdocument', 'media', 'object']);
 const NETWORK_LABELS = { path: 'Block request', prefix: 'Block path prefix', host: 'Block host' };
 
@@ -925,12 +958,11 @@ function resolveUrl(url) {
  */
 export function urlToNetworkPattern(url, { scope = 'path', type, domain } = {}) {
   if (!NETWORK_TYPES.has(type)) return null;
-  if (domain && (!SITE_HOSTNAME.test(domain) || isPublicSuffix(domain) ||
-    (NUMERIC_TAIL.test(domain) && !IPV4.test(domain)))) return null;
+  if (domain && (!SITE_HOSTNAME.test(domain) || scopeTooBroad(domain))) return null;
   const u = resolveUrl(url);
   if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:')) return null;
   const host = u.hostname.toLowerCase();
-  if (!NETWORK_HOST.test(host) || isPublicSuffix(host)) return null;
+  if (!NETWORK_HOST.test(host) || scopeTooBroad(host)) return null;
 
   let base = `||${host}^`;
   if (scope === 'path' && !u.port) {
@@ -1068,13 +1100,23 @@ function openPickerDialog(target) {
 
 function updatePickerDialog(dialog) {
   const target = currentNavTarget;
-  const hostname = siteScope();
+  const site = siteScope();
+  const refusal = scopeRefusal(site);
+  const hostname = refusal ? null : site;
   const cosmetic = generateSelectors(target);
   const candidates = [...generateNetworkCandidates(target, cosmetic), ...cosmetic];
   const scopeOf = () => (dialog.querySelector('#adblock-scope-site')?.checked ? hostname : null);
 
   updateHighlight(target);
-  dialog.innerHTML = buildDialogHTML(candidates, target, hostname);
+  dialog.innerHTML = buildDialogHTML(candidates, target, site, !refusal);
+  // A line scoped to a site the gate will not scope to is refused: offer
+  // only the unscoped rule, and say why (review R5).
+  const siteCheck = dialog.querySelector('#adblock-scope-site');
+  const scopeReason = dialog.querySelector('#adblock-scope-reason');
+  if (refusal) {
+    if (siteCheck) Object.assign(siteCheck, { checked: false, disabled: true });
+    if (scopeReason) scopeReason.textContent = `Can't limit the rule to ${site || 'this page'}: ${refusal}.`;
+  }
 
   // Select first (best) candidate by default
   if (candidates.length > 0) {
@@ -1146,7 +1188,7 @@ function updatePickerDialog(dialog) {
   });
 }
 
-function buildDialogHTML(candidates, target, hostname) {
+function buildDialogHTML(candidates, target, hostname, scopable) {
   const tagName = target.tagName.toLowerCase();
   const preview = [tagName, target.id ? `#${target.id}` : '', ...Array.from(target.classList).slice(0, 3)]
     .filter(Boolean).join(' ');
@@ -1201,9 +1243,10 @@ function buildDialogHTML(candidates, target, hostname) {
 
       <div class="adblock-picker-scope-row">
         <label>
-          <input type="checkbox" id="adblock-scope-site" checked>
-          Apply only to <strong>${escHTML(hostname)}</strong>
+          <input type="checkbox" id="adblock-scope-site" ${scopable ? 'checked' : 'disabled'}>
+          Apply only to <strong>${escHTML(hostname || 'this page')}</strong>
         </label>
+        <span class="adblock-picker-scope-reason" id="adblock-scope-reason"></span>
         <span class="adblock-picker-rule-preview" id="adblock-rule-preview"></span>
       </div>
     </div>
@@ -1307,6 +1350,8 @@ function buildDialogHTML(candidates, target, hostname) {
       }
       .adblock-picker-scope-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
       .adblock-picker-scope-row input { accent-color: #58a6ff; }
+      .adblock-picker-scope-reason:empty { display: none; }
+      .adblock-picker-scope-reason { font-size: 11px; color: #d29922; }
       .adblock-picker-rule-preview {
         font-family: monospace; font-size: 11px; color: #3fb950;
         background: rgba(63,185,80,0.08); padding: 2px 8px; border-radius: 4px;

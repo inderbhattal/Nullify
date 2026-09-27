@@ -1950,3 +1950,88 @@ test('R3: compilerKeepsAsCss mirrors is_css_safe_selector, clause by clause', ()
   for (const selector of refused) assert.equal(compilerKeepsAsCss(selector), false, printable(selector));
   for (const selector of kept) assert.equal(compilerKeepsAsCss(selector), true, printable(selector));
 });
+
+// Review R5 — the gate scopes a rule only to a plain hostname that reaches no
+// further than one site: not a public suffix, not a numeric tail short of an
+// IPv4 address, and (R10) not a single label, `localhost` included, since the
+// list's implicit `*` rule makes every unknown single label a suffix. On any
+// other site "Apply only to <site>" offered a line the gate refuses, so the
+// save failed; now the box is unchecked and disabled, with the reason.
+
+/** Open the dialog on a plain `.ad-slot` element and press Create; returns the lines sent and the controls. */
+function createOn(hostname, { thenCheck = false } = {}) {
+  resetPickerEnv();
+  const target = el({ tagName: 'DIV', classList: ['ad-slot'] });
+  docState.byLevel = new Map([['.ad-slot', [target]]]);
+  const sent = [];
+  globalThis.chrome = { runtime: { sendMessage: (msg) => { sent.push(msg); return new Promise(() => {}); } } };
+  try {
+    return onSite(hostname, () => {
+      const control = openDialogFor(target);
+      const index = generateSelectors(target).findIndex((c) => c.selector === '.ad-slot');
+      control('input[type="radio"]:checked').value = String(index);
+      control('#adblock-picker-create').listeners.get('click')();
+      if (thenCheck) {
+        // Whatever ticks the box afterwards (the page can reach the dialog's DOM).
+        control('#adblock-scope-site').checked = true;
+        control('#adblock-picker-create').listeners.get('click')();
+      }
+      return { lines: sent.map((m) => m.payload.line), control };
+    });
+  } finally {
+    resetPickerEnv();
+  }
+}
+
+test('R5: where the gate will not scope to the site, "Apply only to" is unchecked and disabled, with the reason', () => {
+  for (const [hostname, reason] of [
+    ['localhost', /single-label/],
+    ['intranet', /single-label/],
+    ['github.io', /public suffix/],
+    ['my_host.example', /can.t scope/],
+  ]) {
+    const { lines, control } = createOn(hostname);
+    const box = control('#adblock-scope-site');
+    assert.equal(box.checked, false, hostname);
+    assert.equal(box.disabled, true, hostname);
+    assert.match(control('#adblock-scope-reason').textContent, reason, hostname);
+    // Prior code sent `<site>##.ad-slot`, which the gate refuses.
+    assert.deepEqual(lines, ['##.ad-slot'], hostname);
+    // A box ticked behind the dialog's back still scopes nothing.
+    assert.deepEqual(createOn(hostname, { thenCheck: true }).lines, ['##.ad-slot', '##.ad-slot'], hostname);
+  }
+});
+
+test('R5 (didn\'t re-break): on a site the gate scopes to, the box stays checked and the line is scoped', () => {
+  for (const hostname of ['example.test', '192.168.1.1', 'www.ck']) {
+    const { lines, control } = createOn(hostname);
+    assert.equal(control('#adblock-scope-site').checked, true, hostname);
+    assert.notEqual(control('#adblock-scope-site').disabled, true, hostname);
+    assert.equal(control('#adblock-scope-reason').textContent, '', hostname);
+    assert.deepEqual(lines, [`${hostname}##.ad-slot`], hostname);
+  }
+});
+
+test('R5: no candidate carries a scope the gate refuses, of either kind', () => {
+  docState.byLevel = new Map();
+  docState.all = [];
+  const img = () => tagged('IMG', { src: 'https://ads.example/b.png' }, { classList: ['ad-slot'] });
+  for (const hostname of ['localhost', 'intranet', 'github.io']) {
+    onSite(hostname, () => {
+      assert.ok(generateSelectors(img()).every((c) => c.domain === null), hostname);
+      // Unscoped network blocks reach every site: none is offered.
+      assert.deepEqual(generateNetworkCandidates(img(), []), [], hostname);
+    });
+  }
+  // A single-label resource host or `domain=` is refused; a bracketed IPv6
+  // literal is one host and stays.
+  const opts = { type: 'image', domain: 'example.test' };
+  assert.equal(urlToNetworkPattern('http://intranet/ad.png', opts), null);
+  assert.equal(urlToNetworkPattern('http://localhost./ad.png', opts), null);
+  assert.equal(urlToNetworkPattern('https://ads.example/b.png', { type: 'image', domain: 'localhost' }), null);
+  assert.equal(urlToNetworkPattern('http://[::1]/ad.png', opts), '||[::1]/ad.png^$image,domain=example.test');
+  onSite('example.test', () => {
+    assert.ok(generateSelectors(img()).every((c) => c.domain === 'example.test'));
+    assert.equal(generateNetworkCandidates(img(), [])[0].domain, 'example.test');
+  });
+});

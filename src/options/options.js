@@ -6,11 +6,19 @@ import './options.css';
 
 import { FILTER_LIST_DESCRIPTIONS, FILTER_LIST_NAMES } from '../shared/filter-list-names.js';
 import { normalizeAllowlist, normalizeHostname } from '../shared/hostname.js';
+import {
+  allowlistExportText,
+  filtersExportText,
+  parseAllowlistImport,
+  parseFiltersImport,
+} from './import-export.js';
 import { call, MAX_USER_FILTERS_BYTES, utf8ByteLength } from './messaging.js';
 import {
   describeAllowlistImport,
   describeFilterApply,
   describeFilterImport,
+  describeMisdirectedImport,
+  describeNonSiteLines,
   describeUpdateResult,
   describeWriteFailure,
   filtersEditorState,
@@ -274,8 +282,7 @@ async function initMyFilters() {
       showFilterStatus('Nothing to export — filters are empty', 'error');
       return;
     }
-    const header = `! Title: My Filters\n! Exported: ${new Date().toISOString()}\n!\n`;
-    const blob = new Blob([header + filters], { type: 'text/plain' });
+    const blob = new Blob([filtersExportText(filters)], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     try {
       const a = document.createElement('a');
@@ -307,21 +314,21 @@ async function initMyFilters() {
       }
       try {
         const text = await file.text();
-        // Strip header comments added by export (! Title:, ! Exported:, blank ! lines)
-        const lines = text.split('\n');
-        const filtered = lines.filter(l => {
-          const t = l.trim();
-          if (t === '!') return false;
-          if (/^!\s*(Title|Exported):/i.test(t)) return false;
-          return true;
-        }).join('\n').trim();
-        if (!filtered) {
+        // An Allowlist export is refused before anything is merged or saved:
+        // here its sites would compile to block rules (see import-export.js).
+        const parsed = parseFiltersImport(text);
+        if (parsed.refused) {
+          const refusal = describeMisdirectedImport(file.name, parsed.refused);
+          showFilterStatus(refusal.message, refusal.type);
+          return;
+        }
+        const newRules = parsed.rules;
+        if (newRules.length === 0) {
           showFilterStatus('⚠ Imported file contains no filter rules', 'error');
           return;
         }
         const area = $('userFiltersArea');
         const existing = area.value.trim();
-        const newRules = filtered.split('\n').map(r => r.trim()).filter(Boolean);
         const existingRules = existing.split('\n').map(r => r.trim()).filter(Boolean);
 
         // Merge and deduplicate
@@ -445,8 +452,7 @@ async function initAllowlist() {
       return;
     }
 
-    const header = `# Title: Allowlist\n# Exported: ${new Date().toISOString()}\n#\n`;
-    const blob = new Blob([header + allowlist.join('\n') + '\n'], { type: 'text/plain' });
+    const blob = new Blob([allowlistExportText(allowlist)], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     try {
       const a = document.createElement('a');
@@ -475,7 +481,18 @@ async function initAllowlist() {
 
       try {
         const text = await file.text();
-        const imported = parseAllowlistText(text);
+        // A My Filters export, or any file with a line that is not a site, is
+        // refused whole: `shop.example##.ad` used to allowlist shop.example,
+        // and a filter file's bare hostnames are block rules (import-export.js).
+        const parsed = parseAllowlistImport(text);
+        if (parsed.refused) {
+          const refusal = parsed.refused === 'not-sites'
+            ? describeNonSiteLines(file.name, parsed.lines)
+            : describeMisdirectedImport(file.name, parsed.refused);
+          showAllowlistStatus(refusal.message, refusal.type, refusal.detail);
+          return;
+        }
+        const imported = parsed.domains;
         if (imported.length === 0) {
           showAllowlistStatus('⚠ Imported file contains no valid sites', 'warning');
           return;
@@ -515,20 +532,6 @@ async function initAllowlist() {
   $('allowlistInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') $('btnAddAllowlist').click();
   });
-}
-
-function parseAllowlistText(text) {
-  return normalizeAllowlist(
-    text.split('\n')
-      .map((line) => line.trim())
-      .filter((line) => {
-        if (!line) return false;
-        if (/^(?:!|#)\s*$/.test(line)) return false;
-        if (/^(?:!|#)\s*(Title|Exported):/i.test(line)) return false;
-        if (/^(?:!|#)/.test(line)) return false;
-        return true;
-      })
-  );
 }
 
 // Throws on failure — callers must not treat "could not read" as "empty".

@@ -21,6 +21,8 @@ const {
   describeAllowlistImport,
   describeFilterApply,
   describeFilterImport,
+  describeMisdirectedImport,
+  describeNonSiteLines,
   describeRejectedDomains,
   describeSkippedRules,
   describeUpdateResult,
@@ -211,6 +213,55 @@ test('zero added but some rejected reports the rejection rather than "nothing to
   const out = describeAllowlistImport('list.txt', 0, ['co.uk', 'org']);
   assert.equal(out.message, '⚠ Imported list.txt (0 sites added, 2 entries rejected)');
   assert.equal(out.detail.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Imports handed the other tab's file (import-export.js)
+// ---------------------------------------------------------------------------
+
+test('a file refused for non-site lines says nothing was imported, and lists the lines', () => {
+  const out = describeNonSiteLines('rules.txt', ['shop.example##.ad', 'cdn.example/ads/*']);
+  assert.equal(
+    out.message,
+    '✗ Nothing was imported from rules.txt — 2 lines are not sites. An allowlist file holds one hostname per line; filter rules go in My Filters.',
+  );
+  assert.equal(out.type, 'error');
+  assert.deepEqual(out.detail, ['shop.example##.ad', 'cdn.example/ads/*']);
+  assert.match(describeNonSiteLines('one.txt', ['a##b']).message, /— 1 line is not a site\./);
+});
+
+test('non-site lines past 20 are counted, not listed', () => {
+  const lines = Array.from({ length: 25 }, (_, i) => `site${i}.example##.ad`);
+  const out = describeNonSiteLines('rules.txt', lines);
+  assert.match(out.message, /— 25 lines are not sites\./);
+  assert.equal(out.detail.length, 21);
+  assert.equal(out.detail[20], '…and 5 more lines not listed');
+});
+
+test('a long non-site line is cut to 120 characters, never inside a surrogate pair', () => {
+  // A 1 MB import can be one line; it must not become a 1 MB list item.
+  const [cut] = describeNonSiteLines('big.txt', [`${'x'.repeat(200_000)}`]).detail;
+  assert.equal(cut, `${'x'.repeat(119)}…`);
+  const astral = String.fromCodePoint(0x1f600);
+  const [pair] = describeNonSiteLines('big.txt', [`${'x'.repeat(118)}${astral}${'y'.repeat(10)}`]).detail;
+  assert.equal(pair, `${'x'.repeat(118)}…`, 'the half pair at the cut is dropped, not left dangling');
+  assert.deepEqual(describeNonSiteLines('f.txt', ['', '  ', null, 7, 'a##b']).detail, ['a##b']);
+});
+
+test('an Allowlist export handed to My Filters is an error that names the right tab', () => {
+  const out = describeMisdirectedImport('allowlist-2026-10-06.txt', 'allowlist');
+  assert.equal(out.type, 'error');
+  assert.ok(out.message.startsWith('✗ allowlist-2026-10-06.txt is an Allowlist export — nothing was imported.'));
+  assert.match(out.message, /would be blocked, not allowed/);
+  assert.match(out.message, /import it on the Allowlist tab\.$/);
+});
+
+test('a My Filters export handed to the Allowlist is an error that names the right tab', () => {
+  const out = describeMisdirectedImport('my-filters-2026-10-06.txt', 'filters');
+  assert.equal(out.type, 'error');
+  assert.ok(out.message.startsWith('✗ my-filters-2026-10-06.txt is a My Filters export — nothing was imported.'));
+  assert.match(out.message, /turn off blocking/);
+  assert.match(out.message, /import it on the My Filters tab\.$/);
 });
 
 // ---------------------------------------------------------------------------

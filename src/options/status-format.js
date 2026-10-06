@@ -133,6 +133,53 @@ export function describeAllowlistImport(fileName, addedCount, rejected) {
 }
 
 /**
+ * Status for an Import handed the other tab's export (`kind` is the tab that
+ * wrote it, from import-export.js). Nothing was written, so it is an error,
+ * and it says what the file would have done here and where it belongs.
+ */
+export function describeMisdirectedImport(fileName, kind) {
+  const message = kind === 'allowlist'
+    ? `✗ ${fileName} is an Allowlist export — nothing was imported. Here its sites would be blocked, not allowed; import it on the Allowlist tab.`
+    : `✗ ${fileName} is a My Filters export — nothing was imported. Here its rules would turn off blocking on the sites they target; import it on the My Filters tab.`;
+  return { message, type: 'error' };
+}
+
+/** Lines listed in full, and the length each is cut to, before summarizing. */
+const MAX_LISTED_LINES = 20;
+const MAX_LINE_LENGTH = 120;
+
+/** `text` cut to MAX_LINE_LENGTH UTF-16 units, never inside a surrogate pair. */
+function clip(text) {
+  if (text.length <= MAX_LINE_LENGTH) return text;
+  let cut = text.slice(0, MAX_LINE_LENGTH - 1);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return `${cut}…`;
+}
+
+/**
+ * Status for an allowlist file refused because some lines are not sites (see
+ * import-export.js). Nothing was imported, so it is an error. A filter file
+ * can hold thousands of such lines, and one line can be the whole 1 MB file,
+ * so the detail lists the first 20, each cut to 120 characters, and counts the
+ * rest, as describeSkippedRules does.
+ */
+export function describeNonSiteLines(fileName, lines) {
+  const list = (Array.isArray(lines) ? lines : [])
+    .filter((line) => typeof line === 'string' && line.trim() !== '');
+  const n = list.length;
+  const detail = list.slice(0, MAX_LISTED_LINES).map(clip);
+  if (n > MAX_LISTED_LINES) {
+    detail.push(`…and ${count(n - MAX_LISTED_LINES, 'more line')} not listed`);
+  }
+  return {
+    message: `✗ Nothing was imported from ${fileName} — ${count(n, 'line')} ${n === 1 ? 'is not a site' : 'are not sites'}. An allowlist file holds one hostname per line; filter rules go in My Filters.`,
+    type: 'error',
+    detail,
+  };
+}
+
+/**
  * Status for a `CHECK_FILTER_UPDATES` response (§5.3).
  *
  * Total failure never reaches here — `call()` rejects on `{ok:false}`/`{error}`

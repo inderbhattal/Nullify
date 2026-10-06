@@ -624,7 +624,7 @@ function extractFirstOp(selector) {
         else if (selector[j] === ')') d--;
         j++;
       }
-      if (d > 0) return MALFORMED; // unterminated `:has(` etc — §7.5
+      if (d > 0) return MALFORMED; // unterminated `:has(` etc. — §7.5
       const inner = selector.slice(idx + pseudo.length, j - 1);
       if (isProceduralSelector(inner)) {
         const base = selector.slice(0, idx).trimEnd();
@@ -1094,7 +1094,7 @@ function clampExpiresMinutes(expiresMinutes) {
 /**
  * The stored per-list meta (`{}` when never written), or `null` when the read
  * failed. §3.1: it feeds a write, so a failed read must not degrade to "no
- * list has meta" — callers fall back to today's behaviour instead (fetch
+ * list has meta" — callers fall back to today's behavior instead (fetch
  * every list, packaged copy wins, write nothing).
  */
 async function readFilterListsMeta() {
@@ -1939,13 +1939,13 @@ async function refreshMemoryCache() {
 /**
  * True when the filter matches nothing at all.
  *
- * Both deserializers now degrade to an EMPTY filter rather than throwing when
- * a stored payload fails validation — `BloomFilter.deserialize` on an unknown
- * `format` tag, and (since the wasm-core parity pass) `deserialize_from_json`
- * on a payload with no `format` tag, which is exactly the shape every
- * wasm-produced legacy blob has. Degrading is the right call; silently
- * *continuing* with the result is not, and neither deserializer can tell the
- * caller which happened.
+ * Both deserializers now degrade to an EMPTY filter, rather than throwing,
+ * when a stored payload fails validation. `BloomFilter.deserialize` does so on
+ * an unknown `format` tag. Since the wasm-core parity pass,
+ * `deserialize_from_json` does so on a payload with no `format` tag, which is
+ * exactly the shape every wasm-produced legacy blob has. Degrading is the
+ * right call; silently *continuing* with the result is not, and neither
+ * deserializer can tell the caller which happened.
  *
  * Engine-agnostic: WASM filters expose `fill_ratio()`, the JS class exposes
  * its bitset. Bails out at the first set bit, so the populated case is O(1)
@@ -2313,7 +2313,7 @@ function stablePrivacyRuleJson(rule) {
  *
  * The comparison is deliberately exact: if a future Chrome returned a
  * normalized rule that never compares equal, every start would write the
- * whole band — today's behaviour — whereas a subset comparison could accept a
+ * whole band — today's behavior — whereas a subset comparison could accept a
  * stale rule left by an older release as equal and never replace it.
  *
  * `applyPrivacySettings` is also reached from UPDATE_SETTINGS, so a snapshot
@@ -3330,8 +3330,8 @@ async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
   }
   // Code review R8 — a cut after compilation (budget, id range, preflight, a
   // per-rule rejection, a capacity stop) is reported by id or in aggregate,
-  // never with a `line`, and the appended rule is last in the batch, so it is
-  // the first cut. For APPEND, find the appended line's own rules (compiled
+  // never with a `line`. The appended rule is last in the batch, so it is the
+  // first cut. For APPEND, find the appended line's own rules (compiled
   // alone, matched by content: an identical rule from another line is its
   // effect too) and, if none went live, report it with its line.
   // (A line the compiler already dropped has no rules, so it is never re-reported.)
@@ -3561,7 +3561,7 @@ const PICKER_EXTENDED_MARKER = /#[@?$%+]/;
 // or `domain=`: ASCII lowercase labels, no wildcard, list or negation.
 const PICKER_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
 // A last label the URL parser reads as a number (WHATWG "ends in a number":
-// decimal, or `0x` hex), and the dotted quad it then serialises the host as.
+// decimal, or `0x` hex), and the dotted quad it then serializes the host as.
 // The parser yields no other numeric-tailed host, so nothing it produces is
 // refused.
 const PICKER_NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
@@ -3735,7 +3735,7 @@ const SIMPLE_RULE_RESOURCE_TYPES = {
 // §5.6 — options that scope *cosmetic* filtering. An `@@…$ghide` line is a
 // generic-hide exception, not a network allow; emitting `{action: allow}` for
 // it switched off network blocking for the whole domain (§3.3's blanket-allow
-// shape, verbatim). Recognised here purely so the line can be refused.
+// shape, verbatim). Recognized here purely so the line can be refused.
 //
 // Shared with the runtime parser rather than restated: a scope option this set
 // misses becomes a network allow, which is the failure this guard exists to
@@ -3769,7 +3769,7 @@ const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = COSMETIC_SCOPE_OPTIONS;
  * option it cannot express` pins `$Script, image` as a script+image rule
  * ("like uBO's"), while the build's own head is lowercase-only and leaves
  * `$SCRIPT` in the pattern. Both cannot be right; until that is decided the
- * runtime keeps the behaviour its tests pin, and the divergence is pinned as
+ * runtime keeps the behavior its tests pin, and the divergence is pinned as
  * well (`7.3: option-name case is the one divergence left`). Everything else
  * here mirrors scripts/build-rules.mjs `splitPatternAndOptions` (Track D's).
  */
@@ -4197,9 +4197,9 @@ async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds, { 
 // §7.9 — serialized: the options page flips a card optimistically and leaves
 // the control live, so a list clicked off and straight back on runs this twice
 // at once. Unserialized, the second run's getEnabledRulesets() snapshot can
-// predate the first run's write, the delta comes out empty, nothing is sent,
-// and the first run's disable is final — storage, the effective map and the
-// options toggle all say ON while the ruleset is OFF in Chrome. Internal:
+// predate the first run's write. Then the delta comes out empty, nothing is
+// sent, and the first run's disable is final. Storage, the effective map and
+// the options toggle all say ON while the ruleset is OFF in Chrome. Internal:
 // callers go through applyRulesets.
 function applyRulesets() {
   return enqueueRulesetOp(_applyRulesetsNow);
@@ -4419,13 +4419,13 @@ const SCRIPTLET_REGISTRY_KEY = (() => {
 //
 // uBO marks a handful of scriptlets `requiresTrust` and refuses any filter that
 // names one unless the filter came from a trusted source. Nothing enforced that
-// here, so `trusted-set-constant` (which `JSON.parse`s a value and installs the
-// result at an arbitrary `window` path) and `trusted-replace-fetch-response`
-// (which rewrites arbitrary response bodies) were reachable from ANY filter the
-// user could be induced to add — including, critically, through
-// `APPEND_USER_FILTER`, which is SENDER_ANY. That made it a privilege
-// escalation from a compromised renderer: append one line, get arbitrary code
-// semantics injected into the MAIN world of the next page load.
+// here. `trusted-set-constant` parses a value as JSON and installs the result
+// at an arbitrary `window` path; `trusted-replace-fetch-response` rewrites
+// arbitrary response bodies. Both were reachable from ANY filter the user could
+// be induced to add — including, critically, through `APPEND_USER_FILTER`,
+// which is SENDER_ANY. That made it a privilege escalation from a compromised
+// renderer: append one line, get arbitrary code semantics injected into the
+// MAIN world of the next page load.
 //
 // The gate lives here, at spec-build time, because this is the only layer that
 // knows where a spec came from. Filtering in the page would be too late (the
@@ -4481,7 +4481,7 @@ const scriptletDiagnostics = {
 // ones the cap turned away. Plain totals, not per-key maps: the text itself is
 // renderer-controlled and must never become a diagnostic key. `refused`
 // climbing is the only signal that something is sending oversized text, which
-// is otherwise a silent defence.
+// is otherwise a silent defense.
 let semanticChecksAttempted = 0;
 let semanticChecksRefused = 0;
 
@@ -5599,8 +5599,8 @@ function isHostnameAllowedCached(hostname) {
 //     and GET_INIT_DATA answers sub-frames;
 //   - it stores the document URL it was made for, and GET_INIT_DATA matches
 //     it against `sender.url`. A document_start content script can ask before
-//     the worker has processed that frame's `onCommitted` — both wake the
-//     worker and the order is not guaranteed — so a bare boolean could hand a
+//     the worker has processed that frame's `onCommitted`: both wake the
+//     worker, and the order is not guaranteed. So a bare boolean could hand a
 //     new document the previous one's `true`, whose sheet died with it.
 // Every failure mode above resolves to `false`, i.e. one duplicated sheet in
 // that frame, which is exactly what shipped before this flag.

@@ -26,7 +26,7 @@
  *  - Reports hidden element count to background
  *
  * The operator list lives in src/shared/proc-ops.js (§3.2, 2026-09): every
- * name there is tokenised as procedural so it never reaches a CSS joiner;
+ * name there is tokenized as procedural so it never reaches a CSS joiner;
  * names this engine does not implement fail closed in `_applyOp`.
  */
 
@@ -149,7 +149,7 @@ function extractFirstOp(selector) {
         else if (selector[j] === ')') d--;
         j++;
       }
-      if (d > 0) return MALFORMED; // unterminated `:has(` etc — see above (§5.20)
+      if (d > 0) return MALFORMED; // unterminated `:has(` etc. — see above (§5.20)
       const inner = selector.slice(idx + pseudo.length, j - 1);
       if (isProceduralSelector(inner)) {
         // We found a nested procedural operator.
@@ -832,7 +832,7 @@ export class CosmeticEngine {
     }
   }
 
-  /** Check if an element matches a procedural selector plan (used by :has, :not, etc). */
+  /** Check if an element matches a procedural selector plan (used by :has, :not, etc.). */
   _matchesProcedural(el, proceduralSelector) {
     const isPreParsed = typeof proceduralSelector === 'object' && proceduralSelector.plan;
     const plan = isPreParsed ? proceduralSelector.plan : parseProceduralPlan(proceduralSelector);
@@ -1062,7 +1062,7 @@ export class CosmeticEngine {
         // exactly `:has()` and its negation. Both were tokenized by PROC_OPS
         // but had no case here, so they hit `default` and reported a match
         // unconditionally — hiding every element the base selector touched.
-        // `-abp-has` is the ABP spelling; the JS planner canonicalises it to
+        // `-abp-has` is the ABP spelling; the JS planner canonicalizes it to
         // `has`, the Rust planner emits it as written (§3.2).
         case 'has':
         case 'if':

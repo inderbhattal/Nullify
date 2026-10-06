@@ -91,7 +91,7 @@ These are the scenarios the unit harness cannot reach.
 `$all` compiles to a block over every resource type *including*
 `main_frame`, so a host on `anti-adblock` (uAssets' badware.txt) or on
 `malware` does not load with its subresources stripped — the navigation
-itself is refused. It is the one filter-list behaviour that changes what
+itself is refused. It is the one filter-list behavior that changes what
 typing a URL does (README, "`$all` blocks the navigation", carries the
 measured host counts), and no automated test exercises it against a real
 Chrome. Both directions matter: the block must fire, and it must not fire
@@ -157,6 +157,12 @@ grep -hoP '^[a-z0-9.-]+(?=##\+js\(aopr,)' scripts/filter-lists/*.txt | head -5
 - [ ] Allowlist export → import round-trip preserves the domains, and an
       import containing an invalid entry (e.g. `co.uk`) reports it as
       rejected rather than silently dropping it.
+- [ ] Each Import refuses the other tab's export: an Allowlist export on My
+      Filters, and a My Filters export on the Allowlist, each show an error
+      naming the right tab and leave the filters and the allowlist unchanged.
+      An allowlist file with any line that is not a site (a filter rule such
+      as `example.com##.ad`, or a page URL) imports nothing and lists that
+      line; `example.com` is never added from it.
 
 ## Diagnostics
 

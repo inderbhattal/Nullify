@@ -27,10 +27,10 @@ import { proxyApply, wrapInstanceGetter } from '../scriptlets/shared-utils.js';
   // Nor may it be a brand on the wrapper: the version marker §4.12 moved onto
   // JSON.parse was a global-registry symbol any page could look up by name,
   // which identified the extension *and its version* in one expression
-  // (§4.4). The guard is now the behavioural probe alone. A hook
+  // (§4.4). The guard is now the behavioral probe alone. A hook
   // that neutralizes ad payloads the way ours does is treated as installed,
   // whichever generation planted it — the version number bought nothing a
-  // forger could not also forge. A forged hook *without* the behaviour does
+  // forger could not also forge. A forged hook *without* the behavior does
   // not pass, so the shield installs over the top of it.
   const isShieldInstalled = () => {
     try {
@@ -194,7 +194,7 @@ import { proxyApply, wrapInstanceGetter } from '../scriptlets/shared-utils.js';
       // shapes — but once one matches, walk the whole envelope. The old code
       // let this gate pass and then ran the *shallow* prune, so a payload like
       // `{playerResponse:{streamingData:{}, <container>:{adPlacements:[…]}}}`
-      // was recognised as a player response and then left untouched: the
+      // was recognized as a player response and then left untouched: the
       // shallow walk only looks at `result` and `result.playerResponse`.
       if (
         hasAdPayload(nested) ||
@@ -297,7 +297,7 @@ import { proxyApply, wrapInstanceGetter } from '../scriptlets/shared-utils.js';
       // convention: a Shorts entry whose reelWatchEndpoint is flagged `isAd`,
       // or a rich-grid item whose content is an adSlotRenderer, is an ad and
       // nothing else — neutering one key would leave an empty husk occupying a
-      // slot in the sequence/feed, which is exactly the artefact uBO avoids by
+      // slot in the sequence/feed, which is exactly the artifact uBO avoids by
       // splicing. Iterate backwards so splicing does not skip elements.
       let removed = false;
       for (let i = target.length - 1; i >= 0; i--) {

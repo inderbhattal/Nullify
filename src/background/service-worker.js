@@ -1939,13 +1939,13 @@ async function refreshMemoryCache() {
 /**
  * True when the filter matches nothing at all.
  *
- * Both deserializers now degrade to an EMPTY filter rather than throwing when
- * a stored payload fails validation — `BloomFilter.deserialize` on an unknown
- * `format` tag, and (since the wasm-core parity pass) `deserialize_from_json`
- * on a payload with no `format` tag, which is exactly the shape every
- * wasm-produced legacy blob has. Degrading is the right call; silently
- * *continuing* with the result is not, and neither deserializer can tell the
- * caller which happened.
+ * Both deserializers now degrade to an EMPTY filter, rather than throwing,
+ * when a stored payload fails validation. `BloomFilter.deserialize` does so on
+ * an unknown `format` tag. Since the wasm-core parity pass,
+ * `deserialize_from_json` does so on a payload with no `format` tag, which is
+ * exactly the shape every wasm-produced legacy blob has. Degrading is the
+ * right call; silently *continuing* with the result is not, and neither
+ * deserializer can tell the caller which happened.
  *
  * Engine-agnostic: WASM filters expose `fill_ratio()`, the JS class exposes
  * its bitset. Bails out at the first set bit, so the populated case is O(1)
@@ -3330,8 +3330,8 @@ async function _applyUserFiltersNow(filtersText, { appendedLine } = {}) {
   }
   // Code review R8 — a cut after compilation (budget, id range, preflight, a
   // per-rule rejection, a capacity stop) is reported by id or in aggregate,
-  // never with a `line`, and the appended rule is last in the batch, so it is
-  // the first cut. For APPEND, find the appended line's own rules (compiled
+  // never with a `line`. The appended rule is last in the batch, so it is the
+  // first cut. For APPEND, find the appended line's own rules (compiled
   // alone, matched by content: an identical rule from another line is its
   // effect too) and, if none went live, report it with its line.
   // (A line the compiler already dropped has no rules, so it is never re-reported.)
@@ -4197,9 +4197,9 @@ async function applyRulesetsSequentially(enableRulesetIds, disableRulesetIds, { 
 // §7.9 — serialized: the options page flips a card optimistically and leaves
 // the control live, so a list clicked off and straight back on runs this twice
 // at once. Unserialized, the second run's getEnabledRulesets() snapshot can
-// predate the first run's write, the delta comes out empty, nothing is sent,
-// and the first run's disable is final — storage, the effective map and the
-// options toggle all say ON while the ruleset is OFF in Chrome. Internal:
+// predate the first run's write. Then the delta comes out empty, nothing is
+// sent, and the first run's disable is final. Storage, the effective map and
+// the options toggle all say ON while the ruleset is OFF in Chrome. Internal:
 // callers go through applyRulesets.
 function applyRulesets() {
   return enqueueRulesetOp(_applyRulesetsNow);
@@ -4419,13 +4419,13 @@ const SCRIPTLET_REGISTRY_KEY = (() => {
 //
 // uBO marks a handful of scriptlets `requiresTrust` and refuses any filter that
 // names one unless the filter came from a trusted source. Nothing enforced that
-// here, so `trusted-set-constant` (which `JSON.parse`s a value and installs the
-// result at an arbitrary `window` path) and `trusted-replace-fetch-response`
-// (which rewrites arbitrary response bodies) were reachable from ANY filter the
-// user could be induced to add — including, critically, through
-// `APPEND_USER_FILTER`, which is SENDER_ANY. That made it a privilege
-// escalation from a compromised renderer: append one line, get arbitrary code
-// semantics injected into the MAIN world of the next page load.
+// here. `trusted-set-constant` parses a value as JSON and installs the result
+// at an arbitrary `window` path; `trusted-replace-fetch-response` rewrites
+// arbitrary response bodies. Both were reachable from ANY filter the user could
+// be induced to add — including, critically, through `APPEND_USER_FILTER`,
+// which is SENDER_ANY. That made it a privilege escalation from a compromised
+// renderer: append one line, get arbitrary code semantics injected into the
+// MAIN world of the next page load.
 //
 // The gate lives here, at spec-build time, because this is the only layer that
 // knows where a spec came from. Filtering in the page would be too late (the
@@ -5599,8 +5599,8 @@ function isHostnameAllowedCached(hostname) {
 //     and GET_INIT_DATA answers sub-frames;
 //   - it stores the document URL it was made for, and GET_INIT_DATA matches
 //     it against `sender.url`. A document_start content script can ask before
-//     the worker has processed that frame's `onCommitted` — both wake the
-//     worker and the order is not guaranteed — so a bare boolean could hand a
+//     the worker has processed that frame's `onCommitted`: both wake the
+//     worker, and the order is not guaranteed. So a bare boolean could hand a
 //     new document the previous one's `true`, whose sheet died with it.
 // Every failure mode above resolves to `false`, i.e. one duplicated sheet in
 // that frame, which is exactly what shipped before this flag.

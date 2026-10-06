@@ -91,7 +91,7 @@ These are the scenarios the unit harness cannot reach.
 `$all` compiles to a block over every resource type *including*
 `main_frame`, so a host on `anti-adblock` (uAssets' badware.txt) or on
 `malware` does not load with its subresources stripped — the navigation
-itself is refused. It is the one filter-list behaviour that changes what
+itself is refused. It is the one filter-list behavior that changes what
 typing a URL does (README, "`$all` blocks the navigation", carries the
 measured host counts), and no automated test exercises it against a real
 Chrome. Both directions matter: the block must fire, and it must not fire

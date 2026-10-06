@@ -624,7 +624,7 @@ function extractFirstOp(selector) {
         else if (selector[j] === ')') d--;
         j++;
       }
-      if (d > 0) return MALFORMED; // unterminated `:has(` etc — §7.5
+      if (d > 0) return MALFORMED; // unterminated `:has(` etc. — §7.5
       const inner = selector.slice(idx + pseudo.length, j - 1);
       if (isProceduralSelector(inner)) {
         const base = selector.slice(0, idx).trimEnd();
@@ -1094,7 +1094,7 @@ function clampExpiresMinutes(expiresMinutes) {
 /**
  * The stored per-list meta (`{}` when never written), or `null` when the read
  * failed. §3.1: it feeds a write, so a failed read must not degrade to "no
- * list has meta" — callers fall back to today's behaviour instead (fetch
+ * list has meta" — callers fall back to today's behavior instead (fetch
  * every list, packaged copy wins, write nothing).
  */
 async function readFilterListsMeta() {
@@ -2313,7 +2313,7 @@ function stablePrivacyRuleJson(rule) {
  *
  * The comparison is deliberately exact: if a future Chrome returned a
  * normalized rule that never compares equal, every start would write the
- * whole band — today's behaviour — whereas a subset comparison could accept a
+ * whole band — today's behavior — whereas a subset comparison could accept a
  * stale rule left by an older release as equal and never replace it.
  *
  * `applyPrivacySettings` is also reached from UPDATE_SETTINGS, so a snapshot
@@ -3561,7 +3561,7 @@ const PICKER_EXTENDED_MARKER = /#[@?$%+]/;
 // or `domain=`: ASCII lowercase labels, no wildcard, list or negation.
 const PICKER_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)*$/;
 // A last label the URL parser reads as a number (WHATWG "ends in a number":
-// decimal, or `0x` hex), and the dotted quad it then serialises the host as.
+// decimal, or `0x` hex), and the dotted quad it then serializes the host as.
 // The parser yields no other numeric-tailed host, so nothing it produces is
 // refused.
 const PICKER_NUMERIC_TAIL = /(?:^|\.)(?:\d+|0x[0-9a-f]*)\.?$/;
@@ -3735,7 +3735,7 @@ const SIMPLE_RULE_RESOURCE_TYPES = {
 // §5.6 — options that scope *cosmetic* filtering. An `@@…$ghide` line is a
 // generic-hide exception, not a network allow; emitting `{action: allow}` for
 // it switched off network blocking for the whole domain (§3.3's blanket-allow
-// shape, verbatim). Recognised here purely so the line can be refused.
+// shape, verbatim). Recognized here purely so the line can be refused.
 //
 // Shared with the runtime parser rather than restated: a scope option this set
 // misses becomes a network allow, which is the failure this guard exists to
@@ -3769,7 +3769,7 @@ const SIMPLE_RULE_COSMETIC_SCOPE_OPTIONS = COSMETIC_SCOPE_OPTIONS;
  * option it cannot express` pins `$Script, image` as a script+image rule
  * ("like uBO's"), while the build's own head is lowercase-only and leaves
  * `$SCRIPT` in the pattern. Both cannot be right; until that is decided the
- * runtime keeps the behaviour its tests pin, and the divergence is pinned as
+ * runtime keeps the behavior its tests pin, and the divergence is pinned as
  * well (`7.3: option-name case is the one divergence left`). Everything else
  * here mirrors scripts/build-rules.mjs `splitPatternAndOptions` (Track D's).
  */
@@ -4481,7 +4481,7 @@ const scriptletDiagnostics = {
 // ones the cap turned away. Plain totals, not per-key maps: the text itself is
 // renderer-controlled and must never become a diagnostic key. `refused`
 // climbing is the only signal that something is sending oversized text, which
-// is otherwise a silent defence.
+// is otherwise a silent defense.
 let semanticChecksAttempted = 0;
 let semanticChecksRefused = 0;
 

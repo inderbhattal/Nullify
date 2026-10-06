@@ -325,7 +325,7 @@ test('a page with no procedural rules still short-circuits (§5.20 didn\'t re-br
 
 // ---------------------------------------------------------------------------
 // docs/REVIEW-2026-09.md §3.2 — the engine-construction check reads the one
-// shared operator list, so an operator the engine tokenises always reaches it.
+// shared operator list, so an operator the engine tokenizes always reaches it.
 // ---------------------------------------------------------------------------
 
 test('3.2: a string-form :others() rule constructs the engine', async () => {

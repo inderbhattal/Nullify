@@ -746,7 +746,7 @@ test('well-formed selectors are unaffected by the malformed-input guard (§5.20)
 
 // ---------------------------------------------------------------------------
 // docs/REVIEW-2026-09.md §3.2 — one shared operator list; unknown operators
-// are tokenised as procedural (so they never reach a CSS joiner) and fail
+// are tokenized as procedural (so they never reach a CSS joiner) and fail
 // closed in `_applyOp`.
 // ---------------------------------------------------------------------------
 
@@ -786,7 +786,7 @@ test('3.2: :matches-media()/:shadow()/:matches-prop()/:others()/:remove-*() are 
 });
 
 test('3.2: ABP aliases plan as their uBO equivalents', () => {
-  // The JS planner canonicalises the step name.
+  // The JS planner canonicalizes the step name.
   assert.deepEqual(parseProceduralPlan('div:-abp-has(.x)'), [
     { type: 'css', kind: 'compound', selector: 'div' },
     { type: 'op', op: 'has', arg: '.x' },
